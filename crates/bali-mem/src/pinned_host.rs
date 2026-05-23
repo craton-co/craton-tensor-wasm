@@ -2,17 +2,26 @@
 //! disabled.
 //!
 //! The "pinned" in the name reflects the intended end-state, not the current
-//! behavior. Today this type unconditionally allocates a plain
-//! `Box<[u8]>` — which is sufficient for the `--no-default-features` CI path
-//! and for developer laptops without CUDA installed.
+//! behavior. Today this type unconditionally allocates a page-aligned
+//! anonymous mapping (via the cross-platform [`region`] crate) — which is
+//! sufficient for the `--no-default-features` CI path and for developer
+//! laptops without CUDA installed.
+//!
+//! On all hosts the usable region is bracketed by `PROT_NONE` /
+//! `PAGE_NOACCESS` guard pages, catching OOB reads/writes at the OS level
+//! (SIGSEGV on Unix; `EXCEPTION_ACCESS_VIOLATION` on Windows). The managed
+//! memory paths ([`crate::unified::UnifiedBuffer`] on CUDA hosts) still
+//! cannot use guard pages — the CUDA driver page-migrates managed memory
+//! between host and device and applying host page protection would race
+//! with the migration machinery. That limitation is unchanged.
 //!
 //! Wiring a real `cudaHostAlloc` (with `cudaHostAllocMapped |
 //! cudaHostAllocPortable`) path that produces page-locked, DMA-friendly memory
 //! is deferred. When that work lands it will be gated behind the
 //! `pinned-host-memory` feature flag and engaged only when the
 //! `unified-memory` feature is disabled on a host that does have CUDA
-//! available; the heap-`Box<[u8]>` path will remain the fallback for everyone
-//! else.
+//! available; the guarded anonymous-mapping path will remain the fallback
+//! for everyone else.
 //!
 //! The API is intentionally symmetric with [`crate::unified::UnifiedBuffer`]
 //! so call sites can swap one buffer type for the other without conditional
@@ -21,17 +30,52 @@
 use std::fmt;
 use std::ptr::NonNull;
 
+use region::{Allocation, Protection};
+
 use crate::unified::{DeviceId, UnifiedError};
 
-/// A page-locked host buffer (or a plain heap buffer when CUDA isn't linked).
-pub struct PinnedHostBuffer {
-    ptr: NonNull<u8>,
-    size: usize,
-    device_id: DeviceId,
-    _backing: Box<[u8]>,
+/// Owns the full guarded region: `[guard | usable | guard]`.
+///
+/// The `region::Allocation` releases its mapping (and therefore the guard
+/// pages) when this struct is dropped — there is no separate teardown for
+/// the protections.
+struct GuardedAllocation {
+    /// Full anonymous mapping. Total length is `2 * page + usable_size`.
+    ///
+    /// Held purely for its `Drop`, which unmaps the entire region (guard
+    /// pages included). Reads of this field would be unsound — the live
+    /// `ptr` inside [`PinnedHostBuffer`] aliases the same memory.
+    #[allow(dead_code)]
+    full_alloc: Allocation,
+    /// Offset (in bytes) from the start of the mapping to the usable region.
+    /// Always equal to one page. Used by `#[cfg(test)]` accessors.
+    #[allow(dead_code)]
+    usable_offset: usize,
+    /// Size in bytes of the read/write region between the guard pages,
+    /// rounded up to a multiple of the page size. Used by `Debug` and the
+    /// `#[cfg(test)]` `usable_size()` accessor.
+    #[allow(dead_code)]
+    usable_size: usize,
 }
 
-// SAFETY: the inner buffer is owned by this struct, not shared.
+/// A page-locked host buffer (or a plain heap buffer when CUDA isn't linked).
+///
+/// The usable region is bracketed by `PROT_NONE` / `PAGE_NOACCESS` guard
+/// pages so that out-of-bounds reads or writes raise a hardware fault at the
+/// OS level instead of silently corrupting adjacent allocations.
+pub struct PinnedHostBuffer {
+    /// Pointer to the first usable byte (one page past the start of
+    /// `allocation.full_alloc`).
+    ptr: NonNull<u8>,
+    /// Number of bytes the caller requested (always `<= allocation.usable_size`).
+    size: usize,
+    device_id: DeviceId,
+    allocation: GuardedAllocation,
+}
+
+// SAFETY: the inner buffer is owned by this struct, not shared. The
+// `region::Allocation` mapping is `Send + Sync`; the raw `NonNull<u8>` derived
+// from it is just an offset into that mapping and inherits the same guarantee.
 unsafe impl Send for PinnedHostBuffer {}
 unsafe impl Sync for PinnedHostBuffer {}
 
@@ -42,22 +86,47 @@ impl PinnedHostBuffer {
     }
 
     /// Allocate `size` bytes of pinned host memory on the named device.
+    ///
+    /// The returned buffer is bracketed by `PROT_NONE` guard pages. The
+    /// usable region is rounded up to a multiple of the OS page size, but
+    /// [`Self::len`] still reports the caller-requested `size`.
     pub fn new_on(size: usize, device_id: DeviceId) -> Result<Self, UnifiedError> {
         if size == 0 {
             return Err(UnifiedError::ZeroSize);
         }
-        let mut backing: Box<[u8]> = vec![0u8; size].into_boxed_slice();
-        let ptr = NonNull::new(backing.as_mut_ptr())
-            .ok_or_else(|| UnifiedError::Allocation("Box returned null".into()))?;
+        let page = region::page::size();
+        // Round usable up to a page multiple.
+        let usable = size.div_ceil(page) * page;
+        let total = usable + 2 * page;
+        // Allocate the whole region as PROT_NONE first, then mark the middle
+        // as ReadWrite. `region::alloc` returns page-aligned anonymous memory.
+        let alloc = region::alloc(total, Protection::NONE)
+            .map_err(|e| UnifiedError::Allocation(format!("region::alloc: {e}")))?;
+        let base = alloc.as_ptr::<u8>();
+        // SAFETY: `base..base + total` is the freshly allocated mapping;
+        // adding one page lands strictly inside it.
+        let usable_start = unsafe { base.add(page) };
+        // SAFETY: `usable_start..usable_start + usable` is the middle slice
+        // of the mapping (between the two guard pages).
+        unsafe {
+            region::protect(usable_start, usable, Protection::READ_WRITE)
+                .map_err(|e| UnifiedError::Allocation(format!("region::protect: {e}")))?;
+        }
+        let ptr = NonNull::new(usable_start as *mut u8)
+            .ok_or_else(|| UnifiedError::Allocation("region::alloc returned null".into()))?;
         Ok(Self {
             ptr,
             size,
             device_id,
-            _backing: backing,
+            allocation: GuardedAllocation {
+                full_alloc: alloc,
+                usable_offset: page,
+                usable_size: usable,
+            },
         })
     }
 
-    /// Length in bytes.
+    /// Length in bytes — matches the caller-requested size, not the page-rounded usable region.
     pub fn len(&self) -> usize {
         self.size
     }
@@ -94,6 +163,28 @@ impl PinnedHostBuffer {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.size) }
     }
 
+    /// Size of the read/write region between the two guard pages, in bytes.
+    ///
+    /// Always a multiple of the OS page size and `>= self.len()`. Primarily
+    /// useful for tests that need to address the byte one past the end of
+    /// the usable region (the start of the trailing guard page).
+    #[cfg(test)]
+    pub(crate) fn usable_size(&self) -> usize {
+        self.allocation.usable_size
+    }
+
+    /// Total size of the underlying mapping (guard pages included), in bytes.
+    #[cfg(test)]
+    pub(crate) fn full_mapping_size(&self) -> usize {
+        self.allocation.full_alloc.len()
+    }
+
+    /// Byte offset from the mapping start to the first usable byte. Always one page.
+    #[cfg(test)]
+    pub(crate) fn usable_offset(&self) -> usize {
+        self.allocation.usable_offset
+    }
+
     /// No-op prefetch hint. Present for API parity with [`crate::unified::UnifiedBuffer`].
     pub fn prefetch_to_device(&self) -> Result<(), UnifiedError> {
         Ok(())
@@ -110,6 +201,7 @@ impl fmt::Debug for PinnedHostBuffer {
         f.debug_struct("PinnedHostBuffer")
             .field("ptr", &self.ptr.as_ptr())
             .field("size", &self.size)
+            .field("usable_size", &self.allocation.usable_size)
             .field("device_id", &self.device_id)
             .finish()
     }
@@ -147,5 +239,90 @@ mod tests {
         let b = PinnedHostBuffer::new(32).unwrap();
         b.prefetch_to_device().expect("no-op should succeed");
         b.prefetch_to_host().expect("no-op should succeed");
+    }
+
+    /// Reported `len` matches the caller request, not the page-rounded usable region.
+    #[test]
+    fn len_reports_requested_not_rounded() {
+        let page = region::page::size();
+        // Pick a size that is definitely not a page multiple.
+        let requested = 1234;
+        assert!(requested < page, "test assumes requested < page");
+        let b = PinnedHostBuffer::new(requested).unwrap();
+        assert_eq!(b.len(), requested);
+        assert_eq!(b.as_slice().len(), requested);
+        // Usable region rounded up to one page.
+        assert_eq!(b.usable_size(), page);
+        // Full mapping is usable + two guard pages.
+        assert_eq!(b.full_mapping_size(), 3 * page);
+        assert_eq!(b.usable_offset(), page);
+    }
+
+    /// Writes across the full usable byte range succeed and read back intact.
+    #[test]
+    fn full_range_round_trip() {
+        let page = region::page::size();
+        // Choose a request that spans more than one page so we exercise multiple pages.
+        let requested = page + 17;
+        let mut b = PinnedHostBuffer::new(requested).unwrap();
+        for (i, byte) in b.as_mut_slice().iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+        for (i, &byte) in b.as_slice().iter().enumerate() {
+            assert_eq!(byte, (i % 251) as u8, "mismatch at {i}");
+        }
+    }
+
+    /// Confirms the bracketing pages are mapped `Protection::NONE`.
+    ///
+    /// This is the cross-platform stand-in for catching a SIGSEGV /
+    /// `EXCEPTION_ACCESS_VIOLATION`: rather than provoke the fault (which
+    /// would terminate the test process), we ask the OS to report the
+    /// protection bits on those pages and assert they are inaccessible.
+    #[test]
+    fn guard_pages_are_inaccessible() {
+        let page = region::page::size();
+        let b = PinnedHostBuffer::new(1024).unwrap();
+        let usable_ptr = b.as_ptr();
+
+        // SAFETY: `usable_ptr` lies one page past the mapping start, so
+        // subtracting one page lands inside the leading guard page; adding
+        // the usable size lands at the start of the trailing guard page.
+        let before = unsafe { usable_ptr.sub(page) };
+        let after = unsafe { usable_ptr.add(b.usable_size()) };
+
+        let prot_before = region::query(before).expect("query before-guard");
+        let prot_after = region::query(after).expect("query after-guard");
+        assert_eq!(
+            prot_before.protection(),
+            Protection::NONE,
+            "before-guard must be PROT_NONE/PAGE_NOACCESS",
+        );
+        assert_eq!(
+            prot_after.protection(),
+            Protection::NONE,
+            "after-guard must be PROT_NONE/PAGE_NOACCESS",
+        );
+
+        // And the usable region itself must be readable + writable.
+        let prot_usable = region::query(usable_ptr).expect("query usable");
+        assert_eq!(
+            prot_usable.protection(),
+            Protection::READ_WRITE,
+            "usable region must be RW",
+        );
+    }
+
+    /// Dropping a buffer must release its full mapping, including guard pages.
+    #[test]
+    fn drop_releases_mapping() {
+        // Allocate and drop many buffers; if guards leaked we'd run out of
+        // virtual address space well before this loop completes on 64-bit
+        // systems, but the more realistic failure mode is the kernel's
+        // per-process mapping count limit (e.g. vm.max_map_count on Linux).
+        for _ in 0..256 {
+            let b = PinnedHostBuffer::new(64 * 1024).unwrap();
+            drop(b);
+        }
     }
 }

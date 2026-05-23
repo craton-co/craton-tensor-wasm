@@ -7,3 +7,4 @@ pub mod deopt;
 pub mod detector;
 pub mod ir;
 pub mod ptx_emit;
+pub mod rewrite;

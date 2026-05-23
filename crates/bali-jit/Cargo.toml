@@ -17,12 +17,13 @@ dashmap.workspace = true
 lru.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+wasmparser.workspace = true
+wasm-encoder = { version = "0.218", features = ["wasmparser"] }
 ptx-builder = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true
 wat.workspace = true
-wasmparser.workspace = true
 
 [features]
 default = []

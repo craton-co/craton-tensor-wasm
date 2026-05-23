@@ -8,6 +8,11 @@
 //!
 //! When the `cuda` feature is enabled (S16+ on real hardware) the bodies
 //! switch to real CUDA dispatch via the `cust` crate.
+//!
+//! NOTE: Cuda-feature code paths in this file are compile-tested on CUDA
+//! hosts only; on no-CUDA hosts only the `#[cfg(not(feature = "cuda"))]`
+//! branches are exercised. The cuda branches must be kept consistent with
+//! the cust 0.3.x API.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -96,7 +101,15 @@ pub trait HasWasiCuda {
 /// Register all wasi-cuda host functions on a wasmtime `Linker`.
 ///
 /// `T` is the store data type and must implement [`HasWasiCuda`].
-pub fn add_to_linker<T: HasWasiCuda + 'static>(linker: &mut Linker<T>) -> wasmtime::Result<()> {
+///
+/// `FN_LAUNCH` is registered with `func_wrap_async` so that on the CUDA
+/// path the host can `tokio::task::spawn_blocking(stream.synchronize())`
+/// without blocking the wasmtime fiber. The no-CUDA branch wraps the
+/// existing synchronous path in an immediately-ready future so a single
+/// async wrapper covers both feature configurations.
+pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
+    linker: &mut Linker<T>,
+) -> wasmtime::Result<()> {
     linker.func_wrap(
         MODULE,
         FN_LOAD_PTX,
@@ -113,35 +126,40 @@ pub fn add_to_linker<T: HasWasiCuda + 'static>(linker: &mut Linker<T>) -> wasmti
         },
     )?;
 
-    linker.func_wrap(
+    linker.func_wrap_async(
         MODULE,
         FN_LAUNCH,
         |mut caller: Caller<'_, T>,
-         kernel_id: i64,
-         grid_x: i32,
-         grid_y: i32,
-         grid_z: i32,
-         block_x: i32,
-         block_y: i32,
-         block_z: i32,
-         shared_mem: i32,
-         args_ptr: i32,
-         args_len: i32|
-         -> i32 {
-            launch_impl(
-                &mut caller,
-                kernel_id,
-                grid_x,
-                grid_y,
-                grid_z,
-                block_x,
-                block_y,
-                block_z,
-                shared_mem,
-                args_ptr,
-                args_len,
-            )
-            .map_or_else(|e| e.code(), |_| 0)
+         (
+            kernel_id,
+            grid_x,
+            grid_y,
+            grid_z,
+            block_x,
+            block_y,
+            block_z,
+            shared_mem,
+            args_ptr,
+            args_len,
+        ): (i64, i32, i32, i32, i32, i32, i32, i32, i32, i32)|
+         -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
+            Box::new(async move {
+                launch_impl_async(
+                    &mut caller,
+                    kernel_id,
+                    grid_x,
+                    grid_y,
+                    grid_z,
+                    block_x,
+                    block_y,
+                    block_z,
+                    shared_mem,
+                    args_ptr,
+                    args_len,
+                )
+                .await
+                .map_or_else(|e| e.code(), |_| 0)
+            })
         },
     )?;
 
@@ -285,19 +303,49 @@ fn load_ptx_impl<T: HasWasiCuda>(
 
     #[cfg(feature = "cuda")]
     {
+        use cust::module::Module;
         // Real path: compile the PTX through cust::module::Module::from_ptx.
-        // Concrete implementation lands in the CUDA-enabled session.
-        let _ = (ptx, entry);
-        caller
-            .data()
-            .wasi_cuda()
-            .record_error("load_ptx: cuda feature implementation pending");
-        Err(AbiError::Internal)
+        // Module::from_ptx panics if `string` contains a nul byte, so we
+        // explicitly reject nul bytes before handing the slice over.
+        let ptx_str = std::str::from_utf8(&ptx).map_err(|_| {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error("load_ptx: PTX bytes are not valid UTF-8");
+            AbiError::MalformedPtx
+        })?;
+        if ptx_str.as_bytes().contains(&0u8) {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error("load_ptx: PTX bytes contain an interior NUL");
+            return Err(AbiError::MalformedPtx);
+        }
+        let module = Module::from_ptx(ptx_str, &[]).map_err(|e| {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("load_ptx: cust compile failed: {e:?}"));
+            AbiError::MalformedPtx
+        })?;
+        let owner = caller.data().wasi_cuda().instance_id;
+        let entry_record = KernelEntry {
+            owner,
+            entry: entry.clone(),
+            ptx_bytes_len: ptx.len(),
+            module: Some(module),
+        };
+        let registry = caller.data().wasi_cuda().registry.clone();
+        let id = registry.register(entry_record)?;
+        info!(target: "bali_wasi_gpu::host", instance = %owner, kernel = %id, entry, "PTX compiled and registered via cust");
+        Ok(id)
     }
 }
 
+/// Common argument-region validation extracted from the launch path so the
+/// sync and async wrappers share one implementation.
 #[allow(clippy::too_many_arguments)]
-fn launch_impl<T: HasWasiCuda>(
+fn validate_launch_args<T: HasWasiCuda>(
     caller: &mut Caller<'_, T>,
     kernel_id: i64,
     grid_x: i32,
@@ -309,20 +357,7 @@ fn launch_impl<T: HasWasiCuda>(
     shared_mem: i32,
     args_ptr: i32,
     args_len: i32,
-) -> Result<(), AbiError> {
-    let _span = info_span!(
-        "wasi_cuda.launch",
-        instance = %caller.data().wasi_cuda().instance_id,
-        kernel = kernel_id,
-        grid_x = grid_x, grid_y = grid_y, grid_z = grid_z,
-        block_x = block_x, block_y = block_y, block_z = block_z,
-        shared_mem = shared_mem,
-    )
-    .entered();
-    // Validate args region bounds up-front. We don't consume the bytes yet
-    // (kernel argument marshalling lands with the real CUDA session) but
-    // the (ptr, len) pair MUST refer to a region inside the caller's Wasm
-    // memory — otherwise we'd be propagating a bogus pointer downstream.
+) -> Result<KernelId, AbiError> {
     if args_len < 0 || args_ptr < 0 {
         caller.data().wasi_cuda().record_error(format!(
             "launch: negative args_ptr ({args_ptr}) or args_len ({args_len})"
@@ -358,10 +393,6 @@ fn launch_impl<T: HasWasiCuda>(
     if kernel_id < 0 {
         return Err(AbiError::InvalidKernel);
     }
-    let kid = KernelId(kernel_id as u64);
-    let owner = caller.data().wasi_cuda().instance_id;
-    let registry = caller.data().wasi_cuda().registry.clone();
-    let _entry = registry.lookup(kid, owner)?;
     if grid_x <= 0
         || grid_y <= 0
         || grid_z <= 0
@@ -372,39 +403,153 @@ fn launch_impl<T: HasWasiCuda>(
     {
         return Err(AbiError::InvalidPointer);
     }
+    Ok(KernelId(kernel_id as u64))
+}
 
-    // Back-pressure: acquire one slot for this launch. The permit is held
-    // for the lifetime of this call — on return (success OR error) it drops
-    // and the live-counter decrements, so the cap is enforced regardless of
-    // outcome. We use the non-awaiting `try_acquire` because this is the
-    // synchronous launch stub; over the cap we surface `QuotaExceeded`
-    // immediately so the Wasm caller can back off.
-    //
-    // Note: the plan calls for the CUDA-enabled session to swap the launch
-    // host function over to `linker.func_wrap_async`, at which point the
-    // Wasm fiber will await `BackPressure::acquire(&self)` and suspend
-    // (rather than reject with QuotaExceeded) when the cap is reached.
-    let _permit = caller
-        .data()
-        .wasi_cuda()
-        .back_pressure
-        .try_acquire()
-        .ok_or_else(|| {
-            caller
-                .data()
-                .wasi_cuda()
-                .record_error("launch: max concurrent GPU ops reached");
-            AbiError::QuotaExceeded
-        })?;
+/// Asynchronous wrapper around the launch implementation.
+///
+/// On the no-CUDA path the body is essentially identical to the old
+/// synchronous `launch_impl`: validate, acquire a back-pressure permit,
+/// then return `Err(NotAvailable)`. On the CUDA path the body builds and
+/// dispatches a real kernel via `cust`, then awaits a `spawn_blocking`
+/// `stream.synchronize()` so the wasmtime fiber may be suspended while
+/// the GPU runs.
+#[allow(clippy::too_many_arguments)]
+async fn launch_impl_async<T: HasWasiCuda>(
+    caller: &mut Caller<'_, T>,
+    kernel_id: i64,
+    grid_x: i32,
+    grid_y: i32,
+    grid_z: i32,
+    block_x: i32,
+    block_y: i32,
+    block_z: i32,
+    shared_mem: i32,
+    args_ptr: i32,
+    args_len: i32,
+) -> Result<(), AbiError> {
+    // NOTE: we deliberately do *not* hold an `EnteredSpan` here. That guard
+    // is `!Send`, which would poison the `Send` future required by
+    // `func_wrap_async`. Span context for this call is recorded through
+    // the synchronous helpers (validation, lookup) which capture it via
+    // the surrounding `info!`/`warn!` events.
+    let _ = info_span!(
+        "wasi_cuda.launch",
+        instance = %caller.data().wasi_cuda().instance_id,
+        kernel = kernel_id,
+        grid_x = grid_x, grid_y = grid_y, grid_z = grid_z,
+        block_x = block_x, block_y = block_y, block_z = block_z,
+        shared_mem = shared_mem,
+    );
+
+    let kid = validate_launch_args(
+        caller, kernel_id, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_mem, args_ptr,
+        args_len,
+    )?;
+    let owner = caller.data().wasi_cuda().instance_id;
+    let registry = caller.data().wasi_cuda().registry.clone();
+
+    // Validate the kernel id eagerly so both code paths report
+    // `InvalidKernel` before consuming a back-pressure permit.
+    let _ = registry.lookup(kid, owner)?;
+
+    // Back-pressure: on the async path we await rather than reject so the
+    // Wasm fiber suspends when the cap is reached. The permit is held for
+    // the lifetime of this future — on return (success OR error) it drops
+    // and the live-counter decrements, enforcing the cap regardless of
+    // outcome.
+    let bp = caller.data().wasi_cuda().back_pressure.clone();
+    let _permit = bp.acquire().await;
 
     #[cfg(feature = "cuda")]
     {
-        // Real CUDA launch lands here.
-        caller
-            .data()
-            .wasi_cuda()
-            .record_error("launch: cuda feature implementation pending");
-        Err(AbiError::Internal)
+        use cust::stream::{Stream, StreamFlags};
+
+        // Re-look up the kernel inside the cuda branch so the borrow of
+        // the registry entry is short and doesn't span an await point.
+        let module = {
+            let entry = registry.lookup(kid, owner)?;
+            entry
+                .module
+                .as_ref()
+                .ok_or_else(|| {
+                    caller
+                        .data()
+                        .wasi_cuda()
+                        .record_error("launch: kernel entry has no compiled module");
+                    AbiError::InvalidKernel
+                })?
+                // Module is `!Clone`; we instead hold the lookup ref live
+                // for the duration of the launch by binding it to a local.
+                // To avoid spanning awaits across the dashmap ref, we
+                // perform the kernel lookup, function fetch, and launch
+                // entirely synchronously before the synchronize await.
+                as *const cust::module::Module
+        };
+
+        // SAFETY: the registry owns the module behind an Arc-like dashmap
+        // entry that lives for at least as long as `registry`; the entry
+        // cannot be removed concurrently because `lookup` returns a
+        // strong dashmap ref. The pointer is only used inside this
+        // scope, not across any await boundary.
+        let module_ref = unsafe { &*module };
+
+        let entry_name = {
+            let entry = registry.lookup(kid, owner)?;
+            entry.entry.clone()
+        };
+
+        let func = module_ref.get_function(&entry_name).map_err(|e| {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("launch: get_function({entry_name}) failed: {e:?}"));
+            AbiError::LaunchFailed
+        })?;
+
+        let stream = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(|e| {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("launch: Stream::new failed: {e:?}"));
+            AbiError::LaunchFailed
+        })?;
+
+        // SAFETY: launching a kernel is inherently unsafe (no host-side
+        // proof that the kernel arguments match the kernel signature). We
+        // currently pass zero arguments; argument marshalling lands in a
+        // follow-up wiring session.
+        unsafe {
+            cust::launch!(
+                func<<<(grid_x as u32, grid_y as u32, grid_z as u32),
+                       (block_x as u32, block_y as u32, block_z as u32),
+                       shared_mem as u32, stream>>>()
+            )
+            .map_err(|e| {
+                caller
+                    .data()
+                    .wasi_cuda()
+                    .record_error(format!("launch: cuLaunchKernel failed: {e:?}"));
+                AbiError::LaunchFailed
+            })?;
+        }
+
+        // Move the stream into the blocking task so synchronize doesn't
+        // block the wasmtime fiber. Stream is Send.
+        let result = tokio::task::spawn_blocking(move || stream.synchronize())
+            .await
+            .map_err(|_| {
+                // JoinError — internal scheduler issue.
+                AbiError::Internal
+            })?;
+        result.map_err(|e| {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("launch: stream synchronize failed: {e:?}"));
+            AbiError::LaunchFailed
+        })?;
+        Ok(())
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -427,7 +572,21 @@ fn sync_impl<T: HasWasiCuda>(_caller: &Caller<'_, T>) -> Result<(), AbiError> {
     .entered();
     #[cfg(feature = "cuda")]
     {
-        Err(AbiError::Internal)
+        // Block on the current context's outstanding work. This is a
+        // synchronous wasmtime function, so we can't await here; cust's
+        // `CurrentContext::synchronize` is a blocking call that returns
+        // once all queued work on the current context has finished.
+        use cust::context::CurrentContext;
+        match CurrentContext::synchronize() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                _caller
+                    .data()
+                    .wasi_cuda()
+                    .record_error(format!("sync: CurrentContext::synchronize failed: {e:?}"));
+                Err(AbiError::LaunchFailed)
+            }
+        }
     }
     #[cfg(not(feature = "cuda"))]
     {

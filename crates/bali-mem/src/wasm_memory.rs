@@ -23,6 +23,15 @@
 //! and not on OS-level page guards (managed memory is migrated by the
 //! CUDA driver, which is incompatible with host `mprotect`). See
 //! `SECURITY.md` at the repo root for the full threat model.
+//!
+//! MPK is now available as an *alternate* engine mode via
+//! `bali_exec::engine::MemoryBackend::PoolingMpk`, at the explicit cost of
+//! dropping `BaliMemoryCreator` / `UnifiedBuffer` integration (and therefore
+//! the GPU integration path). Operators can pick the mode that fits their
+//! workload: `UnifiedBuffer` for the GPU integration path described above,
+//! or `PoolingMpk` for CPU-only / batch-GPU workloads that want intra-process
+//! Wasm isolation via CPU PKU. The architectural exclusivity between the
+//! two modes is real and enforced by Wasmtime.
 
 use std::ops::Range;
 use std::sync::Arc;

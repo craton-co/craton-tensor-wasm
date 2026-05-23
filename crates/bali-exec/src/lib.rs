@@ -11,3 +11,4 @@ pub mod auto_offload;
 pub mod engine;
 pub mod executor;
 pub mod instance;
+pub mod jit_dispatch;

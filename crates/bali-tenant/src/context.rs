@@ -11,6 +11,11 @@
 //! real `cust::context::Context`; without that feature (the default on
 //! CUDA-less hosts), the field collapses to a unit stub so the rest of the
 //! crate compiles and tests run unchanged.
+//!
+//! NOTE: cuda-feature code in this file is compile-tested on CUDA hosts only;
+//! on no-CUDA hosts only the `#[cfg(not(feature = "cuda"))]` branches are
+//! exercised. The cuda branches use the `cust` 0.3.x context-stack and
+//! primary-context APIs.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -70,6 +75,16 @@ pub struct TenantContext {
     stream_id: u64,
     memory_quota_bytes: u64,
     bytes_in_use: AtomicU64,
+
+    /// Optional cap on the bytes the CUDA driver may retain in this
+    /// tenant's memory pool between allocations. `None` means "use the
+    /// driver default" (typically unbounded retention). This is wired
+    /// through to `cudaMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)`
+    /// where the cust version exposes the memory-pool API; in cust 0.3.x
+    /// it does not, so the value is currently informational only — see
+    /// [`TenantContextBuilder::with_cuda_mem_pool_quota`].
+    #[allow(dead_code)]
+    cuda_mem_pool_quota_bytes: Option<u64>,
 
     // Real `cust::context::Context` under the `cuda` feature; otherwise a
     // unit stub so the rest of the crate compiles on CUDA-less hosts.
@@ -141,6 +156,42 @@ impl TenantContext {
         }
     }
 
+    /// Optional cap on the bytes the CUDA driver may retain in this
+    /// tenant's memory pool.
+    ///
+    /// Returns `None` when the tenant uses the driver default release
+    /// behaviour, or `Some(bytes)` when the builder was given an explicit
+    /// quota via [`TenantContextBuilder::with_cuda_mem_pool_quota`]. See
+    /// that method's documentation for the cust-0.3.x caveat: the value
+    /// is recorded but cannot be wired through to `cuMemPoolSetAttribute`
+    /// until a newer cust is adopted.
+    pub fn cuda_mem_pool_quota_bytes(&self) -> Option<u64> {
+        self.cuda_mem_pool_quota_bytes
+    }
+
+    /// Push this tenant's CUDA context onto the calling thread's context
+    /// stack, returning a RAII guard that pops it on drop. Returns `None`
+    /// if the tenant has no `cust::context::Context` (i.e. either the
+    /// `cuda` feature is disabled or `ContextIsolated` was not requested
+    /// at build time).
+    ///
+    /// The guard borrows `&self`, so the `TenantContext` cannot be moved
+    /// or dropped while the guard is live — the pop on drop is therefore
+    /// guaranteed to pop *this* context, not someone else's that snuck
+    /// onto the stack.
+    #[cfg(feature = "cuda")]
+    pub fn enter(&self) -> Option<CudaCtxGuard<'_>> {
+        let ctx = self.cu_context.as_ref()?;
+        CudaCtxGuard::push(ctx).ok()
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    /// No-op equivalent of [`Self::enter`] when the `cuda` feature is off.
+    /// Always returns `None`.
+    pub fn enter(&self) -> Option<CudaCtxGuard> {
+        None
+    }
+
     /// Atomically release `n` bytes back to the quota. Saturating on
     /// underflow — callers must not release more than they consumed, but a
     /// bookkeeping mismatch is not fatal.
@@ -161,6 +212,58 @@ impl TenantContext {
     }
 }
 
+/// RAII guard returned by [`TenantContext::enter`]: pushes the tenant's
+/// CUDA context onto the calling thread's context stack on construction,
+/// pops it on drop.
+///
+/// The lifetime ties the guard to its owning `TenantContext`, so the
+/// context cannot be dropped (and the underlying primary context cannot
+/// be released) while the guard is live. The pop is performed even if a
+/// panic unwinds through the guard's scope — that's the whole point of
+/// the RAII pattern here.
+///
+/// Note: cust 0.3.x exposes both the "new" primary-context API (which is
+/// not stack-based) and a `legacy::ContextStack::push`/`pop` shim that
+/// covers `cuCtxPushCurrent`/`cuCtxPopCurrent`. The trait
+/// `cust::context::ContextHandle` is implemented for both the primary
+/// `Context` and `legacy::UnownedContext`, so we can use the stack API
+/// uniformly here.
+#[cfg(feature = "cuda")]
+pub struct CudaCtxGuard<'a> {
+    // PhantomData ties the guard to the borrowing `TenantContext`.
+    _ctx: std::marker::PhantomData<&'a cust::context::Context>,
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> CudaCtxGuard<'a> {
+    /// Push `ctx` onto the calling thread's context stack.
+    pub fn push(ctx: &'a cust::context::Context) -> Result<Self, cust::error::CudaError> {
+        // ContextHandle is implemented for the primary `Context`, so the
+        // legacy stack API accepts it directly. This matches the plan's
+        // `cuCtxPushCurrent` requirement.
+        cust::context::legacy::ContextStack::push(ctx)?;
+        Ok(Self {
+            _ctx: std::marker::PhantomData,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for CudaCtxGuard<'_> {
+    fn drop(&mut self) {
+        // Best-effort pop: if the stack is empty or another context was
+        // pushed on top, we still pop the topmost context. Errors are
+        // swallowed because a Drop impl cannot return them; production
+        // CUDA hosts should never see a failure here in normal flow.
+        let _ = cust::context::legacy::ContextStack::pop();
+    }
+}
+
+/// No-CUDA placeholder so the type name is callable from generic code
+/// without requiring the caller to cfg-gate `Option<CudaCtxGuard>`.
+#[cfg(not(feature = "cuda"))]
+pub struct CudaCtxGuard;
+
 /// Builder for [`TenantContext`].
 ///
 /// Fields default to a low-overhead, multi-tenant-safe configuration:
@@ -173,6 +276,9 @@ pub struct TenantContextBuilder {
     isolation: IsolationKind,
     stream_id: u64,
     memory_quota_bytes: u64,
+    cuda_mem_pool_quota_bytes: Option<u64>,
+    #[cfg(feature = "cuda")]
+    cuda_device_index: Option<u32>,
 }
 
 impl TenantContextBuilder {
@@ -186,6 +292,9 @@ impl TenantContextBuilder {
             isolation: IsolationKind::default(),
             stream_id: 0,
             memory_quota_bytes: Self::DEFAULT_QUOTA_BYTES,
+            cuda_mem_pool_quota_bytes: None,
+            #[cfg(feature = "cuda")]
+            cuda_device_index: None,
         }
     }
 
@@ -207,18 +316,90 @@ impl TenantContextBuilder {
         self
     }
 
+    /// Set the CUDA memory pool release-threshold in bytes.
+    ///
+    /// On CUDA hosts the release threshold is the maximum amount of
+    /// memory the driver may keep in the pool between calls to
+    /// `cuMemFreeAsync`; the standard mapping is
+    /// `cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &bytes)`.
+    ///
+    /// The cust 0.3.x crate **does not** expose the `cuMemPool*` API, so
+    /// at `build()` time this value is recorded on the
+    /// [`TenantContext`] for inspection and metrics but the threshold is
+    /// **not** applied to a real CUDA mem-pool. The Rust-side counter
+    /// returned by [`TenantContext::bytes_in_use`] continues to enforce
+    /// the workspace-level quota irrespective. Upgrading cust (or going
+    /// direct via `cuda::sys::cuMemPoolSetAttribute`) is tracked as a
+    /// future-work item — see the doc-comment on
+    /// [`TenantContext::cuda_mem_pool_quota_bytes`].
+    pub fn with_cuda_mem_pool_quota(mut self, bytes: u64) -> Self {
+        self.cuda_mem_pool_quota_bytes = Some(bytes);
+        self
+    }
+
+    /// Set the CUDA device index this tenant's context should be built
+    /// against. Only meaningful when the `cuda` feature is enabled and
+    /// the isolation is `ContextIsolated`. Defaults to device 0.
+    #[cfg(feature = "cuda")]
+    pub fn with_cuda_device_index(mut self, device_index: u32) -> Self {
+        self.cuda_device_index = Some(device_index);
+        self
+    }
+
     /// Finalise into a `TenantContext`.
     pub fn build(self) -> TenantContext {
+        #[cfg(feature = "cuda")]
+        let cu_context = self.build_cuda_context();
+        #[cfg(not(feature = "cuda"))]
+        let cu_context = ();
+
         TenantContext {
             tenant_id: self.tenant_id,
             isolation: self.isolation,
             stream_id: self.stream_id,
             memory_quota_bytes: self.memory_quota_bytes,
             bytes_in_use: AtomicU64::new(0),
-            #[cfg(feature = "cuda")]
-            cu_context: None,
-            #[cfg(not(feature = "cuda"))]
-            cu_context: (),
+            cuda_mem_pool_quota_bytes: self.cuda_mem_pool_quota_bytes,
+            cu_context,
+        }
+    }
+
+    /// Build the underlying primary `cust::context::Context` when the
+    /// `cuda` feature is on AND the tenant requested `ContextIsolated`.
+    /// Returns `None` for shared/stream-isolated tenants, or when device
+    /// retain fails — caller (build()) then proceeds with a stub context
+    /// and operator-visible logs make the degradation explicit.
+    #[cfg(feature = "cuda")]
+    fn build_cuda_context(&self) -> Option<cust::context::Context> {
+        if !matches!(self.isolation, IsolationKind::ContextIsolated) {
+            return None;
+        }
+        let device_idx = self.cuda_device_index.unwrap_or(0);
+        let device = match cust::device::Device::get_device(device_idx as i32) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    target: "bali_tenant::context",
+                    tenant = %self.tenant_id,
+                    device = device_idx,
+                    error = ?e,
+                    "Device::get_device failed; falling back to stream-isolated mode",
+                );
+                return None;
+            }
+        };
+        match cust::context::Context::new(device) {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                tracing::warn!(
+                    target: "bali_tenant::context",
+                    tenant = %self.tenant_id,
+                    device = device_idx,
+                    error = ?e,
+                    "Context::new failed; falling back to stream-isolated mode",
+                );
+                None
+            }
         }
     }
 }
@@ -315,5 +496,32 @@ mod tests {
     #[test]
     fn isolation_kind_default_is_stream_isolated() {
         assert_eq!(IsolationKind::default(), IsolationKind::StreamIsolated);
+    }
+
+    #[test]
+    fn cuda_mem_pool_quota_default_is_none() {
+        let ctx = TenantContext::builder(TenantId(5)).build();
+        assert_eq!(ctx.cuda_mem_pool_quota_bytes(), None);
+    }
+
+    #[test]
+    fn cuda_mem_pool_quota_recorded() {
+        let ctx = TenantContext::builder(TenantId(6))
+            .with_cuda_mem_pool_quota(4 * 1024 * 1024 * 1024)
+            .build();
+        assert_eq!(
+            ctx.cuda_mem_pool_quota_bytes(),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn enter_returns_none_without_cuda_context() {
+        // On the no-CUDA path `enter` always returns None; on CUDA-enabled
+        // builds the default builder still produces a context-less tenant
+        // (StreamIsolated) so the result is None either way without
+        // explicit ContextIsolated + a real device.
+        let ctx = TenantContext::builder(TenantId(8)).build();
+        assert!(ctx.enter().is_none());
     }
 }

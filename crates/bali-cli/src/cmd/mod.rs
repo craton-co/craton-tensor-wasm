@@ -31,9 +31,7 @@ pub(crate) fn validate_server_url(url: &str) -> Result<()> {
         anyhow::bail!("--server must start with http:// or https://, got `{url}`");
     };
     // Host is everything up to the first `/` or `?`. It must be non-empty.
-    let host_end = rest
-        .find(['/', '?'])
-        .unwrap_or(rest.len());
+    let host_end = rest.find(['/', '?']).unwrap_or(rest.len());
     if rest[..host_end].is_empty() {
         anyhow::bail!("--server has no host component: `{url}`");
     }

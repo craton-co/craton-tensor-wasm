@@ -22,7 +22,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 wasmparser.workspace = true
-wasmtime.workspace = true
+wasmtime = { workspace = true, features = ["pooling-allocator", "memory-protection-keys"] }
 wasmtime-wasi.workspace = true
 
 [dev-dependencies]

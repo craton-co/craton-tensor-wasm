@@ -66,6 +66,15 @@ migration machinery. Hardware-level page protection across tenants is the
 responsibility of NVIDIA MIG; see the "GPU L2 cache timing side channel"
 gap below for the MIG/MPS deployment story.
 
+The non-managed `PinnedHostBuffer` (`bali-mem/src/pinned_host.rs`), used on
+the `--no-default-features` host fallback path, **is** bracketed by OS-level
+guard pages. Each allocation reserves `[PROT_NONE | usable | PROT_NONE]`
+via the cross-platform `region` crate (`mprotect` on Linux/macOS,
+`VirtualProtect(PAGE_NOACCESS)` on Windows). Out-of-bounds reads or writes
+that miss Wasmtime's bounds checks raise a hardware fault before they can
+corrupt adjacent allocations. This applies only to the host-backed buffer;
+managed memory remains unguarded for the reason above.
+
 ### Kernel launch hardening
 
 `wasi_cuda_load_ptx` validates PTX with `ptxas --gpu-name <arch>` before

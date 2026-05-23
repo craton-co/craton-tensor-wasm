@@ -14,10 +14,38 @@ use std::time::Duration;
 use bali_mem::wasm_memory::BaliMemoryCreator;
 use tokio::task::JoinHandle;
 use tracing::trace;
-use wasmtime::{Config, Engine, Strategy};
+use wasmtime::{
+    Config, Engine, InstanceAllocationStrategy, MpkEnabled, PoolingAllocationConfig, Strategy,
+};
 
 /// Default epoch tick. Matches the plan's 10 ms cadence.
 const DEFAULT_EPOCH_TICK: Duration = Duration::from_millis(10);
+
+/// Selects the linear-memory backing strategy for the engine.
+///
+/// The two modes are mutually exclusive at the Wasmtime level:
+/// `with_host_memory` (used by [`MemoryBackend::UnifiedBuffer`]) cannot coexist
+/// with the pooling allocator (required by [`MemoryBackend::PoolingMpk`]).
+/// Operators pick the mode that fits their workload.
+#[derive(Debug, Clone, Default)]
+pub enum MemoryBackend {
+    /// Host-provided UnifiedBuffer-backed linear memory via `with_host_memory`.
+    /// Required for the GPU integration path (kernels read/write the same
+    /// allocation the Wasm guest sees). DOES NOT support MPK — Wasmtime's
+    /// pooling+MPK machinery is mutually exclusive with custom MemoryCreator.
+    #[default]
+    UnifiedBuffer,
+    /// Wasmtime's pooling allocator with MPK (memory protection keys).
+    /// Trades the GPU integration path for intra-process Wasm isolation via
+    /// CPU PKU. Suitable for CPU-only or batch-GPU workloads where kernel
+    /// launches don't share memory with Wasm at byte level.
+    PoolingMpk {
+        /// Maximum total memories tracked by the pooling allocator.
+        max_memories: u32,
+        /// Bytes per memory slot.
+        memory_bytes: usize,
+    },
+}
 
 /// Configuration knobs for the engine.
 #[derive(Debug, Clone)]
@@ -30,6 +58,9 @@ pub struct EngineConfig {
     pub strategy: Strategy,
     /// Enable Wasm component model.
     pub component_model: bool,
+    /// Linear-memory backing strategy. See [`MemoryBackend`] for the
+    /// UnifiedBuffer vs PoolingMpk trade-off.
+    pub backend: MemoryBackend,
 }
 
 impl Default for EngineConfig {
@@ -39,6 +70,7 @@ impl Default for EngineConfig {
             epoch_tick: DEFAULT_EPOCH_TICK,
             strategy: Strategy::Cranelift,
             component_model: true,
+            backend: MemoryBackend::default(),
         }
     }
 }
@@ -69,11 +101,28 @@ impl BaliEngine {
         wt_cfg.wasm_component_model(cfg.component_model);
         wt_cfg.strategy(cfg.strategy);
 
-        let memory_creator = Arc::new(BaliMemoryCreator::default());
-        wt_cfg.with_host_memory(memory_creator);
-        wt_cfg.guard_before_linear_memory(false);
-        wt_cfg.static_memory_maximum_size(0);
-        wt_cfg.dynamic_memory_guard_size(0);
+        match cfg.backend {
+            MemoryBackend::UnifiedBuffer => {
+                let memory_creator = Arc::new(BaliMemoryCreator::default());
+                wt_cfg.with_host_memory(memory_creator);
+                wt_cfg.guard_before_linear_memory(false);
+                wt_cfg.static_memory_maximum_size(0);
+                wt_cfg.dynamic_memory_guard_size(0);
+            }
+            MemoryBackend::PoolingMpk {
+                max_memories,
+                memory_bytes,
+            } => {
+                // Pooling owns the memory backing — do NOT install a host
+                // memory creator, and leave Wasmtime's default guard sizes
+                // in place (the pooling allocator depends on them).
+                let mut pooling = PoolingAllocationConfig::default();
+                pooling.total_memories(max_memories);
+                pooling.max_memory_size(memory_bytes);
+                pooling.memory_protection_keys(MpkEnabled::Auto);
+                wt_cfg.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
+            }
+        }
 
         let engine = Engine::new(&wt_cfg)?;
         Ok(Self {
@@ -172,5 +221,37 @@ mod tests {
         assert_eq!(c.max_memory_bytes, 256 * 1024 * 1024);
         assert_eq!(c.epoch_tick, Duration::from_millis(10));
         assert!(c.component_model);
+        assert!(matches!(c.backend, MemoryBackend::UnifiedBuffer));
+    }
+
+    #[tokio::test]
+    async fn engine_constructs_with_unified_backend() {
+        let cfg = EngineConfig {
+            backend: MemoryBackend::UnifiedBuffer,
+            ..EngineConfig::default()
+        };
+        let engine = BaliEngine::with_config(cfg);
+        assert!(
+            engine.is_ok(),
+            "engine should construct: {:?}",
+            engine.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_constructs_with_pooling_mpk_backend() {
+        let cfg = EngineConfig {
+            backend: MemoryBackend::PoolingMpk {
+                max_memories: 32,
+                memory_bytes: 64 * 1024,
+            },
+            ..EngineConfig::default()
+        };
+        let engine = BaliEngine::with_config(cfg);
+        assert!(
+            engine.is_ok(),
+            "engine should construct: {:?}",
+            engine.err()
+        );
     }
 }

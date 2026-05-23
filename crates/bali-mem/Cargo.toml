@@ -14,6 +14,7 @@ description = "CUDA Unified Memory allocator and Wasmtime `MemoryCreator` integr
 anyhow.workspace = true
 bali-core = { path = "../bali-core" }
 parking_lot.workspace = true
+region = "3"
 thiserror.workspace = true
 tracing.workspace = true
 wasmtime.workspace = true

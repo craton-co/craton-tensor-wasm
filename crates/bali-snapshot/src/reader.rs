@@ -5,6 +5,10 @@
 //! zstd frames, and broken bincode payloads are all surfaced as
 //! [`BaliError::Serialization`]. The hot path is a single zstd decode followed
 //! by a bincode deserialise; no I/O is performed.
+//!
+//! NOTE: cuda-feature code in this file is compile-tested on CUDA hosts only;
+//! on no-CUDA hosts only the `#[cfg(not(feature = "cuda"))]` branches are
+//! exercised. The cuda branches use the `cust` 0.3.x unified-memory APIs.
 
 use bali_core::error::{BaliError, Result};
 use tracing::{debug, instrument};
@@ -109,6 +113,79 @@ impl SnapshotReader {
         );
         Ok(snapshot)
     }
+}
+
+/// In-memory representation of a snapshot whose `gpu_memory` blob has been
+/// materialised into a CUDA `UnifiedBuffer` and prefetched to the target
+/// device. Only available when the `cuda` feature is enabled.
+///
+/// The wasm-memory, registers, and metadata fields are owned exactly like
+/// the corresponding fields on [`Snapshot`]; the GPU buffer is a fresh
+/// allocation backed by managed memory, ready to be handed to a kernel.
+#[cfg(feature = "cuda")]
+pub struct RestoredOnGpu {
+    /// Raw bytes of the Wasm linear memory at capture time (host-side copy).
+    pub wasm_memory: Vec<u8>,
+    /// GPU device-side memory blob, now resident in unified memory.
+    pub gpu_memory: cust::memory::UnifiedBuffer<u8>,
+    /// Register-file snapshot (PTX-level state captured by the JIT).
+    pub registers: Vec<u8>,
+    /// Free-form metadata describing the snapshot's provenance.
+    pub metadata: crate::writer::SnapshotMetadata,
+}
+
+/// Restore `bytes` and stage the `gpu_memory` payload onto the GPU at
+/// `device_index` via `cuMemPrefetchAsync` on a fresh non-blocking stream.
+///
+/// On success the returned [`RestoredOnGpu`] owns a populated
+/// `UnifiedBuffer<u8>` whose pages have been requested to migrate to the
+/// target device. The stream is synchronised before return so the buffer
+/// is observably ready (no half-prefetched state leaks to the caller).
+///
+/// Requires the `cuda` feature; on no-CUDA builds this symbol does not
+/// exist, and callers should fall back to [`SnapshotReader::restore`]
+/// followed by a manual host-to-device copy.
+#[cfg(feature = "cuda")]
+pub fn restore_to_gpu(bytes: &[u8], device_index: u32) -> Result<RestoredOnGpu> {
+    use cust::memory::MemoryAdvise;
+    use cust::memory::UnifiedBuffer;
+    use cust::stream::{Stream, StreamFlags};
+
+    let snapshot = SnapshotReader::new().restore(bytes)?;
+
+    // UnifiedBuffer::new requires a non-zero capacity to actually allocate;
+    // a zero-length snapshot is allowed — we just produce an empty buffer.
+    let mut gpu_buf: UnifiedBuffer<u8> = if snapshot.gpu_memory.is_empty() {
+        // SAFETY: capacity 0 -> no allocation, no uninitialised reads possible.
+        unsafe { UnifiedBuffer::uninitialized(0) }
+            .map_err(|e| BaliError::CudaError(format!("UnifiedBuffer::uninitialized(0): {e:?}")))?
+    } else {
+        UnifiedBuffer::new(&0u8, snapshot.gpu_memory.len())
+            .map_err(|e| BaliError::CudaError(format!("UnifiedBuffer::new: {e:?}")))?
+    };
+
+    if !snapshot.gpu_memory.is_empty() {
+        gpu_buf.as_mut_slice().copy_from_slice(&snapshot.gpu_memory);
+
+        let device = cust::device::Device::get_device(device_index as i32).map_err(|e| {
+            BaliError::CudaError(format!("Device::get_device({device_index}): {e:?}"))
+        })?;
+        let stream = Stream::new(StreamFlags::NON_BLOCKING, None)
+            .map_err(|e| BaliError::CudaError(format!("Stream::new: {e:?}")))?;
+        gpu_buf
+            .prefetch_to_device(&stream, &device)
+            .map_err(|e| BaliError::CudaError(format!("prefetch_to_device: {e:?}")))?;
+        stream
+            .synchronize()
+            .map_err(|e| BaliError::CudaError(format!("stream.synchronize: {e:?}")))?;
+    }
+
+    Ok(RestoredOnGpu {
+        wasm_memory: snapshot.wasm_memory,
+        gpu_memory: gpu_buf,
+        registers: snapshot.registers,
+        metadata: snapshot.metadata,
+    })
 }
 
 #[cfg(test)]
