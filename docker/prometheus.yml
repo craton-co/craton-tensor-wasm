@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: bali-api
+    static_configs:
+      - targets: ["bali-api:8080"]
+    metrics_path: /metrics
+    honor_labels: true

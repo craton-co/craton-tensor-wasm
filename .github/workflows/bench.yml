@@ -1,0 +1,45 @@
+name: bench
+
+on:
+  pull_request:
+    paths:
+      - "crates/bali-bench/**"
+      - "crates/*/src/**"
+      - ".github/workflows/bench.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install CUDA stub libraries
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+      - name: Compile benches
+        run: cargo bench --workspace --no-run
+      - name: Run benches (short)
+        run: |
+          mkdir -p bench-results
+          cargo bench --workspace -- --output-format bencher --warm-up-time 1 --measurement-time 5 \
+            | tee bench-results/current.txt
+      - name: Compare against baseline
+        if: hashFiles('bench-results/baseline.json') != ''
+        run: |
+          echo "Regression check is a stub for S19; full diff lands when criterion-cmp is wired in S22."
+          echo "current.txt size: $(wc -l < bench-results/current.txt)"

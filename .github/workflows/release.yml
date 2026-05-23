@@ -1,0 +1,91 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  publish-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install CUDA stub libraries
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+      - name: cargo publish --dry-run (every member)
+        run: |
+          for crate in bali-core bali-mem bali-exec bali-wasi-gpu bali-jit bali-snapshot bali-tenant bali-api bali-cli; do
+            echo "::group::cargo publish --dry-run -p $crate"
+            cargo publish --dry-run -p "$crate" --allow-dirty
+            echo "::endgroup::"
+          done
+
+  linux-binary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install CUDA stub libraries
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+      - name: Build release binary
+        run: cargo build --release --bin bali
+      - name: Package
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          tar -C target/release -czf "dist/bali-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" bali
+          (cd dist && sha256sum "bali-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" > "bali-${VERSION}-x86_64-unknown-linux-gnu.tar.gz.sha256")
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bali-linux-x86_64
+          path: dist/
+
+  github-release:
+    needs: [publish-dry-run, linux-binary]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bali-linux-x86_64
+          path: dist/
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          body_path: CHANGELOG.md
+          generate_release_notes: false
+          draft: false
+          prerelease: false

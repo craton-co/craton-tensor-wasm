@@ -1,0 +1,80 @@
+# Bali observability stack.
+#
+# Start with: docker compose up -d
+# Tear down:  docker compose down -v
+#
+# Endpoints after startup:
+# - bali-api:       http://localhost:8080
+# - Prometheus:     http://localhost:9090
+# - Grafana:        http://localhost:3000 (admin / admin)
+# - Jaeger UI:      http://localhost:16686
+# - Jaeger OTLP:    grpc://jaeger:4317 (used by bali-api when BALI_OTLP_ENDPOINT is set)
+
+services:
+  bali-api:
+    image: rust:1.81-slim
+    working_dir: /workspace
+    command:
+      - sh
+      - -c
+      - |
+        cargo build --release --bin bali && \
+        ./target/release/bali serve --addr 0.0.0.0:8080
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+    environment:
+      BALI_LOG: info
+      BALI_OTLP_ENDPOINT: http://jaeger:4317
+      RUST_BACKTRACE: "1"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - jaeger
+      - prometheus
+    networks: [bali]
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks: [bali]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    networks: [bali]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    networks: [bali]
+
+networks:
+  bali:
+
+volumes:
+  cargo-cache:
+  prom-data:
+  grafana-data:

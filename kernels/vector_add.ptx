@@ -1,0 +1,53 @@
+//
+// kernels/vector_add.ptx
+//
+// Element-wise float32 vector addition: c[i] = a[i] + b[i]
+//
+// Fixture used by Bali's S8 / S14 integration tests on CUDA hardware.
+// Built for sm_80 (Ampere); CUDA 12 PTX 8.0.
+//
+
+.version 8.0
+.target sm_80
+.address_size 64
+
+.visible .entry vector_add(
+    .param .u64 a_ptr,
+    .param .u64 b_ptr,
+    .param .u64 c_ptr,
+    .param .u32 n
+)
+{
+    .reg .pred  %p<2>;
+    .reg .s32   %r<6>;
+    .reg .s64   %rd<11>;
+    .reg .f32   %f<4>;
+
+    ld.param.u64    %rd1, [a_ptr];
+    ld.param.u64    %rd2, [b_ptr];
+    ld.param.u64    %rd3, [c_ptr];
+    ld.param.u32    %r1,  [n];
+
+    mov.u32         %r2, %ntid.x;
+    mov.u32         %r3, %ctaid.x;
+    mov.u32         %r4, %tid.x;
+    mad.lo.s32      %r5, %r2, %r3, %r4;
+
+    setp.ge.s32     %p1, %r5, %r1;
+    @%p1 bra        L_done;
+
+    cvt.s64.s32     %rd4, %r5;
+    shl.b64         %rd5, %rd4, 2;
+
+    add.s64         %rd6, %rd1, %rd5;
+    add.s64         %rd7, %rd2, %rd5;
+    add.s64         %rd8, %rd3, %rd5;
+
+    ld.global.f32   %f1, [%rd6];
+    ld.global.f32   %f2, [%rd7];
+    add.f32         %f3, %f1, %f2;
+    st.global.f32   [%rd8], %f3;
+
+L_done:
+    ret;
+}

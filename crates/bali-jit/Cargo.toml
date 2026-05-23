@@ -1,0 +1,29 @@
+[package]
+name = "bali-jit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "JIT pipeline: Cranelift detector, IR normalisation, PTX codegen, kernel cache, deopt."
+
+[lib]
+
+[dependencies]
+bali-core = { path = "../bali-core" }
+cranelift-codegen.workspace = true
+dashmap.workspace = true
+lru.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ptx-builder = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+wat.workspace = true
+wasmparser.workspace = true
+
+[features]
+default = []
+auto-offload = ["dep:ptx-builder"]

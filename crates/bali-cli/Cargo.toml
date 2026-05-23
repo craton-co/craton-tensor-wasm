@@ -1,0 +1,29 @@
+[package]
+name = "bali-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Developer CLI for Project Bali (`bali run`, `bali deploy`, `bali invoke`, ...)."
+
+[[bin]]
+name = "bali"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+clap.workspace = true
+clap_complete.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bali-core = { path = "../bali-core" }
+bali-exec = { path = "../bali-exec" }
+
+[dev-dependencies]
+tempfile.workspace = true
+wat.workspace = true

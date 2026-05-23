@@ -1,0 +1,11 @@
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+*.pdb
+.DS_Store
+.idea/
+.vscode/
+*.iml
+/coverage/
+/perf.data*
+/flamegraph.svg

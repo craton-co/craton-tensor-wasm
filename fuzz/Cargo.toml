@@ -1,0 +1,41 @@
+[package]
+name = "bali-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+bali-core = { path = "../crates/bali-core" }
+bali-jit = { path = "../crates/bali-jit" }
+bali-snapshot = { path = "../crates/bali-snapshot" }
+wasmtime = { version = "25", default-features = false, features = ["async", "cranelift", "runtime"] }
+
+[[bin]]
+name = "fuzz_wasm_compile"
+path = "fuzz_targets/fuzz_wasm_compile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ptx_emit"
+path = "fuzz_targets/fuzz_ptx_emit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_snapshot_restore"
+path = "fuzz_targets/fuzz_snapshot_restore.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

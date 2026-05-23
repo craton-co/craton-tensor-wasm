@@ -1,0 +1,33 @@
+[package]
+name = "bali-tenant"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Multi-tenant CUDA context management (MPS-backed or per-context fallback)."
+
+[lib]
+
+[dependencies]
+bali-core = { path = "../bali-core" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+cust = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio-test.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "context_switch"
+harness = false
+
+[features]
+default = []
+mps = []
+cuda = ["dep:cust"]

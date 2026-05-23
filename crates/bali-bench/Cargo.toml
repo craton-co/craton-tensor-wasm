@@ -1,0 +1,50 @@
+[package]
+name = "bali-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Benchmark harness for Project Bali (Criterion + custom suites)."
+
+[lib]
+
+[dependencies]
+bali-api = { path = "../bali-api" }
+bali-core = { path = "../bali-core" }
+bali-jit = { path = "../bali-jit" }
+bali-mem = { path = "../bali-mem" }
+bali-snapshot = { path = "../bali-snapshot" }
+bali-wasi-gpu = { path = "../bali-wasi-gpu" }
+tokio.workspace = true
+
+[dev-dependencies]
+axum = { workspace = true }
+base64 = "0.22"
+criterion.workspace = true
+http-body-util = "0.1"
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { workspace = true, features = ["util"] }
+
+[[bench]]
+name = "kernel_dispatch"
+harness = false
+
+[[bench]]
+name = "cold_start"
+harness = false
+
+[[bench]]
+name = "memory_bandwidth"
+harness = false
+
+[[bench]]
+name = "jit_compile"
+harness = false
+
+[[bench]]
+name = "e2e_inference"
+harness = false
