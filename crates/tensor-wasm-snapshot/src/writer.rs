@@ -310,7 +310,12 @@ impl SnapshotWriter {
             crc32,
         };
 
-        let encoded = bincode::serialize(&snapshot_ref)
+        // `bincode::config::legacy()` produces the same wire format as bincode 1.x's
+        // `DefaultOptions::new().with_fixint_encoding().with_little_endian()` —
+        // little-endian, fixed-width integers, no length limit on the encoder.
+        // Documented byte-compatible with the v1 default config.
+        let cfg = bincode::config::legacy();
+        let encoded = bincode::serde::encode_to_vec(&snapshot_ref, cfg)
             .map_err(|e| TensorWasmError::Serialization(format!("bincode encode: {e}").into()))?;
         let compressed = zstd::encode_all(encoded.as_slice(), self.zstd_level)
             .map_err(|e| TensorWasmError::Serialization(format!("zstd encode: {e}").into()))?;
@@ -378,7 +383,8 @@ mod tests {
             crc32: payload_crc32(&[], &[], &[]),
         };
         // Build a hand-rolled blob with a bad version field.
-        let encoded = bincode::serialize(&s).unwrap();
+        let cfg = bincode::config::legacy();
+        let encoded = bincode::serde::encode_to_vec(&s, cfg).unwrap();
         let compressed = zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL).unwrap();
         let err = SnapshotReader::new()
             .restore(&compressed)
@@ -386,7 +392,7 @@ mod tests {
         assert!(matches!(err, TensorWasmError::Serialization(_)));
         // Sanity: a corrected version round-trips.
         s.version = SNAPSHOT_VERSION;
-        let encoded = bincode::serialize(&s).unwrap();
+        let encoded = bincode::serde::encode_to_vec(&s, cfg).unwrap();
         let compressed = zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL).unwrap();
         SnapshotReader::new().restore(&compressed).expect("ok");
     }
@@ -407,7 +413,8 @@ mod tests {
             },
             crc32: payload_crc32(&[], &[], &[]),
         };
-        let encoded = bincode::serialize(&s).unwrap();
+        let cfg = bincode::config::legacy();
+        let encoded = bincode::serde::encode_to_vec(&s, cfg).unwrap();
         let compressed = zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL).unwrap();
         let err = SnapshotReader::new()
             .restore(&compressed)

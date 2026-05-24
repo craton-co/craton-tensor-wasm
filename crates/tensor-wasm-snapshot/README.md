@@ -18,7 +18,7 @@ External crates this crate depends on (pinned at workspace root unless noted):
 - `tracing` — structured spans/events for checkpoint and restore.
 - `serde` — derive support for the snapshot header format.
 - `serde_bytes` — zero-copy byte-blob serialisation on the write path (crate-local pin).
-- `bincode` — compact binary encoding of the snapshot payload (with `Options::with_limit` to bound restore-time allocation).
+- `bincode` (2.x, with the `serde` feature) — compact binary encoding of the snapshot payload, using `bincode::config::legacy()` for byte-identical wire compatibility with the 1.x default config. Restore-time allocation is bounded by a `Configuration::with_limit::<N>` const-generic ceiling sized to `limits::MAX_TOTAL_PAYLOAD_BYTES`.
 - `zstd` — streaming compression for snapshot bodies on disk.
 - `crc32fast` — payload checksum (IEEE polynomial).
 - `cust` *(optional, behind `cuda`)* — CUDA unified-memory bindings for `restore_to_gpu`.
@@ -31,7 +31,7 @@ The reader is the hardened side of the API and treats every input as untrusted:
 
 - **Compressed-input cap**: rejected before zstd runs if larger than `limits::MAX_INPUT_BYTES` (~4 GiB).
 - **Decompressed-stream cap**: streamed through `zstd::stream::read::Decoder` wrapped in `Read::take`, default ceiling `limits::MAX_DECOMPRESSED_BYTES` (256 MiB). Override per-reader via `SnapshotReader::with_max_decompressed`.
-- **bincode allocation cap**: deserialised via `bincode::Options::with_limit` matching the decompressed cap, so a tampered `Vec<u8>` length field cannot drive the allocator past the ceiling.
+- **bincode allocation cap**: deserialised via `bincode::config::legacy().with_limit::<{ limits::MAX_TOTAL_PAYLOAD_BYTES }>()` (bincode 2.x compile-time const-generic limit), so a tampered `Vec<u8>` length field cannot drive the allocator past the static ceiling (sum of the per-blob caps + envelope slack). The per-blob caps below catch any oversized declared length that fits under the bincode ceiling.
 - **Per-blob caps**: each memory blob has an explicit `limits::MAX_*_BYTES` ceiling (Wasm 1 GiB, GPU 4 GiB, registers 1 MiB).
 - **CRC32**: payload-wide integrity check (over the three byte blobs in order) catches bit-flips that survive framing.
 - **Magic + version**: refused before any further work, so foreign or stale blobs short-circuit.
