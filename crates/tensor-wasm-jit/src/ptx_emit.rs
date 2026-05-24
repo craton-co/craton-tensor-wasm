@@ -92,7 +92,11 @@ pub fn emit(blueprint: &TensorWasmKernelBlueprint) -> EmittedPtx {
 /// the declaration is always well-formed even for empty kernels.
 fn lower_body(blueprint: &TensorWasmKernelBlueprint) -> (String, u32, u32, u32, u32) {
     let mut body = String::new();
-    let mut value_stack: Vec<u32> = Vec::new();
+    // Pre-size the value stack to `ops.len()` — each op pushes at most a
+    // handful of registers, and most pop more than they push, so this is a
+    // safe upper bound that avoids grow-by-doubling reallocs on the hot
+    // emit path (matmul[16x16x16] visibly suffered from this).
+    let mut value_stack: Vec<u32> = Vec::with_capacity(blueprint.ops.len());
     let mut next_f = 0u32;
     // Counters for the other reg classes — track high-water mark so the
     // header `.reg` declarations are exactly sized.
@@ -240,7 +244,10 @@ fn lower_body(blueprint: &TensorWasmKernelBlueprint) -> (String, u32, u32, u32, 
 
 /// Emit PTX text for a blueprint with caller-supplied config.
 pub fn emit_with(blueprint: &TensorWasmKernelBlueprint, cfg: &EmitConfig) -> EmittedPtx {
-    let mut text = String::new();
+    // Rough estimate: ~64 B/op covers the per-op body line plus a fair share
+    // of the fixed prologue/epilogue. Avoids grow-by-doubling reallocs on
+    // the hot emit path.
+    let mut text = String::with_capacity(blueprint.ops.len().saturating_mul(64));
     let _ = writeln!(text, "//");
     let _ = writeln!(text, "// Auto-emitted by tensor-wasm-jit::ptx_emit");
     let _ = writeln!(text, "// entry: {}", blueprint.entry);
