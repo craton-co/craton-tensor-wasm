@@ -310,13 +310,22 @@ impl SnapshotWriter {
             crc32,
         };
 
-        let encoded = bincode::serialize(&snapshot_ref)
+        // Stream bincode directly into the zstd encoder so we never materialise
+        // the full uncompressed payload as an intermediate `Vec<u8>`. For large
+        // captures (hundreds of MiB) this eliminates a peak-resident copy and a
+        // redundant pass over the buffer, lifting capture throughput on hosts
+        // with ample memory bandwidth.
+        let mut compressed: Vec<u8> = Vec::with_capacity(8 * 1024);
+        let mut encoder = zstd::stream::write::Encoder::new(&mut compressed, self.zstd_level)
+            .map_err(|e| TensorWasmError::Serialization(format!("zstd init: {e}").into()))?;
+        bincode::serialize_into(&mut encoder, &snapshot_ref)
             .map_err(|e| TensorWasmError::Serialization(format!("bincode encode: {e}").into()))?;
-        let compressed = zstd::encode_all(encoded.as_slice(), self.zstd_level)
-            .map_err(|e| TensorWasmError::Serialization(format!("zstd encode: {e}").into()))?;
+        encoder
+            .finish()
+            .map_err(|e| TensorWasmError::Serialization(format!("zstd finish: {e}").into()))?;
 
         debug!(
-            uncompressed = encoded.len(),
+            uncompressed = total_uncompressed_bytes,
             compressed = compressed.len(),
             "snapshot captured",
         );
