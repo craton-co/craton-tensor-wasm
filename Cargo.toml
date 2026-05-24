@@ -99,9 +99,11 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 debug = 1
+panic = "abort"
 
 [profile.bench]
 inherits = "release"
+panic = "unwind"
 
 [profile.dev]
 opt-level = 0
