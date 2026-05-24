@@ -6,7 +6,7 @@
 //! ([`abi::FN_LAUNCH`]). On hosts without CUDA the host functions return
 //! [`abi::AbiError::NotAvailable`]; on CUDA hosts they call into the
 //! `cust` crate via the `cuda` feature.
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 pub mod abi;
 pub mod async_dispatch;

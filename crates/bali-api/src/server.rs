@@ -7,7 +7,7 @@ use std::time::Duration;
 use axum::routing::{delete, get, post};
 use axum::Router;
 
-use crate::middleware::{concurrency_limit_layer, timeout_layer, trace_layer};
+use crate::middleware::{concurrency_limit_layer, timeout_layer, trace_layer_with_propagation};
 use crate::routes::{
     create_function, delete_function, get_job, healthz, invoke_function, invoke_function_async,
     metrics, AppState,
@@ -25,7 +25,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/jobs/:id", get(get_job))
         .layer(timeout_layer(Duration::from_secs(30)))
         .layer(concurrency_limit_layer(64))
-        .layer(trace_layer())
+        .layer(trace_layer_with_propagation())
         .with_state(state)
 }
 

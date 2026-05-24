@@ -1,10 +1,14 @@
 //! S19 cold-start bench: snapshot save -> reload round-trip latency at
-//! 1 MiB, 16 MiB, 128 MiB payload sizes.
+//! 1 MiB, 16 MiB, 128 MiB, 512 MiB payload sizes.
 //!
 //! On a CUDA host this would additionally measure UVM warmup; here we
 //! capture the host-side `bincode -> zstd -> fs::write -> fs::read -> zstd ->
 //! bincode` path. PERFORMANCE.md (S19) documents the expected gap to a
 //! full CUDA-restore path.
+//!
+//! Note: the `disk_round_trip` group intentionally stops at 16 MiB. Above
+//! that, disk IO dominates and blows the bench wall-clock with little
+//! signal — capture/restore alone are exercised at the larger sizes.
 
 use std::time::Duration;
 
@@ -25,7 +29,12 @@ fn fixture_bytes(size_bytes: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 fn bench_snapshot_capture(c: &mut Criterion) {
     let mut group = c.benchmark_group("cold_start/capture");
     group.measurement_time(Duration::from_secs(3));
-    for &size in &[1024usize * 1024, 16 * 1024 * 1024, 128 * 1024 * 1024] {
+    for &size in &[
+        1024usize * 1024,
+        16 * 1024 * 1024,
+        128 * 1024 * 1024,
+        512 * 1024 * 1024,
+    ] {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             let (wasm, gpu, regs) = fixture_bytes(size);
@@ -50,7 +59,12 @@ fn bench_snapshot_capture(c: &mut Criterion) {
 fn bench_snapshot_restore(c: &mut Criterion) {
     let mut group = c.benchmark_group("cold_start/restore");
     group.measurement_time(Duration::from_secs(3));
-    for &size in &[1024usize * 1024, 16 * 1024 * 1024, 128 * 1024 * 1024] {
+    for &size in &[
+        1024usize * 1024,
+        16 * 1024 * 1024,
+        128 * 1024 * 1024,
+        512 * 1024 * 1024,
+    ] {
         group.throughput(Throughput::Bytes(size as u64));
         let (wasm, gpu, regs) = fixture_bytes(size);
         let captured = SnapshotWriter::new()

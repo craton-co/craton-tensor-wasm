@@ -1,11 +1,13 @@
 //! `bali metrics` — fetch Prometheus metrics from a Bali server.
 //!
-//! S18 stub: validates the server URL and prints the planned `GET /metrics`
-//! request. S20 will swap the print for a real HTTP fetch via `reqwest` and
-//! pretty-print the Prometheus text-format response, optionally filtered to
-//! `bali_*` series.
+//! Issues `GET {server}/metrics` and prints the response body verbatim.
+//! Prometheus text exposition is plain UTF-8 by design, so no extra
+//! formatting is applied. A non-2xx response is rendered through the shared
+//! error-envelope helper and the process exits non-zero.
 
-use anyhow::Result;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
 use clap::Args;
 
 /// Arguments to `bali metrics`.
@@ -17,12 +19,32 @@ pub struct MetricsArgs {
 }
 
 /// Entry point for `bali metrics`.
-pub fn run(args: MetricsArgs) -> Result<()> {
+pub async fn run(args: MetricsArgs) -> Result<()> {
     super::validate_server_url(&args.server)?;
-    println!(
-        "metrics: would GET {}/metrics",
-        args.server.trim_end_matches('/')
-    );
-    println!("HTTP transport wired in S20 with reqwest");
+
+    let url = format!("{}/metrics", super::server_base(&args.server));
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("building HTTP client")?;
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .with_context(|| format!("reading response body from {url}"))?;
+
+    if !status.is_success() {
+        return Err(super::render_error_response(status, &text));
+    }
+
+    println!("{text}");
     Ok(())
 }

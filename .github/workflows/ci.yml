@@ -76,6 +76,30 @@ jobs:
       - name: Test (CUDA stub, default features)
         run: cargo test --workspace
 
+  doc:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install CUDA stub libraries
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+      - name: cargo doc
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --no-default-features
+
   actionlint:
     runs-on: ubuntu-latest
     steps:

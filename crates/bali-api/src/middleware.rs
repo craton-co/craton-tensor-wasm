@@ -40,6 +40,25 @@ pub fn concurrency_limit_layer(max: usize) -> ConcurrencyLimitLayer {
     ConcurrencyLimitLayer::new(max)
 }
 
+/// Adapter that lets the OpenTelemetry `TextMapPropagator` read from an
+/// `axum`/`http` [`HeaderMap`](axum::http::HeaderMap).
+///
+/// The propagator API is generic over an [`opentelemetry::propagation::Extractor`],
+/// which expects `get(&str) -> Option<&str>` and `keys() -> Vec<&str>` semantics.
+/// We provide the smallest possible bridge so we do not need the
+/// `opentelemetry-http` crate as an additional dependency.
+struct HeaderMapExtractor<'a>(&'a axum::http::HeaderMap);
+
+impl<'a> opentelemetry::propagation::Extractor for HeaderMapExtractor<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
 /// Returns a [`TraceLayer`] that, in addition to the per-request span,
 /// reads the W3C `traceparent` header from the incoming request and uses
 /// it as the parent context for the resulting span.
@@ -47,29 +66,46 @@ pub fn concurrency_limit_layer(max: usize) -> ConcurrencyLimitLayer {
 /// When a downstream service (or load test client) sends the W3C standard
 /// header, traces stitch correctly across the boundary. When no header is
 /// present, the span is parented to the local context as usual.
+///
+/// The function delegates the actual parsing to the OpenTelemetry global
+/// `TextMapPropagator` (installed by `bali-core::telemetry` under the
+/// `otlp` feature). If no propagator is installed the extraction returns
+/// an empty context and the span is parented locally — i.e. behaviour
+/// degrades gracefully.
 pub fn trace_layer_with_propagation() -> tower_http::trace::TraceLayer<
     tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
     impl Fn(&axum::http::Request<axum::body::Body>) -> tracing::Span + Clone,
 > {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
     TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<axum::body::Body>| {
-        // Extract the W3C traceparent header (if present). The full
-        // W3C parse / context attachment lands when the opentelemetry
-        // global propagator is wired in `bali-core::telemetry` (the
-        // `otlp` feature there installs it). For now we still surface
-        // the header value as a span attribute so traces emitted by
-        // this process carry the incoming trace id for correlation.
+        // Surface the raw traceparent value as a span field for log-based
+        // correlation, even when no OTel propagator is installed.
         let traceparent = req
             .headers()
             .get("traceparent")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        tracing::info_span!(
+
+        let span = tracing::info_span!(
             "http.request",
             method = %req.method(),
             uri = %req.uri(),
             version = ?req.version(),
             traceparent = %traceparent,
-        )
+        );
+
+        // Extract the parent `opentelemetry::Context` from the incoming
+        // headers via whichever `TextMapPropagator` was installed globally
+        // (typically `TraceContextPropagator` for W3C `traceparent`). Then
+        // attach it as the parent of the freshly-created tracing span via
+        // the `OpenTelemetrySpanExt::set_parent` bridge.
+        let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.extract(&HeaderMapExtractor(req.headers()))
+        });
+        span.set_parent(parent_cx);
+
+        span
     })
 }
 

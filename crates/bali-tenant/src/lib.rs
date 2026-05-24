@@ -6,7 +6,7 @@
 //! contexts and per-tenant `cuCtxCreate` fallback via a filesystem probe — see
 //! `docs/MPS-SETUP.md` for daemon configuration and `SECURITY.md` for the
 //! threat model that motivates the [`IsolationKind`] taxonomy.
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 pub mod context;
 pub mod registry;

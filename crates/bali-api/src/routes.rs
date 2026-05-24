@@ -1,9 +1,11 @@
 //! REST route handlers (deploy, invoke, metrics, healthz).
 //!
 //! All handlers operate on a shared [`AppState`] containing in-memory registries
-//! of deployed functions and pending jobs. Wasm bytes are accepted as base64;
-//! S17 only validates the magic-number header and stores the bytes — actual
-//! instantiation is wired through `bali_exec::executor::BaliExecutor` in S20.
+//! of deployed functions and pending jobs, plus a shared [`BaliMetrics`]
+//! registry and a [`BaliExecutor`]. Wasm bytes are accepted as base64; the
+//! deploy path validates the magic-number header and stores the bytes, and
+//! the synchronous invoke path drives `bali_exec::executor::BaliExecutor` to
+//! spawn, call `_start` / `main`, and terminate the instance.
 //!
 //! ## Error envelope
 //!
@@ -16,7 +18,7 @@
 //! `kind` strings are stable; `message` strings are not.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
@@ -24,11 +26,18 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use bali_core::metrics::BaliMetrics;
+use bali_core::types::TenantId;
+use bali_exec::engine::BaliEngine;
+use bali_exec::executor::{BaliExecutor, ExecError, SpawnConfig};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Default per-invocation deadline used by the synchronous `/invoke` handler.
+const INVOKE_DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Minimum length, in bytes, of a Wasm module: the 4-byte `\0asm` magic plus
 /// the 4-byte version field. Anything shorter cannot be a valid module.
@@ -91,19 +100,39 @@ pub struct JobRecord {
 /// `Arc<AppState>` is cloned into the router via `with_state`; the inner
 /// `DashMap`s sit behind their own `Arc` so cheap clones of the maps remain
 /// possible across the codebase.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     /// Deployed-function registry, keyed by id.
     pub functions: Arc<DashMap<Uuid, FunctionRecord>>,
     /// Async-job registry, keyed by id.
     pub jobs: Arc<DashMap<Uuid, JobRecord>>,
+    /// Shared metrics registry. Cloned into the executor so spawn/terminate
+    /// counters and the `/metrics` scrape view the same atomics.
+    pub metrics: Arc<BaliMetrics>,
+    /// Wasm executor driving the synchronous `/invoke` path.
+    pub executor: Arc<BaliExecutor>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("functions", &self.functions.len())
+            .field("jobs", &self.jobs.len())
+            .finish()
+    }
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let metrics = Arc::new(BaliMetrics::new());
+        let engine =
+            Arc::new(BaliEngine::new().expect("BaliEngine::new must succeed for default AppState"));
+        let executor = Arc::new(BaliExecutor::with_metrics(engine, (*metrics).clone()));
         Self {
             functions: Arc::new(DashMap::new()),
             jobs: Arc::new(DashMap::new()),
+            metrics,
+            executor,
         }
     }
 }
@@ -113,6 +142,19 @@ impl AppState {
     /// `Router::with_state`.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Override the metrics registry, rebuilding the executor so its
+    /// spawn/terminate counters share the supplied handle.
+    ///
+    /// Useful for tests that need to inspect counter values, or for embedders
+    /// who construct a process-wide registry separately.
+    pub fn with_metrics(mut self, metrics: Arc<BaliMetrics>) -> Self {
+        let engine =
+            Arc::new(BaliEngine::new().expect("BaliEngine::new must succeed for with_metrics"));
+        self.executor = Arc::new(BaliExecutor::with_metrics(engine, (*metrics).clone()));
+        self.metrics = metrics;
+        self
     }
 }
 
@@ -202,6 +244,33 @@ impl From<JsonRejection> for ApiError {
     }
 }
 
+impl From<ExecError> for ApiError {
+    fn from(err: ExecError) -> Self {
+        match err {
+            ExecError::NotFound(_) => ApiError {
+                status: StatusCode::NOT_FOUND,
+                kind: "instance_not_found".to_string(),
+                message: err.to_string(),
+            },
+            ExecError::MissingExport(_) => ApiError {
+                status: StatusCode::BAD_REQUEST,
+                kind: "missing_export".to_string(),
+                message: err.to_string(),
+            },
+            ExecError::Timeout(_) => ApiError {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                kind: "invoke_timeout".to_string(),
+                message: err.to_string(),
+            },
+            ExecError::Wasmtime(_) => ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                kind: "wasmtime".to_string(),
+                message: err.to_string(),
+            },
+        }
+    }
+}
+
 /// Convenience alias.
 pub type ApiResult<T> = Result<T, ApiError>;
 
@@ -234,14 +303,18 @@ pub async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-/// `GET /metrics` — Prometheus text exposition scaffold.
+/// `GET /metrics` — Prometheus text exposition.
 ///
-/// S17 returns a stub; real exposition wires in S20.
-pub async fn metrics() -> impl IntoResponse {
+/// Renders the shared [`BaliMetrics`] registry into the standard text-format
+/// (`text/plain; version=0.0.4`). Every metric registered in
+/// `bali_core::metrics` is exposed; counter names carry the `_total` suffix
+/// per Prometheus convention.
+pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let body = state.metrics.encode_text();
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        "# bali metrics scaffold\n# real exposition wires in S20\n",
+        body,
     )
 }
 
@@ -310,19 +383,50 @@ pub async fn delete_function(
 
 /// `POST /functions/{id}/invoke` — synchronous invocation.
 ///
-/// S17 returns a placeholder result; real execution is routed through
-/// `bali_exec::executor::BaliExecutor` in S20.
+/// Looks up the function's stored Wasm bytes, spawns a fresh instance via
+/// the shared [`BaliExecutor`] with a 30-second deadline, calls `_start`
+/// (falling back to `main`), then terminates the instance. Returns the
+/// `function_id` and a string `result` on success; structured `ApiError`
+/// otherwise.
 pub async fn invoke_function(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     _args: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    if !state.functions.contains_key(&id) {
-        return Err(ApiError::not_found(format!("function {id} not found")));
-    }
+    // Snapshot the Wasm bytes under the DashMap shard lock, then drop the
+    // guard before we hit any `.await`. The function record's stored bytes
+    // are immutable post-deploy so a one-shot clone is correct.
+    let wasm_bytes = match state.functions.get(&id) {
+        Some(entry) => entry.value().wasm_bytes.clone(),
+        None => return Err(ApiError::not_found(format!("function {id} not found"))),
+    };
+
+    let cfg = SpawnConfig::for_tenant(TenantId(0)).with_deadline(INVOKE_DEFAULT_DEADLINE);
+    let instance_id = state.executor.spawn_instance(cfg, &wasm_bytes).await?;
+
+    // Try `_start` (WASI command convention) first, then `main`. Anything
+    // other than `MissingExport` from the first attempt bubbles up directly;
+    // a missing `_start` falls through to `main`. If neither exists the
+    // `MissingExport` from the second attempt is returned (mapped to 400).
+    let call_result = match state.executor.call_export(instance_id, "_start").await {
+        Ok(()) => Ok(()),
+        Err(ExecError::MissingExport(_)) => state.executor.call_export(instance_id, "main").await,
+        Err(other) => Err(other),
+    };
+
+    // Always terminate, even on call failure. Swallow a terminate error in
+    // favour of surfacing the original call error — the call result is what
+    // the operator wants to see.
+    let terminate_result = state.executor.terminate(instance_id).await;
+
+    call_result?;
+    // If the call succeeded but terminate failed we still surface the
+    // terminate error: leaking instances is a real bug we want loud.
+    terminate_result?;
+
     Ok(Json(serde_json::json!({
-        "result": "ok",
         "function_id": id.to_string(),
+        "result": "ok",
     })))
 }
 
@@ -391,6 +495,23 @@ mod tests {
         let s = AppState::default();
         assert_eq!(s.functions.len(), 0);
         assert_eq!(s.jobs.len(), 0);
+        // The default metrics registry exposes every Bali metric name.
+        let m = s.metrics.encode_text();
+        assert!(m.contains("bali_active_instances"), "got: {m}");
+    }
+
+    #[test]
+    fn app_state_with_metrics_swaps_handle() {
+        let custom = Arc::new(BaliMetrics::new());
+        custom.kernel_dispatches_total().inc();
+        let s = AppState::default().with_metrics(custom.clone());
+        // The state's metrics handle reflects the externally observed
+        // counter increment — proving the handle was actually swapped in.
+        let text = s.metrics.encode_text();
+        assert!(
+            text.contains("bali_kernel_dispatches_total 1"),
+            "got: {text}"
+        );
     }
 
     #[test]

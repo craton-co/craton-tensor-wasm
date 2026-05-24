@@ -62,9 +62,11 @@ drift.
 | cold_start/capture | 1 MiB snapshot | ~5 ms |
 | cold_start/capture | 16 MiB snapshot | ~75 ms |
 | cold_start/capture | 128 MiB snapshot | ~600 ms |
+| cold_start/capture | 512 MiB snapshot | ~2.4 s (modeled, linear extrapolation) |
 | cold_start/restore | 1 MiB | ~3 ms |
 | cold_start/restore | 16 MiB | ~50 ms |
 | cold_start/restore | 128 MiB | ~400 ms |
+| cold_start/restore | 512 MiB | ~1.6 s (modeled, linear extrapolation) |
 | memory_bandwidth/sequential | 16 MiB | ~3 ms (5+ GB/s host RAM) |
 | jit_compile/emit_text | matmul[16x16x16] | ~5-20 µs |
 | e2e/healthz | — | ~30-60 µs |
@@ -104,10 +106,25 @@ S22 completes.
 The `bench` workflow in `.github/workflows/bench.yml` runs the full bench
 suite on pull requests that touch `crates/bali-bench/**` or `crates/*/src/**`,
 and compares the result against a committed baseline at
-`bench-results/baseline.json`. **Any metric that regresses by more than 10%
-fails the build.** New benches are added to the baseline in a separate
-commit, after a clean run on the reference machine, so that adding a bench
-never lands together with a code change in the same PR.
+[`bench-results/baseline.json`](../bench-results/baseline.json). The CI step
+parses Criterion's `--output-format bencher` lines, looks each tracked
+metric up in the baseline, and fails the build when the measured median
+exceeds `baseline.median_ns * (1 + (tolerance_pct + regress_pct_threshold) / 100)`.
+
+In the committed baseline today, `regress_pct_threshold` is **10%** and
+per-metric `tolerance_pct` ranges from **30%** (cold-start, where each
+sample is tens of milliseconds and noise is small relative to the mean)
+to **100%** (sub-microsecond metrics where CV is naturally high). The
+effective ceiling for a given metric is the sum of those two — e.g. a
+30%-tolerance metric fails only if it regresses by more than 40% above
+baseline. This is deliberately loose for the S19 scaffold; the numbers in
+`baseline.json` are conservative hand-picked starting points, **not
+measured medians**. S22 replaces them with values captured on the
+self-hosted CUDA runner, at which point tolerances tighten.
+
+New benches are added to the baseline in a separate commit, after a clean
+run on the reference machine, so that adding a bench never lands together
+with a code change in the same PR.
 
 Re-baseline procedure:
 

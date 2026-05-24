@@ -14,9 +14,11 @@ description = "HTTP serverless API gateway (axum)."
 anyhow.workspace = true
 axum.workspace = true
 bali-core = { path = "../bali-core" }
+bali-exec = { path = "../bali-exec" }
 base64 = "0.22"
 dashmap.workspace = true
 hyper.workspace = true
+opentelemetry = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -24,6 +26,7 @@ tokio.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
+tracing-opentelemetry = { workspace = true }
 uuid.workspace = true
 
 [dev-dependencies]
@@ -31,3 +34,4 @@ http-body-util = "0.1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-test.workspace = true
 tower = { workspace = true, features = ["util"] }
+wat.workspace = true

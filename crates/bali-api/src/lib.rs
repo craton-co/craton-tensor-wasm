@@ -5,7 +5,7 @@
 //! via `Arc<AppState>`. Real Wasm execution wiring (driving `bali-exec`)
 //! lands in a follow-up; S17 lands the HTTP surface, request validation,
 //! and error envelope.
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 pub mod middleware;
 pub mod routes;

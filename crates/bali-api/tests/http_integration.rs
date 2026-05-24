@@ -73,7 +73,16 @@ async fn metrics_returns_text() {
     assert!(ct.starts_with("text/plain"), "content-type was {ct}");
     let bytes = body_bytes(resp.into_body()).await;
     let text = std::str::from_utf8(&bytes).unwrap();
-    assert!(text.contains("bali metrics scaffold"), "got: {text}");
+    // Real Prometheus exposition from the shared BaliMetrics registry.
+    // Counters are registered without the `_total` suffix in bali-core; the
+    // prometheus-client text encoder appends it per the OpenMetrics rules.
+    for needle in [
+        "bali_active_instances",
+        "bali_kernel_dispatches_total",
+        "bali_offload_success_total",
+    ] {
+        assert!(text.contains(needle), "missing {needle} in:\n{text}");
+    }
 }
 
 #[tokio::test]
@@ -168,6 +177,91 @@ async fn invoke_unknown_returns_404() {
     assert_eq!(
         body.pointer("/error/kind").and_then(Value::as_str),
         Some("not_found")
+    );
+}
+
+#[tokio::test]
+async fn deploy_then_invoke_round_trip() {
+    // A minimal WASI command: a module that exports `_start` taking no args
+    // and returning nothing. `BaliExecutor` will spawn, call, and terminate.
+    let wasm_bytes = wat::parse_str(r#"(module (func (export "_start")))"#).expect("WAT parses");
+    let wasm_b64 = BASE64.encode(&wasm_bytes);
+
+    let router = router();
+
+    // Deploy.
+    let deploy_req = json_post(
+        "/functions",
+        json!({ "name": "round_trip", "wasm_b64": wasm_b64 }),
+    );
+    let deploy_resp = router
+        .clone()
+        .oneshot(deploy_req)
+        .await
+        .expect("deploy oneshot");
+    assert_eq!(deploy_resp.status(), StatusCode::OK);
+    let deploy_body = body_json(deploy_resp.into_body()).await;
+    let id = deploy_body
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("deploy response has id");
+
+    // Invoke.
+    let invoke_req = json_post(&format!("/functions/{id}/invoke"), json!({}));
+    let invoke_resp = router.oneshot(invoke_req).await.expect("invoke oneshot");
+    assert_eq!(
+        invoke_resp.status(),
+        StatusCode::OK,
+        "expected 200, got {:?}",
+        invoke_resp.status()
+    );
+    let body = body_json(invoke_resp.into_body()).await;
+    assert!(
+        body.get("result").is_some(),
+        "response missing `result`: {body}"
+    );
+    assert_eq!(
+        body.get("function_id").and_then(Value::as_str),
+        Some(id),
+        "function_id mismatch: {body}"
+    );
+}
+
+#[tokio::test]
+async fn invoke_module_without_start_or_main_is_400() {
+    // A module whose only export has an unrelated name — neither `_start`
+    // nor `main` is present. The executor's MissingExport bubbles up as a
+    // 400 with `kind = "missing_export"`.
+    let wasm_bytes = wat::parse_str(r#"(module (func (export "noop")))"#).expect("WAT parses");
+    let wasm_b64 = BASE64.encode(&wasm_bytes);
+
+    let router = router();
+
+    let deploy_req = json_post(
+        "/functions",
+        json!({ "name": "no_entry", "wasm_b64": wasm_b64 }),
+    );
+    let deploy_resp = router
+        .clone()
+        .oneshot(deploy_req)
+        .await
+        .expect("deploy oneshot");
+    assert_eq!(deploy_resp.status(), StatusCode::OK);
+    let id = body_json(deploy_resp.into_body())
+        .await
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .expect("deploy response has id");
+
+    let invoke_req = json_post(&format!("/functions/{id}/invoke"), json!({}));
+    let invoke_resp = router.oneshot(invoke_req).await.expect("invoke oneshot");
+    assert_eq!(invoke_resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(invoke_resp.into_body()).await;
+    assert_eq!(
+        body.pointer("/error/kind").and_then(Value::as_str),
+        Some("missing_export"),
+        "got {body}"
     );
 }
 

@@ -1,7 +1,7 @@
 //! `bali run` — locally execute a Wasm module.
 //!
 //! Spawns a `BaliExecutor` over a default `BaliEngine`, instantiates the
-//! supplied `.wasm` file under [`TenantId(1)`], invokes the requested export
+//! supplied `.wasm` file under `TenantId(1)`, invokes the requested export
 //! (default `main`), and prints `ok` on success or the error chain otherwise.
 //!
 //! Arguments destined for the guest are accepted as a JSON array via

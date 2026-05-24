@@ -1,0 +1,18 @@
+{
+  "// generated": "Baseline for CI regression check. Update via `cargo bench` + manual review.",
+  "metrics": [
+    { "name": "cold_start/capture/1048576",    "median_ns": 25000000,  "tolerance_pct": 30 },
+    { "name": "cold_start/capture/16777216",   "median_ns": 350000000, "tolerance_pct": 30 },
+    { "name": "cold_start/restore/1048576",    "median_ns": 30000000,  "tolerance_pct": 30 },
+    { "name": "cold_start/restore/16777216",   "median_ns": 400000000, "tolerance_pct": 30 },
+    { "name": "dispatch/serial/10",            "median_ns": 50000,     "tolerance_pct": 50 },
+    { "name": "dispatch/concurrent_cap64/100", "median_ns": 200000,    "tolerance_pct": 50 },
+    { "name": "jit_compile/emit_text/matmul[16x16x16]", "median_ns": 50000, "tolerance_pct": 50 },
+    { "name": "jit_compile/cache/warm_hit",    "median_ns": 1000,      "tolerance_pct": 100 },
+    { "name": "tenant_registry/lookup/16",     "median_ns": 500,       "tolerance_pct": 100 }
+  ],
+  "policy": {
+    "regress_pct_threshold": 10,
+    "note": "Tolerance widens for sub-microsecond measurements where CV is naturally higher."
+  }
+}

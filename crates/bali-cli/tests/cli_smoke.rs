@@ -162,6 +162,151 @@ fn run_executes_inline_wat_fixture() {
     );
 }
 
+/// `127.0.0.1:1` is reserved (TCPMUX) and never bound in our CI sandboxes,
+/// so every connect attempt fails fast. Used by the three HTTP-shaped
+/// subcommand tests below to prove the real `reqwest` code path runs without
+/// requiring a live server.
+const DEAD_SERVER: &str = "http://127.0.0.1:1";
+
+/// Combined stdout+stderr from a command, lowercased — convenient for
+/// substring assertions on error messages whose exact text changes between
+/// reqwest versions.
+fn combined_lower(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+    .to_lowercase()
+}
+
+#[test]
+fn deploy_against_dead_server_fails_cleanly() {
+    // Write a minimal valid wasm so the file-read step succeeds and we
+    // exercise the HTTP path.
+    let wasm = wat::parse_str("(module)").expect("compile empty module");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path().join("m.wasm");
+    std::fs::write(&p, &wasm).expect("write");
+
+    let out = Command::new(bali_bin())
+        .args(["deploy", p.to_str().unwrap(), "--server", DEAD_SERVER])
+        .output()
+        .expect("spawn bali deploy");
+    assert!(
+        !out.status.success(),
+        "bali deploy against {DEAD_SERVER} should fail, got {:?}",
+        out.status
+    );
+    let msg = combined_lower(&out);
+    // We expect a connect-style error, NOT the legacy `would upload` stub
+    // string, NOT a panic. The exact phrasing comes from reqwest/hyper, so
+    // accept any of the common variants.
+    assert!(
+        !msg.contains("would upload"),
+        "deploy still printing the legacy stub:\n{msg}"
+    );
+    assert!(
+        !msg.contains("panicked"),
+        "deploy panicked instead of returning an error:\n{msg}"
+    );
+    assert!(
+        msg.contains("connect")
+            || msg.contains("connection")
+            || msg.contains("refused")
+            || msg.contains("reset")
+            || msg.contains("post http"),
+        "expected a connection-failure-shaped error, got:\n{msg}"
+    );
+}
+
+#[test]
+fn invoke_against_dead_server_fails_cleanly() {
+    let out = Command::new(bali_bin())
+        .args([
+            "invoke",
+            "00000000-0000-0000-0000-000000000000",
+            "--server",
+            DEAD_SERVER,
+        ])
+        .output()
+        .expect("spawn bali invoke");
+    assert!(
+        !out.status.success(),
+        "bali invoke against {DEAD_SERVER} should fail"
+    );
+    let msg = combined_lower(&out);
+    assert!(
+        !msg.contains("would post"),
+        "invoke still printing the legacy stub:\n{msg}"
+    );
+    assert!(
+        !msg.contains("panicked"),
+        "invoke panicked instead of returning an error:\n{msg}"
+    );
+    assert!(
+        msg.contains("connect")
+            || msg.contains("connection")
+            || msg.contains("refused")
+            || msg.contains("reset")
+            || msg.contains("post http"),
+        "expected a connection-failure-shaped error, got:\n{msg}"
+    );
+}
+
+#[test]
+fn metrics_against_dead_server_fails_cleanly() {
+    let out = Command::new(bali_bin())
+        .args(["metrics", "--server", DEAD_SERVER])
+        .output()
+        .expect("spawn bali metrics");
+    assert!(
+        !out.status.success(),
+        "bali metrics against {DEAD_SERVER} should fail"
+    );
+    let msg = combined_lower(&out);
+    assert!(
+        !msg.contains("would get"),
+        "metrics still printing the legacy stub:\n{msg}"
+    );
+    assert!(
+        !msg.contains("panicked"),
+        "metrics panicked instead of returning an error:\n{msg}"
+    );
+    assert!(
+        msg.contains("connect")
+            || msg.contains("connection")
+            || msg.contains("refused")
+            || msg.contains("reset")
+            || msg.contains("get http"),
+        "expected a connection-failure-shaped error, got:\n{msg}"
+    );
+}
+
+#[test]
+fn invoke_rejects_non_array_args() {
+    let out = Command::new(bali_bin())
+        .args([
+            "invoke",
+            "00000000-0000-0000-0000-000000000000",
+            "--server",
+            DEAD_SERVER,
+            "--args",
+            "{\"not\":\"array\"}",
+        ])
+        .output()
+        .expect("spawn bali invoke");
+    assert!(
+        !out.status.success(),
+        "bali invoke with object --args should fail before any HTTP call"
+    );
+    let msg = combined_lower(&out);
+    assert!(
+        msg.contains("--args must be a json array") || msg.contains("must be a json array"),
+        "expected validation error about JSON array, got:\n{msg}"
+    );
+}
+
 #[test]
 fn run_rejects_non_array_args() {
     // Build a tiny valid wasm so the read step succeeds and we exercise the

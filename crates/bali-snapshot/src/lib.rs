@@ -6,7 +6,7 @@
 //! module produces blobs from a live [`writer::InstanceState`], while the
 //! [`reader`] module restores them with strict magic + version checking so
 //! malformed inputs are surfaced as errors rather than panics.
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 pub mod reader;
 pub mod writer;

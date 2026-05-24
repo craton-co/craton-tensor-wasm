@@ -5,7 +5,7 @@
 //! linear-memory creator backed by [`bali_mem`]. The [`instance`] module
 //! manages per-tenant instance lifecycles, and [`executor`] drives async
 //! invocation of guest exports against a shared engine and store pool.
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 pub mod auto_offload;
 pub mod engine;

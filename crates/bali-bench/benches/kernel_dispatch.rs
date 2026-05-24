@@ -17,7 +17,7 @@ fn bench_serial(c: &mut Criterion) {
         .unwrap();
     let mut group = c.benchmark_group("dispatch/serial");
     group.measurement_time(Duration::from_secs(3));
-    for &n in &[10u64, 100, 1000] {
+    for &n in &[1u64, 10, 100, 1000] {
         group.throughput(Throughput::Elements(n));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter(|| {
@@ -42,7 +42,7 @@ fn bench_concurrent(c: &mut Criterion) {
         .unwrap();
     let mut group = c.benchmark_group("dispatch/concurrent_cap64");
     group.measurement_time(Duration::from_secs(3));
-    for &n in &[10u64, 100, 1000] {
+    for &n in &[1u64, 10, 100, 1000] {
         group.throughput(Throughput::Elements(n));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter(|| {

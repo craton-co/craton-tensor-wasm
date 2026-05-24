@@ -13,7 +13,7 @@
 //! Pools (`pool::UnifiedMemoryPool`) amortise the cost of CUDA allocations
 //! by carving sub-slices from a single slab. Hints (`advise`) forward to
 //! `cudaMemAdvise` on CUDA hosts and are no-ops otherwise.
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 pub mod advise;
 pub mod isolation;

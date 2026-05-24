@@ -9,7 +9,7 @@
 //! Subcommand implementations live under [`cmd`]. Each command parses its
 //! arguments via `clap` derive, runs to completion, and returns an
 //! [`anyhow::Result`] back to `main` for unified error reporting.
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -72,11 +72,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Run(args) => cmd::run::run(args).await,
-        Command::Deploy(args) => cmd::deploy::run(args),
-        Command::Invoke(args) => cmd::invoke::run(args),
+        Command::Deploy(args) => cmd::deploy::run(args).await,
+        Command::Invoke(args) => cmd::invoke::run(args).await,
         Command::Bench(args) => cmd::bench::run(args).await,
         Command::Snapshot { action } => cmd::snapshot::run(action),
-        Command::Metrics(args) => cmd::metrics::run(args),
+        Command::Metrics(args) => cmd::metrics::run(args).await,
         Command::Completions { shell } => cmd::completions::run(shell),
     }
 }

@@ -41,5 +41,62 @@ jobs:
       - name: Compare against baseline
         if: hashFiles('bench-results/baseline.json') != ''
         run: |
-          echo "Regression check is a stub for S19; full diff lands when criterion-cmp is wired in S22."
-          echo "current.txt size: $(wc -l < bench-results/current.txt)"
+          python3 - <<'PY'
+          import json, re, sys
+
+          # Criterion --output-format bencher emits one line per metric:
+          #   test <bench_id> ... bench:   <median> ns/iter (+/- <stddev>)
+          BENCH_LINE = re.compile(
+              r"^test\s+(?P<name>\S+)\s+\.\.\.\s+bench:\s+(?P<median>[\d,]+)\s+ns/iter"
+          )
+
+          with open("bench-results/baseline.json") as f:
+              baseline = json.load(f)
+          policy_threshold = baseline["policy"]["regress_pct_threshold"]
+          metrics = {m["name"]: m for m in baseline["metrics"]}
+
+          measured = {}
+          with open("bench-results/current.txt") as f:
+              for line in f:
+                  m = BENCH_LINE.match(line.strip())
+                  if m:
+                      measured[m.group("name")] = int(m.group("median").replace(",", ""))
+
+          print(f"Parsed {len(measured)} metrics from current.txt")
+          print(f"Baseline has {len(metrics)} tracked metrics")
+
+          failures = []
+          missing = []
+          for name, spec in metrics.items():
+              if name not in measured:
+                  missing.append(name)
+                  continue
+              cur = measured[name]
+              base = spec["median_ns"]
+              tol = spec["tolerance_pct"]
+              # Allow tolerance + regression threshold combined on top of baseline.
+              ceiling = base * (1 + (tol + policy_threshold) / 100.0)
+              delta_pct = (cur - base) / base * 100.0
+              status = "OK" if cur <= ceiling else "FAIL"
+              print(
+                  f"  [{status}] {name}: cur={cur} ns, base={base} ns, "
+                  f"delta={delta_pct:+.1f}%, ceiling={ceiling:.0f} ns "
+                  f"(tol={tol}% + policy={policy_threshold}%)"
+              )
+              if cur > ceiling:
+                  failures.append((name, cur, base, ceiling, delta_pct))
+
+          if missing:
+              print(f"::warning::Baseline metrics not found in current run: {missing}")
+
+          if failures:
+              print("::error::Performance regressions detected:")
+              for name, cur, base, ceiling, delta_pct in failures:
+                  print(
+                      f"  {name}: {cur} ns > {ceiling:.0f} ns ceiling "
+                      f"(baseline {base} ns, delta {delta_pct:+.1f}%)"
+                  )
+              sys.exit(1)
+
+          print("No regressions beyond per-metric tolerance + policy threshold.")
+          PY
