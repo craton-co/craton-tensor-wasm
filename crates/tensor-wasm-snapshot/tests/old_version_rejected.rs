@@ -36,7 +36,8 @@ fn snapshot_version_minus_one_is_rejected() {
         crc32: payload_crc32(&[], &[], &[]),
     };
 
-    let encoded = bincode::serialize(&snap).expect("bincode encode");
+    let cfg = bincode::config::legacy();
+    let encoded = bincode::serde::encode_to_vec(&snap, cfg).expect("bincode encode");
     let compressed = zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL).expect("zstd encode");
 
     let err = SnapshotReader::new()

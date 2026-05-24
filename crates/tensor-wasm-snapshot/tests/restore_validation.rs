@@ -91,7 +91,8 @@ fn restore_rejects_oversized_registers_via_handcrafted_blob() {
         },
         crc32,
     };
-    let encoded = bincode::serialize(&snap).expect("bincode");
+    let cfg = bincode::config::legacy();
+    let encoded = bincode::serde::encode_to_vec(&snap, cfg).expect("bincode");
     let compressed = zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL).expect("zstd");
 
     let err = SnapshotReader::new()
@@ -173,7 +174,8 @@ fn restore_rejects_magic_mismatch() {
         },
         crc32: tensor_wasm_snapshot::payload_crc32(&[], &[], &[]),
     };
-    let encoded = bincode::serialize(&snap).expect("bincode");
+    let cfg = bincode::config::legacy();
+    let encoded = bincode::serde::encode_to_vec(&snap, cfg).expect("bincode");
     let compressed = zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL).expect("zstd");
     let err = reader
         .restore(&compressed)

@@ -18,7 +18,6 @@
 use std::io::Read;
 
 use tensor_wasm_core::error::{TensorWasmError, Result};
-use bincode::Options as _;
 use tracing::{debug, instrument};
 
 use crate::writer::{
@@ -63,8 +62,21 @@ impl SnapshotReader {
     ///
     /// Use when restoring trusted snapshots that legitimately decompress past
     /// the 256 MiB default. The reader still refuses inputs whose compressed
-    /// size exceeds [`limits::MAX_INPUT_BYTES`] and still bounds the bincode
-    /// allocator via [`bincode::Options::with_limit`] using this same value.
+    /// size exceeds [`limits::MAX_INPUT_BYTES`].
+    ///
+    /// Semantic note (bincode 2.x migration): in the 1.x era this knob also
+    /// bounded the bincode allocator via `Options::with_limit(max)` — that
+    /// limit was a runtime value. bincode 2.x's allocator limit is a
+    /// *compile-time* `const` generic, so it can no longer be tied to a
+    /// per-instance runtime override. The reader instead uses a static
+    /// allocator ceiling of [`limits::MAX_TOTAL_PAYLOAD_BYTES`] (the sum of
+    /// the per-blob caps plus envelope slack). This runtime knob continues
+    /// to bound the *decompressed buffer* via `Read::take`, and the per-blob
+    /// caps in [`limits`] still reject any oversized declared length after
+    /// deserialisation — so the practical guarantees (no zip-bomb, no
+    /// length-prefix abuse) are unchanged. Only the layer that catches the
+    /// length-prefix abuse has shifted from "bincode allocator cap" to
+    /// "static bincode allocator cap + per-blob check".
     #[must_use]
     pub const fn with_max_decompressed(mut self, max: usize) -> Self {
         self.max_decompressed = max;
@@ -138,15 +150,23 @@ impl SnapshotReader {
 
         // Bound the bincode allocator separately: even within `cap` bytes of
         // decompressed input, a malicious `Vec<u8>` length prefix could ask
-        // for a much larger allocation. `with_limit` makes bincode refuse any
-        // single allocation that would push the running total past the cap.
-        let snapshot: Snapshot = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_little_endian()
-            .allow_trailing_bytes()
-            .with_limit(cap as u64)
-            .deserialize_from(decompressed.as_slice())
-            .map_err(|e| TensorWasmError::Serialization(format!("bincode decode: {e}").into()))?;
+        // for a much larger allocation. In bincode 2.x the allocator limit is
+        // a const generic, so we use a static upper bound — the sum of every
+        // per-blob cap plus envelope slack. Any single allocation that would
+        // push past this static ceiling is refused by bincode before the
+        // backing buffer is touched. The per-blob `check_blob_size` calls
+        // below catch anything that survives this gate.
+        //
+        // `legacy()` keeps the on-wire encoding (LE, fixint) byte-identical
+        // to bincode 1.x's `DefaultOptions::new().with_fixint_encoding().with_little_endian()`.
+        // `decode_from_slice` returns `(T, consumed_bytes)` and ignores any
+        // trailing bytes by default, replacing the explicit `.allow_trailing_bytes()`
+        // opt-in from 1.x.
+        let cfg = bincode::config::legacy()
+            .with_limit::<{ crate::writer::limits::MAX_TOTAL_PAYLOAD_BYTES }>();
+        let (snapshot, _read): (Snapshot, usize) =
+            bincode::serde::decode_from_slice(decompressed.as_slice(), cfg)
+                .map_err(|e| TensorWasmError::Serialization(format!("bincode decode: {e}").into()))?;
 
         if snapshot.magic != SNAPSHOT_MAGIC {
             return Err(TensorWasmError::Serialization(
