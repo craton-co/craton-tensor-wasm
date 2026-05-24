@@ -120,11 +120,12 @@ impl SnapshotReader {
         let decoder = zstd::stream::read::Decoder::new(bytes)
             .map_err(|e| TensorWasmError::Serialization(format!("zstd init: {e}").into()))?;
         let mut limited = decoder.take(probe_limit);
-        // Pre-size the buffer modestly — we do not know the true decompressed
-        // length up front and refuse to trust an attacker-supplied frame-size
-        // hint, so just grow naturally. The `Take` ceiling guarantees we
-        // cannot grow past `cap + 1` bytes regardless of the input.
-        let mut decompressed: Vec<u8> = Vec::new();
+        // Pre-size the buffer to a small constant (1 MiB, capped by `cap`) to
+        // avoid grow-by-doubling reallocs. We refuse to trust an
+        // attacker-supplied frame-size hint, and the `Take` ceiling guarantees
+        // we cannot grow past `cap + 1` bytes regardless of the input.
+        let initial_capacity = cap.min(1024 * 1024);
+        let mut decompressed: Vec<u8> = Vec::with_capacity(initial_capacity);
         limited
             .read_to_end(&mut decompressed)
             .map_err(|e| TensorWasmError::Serialization(format!("zstd decode: {e}").into()))?;
