@@ -16,7 +16,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, SemaphorePermit, Semaphore};
 
 /// Default maximum number of concurrent GPU operations across the process.
 /// Mirrors the plan's choice of "a few times the number of SMs" — tuned
@@ -53,6 +53,12 @@ impl BackPressure {
     }
 
     /// Acquire one permit, awaiting back-pressure if necessary.
+    ///
+    /// Returns an *owned* permit (`'static`) suitable for callers that move
+    /// the permit across `tokio::spawn` boundaries (tests, benches, any
+    /// future fan-out path). Each call clones the inner `Arc<Semaphore>`.
+    /// On the non-spawning production hot path, prefer
+    /// [`BackPressure::acquire_borrowed`] which avoids that clone.
     pub async fn acquire(&self) -> DispatchPermit {
         let permit = self
             .inner
@@ -65,6 +71,28 @@ impl BackPressure {
         DispatchPermit {
             permit: Some(permit),
             counter: self.inner.clone(),
+        }
+    }
+
+    /// Acquire one permit, awaiting back-pressure if necessary.
+    ///
+    /// Returns a *borrowed* permit whose lifetime is tied to `&self`. This
+    /// avoids the `Arc<Semaphore>` clone that [`BackPressure::acquire`]
+    /// performs and is the right choice for callers that hold the permit
+    /// only within the current async scope (no `tokio::spawn`). The
+    /// production `launch_impl_async` host-function path runs inside a
+    /// wasmtime async fiber that never spawns, so it uses this variant.
+    pub async fn acquire_borrowed(&self) -> BorrowedDispatchPermit<'_> {
+        let permit = self
+            .inner
+            .semaphore
+            .acquire()
+            .await
+            .expect("semaphore closed unexpectedly");
+        self.inner.active.fetch_add(1, Ordering::Relaxed);
+        BorrowedDispatchPermit {
+            permit: Some(permit),
+            counter: &self.inner,
         }
     }
 
@@ -103,6 +131,27 @@ pub struct DispatchPermit {
 }
 
 impl Drop for DispatchPermit {
+    fn drop(&mut self) {
+        // SAFETY: the permit's own Drop releases the slot.
+        self.permit = None;
+        self.counter.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Borrowed counterpart to [`DispatchPermit`] returned by
+/// [`BackPressure::acquire_borrowed`]. Its lifetime is bound to the
+/// `&BackPressure` it was acquired from, so it cannot cross a
+/// `tokio::spawn` boundary — use [`DispatchPermit`] for that. In return,
+/// acquisition skips the `Arc<Semaphore>` clone the owned variant pays.
+///
+/// Drop semantics are identical to [`DispatchPermit`]: releasing the
+/// semaphore slot and decrementing the live-counter.
+pub struct BorrowedDispatchPermit<'a> {
+    permit: Option<SemaphorePermit<'a>>,
+    counter: &'a BackPressureInner,
+}
+
+impl Drop for BorrowedDispatchPermit<'_> {
     fn drop(&mut self) {
         // SAFETY: the permit's own Drop releases the slot.
         self.permit = None;
@@ -248,6 +297,22 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
+        assert_eq!(bp.active(), 0);
+    }
+
+    #[tokio::test]
+    async fn acquire_borrowed_and_release() {
+        // Mirrors `acquire_and_release` but for the borrowed variant: the
+        // live-counter must rise on acquire and fall on drop just as it
+        // does for the owned `DispatchPermit`.
+        let bp = BackPressure::with_cap(2);
+        assert_eq!(bp.active(), 0);
+        let a = bp.acquire_borrowed().await;
+        assert_eq!(bp.active(), 1);
+        let b = bp.acquire_borrowed().await;
+        assert_eq!(bp.active(), 2);
+        drop(a);
+        drop(b);
         assert_eq!(bp.active(), 0);
     }
 
