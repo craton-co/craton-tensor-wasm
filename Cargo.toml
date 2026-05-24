@@ -103,7 +103,6 @@ panic = "abort"
 
 [profile.bench]
 inherits = "release"
-panic = "unwind"
 
 [profile.dev]
 opt-level = 0
