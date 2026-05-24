@@ -124,6 +124,11 @@ pub struct DispatchFuture {
     /// this field is absent and the future resolves on first poll.
     #[cfg(feature = "cuda")]
     event: Option<cust::event::Event>,
+    /// On CUDA builds: an in-flight short sleep used to yield the Tokio
+    /// worker between CUDA event polls. The sleep timer wakes us, so we
+    /// do not need to call `wake_by_ref` and avoid a busy-poll loop.
+    #[cfg(feature = "cuda")]
+    sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl DispatchFuture {
@@ -135,6 +140,8 @@ impl DispatchFuture {
             _permit: permit,
             #[cfg(feature = "cuda")]
             event: None,
+            #[cfg(feature = "cuda")]
+            sleep: None,
         }
     }
 
@@ -149,6 +156,7 @@ impl DispatchFuture {
         Self {
             _permit: permit,
             event: Some(event),
+            sleep: None,
         }
     }
 }
@@ -165,26 +173,61 @@ impl std::future::Future for DispatchFuture {
         // the host bridge even without real CUDA.
         #[cfg(feature = "cuda")]
         {
-            if let Some(ev) = self.event.as_ref() {
-                // `query()` returns `Ok(())` when the event has completed
-                // and a recoverable error when it has not. On any other
-                // error we treat the dispatch as finished so the
-                // wasmtime fiber doesn't hang forever — the host's
-                // launch path will surface the real error to the guest
-                // separately via `last_error`.
-                return match ev.query() {
-                    Ok(()) => std::task::Poll::Ready(()),
-                    Err(_e) => {
-                        // Not done yet — wake immediately so the
-                        // executor re-polls. This is a busy-poll but
-                        // matches the existing `spawn_blocking`-driven
-                        // synchronization the launch path uses; the
-                        // dispatch future is currently advisory and not
-                        // on the launch critical path.
-                        _cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
+            use std::future::Future as _;
+
+            // `DispatchFuture` has no structurally-pinned fields: the
+            // permit, event, and the optional `Pin<Box<Sleep>>` are all
+            // `Unpin`, so the struct itself is `Unpin` and we can take
+            // an `&mut Self` safely. The `Sleep` is heap-pinned through
+            // `Box::pin` and is polled via its own `as_mut()` projection.
+            let this = std::pin::Pin::into_inner(self);
+
+            if this.event.is_some() {
+                // Loop so that when an in-flight sleep elapses we
+                // immediately re-check the CUDA event without bouncing
+                // back through the executor.
+                loop {
+                    // If a sleep is in flight, poll it first. If it is
+                    // still pending, the timer will wake us — no need
+                    // for `wake_by_ref`. If it has fired, clear it and
+                    // re-check the CUDA event.
+                    if let Some(sleep) = this.sleep.as_mut() {
+                        match sleep.as_mut().poll(_cx) {
+                            std::task::Poll::Pending => {
+                                return std::task::Poll::Pending;
+                            }
+                            std::task::Poll::Ready(()) => {
+                                this.sleep = None;
+                            }
+                        }
                     }
-                };
+
+                    // `query()` returns `Ok(())` when the event has
+                    // completed and a recoverable error when it has
+                    // not. On any other error we still treat the
+                    // dispatch as finished so the wasmtime fiber
+                    // doesn't hang forever — the host's launch path
+                    // will surface the real error to the guest
+                    // separately via `last_error`.
+                    let ev = this.event.as_ref().expect("event presence checked above");
+                    match ev.query() {
+                        Ok(()) => return std::task::Poll::Ready(()),
+                        Err(_e) => {
+                            // Not done yet — schedule a short sleep so
+                            // the Tokio worker can park instead of
+                            // busy-polling. 50 µs keeps latency
+                            // overhead small while letting hundreds of
+                            // concurrent dispatches actually overlap.
+                            this.sleep = Some(Box::pin(tokio::time::sleep(
+                                std::time::Duration::from_micros(50),
+                            )));
+                            // Loop back to poll the freshly-created
+                            // sleep so its waker is registered with the
+                            // current context before we return Pending.
+                            continue;
+                        }
+                    }
+                }
             }
         }
         std::task::Poll::Ready(())
