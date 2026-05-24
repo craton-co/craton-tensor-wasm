@@ -15,7 +15,7 @@ use predicates::prelude::*;
 /// Convenience: a fresh `assert_cmd::Command` for the `tensor-wasm` binary that
 /// strips `TENSOR_WASM_TOKEN` from the env so a developer's shell config doesn't
 /// silently leak credentials into the test runs.
-fn tensor-wasm() -> AssertCmd {
+fn tensor_wasm() -> AssertCmd {
     let mut cmd = AssertCmd::cargo_bin("tensor-wasm").expect("tensor-wasm binary built");
     cmd.env_remove("TENSOR_WASM_TOKEN").env_remove("TENSOR_WASM_LOG");
     cmd
@@ -23,7 +23,7 @@ fn tensor-wasm() -> AssertCmd {
 
 #[test]
 fn help_exits_zero_and_prints_usage() {
-    tensor-wasm()
+    tensor_wasm()
         .arg("--help")
         .assert()
         .success()
@@ -32,7 +32,7 @@ fn help_exits_zero_and_prints_usage() {
 
 #[test]
 fn completions_bash_emits_script() {
-    tensor-wasm()
+    tensor_wasm()
         .args(["completions", "bash"])
         .assert()
         .success()
@@ -44,7 +44,7 @@ fn completions_bash_emits_script() {
 #[test]
 fn completions_render_for_every_shell() {
     for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
-        tensor-wasm()
+        tensor_wasm()
             .args(["completions", shell])
             .assert()
             .success()
@@ -54,7 +54,7 @@ fn completions_render_for_every_shell() {
 
 #[test]
 fn run_missing_file_errors() {
-    tensor-wasm()
+    tensor_wasm()
         .args(["run", "definitely_does_not_exist_42.wasm"])
         .assert()
         .failure();
@@ -66,7 +66,7 @@ fn run_missing_file_errors() {
 #[test]
 fn deploy_validates_server_url() {
     // Bogus URL → non-zero exit, clear error.
-    tensor-wasm()
+    tensor_wasm()
         .args(["deploy", "Cargo.toml", "--server", "not-a-url"])
         .assert()
         .failure()
@@ -75,7 +75,7 @@ fn deploy_validates_server_url() {
 
 #[test]
 fn invoke_validates_server_url() {
-    tensor-wasm()
+    tensor_wasm()
         .args([
             "invoke",
             "00000000-0000-0000-0000-000000000000",
@@ -89,7 +89,7 @@ fn invoke_validates_server_url() {
 
 #[test]
 fn metrics_validates_server_url() {
-    tensor-wasm()
+    tensor_wasm()
         .args(["metrics", "--server", "not-a-url"])
         .assert()
         .failure()
@@ -102,7 +102,7 @@ fn deploy_rejects_empty_name() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let p = tmp.path().join("m.wasm");
     std::fs::write(&p, &wasm).expect("write");
-    tensor-wasm()
+    tensor_wasm()
         .args([
             "deploy",
             p.to_str().unwrap(),
@@ -122,7 +122,7 @@ fn deploy_rejects_whitespace_name() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let p = tmp.path().join("m.wasm");
     std::fs::write(&p, &wasm).expect("write");
-    tensor-wasm()
+    tensor_wasm()
         .args([
             "deploy",
             p.to_str().unwrap(),
@@ -142,7 +142,7 @@ fn bench_rejects_zero_iterations() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let p = tmp.path().join("m.wasm");
     std::fs::write(&p, &wasm).expect("write");
-    tensor-wasm()
+    tensor_wasm()
         .args(["bench", p.to_str().unwrap(), "--export", "noop", "--n", "0"])
         .assert()
         .failure()
@@ -166,7 +166,7 @@ fn run_executes_inline_wat_fixture() {
     let wasm_path = tmp.path().join("fixture.wasm");
     std::fs::write(&wasm_path, &wasm).expect("write wasm fixture");
 
-    tensor-wasm()
+    tensor_wasm()
         .args([
             "run",
             wasm_path.to_str().unwrap(),
@@ -193,7 +193,7 @@ fn deploy_against_dead_server_fails_cleanly() {
     let p = tmp.path().join("m.wasm");
     std::fs::write(&p, &wasm).expect("write");
 
-    let assertion = tensor-wasm()
+    let assertion = tensor_wasm()
         .args(["deploy", p.to_str().unwrap(), "--server", DEAD_SERVER])
         .assert()
         .failure();
@@ -224,7 +224,7 @@ fn deploy_against_dead_server_fails_cleanly() {
 
 #[test]
 fn invoke_against_dead_server_fails_cleanly() {
-    let assertion = tensor-wasm()
+    let assertion = tensor_wasm()
         .args([
             "invoke",
             "00000000-0000-0000-0000-000000000000",
@@ -254,7 +254,7 @@ fn invoke_against_dead_server_fails_cleanly() {
 
 #[test]
 fn metrics_against_dead_server_fails_cleanly() {
-    let assertion = tensor-wasm()
+    let assertion = tensor_wasm()
         .args(["metrics", "--server", DEAD_SERVER])
         .assert()
         .failure();
@@ -279,7 +279,7 @@ fn metrics_against_dead_server_fails_cleanly() {
 
 #[test]
 fn invoke_rejects_non_array_args() {
-    tensor-wasm()
+    tensor_wasm()
         .args([
             "invoke",
             "00000000-0000-0000-0000-000000000000",
@@ -299,7 +299,7 @@ fn run_rejects_non_array_args() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let p = tmp.path().join("m.wasm");
     std::fs::write(&p, &wasm).expect("write");
-    tensor-wasm()
+    tensor_wasm()
         .args([
             "run",
             p.to_str().unwrap(),
@@ -320,7 +320,7 @@ fn snapshot_save_fails_when_api_unreachable() {
     // should the CLI exit 0.
     let tmp = tempfile::tempdir().expect("tempdir");
     let out = tmp.path().join("snap.tensor-wasm");
-    tensor-wasm()
+    tensor_wasm()
         .args([
             "snapshot",
             "save",
@@ -341,7 +341,7 @@ fn snapshot_restore_fails_when_api_unreachable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let p = tmp.path().join("snap.tensor-wasm");
     std::fs::write(&p, b"fake snapshot bytes").expect("write");
-    tensor-wasm()
+    tensor_wasm()
         .args([
             "snapshot",
             "restore",
@@ -358,7 +358,7 @@ fn snapshot_restore_fails_when_api_unreachable() {
 
 #[test]
 fn snapshot_restore_rejects_missing_input() {
-    tensor-wasm()
+    tensor_wasm()
         .args([
             "snapshot",
             "restore",

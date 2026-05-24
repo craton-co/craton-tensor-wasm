@@ -270,203 +270,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tensor-wasm-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "tensor-wasm-core",
- "tensor-wasm-exec",
- "base64",
- "dashmap",
- "http-body-util",
- "hyper",
- "opentelemetry",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-test",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "uuid",
- "wasmparser 0.218.1",
- "wat",
-]
-
-[[package]]
-name = "tensor-wasm-bench"
-version = "0.1.0"
-dependencies = [
- "axum",
- "tensor-wasm-api",
- "tensor-wasm-core",
- "tensor-wasm-jit",
- "tensor-wasm-mem",
- "tensor-wasm-snapshot",
- "tensor-wasm-wasi-gpu",
- "base64",
- "criterion",
- "http-body-util",
- "serde_json",
- "tempfile",
- "tokio",
- "tower 0.5.3",
-]
-
-[[package]]
-name = "tensor-wasm-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "tensor-wasm-core",
- "tensor-wasm-exec",
- "base64",
- "clap",
- "clap_complete",
- "insta",
- "predicates",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wat",
-]
-
-[[package]]
-name = "tensor-wasm-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "parking_lot",
- "prometheus-client",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tensor-wasm-exec"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "tensor-wasm-core",
- "tensor-wasm-jit",
- "tensor-wasm-mem",
- "dashmap",
- "futures",
- "parking_lot",
- "thiserror 1.0.69",
- "tokio",
- "tokio-test",
- "tracing",
- "tracing-subscriber",
- "wasmparser 0.218.1",
- "wasmtime",
- "wasmtime-wasi",
- "wat",
-]
-
-[[package]]
-name = "tensor-wasm-jit"
-version = "0.1.0"
-dependencies = [
- "tensor-wasm-core",
- "blake3",
- "cranelift-codegen 0.111.9",
- "dashmap",
- "lru",
- "parking_lot",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "wasm-encoder 0.218.1",
- "wasmparser 0.218.1",
- "wat",
-]
-
-[[package]]
-name = "tensor-wasm-mem"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "tensor-wasm-core",
- "cust",
- "parking_lot",
- "region",
- "tempfile",
- "thiserror 1.0.69",
- "tracing",
- "tracing-subscriber",
- "wasmtime",
- "wat",
-]
-
-[[package]]
-name = "tensor-wasm-snapshot"
-version = "0.1.0"
-dependencies = [
- "tensor-wasm-core",
- "bincode",
- "crc32fast",
- "cust",
- "serde",
- "serde_bytes",
- "tempfile",
- "tracing",
- "zstd",
-]
-
-[[package]]
-name = "tensor-wasm-tenant"
-version = "0.1.0"
-dependencies = [
- "tensor-wasm-core",
- "criterion",
- "cust",
- "dashmap",
- "parking_lot",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-test",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tensor-wasm-wasi-gpu"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "tensor-wasm-core",
- "tensor-wasm-mem",
- "cust",
- "dashmap",
- "parking_lot",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-test",
- "tracing",
- "wasmtime",
- "wat",
-]
-
-[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2376,9 +2179,9 @@ dependencies = [
 
 [[package]]
 name = "prometheus-client"
-version = "0.22.3"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "504ee9ff529add891127c4827eb481bd69dc0ebc72e9a682e187db4caa60c3ca"
+checksum = "cca3d75b4566b9a29fe1ed623587fb058e826eb329a0be4b7c4da1ebb2d7a6ca"
 dependencies = [
  "dtoa",
  "itoa",
@@ -2388,9 +2191,9 @@ dependencies = [
 
 [[package]]
 name = "prometheus-client-derive-encode"
-version = "0.4.2"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "440f724eba9f6996b75d63681b0a92b06947f1457076d503a4d2e2c8f56442b8"
+checksum = "9adf1691c04c0a5ff46ff8f262b58beb07b0dbb61f96f9f54f6cbd82106ed87f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3111,6 +2914,203 @@ dependencies = [
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tensor-wasm-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "dashmap",
+ "http-body-util",
+ "hyper",
+ "opentelemetry",
+ "serde",
+ "serde_json",
+ "tensor-wasm-core",
+ "tensor-wasm-exec",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry",
+ "uuid",
+ "wasmparser 0.218.1",
+ "wat",
+]
+
+[[package]]
+name = "tensor-wasm-bench"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "criterion",
+ "http-body-util",
+ "serde_json",
+ "tempfile",
+ "tensor-wasm-api",
+ "tensor-wasm-core",
+ "tensor-wasm-jit",
+ "tensor-wasm-mem",
+ "tensor-wasm-snapshot",
+ "tensor-wasm-wasi-gpu",
+ "tokio",
+ "tower 0.5.3",
+]
+
+[[package]]
+name = "tensor-wasm-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "base64",
+ "clap",
+ "clap_complete",
+ "insta",
+ "predicates",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tensor-wasm-core",
+ "tensor-wasm-exec",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wat",
+]
+
+[[package]]
+name = "tensor-wasm-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "prometheus-client",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "tensor-wasm-exec"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "futures",
+ "parking_lot",
+ "tensor-wasm-core",
+ "tensor-wasm-jit",
+ "tensor-wasm-mem",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "tracing-subscriber",
+ "wasmparser 0.218.1",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wat",
+]
+
+[[package]]
+name = "tensor-wasm-jit"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cranelift-codegen 0.111.9",
+ "dashmap",
+ "lru",
+ "parking_lot",
+ "tensor-wasm-core",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wasm-encoder 0.218.1",
+ "wasmparser 0.218.1",
+ "wat",
+]
+
+[[package]]
+name = "tensor-wasm-mem"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cust",
+ "parking_lot",
+ "region",
+ "tempfile",
+ "tensor-wasm-core",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
+ "wasmtime",
+ "wat",
+]
+
+[[package]]
+name = "tensor-wasm-snapshot"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "crc32fast",
+ "cust",
+ "serde",
+ "serde_bytes",
+ "tempfile",
+ "tensor-wasm-core",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "tensor-wasm-tenant"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "cust",
+ "dashmap",
+ "parking_lot",
+ "tempfile",
+ "tensor-wasm-core",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "tensor-wasm-wasi-gpu"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cust",
+ "dashmap",
+ "parking_lot",
+ "tempfile",
+ "tensor-wasm-core",
+ "tensor-wasm-mem",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "wasmtime",
+ "wat",
 ]
 
 [[package]]
