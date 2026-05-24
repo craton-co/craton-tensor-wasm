@@ -14,7 +14,10 @@
 //! eviction queue — touched on `put` (insert/promote) and on `get` (promote)
 //! and used to compute which key to evict when the soft cap is exceeded.
 //! Splitting storage from policy means lookups never block on the eviction
-//! mutex, only inserts that need to evict do.
+//! mutex, only inserts that need to evict do. The `get` read path is
+//! lock-free on contention; LRU promotion is best-effort under load —
+//! contended promotions are skipped, so eviction order is approximately
+//! (not strictly) LRU when many readers race.
 //!
 //! `Mutex` poisoning recovery: every lock acquisition uses `into_inner` on a
 //! poisoned guard (after emitting a `tracing::error!`) rather than the prior
@@ -143,13 +146,15 @@ impl KernelCache {
         }
     }
 
-    /// Look up a kernel; touches the LRU position.
+    /// Look up a kernel; best-effort touches the LRU position.
     pub fn get(&self, key: &CacheKey) -> Option<CachedKernel> {
-        // Promote in the policy queue first (cheap parking_lot lock); then
-        // hit storage. Order doesn't change correctness — the storage read
-        // is the single source of truth for "is this cached".
-        {
-            let mut lru = self.lru.lock();
+        // Promote in the policy queue if we can grab the lock uncontended;
+        // otherwise skip promotion this time so the read path stays
+        // contention-free. Eviction order is approximate (not strict) LRU
+        // under load — an acceptable trade for a lock-free hot path.
+        // The storage read is the single source of truth for "is this
+        // cached", so skipping promotion never affects correctness.
+        if let Some(mut lru) = self.lru.try_lock() {
             // `get` on LruCache promotes if present.
             let _ = lru.get(key);
         }
