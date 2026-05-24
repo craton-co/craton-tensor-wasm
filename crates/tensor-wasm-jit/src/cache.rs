@@ -1,0 +1,346 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
+//! Compiled-kernel cache.
+//!
+//! The cache is keyed by `(blueprint_fingerprint, sm_version)`. LRU eviction
+//! caps the entry count. On a cache hit the PTX text is reused without
+//! re-emitting (cheap) and without re-compiling via `ptxas`/`cust` (expensive
+//! — 10-50 ms for non-trivial kernels).
+//!
+//! Storage: a [`dashmap::DashMap`] holds the actual `(CacheKey, CachedKernel)`
+//! entries — `get` / `put` / `len` go straight through the lock-free
+//! per-shard locks so the hot path is uncontended under multi-threaded
+//! dispatch. A separate `parking_lot::Mutex<LruCache<CacheKey, ()>>` is the
+//! eviction queue — touched on `put` (insert/promote) and on `get` (promote)
+//! and used to compute which key to evict when the soft cap is exceeded.
+//! Splitting storage from policy means lookups never block on the eviction
+//! mutex, only inserts that need to evict do.
+//!
+//! `Mutex` poisoning recovery: every lock acquisition uses `into_inner` on a
+//! poisoned guard (after emitting a `tracing::error!`) rather than the prior
+//! `.expect("cache poisoned")` panic — a single panic on any thread used to
+//! poison the entire cache for the rest of the process.
+
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use lru::LruCache;
+use parking_lot::Mutex;
+
+use crate::ir::TensorWasmKernelBlueprint;
+use crate::ptx_emit::EmittedPtx;
+
+/// Cache key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CacheKey {
+    /// `TensorWasmKernelBlueprint::fingerprint()`.
+    pub blueprint: u64,
+    /// CUDA compute capability (e.g. 80 for sm_80, 89 for sm_89).
+    pub sm_version: u32,
+}
+
+/// Default cache capacity (kernels).
+pub const DEFAULT_CAPACITY: usize = 256;
+
+/// Cached PTX module entry.
+#[derive(Debug, Clone)]
+pub struct CachedKernel {
+    /// The blueprint that produced this PTX (for diagnostics).
+    pub fingerprint: u64,
+    /// The emitted PTX text.
+    pub ptx: Arc<EmittedPtx>,
+    /// The cuda module handle is only meaningful when the `cuda` feature is
+    /// on; for the stub path we keep `()`.
+    pub compiled: CompiledHandle,
+}
+
+/// Compiled-module handle. On CUDA hosts this would hold
+/// `cust::module::Module`; for the no-CUDA path it is just `()`.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledHandle {
+    #[allow(dead_code)]
+    private: (),
+}
+
+/// Thread-safe LRU cache of compiled kernels backed by [`dashmap::DashMap`].
+///
+/// `get` and `put` are O(1) and (under typical concurrent workloads) lock-
+/// free except for the per-shard `dashmap` lock and the eviction-policy
+/// `parking_lot::Mutex`. The eviction lock is taken only on `put`s that
+/// would push the cache over capacity; reads never touch it.
+#[derive(Clone)]
+pub struct KernelCache {
+    /// Lock-free storage of the cached values themselves.
+    storage: Arc<DashMap<CacheKey, CachedKernel>>,
+    /// LRU policy: keys ordered by recency. `Mutex` (parking_lot) for
+    /// fast, panic-safe contention. The value side is `()` — the real value
+    /// lives in `storage`.
+    lru: Arc<Mutex<LruCache<CacheKey, ()>>>,
+    /// Soft maximum entries before eviction kicks in.
+    capacity: usize,
+}
+
+impl KernelCache {
+    /// Construct with default capacity.
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_CAPACITY)
+    }
+
+    /// Construct with explicit capacity. Anything below 1 is clamped to 1.
+    pub fn with_capacity(cap: usize) -> Self {
+        let cap = cap.max(1);
+        // The eviction queue is sized to `cap` so the LRU crate's internal
+        // bucket pre-allocation is bounded (sizing it to `usize::MAX` triggers
+        // a hashbrown capacity-overflow panic). Storage eviction is still
+        // driven from the `storage.len() > capacity` check in `put`; both
+        // sides agree on the same `cap` so they stay in sync.
+        let nz = NonZeroUsize::new(cap).expect(">0 (clamped above)");
+        Self {
+            storage: Arc::new(DashMap::with_capacity(cap)),
+            lru: Arc::new(Mutex::new(LruCache::new(nz))),
+            capacity: cap,
+        }
+    }
+
+    /// Insert (or replace) a kernel. If the insert pushes the cache over
+    /// capacity, evicts the LRU entry from storage and the policy queue.
+    pub fn put(&self, key: CacheKey, kernel: CachedKernel) {
+        self.storage.insert(key, kernel);
+        // `LruCache::push` returns `Some((evicted_key, ()))` when sizing the
+        // LRU triggers eviction of an older entry. We use this as the
+        // authoritative signal for storage eviction so the two stay in sync.
+        // Sized to `cap`, the LRU evicts exactly when we want storage to,
+        // and we get the evicted key directly without a second pop_lru call.
+        let evicted = self.lru.lock().push(key, ());
+        if let Some((evicted_key, ())) = evicted {
+            if evicted_key != key {
+                // Don't remove if `push` returned the just-inserted key
+                // (which happens when the cache already held it — push acts
+                // as a replace and returns the old `(K, V)`).
+                self.storage.remove(&evicted_key);
+            }
+        }
+        // Safety net for the rare burst case where two concurrent `put`s
+        // both insert without either triggering LRU's internal eviction
+        // (because they raced on the lock). Drive storage back under cap.
+        while self.storage.len() > self.capacity {
+            let popped = self.lru.lock().pop_lru();
+            match popped {
+                Some((evict_key, ())) => {
+                    self.storage.remove(&evict_key);
+                }
+                None => {
+                    tracing::error!(
+                        target: "tensor_wasm_jit::cache",
+                        storage_len = self.storage.len(),
+                        capacity = self.capacity,
+                        "cache storage exceeds capacity but eviction queue is empty"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Look up a kernel; touches the LRU position.
+    pub fn get(&self, key: &CacheKey) -> Option<CachedKernel> {
+        // Promote in the policy queue first (cheap parking_lot lock); then
+        // hit storage. Order doesn't change correctness — the storage read
+        // is the single source of truth for "is this cached".
+        {
+            let mut lru = self.lru.lock();
+            // `get` on LruCache promotes if present.
+            let _ = lru.get(key);
+        }
+        self.storage.get(key).map(|entry| entry.value().clone())
+    }
+
+    /// Look up by blueprint + sm_version; convenience wrapper around [`Self::get`].
+    pub fn get_for(
+        &self,
+        blueprint: &TensorWasmKernelBlueprint,
+        sm_version: u32,
+    ) -> Option<CachedKernel> {
+        self.get(&CacheKey {
+            blueprint: blueprint.fingerprint(),
+            sm_version,
+        })
+    }
+
+    /// Number of entries currently held.
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+
+    /// True if empty.
+    pub fn is_empty(&self) -> bool {
+        self.storage.is_empty()
+    }
+
+    /// Configured capacity.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+impl Default for KernelCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{TensorWasmKernelBlueprint, TensorWasmOp};
+    use crate::ptx_emit::EmittedPtx;
+    use std::thread;
+
+    fn dummy_kernel(fp: u64) -> CachedKernel {
+        CachedKernel {
+            fingerprint: fp,
+            ptx: Arc::new(EmittedPtx {
+                text: String::new(),
+                launch_geometry: (1, 1),
+            }),
+            compiled: CompiledHandle::default(),
+        }
+    }
+
+    #[test]
+    fn put_then_get() {
+        let cache = KernelCache::new();
+        let key = CacheKey {
+            blueprint: 1,
+            sm_version: 80,
+        };
+        cache.put(key, dummy_kernel(1));
+        assert_eq!(cache.get(&key).unwrap().fingerprint, 1);
+    }
+
+    #[test]
+    fn lru_evicts_oldest() {
+        let cache = KernelCache::with_capacity(2);
+        let k1 = CacheKey {
+            blueprint: 1,
+            sm_version: 80,
+        };
+        let k2 = CacheKey {
+            blueprint: 2,
+            sm_version: 80,
+        };
+        let k3 = CacheKey {
+            blueprint: 3,
+            sm_version: 80,
+        };
+        cache.put(k1, dummy_kernel(1));
+        cache.put(k2, dummy_kernel(2));
+        cache.put(k3, dummy_kernel(3));
+        assert!(cache.get(&k1).is_none(), "k1 should have been evicted");
+        assert!(cache.get(&k2).is_some());
+        assert!(cache.get(&k3).is_some());
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn lookup_by_blueprint() {
+        let cache = KernelCache::new();
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { lanes: 4 });
+        let key = CacheKey {
+            blueprint: bp.fingerprint(),
+            sm_version: 80,
+        };
+        cache.put(key, dummy_kernel(bp.fingerprint()));
+        assert!(cache.get_for(&bp, 80).is_some());
+        assert!(
+            cache.get_for(&bp, 89).is_none(),
+            "different sm_version is a miss"
+        );
+    }
+
+    #[test]
+    fn capacity_floor_one() {
+        let cache = KernelCache::with_capacity(0);
+        assert_eq!(cache.capacity(), 1);
+    }
+
+    #[test]
+    fn empty_when_new() {
+        let cache = KernelCache::new();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn cache_hit_returns_arc_shared_ptx() {
+        use std::sync::Arc;
+        let cache = KernelCache::new();
+        let bp = TensorWasmKernelBlueprint::new("matmul").push(TensorWasmOp::MatMul {
+            m: 16,
+            n: 16,
+            k: 16,
+        });
+        let key = CacheKey {
+            blueprint: bp.fingerprint(),
+            sm_version: 80,
+        };
+        let original = Arc::new(EmittedPtx {
+            text: "// pre-emitted".into(),
+            launch_geometry: (1, 128),
+        });
+        cache.put(
+            key,
+            CachedKernel {
+                fingerprint: bp.fingerprint(),
+                ptx: original.clone(),
+                compiled: CompiledHandle::default(),
+            },
+        );
+        let hit = cache.get(&key).expect("cache hit");
+        // The hit returns the same underlying allocation — no re-emit.
+        assert!(Arc::ptr_eq(&hit.ptx, &original));
+    }
+
+    /// Concurrent get/put across many threads must not corrupt the cache
+    /// or drop entries that haven't been evicted. Uses a capacity large
+    /// enough to hold every key inserted so we can assert all `get`s
+    /// targeting still-present keys succeed.
+    #[test]
+    fn concurrent_get_put_dashmap_safe() {
+        const N_THREADS: usize = 8;
+        const KEYS_PER_THREAD: u64 = 32;
+        let cache = KernelCache::with_capacity((N_THREADS as u64 * KEYS_PER_THREAD) as usize);
+        let mut handles = Vec::new();
+        for t in 0..N_THREADS {
+            let cache = cache.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..KEYS_PER_THREAD {
+                    let key = CacheKey {
+                        blueprint: (t as u64) * KEYS_PER_THREAD + i,
+                        sm_version: 80,
+                    };
+                    cache.put(key, dummy_kernel(key.blueprint));
+                    // Interleave reads of own and (possibly absent) others.
+                    let _ = cache.get(&key);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+        // Every key written must still be retrievable.
+        for t in 0..N_THREADS {
+            for i in 0..KEYS_PER_THREAD {
+                let key = CacheKey {
+                    blueprint: (t as u64) * KEYS_PER_THREAD + i,
+                    sm_version: 80,
+                };
+                assert!(
+                    cache.get(&key).is_some(),
+                    "missing key after concurrent inserts: ({t}, {i})"
+                );
+            }
+        }
+    }
+}

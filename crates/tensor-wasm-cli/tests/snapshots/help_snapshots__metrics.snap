@@ -1,0 +1,13 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+assertion_line: 50
+expression: "help(&[\"metrics\", \"--help\"])"
+---
+Fetch and pretty-print Prometheus metrics from a TensorWasm server
+
+Usage: tensor-wasm metrics [OPTIONS] --server <SERVER>
+
+Options:
+      --server <SERVER>  Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
+      --tenant <TENANT>  Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
+  -h, --help             Print help

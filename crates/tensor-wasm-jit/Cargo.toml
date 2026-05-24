@@ -1,0 +1,42 @@
+[package]
+name = "tensor-wasm-jit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "JIT pipeline: Cranelift detector, IR normalisation, PTX codegen, kernel cache, deopt."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-jit"
+readme = "README.md"
+keywords = ["wasm", "jit", "gpu", "cuda", "ptx"]
+categories = ["wasm", "compilers", "concurrency"]
+
+[lib]
+
+[dependencies]
+tensor-wasm-core = { path = "../tensor-wasm-core" }
+blake3.workspace = true
+cranelift-codegen.workspace = true
+dashmap.workspace = true
+lru.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wasmparser.workspace = true
+wasm-encoder = { version = "0.218", features = ["wasmparser"] }
+
+[dev-dependencies]
+tokio.workspace = true
+wat.workspace = true
+
+[features]
+default = []
+# Auto-offload is a runtime flag now: the pipeline is always compiled; the
+# feature gates additional CUDA-side wiring tested under `--features cuda`.
+auto-offload = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

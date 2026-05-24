@@ -1,10 +1,10 @@
-# Deploying Bali
+# Deploying Craton TensorWasm
 
-This document covers running **Bali** in production: topology, sizing, configuration, and disaster recovery. If you're still onboarding, read [GETTING-STARTED.md](./GETTING-STARTED.md) first; if you're writing the functions, [WASM-DEVELOPER-GUIDE.md](./WASM-DEVELOPER-GUIDE.md) is your starting point.
+This document covers running **TensorWasm** in production: topology, sizing, configuration, and disaster recovery. If you're still onboarding, read [GETTING-STARTED.md](./GETTING-STARTED.md) first; if you're writing the functions, [WASM-DEVELOPER-GUIDE.md](./WASM-DEVELOPER-GUIDE.md) is your starting point.
 
 ## 1. Production topology
 
-A typical Bali production deployment looks like:
+A typical TensorWasm production deployment looks like:
 
 ```
             +---------------------+
@@ -14,7 +14,7 @@ A typical Bali production deployment looks like:
         +--------------+--------------+
         |              |              |
    +----+----+    +----+----+    +----+----+
-   | bali-api|    | bali-api|    | bali-api|
+   | tensor-wasm-api|    | tensor-wasm-api|    | tensor-wasm-api|
    |  + GPU  |    |  + GPU  |    |  + GPU  |
    |  + MPS  |    |  + MPS  |    |  + MPS  |
    +----+----+    +----+----+    +----+----+
@@ -29,7 +29,7 @@ A typical Bali production deployment looks like:
    +------------+              +-------------+
 ```
 
-- **`bali-api` replicas** sit behind a load balancer (any L7 proxy will do — nginx, Caddy, an ALB). Each replica is stateless.
+- **`tensor-wasm-api` replicas** sit behind a load balancer (any L7 proxy will do — nginx, Caddy, an ALB). Each replica is stateless.
 - **MPS (Multi-Process Service)** runs as a daemon on each host that has a GPU, providing context isolation between concurrent tenants. See [MPS-SETUP.md](./MPS-SETUP.md).
 - **Prometheus and Grafana** are shared across replicas for metrics.
 - **Jaeger or Tempo** are shared for traces.
@@ -50,27 +50,27 @@ The SSD recommendation is not cosmetic. At payload sizes above ~32 MiB, snapshot
 
 ## 3. Configuration
 
-Bali is configured by environment variables. The full set:
+Craton TensorWasm is configured by environment variables. The full set:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BALI_LOG` | `info` | `tracing-subscriber` filter directive. |
-| `BALI_OTLP_ENDPOINT` | unset | OpenTelemetry collector endpoint (e.g. `http://otel:4317`). |
-| `BALI_LISTEN_ADDR` | `0.0.0.0:8080` | HTTP bind address for `bali serve`. |
+| `TENSOR_WASM_LOG` | `info` | `tracing-subscriber` filter directive. |
+| `TENSOR_WASM_OTLP_ENDPOINT` | unset | OpenTelemetry collector endpoint (e.g. `http://otel:4317`). |
+| `TENSOR_WASM_LISTEN_ADDR` | `0.0.0.0:8080` | HTTP bind address for `tensor-wasm serve`. |
 | `CUDA_ROOT` | autodetected | Override CUDA toolkit location (build- and run-time). |
 | `CUDA_ARCH` | `sm_80` | Target GPU compute capability for shipped PTX. |
 
-For zero-trust environments, also set `BALI_SNAPSHOT_BUCKET` to point at your object store and `BALI_SNAPSHOT_KMS_KEY` for envelope encryption (see [SECURITY-AUDIT.md](./SECURITY-AUDIT.md)).
+For zero-trust environments, also set `TENSOR_WASM_SNAPSHOT_BUCKET` to point at your object store and `TENSOR_WASM_SNAPSHOT_KMS_KEY` for envelope encryption (see [SECURITY-AUDIT.md](./SECURITY-AUDIT.md)).
 
 ## 4. Docker Compose stack
 
-The repo ships a `docker-compose.yml` at its root that brings up `bali-api`, Prometheus, Grafana, and Jaeger with a single command:
+The repo ships a `docker-compose.yml` at its root that brings up `tensor-wasm-api`, Prometheus, Grafana, and Jaeger with a single command:
 
 ```sh
 docker compose up
 ```
 
-The compose file pins versions, wires up the OTLP exporter, and pre-loads a Grafana dashboard for the four key SLI metrics (see Monitoring below). It's the recommended way to evaluate a real Bali deployment locally before promoting to Kubernetes.
+The compose file pins versions, wires up the OTLP exporter, and pre-loads a Grafana dashboard for the four key SLI metrics (see Monitoring below). It's the recommended way to evaluate a real TensorWasm deployment locally before promoting to Kubernetes.
 
 ## 5. Kubernetes
 
@@ -80,23 +80,23 @@ A Helm chart is **deferred to v0.2**. In the meantime, a minimal `Deployment` lo
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: bali-api
+  name: tensor-wasm-api
 spec:
   replicas: 3
   selector:
-    matchLabels: { app: bali-api }
+    matchLabels: { app: tensor-wasm-api }
   template:
     metadata:
-      labels: { app: bali-api }
+      labels: { app: tensor-wasm-api }
     spec:
       containers:
-        - name: bali-api
-          image: ghcr.io/example/bali-api:0.1.0
+        - name: tensor-wasm-api
+          image: ghcr.io/craton-co/craton-tensor-wasm-api:0.1.0
           args: ["serve", "--addr", "0.0.0.0:8080"]
           ports: [{ containerPort: 8080 }]
           env:
-            - { name: BALI_LOG,           value: "info" }
-            - { name: BALI_OTLP_ENDPOINT, value: "http://otel-collector:4317" }
+            - { name: TENSOR_WASM_LOG,           value: "info" }
+            - { name: TENSOR_WASM_OTLP_ENDPOINT, value: "http://otel-collector:4317" }
             - { name: CUDA_ARCH,          value: "sm_80" }
           resources:
             limits:
@@ -109,13 +109,13 @@ Pair with the standard `nvidia-device-plugin` DaemonSet for GPU scheduling.
 
 ## 6. TLS
 
-Do **not** terminate TLS inside `bali-api` for v0.1 — the axum stack is configured for plaintext H2C. Put a TLS-terminating proxy in front of it: nginx, Caddy, an ALB, or a service mesh sidecar. Any of these is more battle-tested than what we'd ship inline.
+Do **not** terminate TLS inside `tensor-wasm-api` for v0.1 — the axum stack is configured for plaintext H2C. Put a TLS-terminating proxy in front of it: nginx, Caddy, an ALB, or a service mesh sidecar. Any of these is more battle-tested than what we'd ship inline.
 
 A minimal Caddyfile:
 
 ```
 api.example.com {
-    reverse_proxy bali-api:8080
+    reverse_proxy tensor-wasm-api:8080
 }
 ```
 
@@ -127,35 +127,35 @@ Capacity is bounded by **GPU HBM**, not CPU or system RAM. The arithmetic:
 
 - Each instance reserves up to `EngineConfig::max_memory_bytes` (default **256 MiB**) of linear memory, which lives in unified memory and is page-backed on the device.
 - A 40 GiB A100 therefore supports a theoretical ceiling of `40 GiB / 256 MiB ≈ 160` concurrently resident instances, minus headroom for driver state and PTX caches. In practice plan for **120**.
-- Per-tenant quotas are tracked through `bali-tenant` via the `consume_bytes` budget on each tenant principal. Set quotas conservatively; you can always raise them.
+- Per-tenant quotas are tracked through `tensor-wasm-tenant` via the `consume_bytes` budget on each tenant principal. Set quotas conservatively; you can always raise them.
 
-If you need stronger isolation than MPS provides, run one `bali-api` replica per tenant on a dedicated GPU. The replica is stateless, so this scales horizontally without coordination.
+If you need stronger isolation than MPS provides, run one `tensor-wasm-api` replica per tenant on a dedicated GPU. The replica is stateless, so this scales horizontally without coordination.
 
 ## 8. Backup and restore
 
-Snapshots are the **only** durable artifact in a Bali deployment. They contain:
+Snapshots are the **only** durable artifact in a TensorWasm deployment. They contain:
 
 - The Wasm module bytes
-- The serialized `BaliLinearMemory`
+- The serialized `TensorWasmLinearMemory`
 - The `KernelRegistry` state (loaded PTX, kernel ids)
 - Engine config and tenant attribution metadata
 
 Snapshots are **portable across hosts of the same architecture** — `sm_80` to `sm_80` is fine; `sm_80` to `sm_90` requires a rebuild because PTX is JITed per arch.
 
-The snapshot schema is versioned (currently **v2**). On startup, `bali-api` will refuse to load a snapshot from a newer schema; older snapshots are migrated in place using the chain of `vN -> vN+1` migrators in `bali-snapshot`. Always test a migration on a staging snapshot before bumping the binary in production.
+The snapshot schema is versioned (currently **v2**). On startup, `tensor-wasm-api` will refuse to load a snapshot from a newer schema; older snapshots are migrated in place using the chain of `vN -> vN+1` migrators in `tensor-wasm-snapshot`. Always test a migration on a staging snapshot before bumping the binary in production.
 
-Recommended rotation: snapshot every active instance hourly, with a 7-day retention window in your object store. Pair with periodic integrity checks (`bali snapshot verify`) on a random 1% sample.
+Recommended rotation: snapshot every active instance hourly, with a 7-day retention window in your object store. Pair with periodic integrity checks (`tensor-wasm snapshot restore --verify-only`) on a random 1% sample.
 
 ## 9. Monitoring
 
-Bali exposes Prometheus metrics on `/metrics`. The **four SLI metrics** to alert on:
+TensorWasm exposes Prometheus metrics on `/metrics`. The **four SLI metrics** to alert on:
 
 | Metric | What it tells you |
 |---|---|
-| `bali_active_instances` | Capacity headroom. Alert when within 20% of your planned ceiling. |
-| `bali_kernel_dispatches_total` | Throughput. Sudden drops indicate a stuck instance or scheduler. |
-| `bali_kernel_latency_seconds` | Tail latency. p99 regressions usually mean GPU contention. |
-| `bali_offload_success_total / bali_offload_fallback_total` | Auto-offload health. A growing fallback ratio means promoted kernels are failing on the device. |
+| `tensor_wasm_active_instances` | Capacity headroom. Alert when within 20% of your planned ceiling. |
+| `tensor_wasm_kernel_dispatches_total` | Throughput. Sudden drops indicate a stuck instance or scheduler. |
+| `tensor_wasm_kernel_latency_seconds` | Tail latency. p99 regressions usually mean GPU contention. |
+| `tensor_wasm_offload_success_total / tensor_wasm_offload_fallback_total` | Auto-offload health. A growing fallback ratio means promoted kernels are failing on the device. |
 
 The bundled Grafana dashboard groups these into a single overview page. For the full catalog — including the per-tenant breakdown — see [OBSERVABILITY.md](./OBSERVABILITY.md).
 
@@ -164,10 +164,10 @@ The bundled Grafana dashboard groups these into a single overview page. For the 
 Because the gateway tier is stateless, DR is essentially **snapshot DR**:
 
 1. **Ship snapshots off-host.** Mirror to S3, GCS, or your equivalent. The snapshot format is content-addressed by sha256, so the mirror is naturally deduplicating.
-2. **Verify periodically.** Run `bali snapshot verify` against a sample of stored snapshots on a schedule.
+2. **Verify periodically.** Run `tensor-wasm snapshot restore --verify-only` against a sample of stored snapshots on a schedule.
 3. **Practice restore.** A quarterly DR drill that restores a snapshot to a fresh region is cheaper than discovering schema drift the day you actually need it.
 4. **Keep the binary in sync with the snapshot schema.** A binary that can read your latest snapshots should be available in your registry at all times — not just rebuildable from source.
 
-If both the gateway and a snapshot are intact, recovery is a `bali function restore <snapshot-id>` away. If only the Wasm module bytes survive, you can redeploy clean — you lose accumulated linear-memory state, but the function is back online.
+If both the gateway and a snapshot are intact, recovery is a `tensor-wasm function restore <snapshot-id>` away. If only the Wasm module bytes survive, you can redeploy clean — you lose accumulated linear-memory state, but the function is back online.
 
 For broader operational guidance, see the other runbooks in this directory.

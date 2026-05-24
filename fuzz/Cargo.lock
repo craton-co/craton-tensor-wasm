@@ -65,7 +65,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bali-core"
+name = "tensor-wasm-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -78,22 +78,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "bali-fuzz"
+name = "tensor-wasm-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
- "bali-core",
- "bali-jit",
- "bali-snapshot",
+ "tensor-wasm-core",
+ "tensor-wasm-jit",
+ "tensor-wasm-snapshot",
  "libfuzzer-sys",
  "wasmtime",
 ]
 
 [[package]]
-name = "bali-jit"
+name = "tensor-wasm-jit"
 version = "0.1.0"
 dependencies = [
- "bali-core",
+ "tensor-wasm-core",
  "cranelift-codegen 0.111.9",
  "dashmap",
  "lru",
@@ -102,10 +102,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "bali-snapshot"
+name = "tensor-wasm-snapshot"
 version = "0.1.0"
 dependencies = [
- "bali-core",
+ "tensor-wasm-core",
  "bincode",
  "crc32fast",
  "serde",

@@ -1,38 +1,44 @@
-# Bali observability stack.
+# TensorWasm observability stack.
 #
 # Start with: docker compose up -d
 # Tear down:  docker compose down -v
 #
 # Endpoints after startup:
-# - bali-api:       http://localhost:8080
+# - tensor-wasm-api:       http://localhost:8080
 # - Prometheus:     http://localhost:9090
 # - Grafana:        http://localhost:3000 (admin / admin)
 # - Jaeger UI:      http://localhost:16686
-# - Jaeger OTLP:    grpc://jaeger:4317 (used by bali-api when BALI_OTLP_ENDPOINT is set)
+# - Jaeger OTLP:    grpc://jaeger:4317 (used by tensor-wasm-api when TENSOR_WASM_OTLP_ENDPOINT is set)
+#
+# DEV-ONLY: this compose file is intended for local development and demos.
+# It exposes services on plaintext HTTP, ships Grafana with admin/admin,
+# and bind-mounts no secrets. Do NOT use it in production — see
+# docs/DEPLOYMENT.md for production deployment guidance.
 
 services:
-  bali-api:
-    image: rust:1.81-slim
-    working_dir: /workspace
-    command:
-      - sh
-      - -c
-      - |
-        cargo build --release --bin bali && \
-        ./target/release/bali serve --addr 0.0.0.0:8080
-    volumes:
-      - .:/workspace
-      - cargo-cache:/usr/local/cargo/registry
+  tensor-wasm-api:
+    # Build the API image from the workspace-pinned nightly toolchain. The
+    # Dockerfile copies `rust-toolchain.toml` and lets rustup install the
+    # exact channel the workspace requires.
+    build:
+      context: .
+      dockerfile: docker/tensor-wasm-api.Dockerfile
     environment:
-      BALI_LOG: info
-      BALI_OTLP_ENDPOINT: http://jaeger:4317
+      TENSOR_WASM_LOG: info
+      TENSOR_WASM_OTLP_ENDPOINT: http://jaeger:4317
       RUST_BACKTRACE: "1"
     ports:
       - "8080:8080"
     depends_on:
       - jaeger
       - prometheus
-    networks: [bali]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks: [tensor-wasm]
 
   prometheus:
     image: prom/prometheus:v2.55.0
@@ -44,8 +50,17 @@ services:
       - prom-data:/prometheus
     ports:
       - "9090:9090"
-    networks: [bali]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks: [tensor-wasm]
 
+  # DEV-ONLY: Grafana is configured for unauthenticated access and ships with
+  # admin/admin credentials. Do NOT use this compose file in production —
+  # see docs/DEPLOYMENT.md for production deployment guidance.
   grafana:
     image: grafana/grafana:11.3.0
     environment:
@@ -59,7 +74,7 @@ services:
     ports:
       - "3000:3000"
     depends_on: [prometheus]
-    networks: [bali]
+    networks: [tensor-wasm]
 
   jaeger:
     image: jaegertracing/all-in-one:1.62
@@ -69,12 +84,11 @@ services:
       - "16686:16686"  # UI
       - "4317:4317"    # OTLP gRPC
       - "4318:4318"    # OTLP HTTP
-    networks: [bali]
+    networks: [tensor-wasm]
 
 networks:
-  bali:
+  tensor-wasm:
 
 volumes:
-  cargo-cache:
   prom-data:
   grafana-data:

@@ -1,7 +1,7 @@
 .PHONY: help build test bench fmt fmt-check lint check doc clean ci ci-bench
 
 help:
-	@echo "Project Bali - Makefile targets:"
+	@echo "Craton TensorWasm - Makefile targets:"
 	@echo "  build      - Build all workspace crates"
 	@echo "  test       - Run all workspace tests"
 	@echo "  bench      - Run all workspace benchmarks"
@@ -43,6 +43,6 @@ clean:
 
 ci: fmt-check lint check test
 
-ci-bench: ## Run benches with CI-equivalent flags
+ci-bench:
 	cargo bench --workspace --no-run
 	cargo bench --workspace -- --warm-up-time 1 --measurement-time 5

@@ -3,8 +3,8 @@
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 
-use bali_jit::ir::{BaliKernelBlueprint, BaliOp, GridHint};
-use bali_jit::ptx_emit::emit;
+use tensor_wasm_jit::ir::{TensorWasmKernelBlueprint, TensorWasmOp, GridHint};
+use tensor_wasm_jit::ptx_emit::emit;
 
 #[derive(Debug, Arbitrary)]
 enum FuzzOp {
@@ -17,30 +17,30 @@ enum FuzzOp {
     Barrier,
 }
 
-impl From<FuzzOp> for BaliOp {
+impl From<FuzzOp> for TensorWasmOp {
     fn from(o: FuzzOp) -> Self {
         match o {
-            FuzzOp::VecAdd(lanes) => BaliOp::VecAdd {
+            FuzzOp::VecAdd(lanes) => TensorWasmOp::VecAdd {
                 lanes: lanes.max(1) as u32,
             },
-            FuzzOp::VecMul(lanes) => BaliOp::VecMul {
+            FuzzOp::VecMul(lanes) => TensorWasmOp::VecMul {
                 lanes: lanes.max(1) as u32,
             },
-            FuzzOp::VecFma(lanes) => BaliOp::VecFma {
+            FuzzOp::VecFma(lanes) => TensorWasmOp::VecFma {
                 lanes: lanes.max(1) as u32,
             },
-            FuzzOp::MatMul(m, n, k) => BaliOp::MatMul {
+            FuzzOp::MatMul(m, n, k) => TensorWasmOp::MatMul {
                 m: m.max(1) as u32,
                 n: n.max(1) as u32,
                 k: k.max(1) as u32,
             },
-            FuzzOp::LoadUnified(lanes) => BaliOp::LoadUnified {
+            FuzzOp::LoadUnified(lanes) => TensorWasmOp::LoadUnified {
                 lanes: lanes.max(1) as u32,
             },
-            FuzzOp::StoreUnified(lanes) => BaliOp::StoreUnified {
+            FuzzOp::StoreUnified(lanes) => TensorWasmOp::StoreUnified {
                 lanes: lanes.max(1) as u32,
             },
-            FuzzOp::Barrier => BaliOp::Barrier,
+            FuzzOp::Barrier => TensorWasmOp::Barrier,
         }
     }
 }
@@ -56,7 +56,7 @@ fuzz_target!(|data: &[u8]| {
     }
     let total_threads: u32 = u.arbitrary().unwrap_or(256u32);
     let block_size: u32 = u.arbitrary().unwrap_or(128u32);
-    let mut bp = BaliKernelBlueprint::new("fuzz_kernel").with_grid(GridHint {
+    let mut bp = TensorWasmKernelBlueprint::new("fuzz_kernel").with_grid(GridHint {
         total_threads: total_threads.max(1),
         preferred_block_size: block_size.max(1),
     });

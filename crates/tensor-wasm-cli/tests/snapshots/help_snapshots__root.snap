@@ -1,0 +1,30 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+assertion_line: 25
+expression: "help(&[\"--help\"])"
+---
+Run, deploy, invoke, bench, snapshot, and inspect TensorWasm Wasm workloads.
+
+Usage: tensor-wasm [OPTIONS] <COMMAND>
+
+Commands:
+  run          Run a Wasm module locally against the in-process TensorWasm engine
+  deploy       Upload a Wasm module to a TensorWasm server
+  invoke       Invoke a previously deployed function by id
+  bench        Benchmark local invocation latency (P50/P95/P99/max)
+  snapshot     Save or restore an instance snapshot
+  metrics      Fetch and pretty-print Prometheus metrics from a TensorWasm server
+  completions  Emit shell completion scripts for the named shell
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+      --tenant <TENANT>
+          Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility
+          
+          [default: 0]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

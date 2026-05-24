@@ -3,7 +3,7 @@ name: bench
 on:
   pull_request:
     paths:
-      - "crates/bali-bench/**"
+      - "crates/tensor-wasm-bench/**"
       - "crates/*/src/**"
       - ".github/workflows/bench.yml"
   workflow_dispatch:
@@ -40,6 +40,9 @@ jobs:
             | tee bench-results/current.txt
       - name: Compare against baseline
         if: hashFiles('bench-results/baseline.json') != ''
+        # When bench IDs change, update bench-results/baseline.json AND log the
+        # rename in bench-results/baseline-notes.md so future bisects can
+        # reconcile the parser keys below against the baseline file.
         run: |
           python3 - <<'PY'
           import json, re, sys

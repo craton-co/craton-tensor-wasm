@@ -1,0 +1,30 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - rust
+    ignore:
+      # wasmtime is pinned at 25.x per the risk register; major bumps require
+      # tensor-wasm-jit + tensor-wasm-wasi-gpu re-validation. See docs/RISKS.md.
+      - dependency-name: wasmtime
+        update-types: ["version-update:semver-major"]
+      - dependency-name: wasmtime-wasi
+        update-types: ["version-update:semver-major"]
+      # cust (CUDA bindings) tracks the system CUDA toolkit; major bumps are
+      # coordinated with infrastructure rollouts.
+      - dependency-name: cust
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci

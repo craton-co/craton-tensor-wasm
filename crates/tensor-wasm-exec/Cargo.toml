@@ -1,0 +1,42 @@
+[package]
+name = "tensor-wasm-exec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Wasmtime + Tokio async execution engine for TensorWasm instances."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-exec"
+readme = "README.md"
+keywords = ["wasm", "wasmtime", "executor", "runtime", "gpu"]
+categories = ["wasm", "concurrency"]
+
+[dependencies]
+async-trait.workspace = true
+tensor-wasm-core = { path = "../tensor-wasm-core" }
+tensor-wasm-jit = { path = "../tensor-wasm-jit" }
+tensor-wasm-mem = { path = "../tensor-wasm-mem" }
+dashmap.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+wasmparser.workspace = true
+wasmtime = { workspace = true, features = ["pooling-allocator", "memory-protection-keys"] }
+wasmtime-wasi.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true
+tracing-subscriber.workspace = true
+wat.workspace = true
+
+[features]
+default = ["async-execution"]
+async-execution = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

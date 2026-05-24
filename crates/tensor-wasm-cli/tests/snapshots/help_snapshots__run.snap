@@ -1,0 +1,31 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+assertion_line: 30
+expression: "help(&[\"run\", \"--help\"])"
+---
+Run a Wasm module locally against the in-process TensorWasm engine
+
+Usage: tensor-wasm run [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>
+          Path to the `.wasm` file to execute
+
+Options:
+      --export <EXPORT>
+          Name of the exported function to call. Defaults to `main`
+          
+          [default: main]
+
+      --tenant <TENANT>
+          Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility
+          
+          [default: 0]
+
+      --args <ARGS>
+          Arguments to pass to the export, encoded as a JSON array.
+          
+          Example: `--args '[1.0, 2.0]'`. The current executor only invokes `() -> ()` exports, so the array is parsed and validated but the values are not yet wired into the call site.
+
+  -h, --help
+          Print help (see a summary with '-h')

@@ -2,23 +2,22 @@
 
 _Status: introduced in S14. The Cranelift-fork question is settled in
 `docs/WASMTIME-FORK.md`; this document is the user-facing companion that
-explains what code patterns Bali will (and won't) auto-offload to the GPU._
+explains what code patterns TensorWasm will (and won't) auto-offload to the GPU._
 
 ## Triggering auto-offload
 
 Auto-offload is **off by default**. Enable it with the cargo feature flag:
 
 ```
-cargo build --workspace --features bali-jit/auto-offload
+cargo build --workspace --features tensor-wasm-jit/auto-offload
 ```
 
 or via the HTTP API by submitting a function with `"jit_auto_offload": true`
-(see `nova-api/API.md`, S17 — note: the field name preserves API stability
-across the Nova→Bali rename).
+(see `crates/tensor-wasm-api/API.md`, S17).
 
 When enabled, candidate basic blocks are inspected at *pipeline-driver* time
-by [`bali_jit::detector::classify`](../crates/bali-jit/src/detector.rs) —
-that is, by programs that call the `bali-jit` pipeline directly, not by
+by [`tensor_wasm_jit::detector::classify`](../crates/tensor-wasm-jit/src/detector.rs) —
+that is, by programs that call the `tensor-wasm-jit` pipeline directly, not by
 Wasmtime at dispatch time. Blocks marked [`DetectorVerdict::Offload`] are
 lowered to PTX via the pipeline described in this document and the result is
 inserted into the kernel cache. The rest run on the standard Wasmtime CPU
@@ -28,7 +27,7 @@ the next section for why.
 
 ## Integration status in v0.1.0
 
-Bali v0.1.0 ships the auto-offload **pipeline as a library** — the detector,
+TensorWasm v0.1.0 ships the auto-offload **pipeline as a library** — the detector,
 clif-lower, PTX emitter, kernel cache, and deopt guard are all production-
 quality and exhaustively tested. What v0.1.0 does NOT yet ship is the
 runtime swap: at execution time, Wasmtime continues to dispatch the
@@ -39,15 +38,15 @@ into the cached PTX kernel requires per-block compile hooks in
 
 Concretely:
 
-- The pipeline runs ahead-of-time inside `bali-jit` and produces validated
+- The pipeline runs ahead-of-time inside `tensor-wasm-jit` and produces validated
   PTX kernels. Programs can drive it directly via the public API
-  (`bali_jit::detector::classify` → `clif_lower::lower_block` →
+  (`tensor_wasm_jit::detector::classify` → `clif_lower::lower_block` →
   `ptx_emit::emit` → `cache::KernelCache::put`).
 - The runtime-swap hook is intentionally deferred. When Wasmtime upstreams
   the per-block hook (tracked in `WASMTIME-FORK.md`), or when we explicitly
   decide to fork, the executor can begin consulting the cache at dispatch
   time. The pipeline output is then a drop-in.
-- Until then, the `bali-jit/auto-offload` feature flag toggles the *pipeline*
+- Until then, the `tensor-wasm-jit/auto-offload` feature flag toggles the *pipeline*
   on/off (controlling whether kernels are pre-emitted at all) but does not
   change runtime dispatch.
 
@@ -59,7 +58,7 @@ Code that maps a single SIMD op across a statically-bounded loop is the
 sweet spot:
 
 ```rust
-// In Wasm (wasm32-wasi), after rustc + wasm-opt:
+// In Wasm (wasm32-wasip1), after rustc + wasm-opt:
 for i in 0..N {  // N must be a constant
     c[i] = a[i] + b[i];
 }
@@ -111,7 +110,7 @@ Cranelift's pre-passes, so in practice this is rarely a problem.
 
 ## Deopt-on-error behaviour
 
-[`DeoptGuard`](../crates/bali-jit/src/deopt.rs) tracks per-fingerprint deopt
+[`DeoptGuard`](../crates/tensor-wasm-jit/src/deopt.rs) tracks per-fingerprint deopt
 state. A kernel that has been deopted in this process is *not* retried on
 the GPU until the cache is invalidated. Numerical correctness is checked by
 the executor on the first invocation of every newly-emitted kernel
@@ -122,13 +121,13 @@ default 1e-4 absolute for f32).
 
 The following Prometheus counters surface auto-offload behaviour:
 
-- `bali_offload_success_total` — kernels that ran on GPU and passed
+- `tensor_wasm_offload_success_total` — kernels that ran on GPU and passed
   correctness checks.
-- `bali_offload_fallback_total` — kernels that deopted, plus their reason
+- `tensor_wasm_offload_fallback_total` — kernels that deopted, plus their reason
   label (`cuda_error`, `numerical_divergence`, `assembly_failed`).
 
 Compute the success rate as
-`bali_offload_success_total / (bali_offload_success_total + bali_offload_fallback_total)`.
+`tensor_wasm_offload_success_total / (tensor_wasm_offload_success_total + tensor_wasm_offload_fallback_total)`.
 
 ---
 

@@ -1,0 +1,45 @@
+[package]
+name = "tensor-wasm-mem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "CUDA Unified Memory allocator and Wasmtime `MemoryCreator` integration."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-mem"
+readme = "README.md"
+keywords = ["wasm", "cuda", "memory", "wasmtime", "gpu"]
+categories = ["memory-management", "wasm"]
+
+[lib]
+
+[dependencies]
+anyhow.workspace = true
+tensor-wasm-core = { path = "../tensor-wasm-core" }
+parking_lot.workspace = true
+region = "3"
+thiserror.workspace = true
+tracing.workspace = true
+wasmtime.workspace = true
+cust = { workspace = true, optional = true }
+
+[dev-dependencies]
+wat.workspace = true
+wasmtime.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+# Default is empty so `cargo build` works on hosts without a CUDA toolkit
+# (cust's build script panics without one). The `unified-memory` feature is
+# opt-in via `--features unified-memory` on CUDA hosts. CI may also enable it
+# once stub libraries are provisioned.
+default = []
+unified-memory = ["dep:cust"]
+
+[package.metadata.docs.rs]
+all-features = false
+features = []
+rustdoc-args = ["--cfg", "docsrs"]

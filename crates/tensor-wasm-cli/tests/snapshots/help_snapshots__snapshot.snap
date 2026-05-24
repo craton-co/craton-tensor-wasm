@@ -1,0 +1,17 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+assertion_line: 55
+expression: "help(&[\"snapshot\", \"--help\"])"
+---
+Save or restore an instance snapshot
+
+Usage: tensor-wasm snapshot [OPTIONS] <COMMAND>
+
+Commands:
+  save     Capture the state of a running instance into a `.tensor-wasm` file via the API
+  restore  Restore an instance from a `.tensor-wasm` archive via the API
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --tenant <TENANT>  Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
+  -h, --help             Print help

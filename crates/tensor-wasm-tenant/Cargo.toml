@@ -1,0 +1,45 @@
+[package]
+name = "tensor-wasm-tenant"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Multi-tenant CUDA context management (MPS-backed or per-context fallback)."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-tenant"
+readme = "README.md"
+keywords = ["multi-tenant", "quota", "isolation", "cuda", "wasm"]
+categories = ["concurrency"]
+
+[package.metadata.docs.rs]
+all-features = false
+features = []
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+
+[dependencies]
+tensor-wasm-core = { path = "../tensor-wasm-core" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+cust = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio-test.workspace = true
+criterion.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "context_switch"
+harness = false
+
+[features]
+default = []
+mps = []
+cuda = ["dep:cust"]

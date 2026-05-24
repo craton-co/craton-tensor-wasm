@@ -1,72 +1,72 @@
-# Project Bali — Architecture
+# Craton TensorWasm — Architecture
 
-Project Bali is a GPU-accelerated serverless Wasm runtime. It runs untrusted Wasm modules with explicit (and later, auto-offloaded) GPU kernel dispatch on CUDA, built on Wasmtime and Tokio. The project is a 9-month build spanning 22 sessions across 6 phases.
+Craton TensorWasm is a GPU-accelerated serverless Wasm runtime. It runs untrusted Wasm modules with explicit (and later, auto-offloaded) GPU kernel dispatch on CUDA, built on Wasmtime and Tokio. The project is a 9-month build spanning 22 sessions across 6 phases.
 
 ## Workspace layout
 
 The workspace is composed of ten crates:
 
-- `bali-core` — Foundational types, errors, metrics, telemetry.
-- `bali-mem` — CUDA Unified Memory allocator and Wasmtime `MemoryCreator`.
-- `bali-exec` — Wasmtime + Tokio async execution engine.
-- `bali-wasi-gpu` — `wasi-cuda` host bridge for explicit GPU kernel launch.
-- `bali-jit` — JIT pipeline: detector, IR, PTX codegen, kernel cache, deopt.
-- `bali-snapshot` — Wasm + GPU memory snapshot and restore.
-- `bali-tenant` — Multi-tenant CUDA context management.
-- `bali-api` — HTTP serverless API gateway (axum).
-- `bali-cli` — Developer CLI (`bali` binary).
-- `bali-bench` — Benchmark harness (Criterion + custom).
+- `tensor-wasm-core` — Foundational types, errors, metrics, telemetry.
+- `tensor-wasm-mem` — CUDA Unified Memory allocator and Wasmtime `MemoryCreator`.
+- `tensor-wasm-exec` — Wasmtime + Tokio async execution engine.
+- `tensor-wasm-wasi-gpu` — `wasi-cuda` host bridge for explicit GPU kernel launch.
+- `tensor-wasm-jit` — JIT pipeline: detector, IR, PTX codegen, kernel cache, deopt.
+- `tensor-wasm-snapshot` — Wasm + GPU memory snapshot and restore.
+- `tensor-wasm-tenant` — Multi-tenant CUDA context management.
+- `tensor-wasm-api` — HTTP serverless API gateway (axum).
+- `tensor-wasm-cli` — Developer CLI (`tensor-wasm` binary).
+- `tensor-wasm-bench` — Benchmark harness (Criterion + custom).
 
 ## Dependency graph (planned, acyclic)
 
 The crates are layered top-down — higher layers depend on lower layers, never the reverse.
 
 ```
-            bali-cli ──► bali-api
+            tensor-wasm-cli ──► tensor-wasm-api
                             │
         ┌───────────────────┼──────────────────────┐
         ▼                   ▼                      ▼
-   bali-snapshot      bali-tenant            (bali-bench)
+   tensor-wasm-snapshot      tensor-wasm-tenant            (tensor-wasm-bench)
         │                   │
         └─────────┬─────────┘
                   ▼
-              bali-jit
+              tensor-wasm-jit
                   │
                   ▼
-            bali-wasi-gpu
+            tensor-wasm-wasi-gpu
                   │
                   ▼
-              bali-exec
+              tensor-wasm-exec
                   │
                   ▼
-              bali-mem
+              tensor-wasm-mem
                   │
                   ▼
-              bali-core
+              tensor-wasm-core
 ```
 
-The dependency graph is acyclic. `bali-core` has zero internal dependencies; every other crate depends transitively on `bali-core`.
+The dependency graph is acyclic. `tensor-wasm-core` has zero internal dependencies; every other crate depends transitively on `tensor-wasm-core`.
 
 ```mermaid
 graph TD
-  cli[bali-cli] --> api[bali-api]
-  cli --> exec[bali-exec]
+  cli[tensor-wasm-cli] --> api[tensor-wasm-api]
+  cli --> exec[tensor-wasm-exec]
   api --> exec
-  api --> tenant[bali-tenant]
-  api --> snap[bali-snapshot]
+  api --> tenant[tensor-wasm-tenant]
+  api --> snap[tensor-wasm-snapshot]
   snap --> exec
   tenant --> exec
-  jit[bali-jit] --> wgpu[bali-wasi-gpu]
+  jit[tensor-wasm-jit] --> wgpu[tensor-wasm-wasi-gpu]
   wgpu --> exec
-  exec --> mem[bali-mem]
-  mem --> core[bali-core]
+  exec --> mem[tensor-wasm-mem]
+  mem --> core[tensor-wasm-core]
   exec --> core
   wgpu --> core
   jit --> core
   snap --> core
   tenant --> core
   api --> core
-  bench[bali-bench] -.dev-dep.-> core
+  bench[tensor-wasm-bench] -.dev-dep.-> core
 ```
 
 In S1 these dependencies are **not yet wired** in `Cargo.toml` — every crate's manifest is currently empty. Wiring happens incrementally as later sessions need it. This document describes the *planned end state*.
@@ -100,7 +100,7 @@ Related documents authored in later sessions:
 - `docs/AUTO-OFFLOAD.md` (S14)
 - `docs/COLD-START.md` (S15)
 - `docs/MPS-SETUP.md` (S16)
-- `bali-api/API.md` (S17)
+- `tensor-wasm-api/API.md` (S17)
 - `docs/CLI.md` (S18)
 - `docs/PERFORMANCE.md` (S19)
 - `docs/OBSERVABILITY.md` (S20)
@@ -108,4 +108,4 @@ Related documents authored in later sessions:
 
 ---
 
-_Status: S1 scaffold. The graph above describes the planned end state — internal crate dependencies are wired in incrementally as later sessions need them._
+_Status: current as of v0.1.0 (2026-05-24). All crates wired; see CHANGELOG.md for history._

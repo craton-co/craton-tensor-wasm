@@ -3,8 +3,8 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
-  - job_name: bali-api
+  - job_name: tensor-wasm-api
     static_configs:
-      - targets: ["bali-api:8080"]
+      - targets: ["tensor-wasm-api:8080"]
     metrics_path: /metrics
     honor_labels: true

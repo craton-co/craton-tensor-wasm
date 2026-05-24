@@ -1,0 +1,54 @@
+[package]
+name = "tensor-wasm-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Benchmark harness for Craton TensorWasm (Criterion + custom suites)."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-bench"
+readme = "README.md"
+publish = false
+
+[lib]
+
+[dependencies]
+tensor-wasm-api = { path = "../tensor-wasm-api" }
+tensor-wasm-core = { path = "../tensor-wasm-core" }
+tensor-wasm-jit = { path = "../tensor-wasm-jit" }
+tensor-wasm-mem = { path = "../tensor-wasm-mem" }
+tensor-wasm-snapshot = { path = "../tensor-wasm-snapshot" }
+tensor-wasm-wasi-gpu = { path = "../tensor-wasm-wasi-gpu" }
+tokio.workspace = true
+
+[dev-dependencies]
+axum = { workspace = true }
+base64 = "0.22"
+criterion.workspace = true
+http-body-util = "0.1"
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { workspace = true, features = ["util"] }
+
+[[bench]]
+name = "kernel_dispatch"
+harness = false
+
+[[bench]]
+name = "cold_start"
+harness = false
+
+[[bench]]
+name = "memory_bandwidth"
+harness = false
+
+[[bench]]
+name = "jit_compile"
+harness = false
+
+[[bench]]
+name = "e2e_inference"
+harness = false

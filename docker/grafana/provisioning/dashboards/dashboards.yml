@@ -1,7 +1,7 @@
 apiVersion: 1
 
 providers:
-  - name: bali
+  - name: tensor-wasm
     type: file
     disableDeletion: false
     editable: true

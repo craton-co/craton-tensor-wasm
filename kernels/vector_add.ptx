@@ -3,7 +3,7 @@
 //
 // Element-wise float32 vector addition: c[i] = a[i] + b[i]
 //
-// Fixture used by Bali's S8 / S14 integration tests on CUDA hardware.
+// Fixture used by TensorWasm's S8 / S14 integration tests on CUDA hardware.
 // Built for sm_80 (Ampere); CUDA 12 PTX 8.0.
 //
 

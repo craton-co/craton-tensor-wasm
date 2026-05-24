@@ -1,0 +1,17 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+assertion_line: 35
+expression: "help(&[\"deploy\", \"--help\"])"
+---
+Upload a Wasm module to a TensorWasm server
+
+Usage: tensor-wasm deploy [OPTIONS] --server <SERVER> <FILE>
+
+Arguments:
+  <FILE>  Path to the `.wasm` file to deploy
+
+Options:
+      --server <SERVER>  Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
+      --tenant <TENANT>  Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
+      --name <NAME>      Tenant-supplied display name. Defaults to the file stem when omitted
+  -h, --help             Print help

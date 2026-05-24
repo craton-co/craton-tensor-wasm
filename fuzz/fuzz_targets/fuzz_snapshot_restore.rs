@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use bali_snapshot::reader::SnapshotReader;
+use tensor_wasm_snapshot::reader::SnapshotReader;
 
 fuzz_target!(|data: &[u8]| {
     // Cap input length: snapshot validation enforces a max size on real

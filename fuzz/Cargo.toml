@@ -1,5 +1,5 @@
 [package]
-name = "bali-fuzz"
+name = "tensor-wasm-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -11,10 +11,13 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 
-bali-core = { path = "../crates/bali-core" }
-bali-jit = { path = "../crates/bali-jit" }
-bali-snapshot = { path = "../crates/bali-snapshot" }
+tensor-wasm-core = { path = "../crates/tensor-wasm-core" }
+tensor-wasm-jit = { path = "../crates/tensor-wasm-jit" }
+tensor-wasm-snapshot = { path = "../crates/tensor-wasm-snapshot" }
+tensor-wasm-wasi-gpu = { path = "../crates/tensor-wasm-wasi-gpu" }
 wasmtime = { version = "25", default-features = false, features = ["async", "cranelift", "runtime"] }
+tokio = { version = "1.40", features = ["rt", "macros"] }
+wat = "1"
 
 [[bin]]
 name = "fuzz_wasm_compile"
@@ -33,6 +36,13 @@ bench = false
 [[bin]]
 name = "fuzz_snapshot_restore"
 path = "fuzz_targets/fuzz_snapshot_restore.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wasi_cuda_abi"
+path = "fuzz_targets/fuzz_wasi_cuda_abi.rs"
 test = false
 doc = false
 bench = false

@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/bali-core",
-    "crates/bali-mem",
-    "crates/bali-exec",
-    "crates/bali-wasi-gpu",
-    "crates/bali-jit",
-    "crates/bali-snapshot",
-    "crates/bali-tenant",
-    "crates/bali-api",
-    "crates/bali-cli",
-    "crates/bali-bench",
+    "crates/tensor-wasm-core",
+    "crates/tensor-wasm-mem",
+    "crates/tensor-wasm-exec",
+    "crates/tensor-wasm-wasi-gpu",
+    "crates/tensor-wasm-jit",
+    "crates/tensor-wasm-snapshot",
+    "crates/tensor-wasm-tenant",
+    "crates/tensor-wasm-api",
+    "crates/tensor-wasm-cli",
+    "crates/tensor-wasm-bench",
 ]
 exclude = ["fuzz"]
 
@@ -19,13 +19,13 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
 license = "Apache-2.0"
-authors = ["Project Bali Contributors"]
-repository = "https://github.com/project-bali/bali"
+authors = ["Craton Software Company <security@craton.com.ar>"]
+repository = "https://github.com/craton-co/craton-tensor-wasm"
 
 # Centralised dependency versions. Crates inherit via `dep.workspace = true`.
 # CUDA-dependent crates (cust, ptx-builder) are marked `optional = true` so the
 # default `cargo build --workspace` succeeds on hosts without CUDA libraries.
-# Enabling the `unified-memory` feature on bali-mem (transitively) pulls them in.
+# Enabling the `unified-memory` feature on tensor-wasm-mem (transitively) pulls them in.
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
@@ -59,7 +59,7 @@ tracing-opentelemetry = "0.27"
 opentelemetry = "0.26"
 opentelemetry-otlp = { version = "0.26", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
-prometheus-client = "0.22"
+prometheus-client = "0.24"
 
 # Errors / serde
 thiserror = "1"
@@ -75,6 +75,9 @@ lru = "0.12"
 parking_lot = "0.12"
 once_cell = "1"
 crossbeam-channel = "0.5"
+
+# Hashing — used for stable, cross-Rust-version fingerprints (TensorWasmKernelBlueprint).
+blake3 = "1"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

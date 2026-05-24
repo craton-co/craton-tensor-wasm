@@ -1,0 +1,17 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+assertion_line: 40
+expression: "help(&[\"invoke\", \"--help\"])"
+---
+Invoke a previously deployed function by id
+
+Usage: tensor-wasm invoke [OPTIONS] --server <SERVER> <ID>
+
+Arguments:
+  <ID>  Identifier of the deployed function to invoke
+
+Options:
+      --server <SERVER>  Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
+      --tenant <TENANT>  Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
+      --args <ARGS>      Arguments forwarded to the function, encoded as a JSON array
+  -h, --help             Print help

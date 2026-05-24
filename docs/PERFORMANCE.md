@@ -1,6 +1,6 @@
-# Project Bali — Performance
+# Craton TensorWasm — Performance
 
-This document describes how Bali measures performance, what the current
+This document describes how TensorWasm measures performance, what the current
 reference numbers look like, and how the CI regression gate works. Two
 reference points matter: (a) the **host-only path** that a developer laptop
 and the local CI runner exercise (no CUDA libraries, the back-pressure and
@@ -11,7 +11,7 @@ are modeled estimates, clearly marked.
 
 ## How we measure
 
-Every bench lives in [`crates/bali-bench/benches/`](../crates/bali-bench/benches/)
+Every bench lives in [`crates/tensor-wasm-bench/benches/`](../crates/tensor-wasm-bench/benches/)
 and is a [Criterion](https://bheisler.github.io/criterion.rs/book/) bench
 declared with `harness = false` in `Cargo.toml`. The defaults we rely on:
 
@@ -29,24 +29,60 @@ declared with `harness = false` in `Cargo.toml`. The defaults we rely on:
 
 ## Bench inventory
 
-| Bench | File | What it measures | Throughput unit |
-|---|---|---|---|
-| kernel_dispatch/serial | kernel_dispatch.rs | Per-dispatch overhead (back-pressure permit acquire+release) | dispatches/sec |
-| kernel_dispatch/concurrent_cap64 | kernel_dispatch.rs | Throughput under concurrency cap | dispatches/sec |
-| cold_start/capture | cold_start.rs | Snapshot capture (bincode + zstd encode) | bytes/sec |
-| cold_start/restore | cold_start.rs | Snapshot restore (zstd decode + bincode decode) | bytes/sec |
-| cold_start/disk_round_trip | cold_start.rs | capture + fs::write + fs::read + restore | bytes/sec |
-| memory_bandwidth/sequential | memory_bandwidth.rs | Host-side `copy_from_slice` | bytes/sec |
-| memory_bandwidth/random_stride | memory_bandwidth.rs | Strided 64-byte copies | bytes/sec |
-| jit_compile/emit_text | jit_compile.rs | PTX text-emit latency | iters/sec |
-| jit_compile/fingerprint | jit_compile.rs | Blueprint hash latency | iters/sec |
-| e2e/healthz | e2e_inference.rs | Full router roundtrip latency | requests/sec |
-| e2e/create_function | e2e_inference.rs | POST /functions latency | requests/sec |
-| e2e/invoke_not_found | e2e_inference.rs | Error-path latency | requests/sec |
+Every entry below is a Criterion `<group>/<id>` pair, written exactly as
+Criterion emits it on stdout and as it appears under
+`target/criterion/<group>/<id>/`. The "Source" column names the crate
+hosting the bench — most live in `tensor-wasm-bench` but `tenant_registry/*`
+lives in `tensor-wasm-tenant` because the `TenantRegistry` it exercises is
+private to that crate.
 
-`kernel_dispatch` was added in S9; the remaining four bench files
-(`cold_start`, `memory_bandwidth`, `jit_compile`, `e2e_inference`) were
-introduced in S19 alongside this document.
+| Bench id (Criterion `<group>/<id>`) | Source crate | Source file | What it measures | Throughput unit |
+|---|---|---|---|---|
+| `dispatch/serial/<N>` for N in {1, 10, 100, 1000} | `tensor-wasm-bench` | `benches/kernel_dispatch.rs` | Per-dispatch overhead (back-pressure permit acquire+release + future poll), serial. Setup hoisted via `iter_batched_ref`. | dispatches/sec |
+| `dispatch/concurrent_cap64/<N>` for N in {1, 10, 100, 1000} | `tensor-wasm-bench` | `benches/kernel_dispatch.rs` | Same as above but cap=64 with 4 worker threads. | dispatches/sec |
+| `cold_start/capture/<bytes>` for bytes in {1048576, 16777216, 134217728, 536870912} | `tensor-wasm-bench` | `benches/cold_start.rs` | Snapshot capture (bincode + zstd encode). | bytes/sec |
+| `cold_start/restore/<bytes>` for bytes in {1048576, 16777216, 134217728, 536870912} | `tensor-wasm-bench` | `benches/cold_start.rs` | In-memory snapshot restore (zstd decode + bincode decode). Steady-state — see source-file caveat re: page-cache warmth. | bytes/sec |
+| `cold_start/disk_round_trip/<bytes>` for bytes in {1048576, 16777216} | `tensor-wasm-bench` | `benches/cold_start.rs` | True cold-disk reference: capture + `fs::write` + `fs::read` + restore each iteration. Stops at 16 MiB; above that, IO dominates. | bytes/sec |
+| `memory_bandwidth/sequential/<bytes>` for bytes in {4096, 65536, 1048576, 16777216} | `tensor-wasm-bench` | `benches/memory_bandwidth.rs` | Host-side `copy_from_slice` over `GuardedHostBuffer`. | bytes/sec |
+| `memory_bandwidth/strided/<bytes>` for bytes in {65536, 1048576, 16777216} | `tensor-wasm-bench` | `benches/memory_bandwidth.rs` | Fixed-stride 64-byte copies (stride=4096). Renamed from `random_stride` — see `bench-results/baseline-notes.md`. | bytes/sec |
+| `jit_compile/emit_text/<kernel>` for kernel in {`vector_add[4]`, `vector_add[16]`, `matmul[16x16x16]`, `conv2d[3x3]`} | `tensor-wasm-bench` | `benches/jit_compile.rs` | PTX text-emit latency. | iters/sec |
+| `jit_compile/fingerprint/matmul_16x16x16` | `tensor-wasm-bench` | `benches/jit_compile.rs` | Blueprint hash latency. | iters/sec |
+| `jit_compile/cache/cold_miss_then_insert` | `tensor-wasm-bench` | `benches/jit_compile.rs` | emit + `KernelCache::put` + `get`. Cache hoisted via `iter_batched_ref`. | iters/sec |
+| `jit_compile/cache/warm_hit` | `tensor-wasm-bench` | `benches/jit_compile.rs` | Pre-populated `KernelCache::get` only. S13 done-when: <1ms. | iters/sec |
+| `e2e/healthz/get` | `tensor-wasm-bench` | `benches/e2e_inference.rs` | Full axum router round-trip on GET `/healthz`. | requests/sec |
+| `e2e/create_function/post` | `tensor-wasm-bench` | `benches/e2e_inference.rs` | POST `/functions` latency; fresh router per iter via `iter_batched`. | requests/sec |
+| `e2e/invoke_not_found/post` | `tensor-wasm-bench` | `benches/e2e_inference.rs` | POST `/functions/<unknown>/invoke` error path. | requests/sec |
+| `tenant_registry/lookup/<N>` for N in {1, 16, 256} | `tensor-wasm-tenant` | `benches/context_switch.rs` | `TenantRegistry::get` host-side lookup; CUDA equivalent is `cuCtxPushCurrent`/`cuCtxPopCurrent`. S16 done-when: <5µs. | iters/sec |
+| `tenant_registry/consume_release/256KiB` | `tensor-wasm-tenant` | `benches/context_switch.rs` | `consume_bytes` + `release_bytes` quota round-trip. | iters/sec |
+
+`kernel_dispatch` was added in S9 and `tenant_registry` in S16; the
+remaining four bench files in `tensor-wasm-bench` (`cold_start`,
+`memory_bandwidth`, `jit_compile`, `e2e_inference`) were introduced in
+S19 alongside this document.
+
+### Interpreting Criterion HTML
+
+After any `cargo bench` invocation, Criterion writes a static-HTML
+report tree under `target/criterion/`. The useful entry points:
+
+- `target/criterion/report/index.html` — top-level summary across all
+  groups in the run. Skim this to spot which bench moved.
+- `target/criterion/<group>/<id>/report/index.html` — one full report
+  per metric. P50, P95, P99 estimates with confidence intervals, the
+  raw KDE/violin of sample times, an iteration-time scatterplot for
+  spotting outliers, and a regression plot against the previous local
+  run.
+- `target/criterion/<group>/<id>/<baseline>/estimates.json` — machine-
+  readable medians + CIs for the named baseline. The CI gate parses
+  this style of output (via the `bencher`-format stdout lines) to
+  decide pass/fail.
+
+Example: after `cargo bench -p tensor-wasm-bench --bench cold_start`, the 1
+MiB restore metric report is at
+`target/criterion/cold_start/restore/1048576/report/index.html` and
+the published baseline median lives in
+[`bench-results/baseline.json`](../bench-results/baseline.json) under
+the matching key.
 
 ## Reference numbers (host-only, modeled)
 
@@ -103,13 +139,17 @@ S22 completes.
 
 ## Regression policy
 
-The `bench` workflow in `.github/workflows/bench.yml` runs the full bench
-suite on pull requests that touch `crates/bali-bench/**` or `crates/*/src/**`,
-and compares the result against a committed baseline at
+The [`bench` workflow](../.github/workflows/bench.yml) runs the full bench
+suite on pull requests that touch `crates/tensor-wasm-bench/**` or
+`crates/*/src/**`, and compares the result against a committed baseline at
 [`bench-results/baseline.json`](../bench-results/baseline.json). The CI step
 parses Criterion's `--output-format bencher` lines, looks each tracked
 metric up in the baseline, and fails the build when the measured median
 exceeds `baseline.median_ns * (1 + (tolerance_pct + regress_pct_threshold) / 100)`.
+See [`bench-results/README.md`](../bench-results/README.md) for the
+metric-to-source-file map and the re-baseline procedure, and
+[`bench-results/baseline-notes.md`](../bench-results/baseline-notes.md)
+for the running log of bench-id renames and additions.
 
 In the committed baseline today, `regress_pct_threshold` is **10%** and
 per-metric `tolerance_pct` ranges from **30%** (cold-start, where each
@@ -148,7 +188,7 @@ the re-baseline commit message linking to the feature PR.
 cargo bench --workspace
 
 # A single bench file:
-cargo bench -p bali-bench --bench cold_start
+cargo bench -p tensor-wasm-bench --bench cold_start
 
 # Compile-only — CI step zero, useful as a fast sanity check:
 cargo bench --workspace --no-run
@@ -162,7 +202,7 @@ Criterion report, including P95/P99, histograms, and regression plots
 against the previous local run.
 
 See [BUILD.md](BUILD.md) for the wider build-and-test workflow, and
-[`crates/bali-bench/benches/`](../crates/bali-bench/benches/) for the
+[`crates/tensor-wasm-bench/benches/`](../crates/tensor-wasm-bench/benches/) for the
 bench sources.
 
 ---

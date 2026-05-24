@@ -1,0 +1,11 @@
+Craton TensorWasm
+Copyright 2026 Craton Software Company
+
+This product includes software developed by:
+  The Bytecode Alliance (Wasmtime)         — Apache-2.0 WITH LLVM-exception
+  The Tokio Project                         — MIT
+  The OpenTelemetry Authors                 — Apache-2.0
+  The Cranelift Authors                     — Apache-2.0 WITH LLVM-exception
+  The CUDA Rust Working Group (cust)        — MIT OR Apache-2.0
+
+See `docs/RISKS.md` for upstream pinning notes.

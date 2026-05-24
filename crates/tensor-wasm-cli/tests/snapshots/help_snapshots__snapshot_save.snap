@@ -1,0 +1,15 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+assertion_line: 60
+expression: "help(&[\"snapshot\", \"save\", \"--help\"])"
+---
+Capture the state of a running instance into a `.tensor-wasm` file via the API
+
+Usage: tensor-wasm snapshot save [OPTIONS] --instance <INSTANCE> --output <OUTPUT> --server <SERVER>
+
+Options:
+      --instance <INSTANCE>  Identifier of the running instance to snapshot
+      --tenant <TENANT>      Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
+      --output <OUTPUT>      Output path for the resulting `.tensor-wasm` archive
+      --server <SERVER>      Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
+  -h, --help                 Print help

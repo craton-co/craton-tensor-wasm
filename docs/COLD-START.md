@@ -2,7 +2,7 @@
 
 ## Why cold start matters
 
-Serverless GPU workloads live and die by their cold-start latency. A function that ships its weights through a 200 MB container image, JIT-compiles a few PTX modules, and warms the CUDA driver on every invocation cannot meet the millisecond-scale tail-latency targets that interactive inference, RAG retrieval, and online feature stores demand. Project Bali's `bali-snapshot` crate exists to short-circuit that path: instead of re-executing the cold initialisation sequence, the host restores a pre-captured `Snapshot` containing the Wasm linear memory, GPU device memory, and the JIT register file, then resumes execution from where the previous instance left off.
+Serverless GPU workloads live and die by their cold-start latency. A function that ships its weights through a 200 MB container image, JIT-compiles a few PTX modules, and warms the CUDA driver on every invocation cannot meet the millisecond-scale tail-latency targets that interactive inference, RAG retrieval, and online feature stores demand. Craton TensorWasm's `tensor-wasm-snapshot` crate exists to short-circuit that path: instead of re-executing the cold initialisation sequence, the host restores a pre-captured `Snapshot` containing the Wasm linear memory, GPU device memory, and the JIT register file, then resumes execution from where the previous instance left off.
 
 Honest framing matters here. A handful of academic papers and vendor blog posts have claimed "sub-millisecond" GPU cold starts; the marketing has outrun the physics. Real hosts pay for the bincode decode, the zstd decompression, the page-fault-driven UVM migration into device memory, and the first kernel launch before the function can do useful work. This document explains what each of those costs is, gives a calibrated estimate of what we expect to measure once S19's benchmarks land, and lists the levers operators have today to keep cold starts inside their SLO.
 
@@ -41,13 +41,13 @@ The shape of the curve is the takeaway: at the 1 MiB end, fixed driver overhead 
 
 - **Keep snapshots small.** A 512 MiB snapshot will never restore in under ~100 ms on commodity hardware. If you can afford to lazily reload weights from a shared model store instead of bundling them into the snapshot, do so. The snapshot path is for hot, latency-sensitive state, not the entire model weights.
 - **Pre-warm common kernels.** The first launch after a fresh context creation costs 1–3 ms of driver-resident work. The host can pay this once at process startup by running a trivial no-op kernel against every PTX module the tenant is expected to use; subsequent launches drop to 5–10 µs.
-- **Use `cudaMemAdvise(SetReadMostly)` for weight buffers.** For read-only weight regions, advising the driver of the access pattern reduces page-fault traffic on the UVM warmup path. The `bali-mem` advise wrappers expose this directly.
+- **Use `cudaMemAdvise(SetReadMostly)` for weight buffers.** For read-only weight regions, advising the driver of the access pattern reduces page-fault traffic on the UVM warmup path. The `tensor-wasm-mem` advise wrappers expose this directly.
 - **Prefer the page cache.** Repeated restores of the same snapshot blob will be served from the OS page cache after the first read; the `T_read` term effectively disappears. Co-locate the snapshot store with the worker so this caching actually applies.
 - **Avoid zstd levels above 3.** Higher levels marginally improve compression ratios on already-incompressible GPU memory while inflating CPU cost on the hot restore path. The default level 3 is intentional.
-- **Measure end-to-end.** The metrics in `bali-core::metrics::BaliMetrics` expose per-phase histograms for restore latency; alert on the P99 of the UVM phase, not the total, because the UVM term has the worst tail behaviour.
+- **Measure end-to-end.** The metrics in `tensor-wasm-core::metrics::TensorWasmMetrics` expose per-phase histograms for restore latency; alert on the P99 of the UVM phase, not the total, because the UVM term has the worst tail behaviour.
 
 ## Cross references
 
 - `docs/PERFORMANCE.md` — S19 benchmark methodology and the measured numbers that will replace this table.
-- `docs/CUDA-SETUP.md` — toolkit and driver versions Project Bali validates against; UVM behaviour differs meaningfully between CUDA 12.0 and 12.6.
+- `docs/CUDA-SETUP.md` — toolkit and driver versions Craton TensorWasm validates against; UVM behaviour differs meaningfully between CUDA 12.0 and 12.6.
 - `docs/AUTO-OFFLOAD.md` — S14's auto-offload heuristic governs which snapshot regions live on device vs. host, and therefore how much of the restore cost is paid up front vs. on demand.

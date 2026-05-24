@@ -1,0 +1,51 @@
+[package]
+name = "tensor-wasm-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "HTTP serverless API gateway (axum)."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-api"
+readme = "README.md"
+keywords = ["wasm", "axum", "gateway", "serverless", "runtime"]
+categories = ["web-programming::http-server", "wasm"]
+
+[lib]
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+tensor-wasm-core = { path = "../tensor-wasm-core" }
+tensor-wasm-exec = { path = "../tensor-wasm-exec" }
+base64 = "0.22"
+dashmap.workspace = true
+hyper.workspace = true
+opentelemetry = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+# tower-http: workspace declaration enables {trace, timeout, cors}. We
+# additionally enable `limit` here for `RequestBodyLimitLayer` so the
+# gateway can cap inbound bodies at 64 MiB. Cargo unions features across
+# the workspace, so this does not affect the workspace baseline.
+tower-http = { workspace = true, features = ["trace", "timeout", "cors", "limit"] }
+tracing.workspace = true
+tracing-opentelemetry = { workspace = true }
+uuid.workspace = true
+wasmparser.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-test.workspace = true
+tower = { workspace = true, features = ["util"] }
+wat.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

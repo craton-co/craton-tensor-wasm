@@ -1,0 +1,334 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "TensorWasm HTTP API",
+    "description": "REST surface of a TensorWasm serverless Wasm node. See API.md for prose documentation, error semantics, and the full middleware stack.",
+    "version": "0.1.0",
+    "license": {
+      "name": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0"
+    },
+    "contact": {
+      "name": "Craton Software Company",
+      "email": "security@craton.com.ar"
+    }
+  },
+  "servers": [
+    { "url": "http://localhost:8080", "description": "Local dev server" }
+  ],
+  "security": [{ "BearerAuth": [] }],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "summary": "Liveness probe",
+        "operationId": "healthz",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service is alive",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Health" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus text exposition",
+        "operationId": "metrics",
+        "responses": {
+          "200": {
+            "description": "Prometheus 0.0.4 text format",
+            "content": {
+              "text/plain": { "schema": { "type": "string" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/functions": {
+      "post": {
+        "summary": "Deploy a new Wasm module",
+        "operationId": "createFunction",
+        "parameters": [
+          { "$ref": "#/components/parameters/TenantHeader" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateFunctionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Function deployed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreateFunctionResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" }
+        }
+      }
+    },
+    "/functions/{id}": {
+      "delete": {
+        "summary": "Delete a deployed function",
+        "operationId": "deleteFunction",
+        "parameters": [
+          { "$ref": "#/components/parameters/FunctionId" },
+          { "$ref": "#/components/parameters/TenantHeader" }
+        ],
+        "responses": {
+          "204": { "description": "Function removed" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/functions/{id}/invoke": {
+      "post": {
+        "summary": "Invoke a function synchronously",
+        "operationId": "invokeFunction",
+        "parameters": [
+          { "$ref": "#/components/parameters/FunctionId" },
+          { "$ref": "#/components/parameters/TenantHeader" }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": { "schema": { "type": "object" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Invocation complete",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/InvokeResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "504": { "$ref": "#/components/responses/InvokeTimeout" }
+        }
+      }
+    },
+    "/functions/{id}/invoke-async": {
+      "post": {
+        "summary": "Invoke a function asynchronously",
+        "operationId": "invokeFunctionAsync",
+        "parameters": [
+          { "$ref": "#/components/parameters/FunctionId" },
+          { "$ref": "#/components/parameters/TenantHeader" }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": { "schema": { "type": "object" } }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Job accepted",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/InvokeAsyncResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" }
+        }
+      }
+    },
+    "/jobs/{id}": {
+      "get": {
+        "summary": "Poll an async-invocation job",
+        "operationId": "getJob",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/JobRecord" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Token from the TENSOR_WASM_API_TOKENS allowlist. Empty allowlist = dev mode (no auth required)."
+      }
+    },
+    "parameters": {
+      "FunctionId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string", "format": "uuid" }
+      },
+      "TenantHeader": {
+        "name": "X-TensorWasm-Tenant",
+        "in": "header",
+        "required": false,
+        "schema": { "type": "integer", "format": "int64", "minimum": 0 },
+        "description": "Tenant scope (u64). Defaults to 0 if absent. Required if TENSOR_WASM_API_REQUIRE_TENANT=1."
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Validation failure",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ApiErrorEnvelope" }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing or invalid bearer token",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ApiErrorEnvelope" }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Resource not found",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ApiErrorEnvelope" }
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "Body exceeded the 64 MiB cap"
+      },
+      "InternalError": {
+        "description": "Internal server error",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ApiErrorEnvelope" }
+          }
+        }
+      },
+      "InvokeTimeout": {
+        "description": "Invocation exceeded its deadline",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ApiErrorEnvelope" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Health": {
+        "type": "object",
+        "properties": { "status": { "type": "string", "enum": ["ok"] } },
+        "required": ["status"]
+      },
+      "CreateFunctionRequest": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "wasm_b64": { "type": "string", "description": "Base64-encoded Wasm module bytes." }
+        },
+        "required": ["name", "wasm_b64"]
+      },
+      "CreateFunctionResponse": {
+        "type": "object",
+        "properties": { "id": { "type": "string", "format": "uuid" } },
+        "required": ["id"]
+      },
+      "InvokeResult": {
+        "type": "object",
+        "properties": {
+          "function_id": { "type": "string", "format": "uuid" },
+          "result": { "type": "string" }
+        },
+        "required": ["function_id", "result"]
+      },
+      "InvokeAsyncResponse": {
+        "type": "object",
+        "properties": { "job_id": { "type": "string", "format": "uuid" } },
+        "required": ["job_id"]
+      },
+      "JobRecord": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "function_id": { "type": "string", "format": "uuid" },
+          "status": { "type": "string", "enum": ["pending", "completed", "failed"] },
+          "result": {
+            "description": "Present for completed (InvokeResult shape) and failed (ApiErrorBody shape) jobs."
+          },
+          "created_unix_ms": { "type": "integer", "format": "int64" }
+        },
+        "required": ["id", "function_id", "status", "created_unix_ms"]
+      },
+      "ApiErrorBody": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Stable machine-readable identifier.",
+            "enum": [
+              "invalid_json",
+              "invalid_name",
+              "invalid_base64",
+              "invalid_wasm",
+              "missing_export",
+              "missing_tenant",
+              "unauthorized",
+              "not_found",
+              "instance_not_found",
+              "body_too_large",
+              "invoke_timeout",
+              "wasmtime",
+              "internal"
+            ]
+          },
+          "message": { "type": "string", "description": "Human-readable description; not stable." }
+        },
+        "required": ["kind", "message"]
+      },
+      "ApiErrorEnvelope": {
+        "type": "object",
+        "properties": {
+          "error": { "$ref": "#/components/schemas/ApiErrorBody" }
+        },
+        "required": ["error"]
+      }
+    }
+  }
+}

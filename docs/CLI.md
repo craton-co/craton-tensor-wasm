@@ -1,26 +1,26 @@
-# Bali CLI
+# Craton TensorWasm CLI
 
-The `bali` binary is the developer-facing entry point to Project Bali. It wraps the same `bali-exec` engine that powers the server (see [API.md](./API.md)) so anything that runs against a deployed function can also be exercised locally without standing up infrastructure.
+The `tensor-wasm` binary is the developer-facing entry point to Craton TensorWasm. It wraps the same `tensor-wasm-exec` engine that powers the server (see [API.md](../crates/tensor-wasm-api/API.md)) so anything that runs against a deployed function can also be exercised locally without standing up infrastructure.
 
-The CLI is built as part of the workspace — see [BUILD.md](./BUILD.md) for prerequisites and feature flags. After `cargo build -p bali-cli` you will find the binary at `target/<profile>/bali` (`bali.exe` on Windows).
+The CLI is built as part of the workspace — see [BUILD.md](./BUILD.md) for prerequisites and feature flags. After `cargo build -p tensor-wasm-cli` you will find the binary at `target/<profile>/tensor-wasm` (`tensor-wasm.exe` on Windows).
 
 ```
-bali --help
+tensor-wasm --help
 ```
 
 prints the top-level synopsis. Every subcommand also supports `--help` for its own flags.
 
 ## Global behaviour
 
-- Logging is opt-in via `RUST_LOG`. The default level is `warn`; set `RUST_LOG=info` for routine progress or `RUST_LOG=bali_exec=debug` to drill into the executor.
+- Logging is configured via `TENSOR_WASM_LOG` (which uses `tracing-subscriber`'s `EnvFilter` directive syntax). The default level is `info`; set `TENSOR_WASM_LOG=tensor_wasm_exec=debug` to drill into the executor or `TENSOR_WASM_LOG=warn` to quiet routine progress.
 - Exit codes follow the Unix convention: `0` on success, non-zero on any user or runtime error. Errors print to stderr with a chained-cause summary courtesy of `anyhow`.
 - Arguments and outputs that involve guest data use JSON. Use `--args '[1.0, 2.0]'`-style values; non-array JSON is rejected with a clear message.
 
 ## Subcommands
 
-### `bali run <file.wasm> [--export <name>] [--args <json>]`
+### `tensor-wasm run <file.wasm> [--export <name>] [--args <json>]`
 
-Run a Wasm module locally against an in-process `BaliEngine`.
+Run a Wasm module locally against an in-process `TensorWasmEngine`.
 
 - `<file.wasm>`: path to the module to execute. Must exist and be readable.
 - `--export <name>`: function to invoke. Defaults to `main`.
@@ -29,31 +29,31 @@ Run a Wasm module locally against an in-process `BaliEngine`.
 Example:
 
 ```bash
-bali run tests/wasm-fixtures/vector_add.wasm --export add --args '[1.0, 2.0]'
+tensor-wasm run tests/wasm-fixtures/vector_add.wasm --export add --args '[1.0, 2.0]'
 ```
 
-On success the command prints `ok`. On failure the chained-cause stack is written to stderr and the process exits non-zero. This subcommand exercises the same compile-and-spawn path that `bali-api`'s `/v1/invoke` handler uses, so local runs are a faithful reproduction of server behaviour for the supported signatures.
+On success the command prints `ok`. On failure the chained-cause stack is written to stderr and the process exits non-zero. This subcommand exercises the same compile-and-spawn path that `tensor-wasm-api`'s `POST /functions/{id}/invoke` handler uses, so local runs are a faithful reproduction of server behaviour for the supported signatures.
 
-### `bali deploy <file.wasm> --server <url>`
+### `tensor-wasm deploy <file.wasm> --server <url>`
 
-Upload a Wasm module to a Bali server.
+Upload a Wasm module to a TensorWasm server.
 
 - `<file.wasm>`: path to the artefact to deploy.
 - `--server <url>`: base URL of the target server (e.g. `http://localhost:8080`). Must use `http://` or `https://` and have a non-empty host.
 
-In S18 this is a stub that validates inputs and prints the planned action — the wire-level multipart upload arrives in S20 once `reqwest` lands as a workspace dependency. Existing scripts can wire `bali deploy` into their pipelines today and pick up the real upload behaviour without flag changes.
+`tensor-wasm deploy` reads the Wasm bytes, base64-encodes them, and `POST`s them to `/functions` on the target server. On success the response includes the assigned function id, which is printed to stdout for piping into subsequent `tensor-wasm invoke` calls.
 
-### `bali invoke <id> --server <url> [--args <json>]`
+### `tensor-wasm invoke <id> --server <url> [--args <json>]`
 
 Call a deployed function by id.
 
-- `<id>`: the function identifier returned by an earlier `bali deploy`.
-- `--server <url>`: base URL of the target Bali server.
+- `<id>`: the function identifier returned by an earlier `tensor-wasm deploy`.
+- `--server <url>`: base URL of the target TensorWasm server.
 - `--args <json>`: arguments forwarded to the function as a JSON array.
 
-S18 stub: validates the URL and JSON, then prints the planned `POST /v1/invoke/{id}`. Real transport ships in S20.
+The subcommand issues a `POST /functions/{id}/invoke` against the server with the JSON body `{"export": "...", "args": [...]}` and prints the decoded response to stdout. Non-2xx responses surface as non-zero exits with the error body forwarded to stderr.
 
-### `bali bench <file.wasm> --export <name> [--n <iters>]`
+### `tensor-wasm bench <file.wasm> --export <name> [--n <iters>]`
 
 Benchmark a Wasm export locally and print a P50 / P95 / P99 / max latency table. Each iteration spawns a fresh instance, invokes the export, and terminates — so the reported numbers are end-to-end (including cold start), not steady-state.
 
@@ -64,7 +64,7 @@ Benchmark a Wasm export locally and print a P50 / P95 / P99 / max latency table.
 Example:
 
 ```bash
-bali bench tests/wasm-fixtures/vector_add.wasm --export add --n 1000
+tensor-wasm bench tests/wasm-fixtures/vector_add.wasm --export add --n 1000
 ```
 
 Sample output:
@@ -81,17 +81,17 @@ bench: export=`add` iterations=1000
 +-----------+--------------+
 ```
 
-Percentiles use the nearest-rank method on the sorted sample buffer. For a steady-state micro-benchmark (single instance, repeated calls), use the Criterion suite in `bali-bench` — see [BUILD.md](./BUILD.md).
+Percentiles use the nearest-rank method on the sorted sample buffer. For a steady-state micro-benchmark (single instance, repeated calls), use the Criterion suite in `tensor-wasm-bench` — see [BUILD.md](./BUILD.md).
 
-### `bali snapshot save <instance-id> <out.bali>`<br />`bali snapshot restore <in.bali>`
+### `tensor-wasm snapshot save <instance-id> <out.tensor-wasm>`<br />`tensor-wasm snapshot restore <in.tensor-wasm>`
 
-Capture or restore an instance's state from a `.bali` archive. Both subcommands are stubs in S18 — they print `todo` and exit 0 so downstream tooling can wire them up against a stable surface. The real implementation backs onto `bali-snapshot::Writer` / `Reader` and lands in S20 alongside the HTTP transport.
+Capture or restore an instance's state from a `.tensor-wasm` archive. `tensor-wasm snapshot save` writes the running instance's snapshot to the named output path via `tensor-wasm-snapshot::Writer`; `tensor-wasm snapshot restore` reads the archive, verifies the CRC32 integrity check, and rehydrates the instance through `tensor-wasm-snapshot::Reader`. Both commands surface validation errors (bad magic, version mismatch, CRC failure) as non-zero exits with a chained-cause message.
 
-### `bali metrics --server <url>`
+### `tensor-wasm metrics --server <url>`
 
-Fetch and pretty-print the `/metrics` endpoint of a Bali server. S18 stub validates the URL and prints the planned request; S20 swaps in a real HTTP fetch and (optionally) filters output to `bali_*` series.
+Fetch and pretty-print the `/metrics` endpoint of a TensorWasm server. The output is the raw Prometheus text exposition; pipe to `grep '^tensor_wasm_'` to filter to TensorWasm's own series.
 
-### `bali completions <shell>`
+### `tensor-wasm completions <shell>`
 
 Emit a shell-completion script on stdout for the named shell. Supported values match `clap_complete::Shell`: `bash`, `zsh`, `fish`, `elvish`, `powershell`.
 
@@ -99,25 +99,24 @@ Wire-up examples:
 
 ```bash
 # bash, system-wide
-bali completions bash | sudo tee /etc/bash_completion.d/bali
+tensor-wasm completions bash | sudo tee /etc/bash_completion.d/tensor-wasm
 
 # zsh, per-user
-bali completions zsh > ~/.zsh/completions/_bali
+tensor-wasm completions zsh > ~/.zsh/completions/_tensor-wasm
 
 # fish
-bali completions fish > ~/.config/fish/completions/bali.fish
+tensor-wasm completions fish > ~/.config/fish/completions/tensor-wasm.fish
 
 # PowerShell, current session
-bali completions powershell | Out-String | Invoke-Expression
+tensor-wasm completions powershell | Out-String | Invoke-Expression
 ```
 
 ## Cross-references
 
 - [BUILD.md](./BUILD.md) — workspace build matrix and feature flags (the CLI is part of `cargo build --workspace`).
-- [API.md](./API.md) — REST surface that `bali deploy` / `invoke` / `metrics` target.
-- [AUTO-OFFLOAD.md](./AUTO-OFFLOAD.md) — JIT path triggered by `bali run` and `bali bench` when a guest is auto-offload-eligible.
-- [WASMTIME-FORK.md](./WASMTIME-FORK.md) — wasmtime patch set the CLI depends on transitively via `bali-exec`.
+- [API.md](../crates/tensor-wasm-api/API.md) — REST surface that `tensor-wasm deploy` / `invoke` / `metrics` target.
+- [AUTO-OFFLOAD.md](./AUTO-OFFLOAD.md) — JIT path triggered by `tensor-wasm run` and `tensor-wasm bench` when a guest is auto-offload-eligible.
 
 ## Stability
 
-The CLI surface — subcommand names, required positional arguments, and the long-form flags listed above — is considered stable for the S18 → S20 window. Stub subcommands will gain real implementations without renaming flags. Short-form flag aliases and machine-readable output formats (`--json`) are not yet stable.
+The CLI surface — subcommand names, required positional arguments, and the long-form flags listed above — is considered stable for the v0.1 release window. Short-form flag aliases and machine-readable output formats (`--json`) are not yet stable.

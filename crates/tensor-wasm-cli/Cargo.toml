@@ -1,0 +1,40 @@
+[package]
+name = "tensor-wasm-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Developer CLI for Craton TensorWasm (`tensor-wasm run`, `tensor-wasm deploy`, `tensor-wasm invoke`, ...)."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm"
+readme = "README.md"
+keywords = ["wasm", "cli", "serverless", "wasmtime"]
+categories = ["command-line-utilities", "wasm"]
+publish = false
+
+[[bin]]
+name = "tensor-wasm"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+clap.workspace = true
+clap_complete.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+base64 = "0.22"
+tensor-wasm-core = { path = "../tensor-wasm-core" }
+tensor-wasm-exec = { path = "../tensor-wasm-exec" }
+
+[dev-dependencies]
+tempfile.workspace = true
+wat.workspace = true
+assert_cmd = "2"
+predicates = "3"
+insta = "=1.42"

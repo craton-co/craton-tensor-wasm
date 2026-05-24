@@ -1,16 +1,16 @@
 # Wasm Developer Guide
 
-This guide walks you through writing Wasm functions for **Bali**, from a trivial `add(a, b)` through hand-tuned GPU kernels and the auto-offload fast path. If you haven't already deployed a hello-world, start with [GETTING-STARTED.md](./GETTING-STARTED.md).
+This guide walks you through writing Wasm functions for **TensorWasm**, from a trivial `add(a, b)` through hand-tuned GPU kernels and the auto-offload fast path. If you haven't already deployed a hello-world, start with [GETTING-STARTED.md](./GETTING-STARTED.md).
 
 ## 1. The Wasm target
 
-Bali targets **`wasm32-wasip1`** — the WebAssembly System Interface, Preview 1. This is the modern, stable WASI target and the one you almost always want:
+Craton TensorWasm targets **`wasm32-wasip1`** — the WebAssembly System Interface, Preview 1. This is the modern, stable WASI target and the one you almost always want:
 
 ```sh
 rustup target add wasm32-wasip1
 ```
 
-`wasm32-wasip1` gives your guest access to a curated set of host imports: clocks, random, filesystem (sandboxed), and Bali's own `wasi:cuda/host@0.1.0` for GPU work.
+`wasm32-wasip1` gives your guest access to a curated set of host imports: clocks, random, filesystem (sandboxed), and TensorWasm's own `wasi:cuda/host@0.1.0` for GPU work.
 
 If you're writing a **pure compute kernel** with no I/O, you can also use `wasm32-unknown-unknown`. The output is smaller and the link is faster, but you lose all WASI imports — no clocks, no random, no GPU. Use it only when you genuinely need nothing from the host.
 
@@ -21,7 +21,7 @@ If you're writing a **pure compute kernel** with no I/O, you can also use `wasm3
 
 ## 2. Project layout
 
-A minimal `Cargo.toml` for a Bali function:
+A minimal `Cargo.toml` for a TensorWasm function:
 
 ```toml
 [package]
@@ -43,7 +43,7 @@ name = "my_fn"
 path = "src/main.rs"
 ```
 
-Bali handles both layouts; the choice is yours.
+TensorWasm handles both layouts; the choice is yours.
 
 ## 3. A minimal compute function
 
@@ -75,7 +75,7 @@ cargo build --target wasm32-wasip1 --release
 
 The resulting `.wasm` exports `add` and `run`. The host invokes them by name with the arguments you pass through the API.
 
-Pointers (`*const f32`, `*mut f32`) are **guest-relative offsets** into the Wasm linear memory — they're plain `i32` values at the ABI level. Bali's host translates them transparently.
+Pointers (`*const f32`, `*mut f32`) are **guest-relative offsets** into the Wasm linear memory — they're plain `i32` values at the ABI level. TensorWasm's host translates them transparently.
 
 ## 4. Using wasi-cuda for explicit GPU kernels
 
@@ -145,7 +145,7 @@ pub extern "C" fn vector_add_gpu(
 
 Three things to notice:
 
-1. **PTX is embedded** via `include_bytes!`. Bali caches loaded PTX per-instance keyed by hash, so repeat loads are free.
+1. **PTX is embedded** via `include_bytes!`. TensorWasm caches loaded PTX per-instance keyed by hash, so repeat loads are free.
 2. **`kernel_id` is opaque** — treat it as a handle. It's only valid within the lifetime of the current instance.
 3. **`wasi_cuda_sync()` is explicit** — kernel launches are asynchronous on the device. Always sync before reading results from host-shared memory.
 
@@ -153,7 +153,7 @@ If anything goes wrong, `wasi_cuda_last_error_len()` returns the length of a hos
 
 ## 5. Auto-offload (opt-in)
 
-Many compute loops don't need a hand-written PTX kernel — Bali can detect SIMD-shaped Rust loops and promote them to GPU kernels at instantiation time.
+Many compute loops don't need a hand-written PTX kernel — TensorWasm can detect SIMD-shaped Rust loops and promote them to GPU kernels at instantiation time.
 
 The promotion criteria, at a high level:
 
@@ -169,7 +169,7 @@ Auto-offload always has a **CPU fallback path** wired up; you'll never silently 
 
 Your Wasm guest sees its own **linear memory** — a flat `u8` buffer addressed by `i32` offsets. From the guest's point of view, that's the entire universe.
 
-Under the hood, Bali backs that linear memory with a **`UnifiedBuffer`** that's also mapped into the CUDA device's address space. When you call `wasi_cuda_launch` with a pointer, you're passing the host a **guest-relative offset**; the host translates that into the equivalent device pointer for the kernel. The kernel reads and writes the same bytes your guest sees — no explicit `cudaMemcpy` needed.
+Under the hood, TensorWasm backs that linear memory with a **`UnifiedBuffer`** that's also mapped into the CUDA device's address space. When you call `wasi_cuda_launch` with a pointer, you're passing the host a **guest-relative offset**; the host translates that into the equivalent device pointer for the kernel. The kernel reads and writes the same bytes your guest sees — no explicit `cudaMemcpy` needed.
 
 The practical implications:
 
@@ -190,10 +190,10 @@ Hitting any of these terminates the instance with a clear diagnostic; they're gu
 
 ## 8. Debugging
 
-The single most useful knob is `BALI_LOG`:
+The single most useful knob is `TENSOR_WASM_LOG`:
 
 ```sh
-BALI_LOG=debug cargo run --bin bali -- run my_fn.wasm
+TENSOR_WASM_LOG=debug cargo run --bin tensor-wasm -- run my_fn.wasm
 ```
 
 At `debug`, the host logs every WASI-CUDA call with its arguments — PTX hash on load, grid/block dims on launch, return codes on every call. At `trace`, you also get per-arg byte dumps.

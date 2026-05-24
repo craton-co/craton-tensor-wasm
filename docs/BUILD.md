@@ -1,6 +1,6 @@
-# Building Project Bali
+# Building Craton TensorWasm
 
-Bali is a Cargo workspace of 10 crates implementing a GPU-accelerated serverless Wasm runtime. It supports three build matrices: a full CUDA host (real hardware), a CUDA stub (for CI), and a no-CUDA configuration (quick local checks). This document walks through each, plus feature flags, tests, benchmarks, docs, and CI parity.
+Craton TensorWasm is a Cargo workspace of 10 crates implementing a GPU-accelerated serverless Wasm runtime. It supports three build matrices: a full CUDA host (real hardware), a CUDA stub (for CI), and a no-CUDA configuration (quick local checks). This document walks through each, plus feature flags, tests, benchmarks, docs, and CI parity.
 
 ## Prerequisites
 
@@ -10,13 +10,14 @@ Bali is a Cargo workspace of 10 crates implementing a GPU-accelerated serverless
 
 ## Build matrix
 
-| Config | Command | Active bali-mem feature | Use case |
+| Config | Command | Active tensor-wasm-mem feature | Use case |
 |---|---|---|---|
-| CUDA host | `cargo build --workspace` | `unified-memory` (default) | Real hardware — `cudaMallocManaged` |
-| CUDA stub (CI) | `cargo build --workspace` (stub `libcuda.so` on `LD_LIBRARY_PATH`) | `unified-memory` (default) | CI build/test — links against stub libs |
-| No-CUDA | `cargo build --workspace --no-default-features --features bali-mem/pinned-host-memory` | `pinned-host-memory` | Quick local check — no CUDA linkage at all |
+| No-CUDA (default) | `cargo build --workspace` | none (pure-Rust path) | Quick local check — no CUDA linkage at all |
+| CUDA host | `cargo build --workspace --features tensor-wasm-mem/unified-memory` | `unified-memory` | Real hardware — `cudaMallocManaged` |
+| CUDA stub (CI) | `cargo build --workspace --features tensor-wasm-mem/unified-memory` (stub `libcuda.so` on `LD_LIBRARY_PATH`) | `unified-memory` | CI build/test — links against stub libs |
+| No-CUDA pinned host | `cargo build --workspace --features tensor-wasm-mem/pinned-host-memory` | `pinned-host-memory` | Page-locked host buffers without CUDA linkage |
 
-Note: the `unified-memory` feature on `bali-mem` is on by default. It activates the `cust`-backed `UnifiedBuffer` and requires `libcuda.so` to be linkable — either real CUDA, or the empty stub libraries set up by the CI workflow. To build without any CUDA linkage, drop default features and opt into the `pinned-host-memory` fallback (a regular `Vec<u8>` aligned for page-locked access).
+Note: the workspace has **no default features** enabled. `tensor-wasm-mem` ships two opt-in features for memory backing — `unified-memory` (links `cust` and uses `cudaMallocManaged`, requires `libcuda.so` to be linkable) and `pinned-host-memory` (pure-Rust page-locked host buffer). Plain `cargo build --workspace` is the no-CUDA, no-linkage path and is the recommended quick check. Opt into one of the two memory features for production builds.
 
 ## Feature flag reference
 
@@ -24,24 +25,24 @@ Cross-crate feature taxonomy:
 
 | Crate | Flag | Default | Effect |
 |---|---|---|---|
-| bali-mem | `unified-memory` | yes | Links cust; uses `cudaMallocManaged`. |
-| bali-mem | `pinned-host-memory` | no | Pure-Rust pinned host buffers (fallback). |
-| bali-exec | `async-execution` | yes | Enables Wasmtime async; epoch-based interrupt. |
-| bali-wasi-gpu | `cuda` | no | Links cust for `wasi_cuda_*` host functions. |
-| bali-jit | `auto-offload` | no | Enables Cranelift→PTX JIT pipeline. |
-| bali-tenant | `mps` | no | Use NVIDIA MPS-shared context. |
-| bali-tenant | `cuda` | no | Use real CUDA contexts (vs in-process stub). |
+| tensor-wasm-mem | `unified-memory` | no | Links cust; uses `cudaMallocManaged`. |
+| tensor-wasm-mem | `pinned-host-memory` | no | Pure-Rust pinned host buffers (fallback). |
+| tensor-wasm-exec | `async-execution` | no | Enables Wasmtime async; epoch-based interrupt. |
+| tensor-wasm-wasi-gpu | `cuda` | no | Links cust for `wasi_cuda_*` host functions. |
+| tensor-wasm-jit | `auto-offload` | no | Enables Cranelift→PTX JIT pipeline. |
+| tensor-wasm-tenant | `mps` | no | Use NVIDIA MPS-shared context. |
+| tensor-wasm-tenant | `cuda` | no | Use real CUDA contexts (vs in-process stub). |
 
 ## Per-crate quick builds
 
 For per-crate work (faster iteration):
 
 ```sh
-cargo build -p bali-core
-cargo build -p bali-mem
-cargo build -p bali-mem --features unified-memory
-cargo build -p bali-jit --features auto-offload
-cargo build -p bali-api
+cargo build -p tensor-wasm-core
+cargo build -p tensor-wasm-mem
+cargo build -p tensor-wasm-mem --features unified-memory
+cargo build -p tensor-wasm-jit --features auto-offload
+cargo build -p tensor-wasm-api
 ```
 
 ## Tests
@@ -105,4 +106,4 @@ make ci
 ```
 
 ---
-_Updated for bali v0.1.0 (S2 of plan). See [ARCHITECTURE.md](../ARCHITECTURE.md) for the crate dependency graph._
+_Updated for tensor-wasm v0.1.0 (S2 of plan). See [ARCHITECTURE.md](../ARCHITECTURE.md) for the crate dependency graph._

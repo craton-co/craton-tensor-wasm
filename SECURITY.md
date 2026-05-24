@@ -1,4 +1,4 @@
-# Project Bali — Security Model
+# Craton TensorWasm — Security Model
 
 _Status: living document. First written for S6 of the implementation plan.
 This is the threat model and isolation strategy summary; the full security
@@ -6,7 +6,7 @@ audit lands in S21 (`docs/SECURITY-AUDIT.md`)._
 
 ## Threat model
 
-Bali runs untrusted Wasm modules that issue explicit (and, post-S14, implicit)
+Craton TensorWasm runs untrusted Wasm modules that issue explicit (and, post-S14, implicit)
 GPU kernel launches. The adversary controls the Wasm bytecode and the kernel
 PTX. We assume the host kernel, CUDA driver, and Wasmtime runtime are trusted.
 
@@ -27,7 +27,7 @@ PTX. We assume the host kernel, CUDA driver, and Wasmtime runtime are trusted.
 - Arbitrary Wasm bytecode (validated by Wasmtime).
 - Arbitrary PTX uploaded via `wasi_cuda_load_ptx` (validated by `ptxas`).
 - Crafted kernel launch parameters (grid, block, args).
-- Crafted snapshot files (S15) submitted to `nova restore`.
+- Crafted snapshot files (S15) submitted to `tensor-wasm restore`.
 - Crafted HTTP requests at the API gateway (S17).
 
 ### Out of scope (for v0.1.0)
@@ -41,19 +41,19 @@ PTX. We assume the host kernel, CUDA driver, and Wasmtime runtime are trusted.
 ### Memory isolation
 
 The Wasm linear memory is the only memory addressable by Wasm code, and it is
-backed by a per-instance `UnifiedBuffer` allocated by `BaliMemoryCreator`
-(`bali-mem/src/wasm_memory.rs`). Cross-instance memory access is prevented by:
+backed by a per-instance `UnifiedBuffer` allocated by `TensorWasmMemoryCreator`
+(`tensor-wasm-mem/src/wasm_memory.rs`). Cross-instance memory access is prevented by:
 
 1. **Wasmtime bounds checks.** Every Wasm load/store is bounds-checked at
    compile time by Cranelift against the declared linear-memory size. A
-   guest cannot synthesise an address outside its own `BaliLinearMemory`
+   guest cannot synthesise an address outside its own `TensorWasmLinearMemory`
    without the access being trapped by Wasmtime before it reaches CUDA.
-2. **Distinct allocations.** Every `BaliLinearMemory` owns a distinct
+2. **Distinct allocations.** Every `TensorWasmLinearMemory` owns a distinct
    `UnifiedBuffer` returned by a separate `cudaMallocManaged` call. There
    is no shared backing store between instances, so even a confused-deputy
    bug in the host couldn't cause one tenant's pointer to alias another's.
-3. **Per-tenant CUDA streams and contexts** (`bali-exec` streams in S7,
-   `bali-tenant` contexts in S16). Kernels submitted by different tenants
+3. **Per-tenant CUDA streams and contexts** (`tensor-wasm-exec` streams in S7,
+   `tensor-wasm-tenant` contexts in S16). Kernels submitted by different tenants
    execute on different streams (and, in `ContextIsolated` mode, different
    contexts), so an in-flight kernel cannot observe or corrupt a sibling
    tenant's launches.
@@ -66,7 +66,7 @@ migration machinery. Hardware-level page protection across tenants is the
 responsibility of NVIDIA MIG; see the "GPU L2 cache timing side channel"
 gap below for the MIG/MPS deployment story.
 
-The non-managed `PinnedHostBuffer` (`bali-mem/src/pinned_host.rs`), used on
+The non-managed `PinnedHostBuffer` (`tensor-wasm-mem/src/pinned_host.rs`), used on
 the `--no-default-features` host fallback path, **is** bracketed by OS-level
 guard pages. Each allocation reserves `[PROT_NONE | usable | PROT_NONE]`
 via the cross-platform `region` crate (`mprotect` on Linux/macOS,
@@ -81,25 +81,25 @@ managed memory remains unguarded for the reason above.
 caching the compiled module. `wasi_cuda_launch` clamps grid/block sizes to
 device-reported maxima and validates argument pointers fall within the
 caller's `UnifiedBuffer` range. Kernel timeouts (`KernelTimeout`, see
-`bali-core/src/error.rs`) are enforced via CUDA events plus an epoch timer.
+`tensor-wasm-core/src/error.rs`) are enforced via CUDA events plus an epoch timer.
 
 ### CPU/IO time
 
-Wasmtime epoch-based interruption (`bali-exec`, S7) terminates instances that
+Wasmtime epoch-based interruption (`tensor-wasm-exec`, S7) terminates instances that
 exceed their per-invocation deadline. The HTTP API gateway (S17) enforces
 per-tenant request rate limiting via `tower_governor`.
 
 ### Error containment
 
-`BaliError::TenantIsolationViolation` is raised when any of the above checks
+`TensorWasmError::TenantIsolationViolation` is raised when any of the above checks
 fail. The instance is terminated, its `UnifiedBuffer` freed, and the event is
-emitted as a tracing span (`bali_core::telemetry`) plus a metric increment
-(`bali_offload_fallback_total` is *not* the right one — S21 adds a dedicated
-`bali_isolation_violations_total` counter).
+emitted as a tracing span (`tensor_wasm_core::telemetry`) plus a metric increment
+(`tensor_wasm_offload_fallback_total` is *not* the right one — S21 adds a dedicated
+`tensor_wasm_isolation_violations_total` counter).
 
 ## IsolationLevel taxonomy
 
-The `bali_mem::isolation::IsolationLevel` enum (added in this session) makes
+The `tensor_wasm_mem::isolation::IsolationLevel` enum (added in this session) makes
 the operator's choice explicit:
 
 | Level | Streams | Contexts | Use case |
@@ -140,7 +140,26 @@ incident (see `docs/SECURITY-AUDIT.md`).
 S21 will fuzz the Wasm → Cranelift → host transition with `cargo-fuzz`. v0.1.0
 ships with Wasmtime's upstream fuzz corpus only.
 
+## Supported versions
+
+Only the `0.1.x` line receives security fixes during the preview window.
+Older pre-release tags are not supported. When `0.2.0` ships, this matrix
+will be revised; until then the table below applies.
+
+| Version | Supported |
+|---------|-----------|
+| 0.1.x   | Yes       |
+| < 0.1   | No        |
+
+## Authentication
+
+`tensor-wasm-api` supports bearer-token authentication via the `TENSOR_WASM_API_TOKENS`
+environment variable (a comma-separated list of accepted tokens). When set,
+all `/functions/*` and `/jobs/*` routes require `Authorization: Bearer <token>`;
+`/healthz` and `/metrics` remain unauthenticated. See
+[`crates/tensor-wasm-api/API.md`](crates/tensor-wasm-api/API.md) for the wire details.
+
 ## Reporting vulnerabilities
 
-Email `security@<project-host>` with a reproducer. We aim to triage within
+Email `security@craton.com.ar` with a reproducer. We aim to triage within
 2 business days. Coordinated disclosure preferred.

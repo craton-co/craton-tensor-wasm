@@ -1,0 +1,262 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
+
+//! [`TensorWasmEngine`] — a [`wasmtime::Engine`] wrapper preconfigured for TensorWasm.
+//!
+//! - Async execution (cooperative fuel via epoch-based interruption).
+//! - Custom [`MemoryCreator`](wasmtime::MemoryCreator) so linear memory is
+//!   carved from [`tensor_wasm_mem::wasm_memory::TensorWasmMemoryCreator`] (CUDA Unified
+//!   Memory on supported hosts; plain Box on others).
+//! - Epoch ticker: a background Tokio task increments the engine's epoch
+//!   counter every [`TensorWasmEngine::EPOCH_TICK`] so calls past their deadline are
+//!   interrupted promptly.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tensor_wasm_mem::wasm_memory::TensorWasmMemoryCreator;
+use tokio::task::JoinHandle;
+use wasmtime::{
+    Config, Engine, InstanceAllocationStrategy, MpkEnabled, PoolingAllocationConfig, Strategy,
+};
+
+/// Default epoch tick. Matches the plan's 10 ms cadence.
+const DEFAULT_EPOCH_TICK: Duration = Duration::from_millis(10);
+
+/// Selects the linear-memory backing strategy for the engine.
+///
+/// The two modes are mutually exclusive at the Wasmtime level:
+/// `with_host_memory` (used by [`MemoryBackend::UnifiedBuffer`]) cannot coexist
+/// with the pooling allocator (required by [`MemoryBackend::PoolingMpk`]).
+/// Operators pick the mode that fits their workload.
+#[derive(Debug, Clone, Default)]
+pub enum MemoryBackend {
+    /// Host-provided UnifiedBuffer-backed linear memory via `with_host_memory`.
+    /// Required for the GPU integration path (kernels read/write the same
+    /// allocation the Wasm guest sees). DOES NOT support MPK — Wasmtime's
+    /// pooling+MPK machinery is mutually exclusive with custom MemoryCreator.
+    #[default]
+    UnifiedBuffer,
+    /// Wasmtime's pooling allocator with MPK (memory protection keys).
+    /// Trades the GPU integration path for intra-process Wasm isolation via
+    /// CPU PKU. Suitable for CPU-only or batch-GPU workloads where kernel
+    /// launches don't share memory with Wasm at byte level.
+    PoolingMpk {
+        /// Maximum total memories tracked by the pooling allocator.
+        max_memories: u32,
+        /// Bytes per memory slot.
+        memory_bytes: usize,
+    },
+}
+
+/// Configuration knobs for the engine.
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    /// Maximum allocated linear memory per instance (bytes).
+    pub max_memory_bytes: usize,
+    /// Period between background `increment_epoch` ticks.
+    pub epoch_tick: Duration,
+    /// Compilation strategy. `Strategy::Cranelift` for production.
+    pub strategy: Strategy,
+    /// Enable Wasm component model.
+    pub component_model: bool,
+    /// Linear-memory backing strategy. See [`MemoryBackend`] for the
+    /// UnifiedBuffer vs PoolingMpk trade-off.
+    pub backend: MemoryBackend,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            max_memory_bytes: 256 * 1024 * 1024,
+            epoch_tick: DEFAULT_EPOCH_TICK,
+            strategy: Strategy::Cranelift,
+            component_model: true,
+            backend: MemoryBackend::default(),
+        }
+    }
+}
+
+/// A configured [`wasmtime::Engine`] plus the background epoch ticker that
+/// drives interruption.
+pub struct TensorWasmEngine {
+    engine: Engine,
+    ticker_handle: Option<JoinHandle<()>>,
+    config: EngineConfig,
+}
+
+impl TensorWasmEngine {
+    /// Default epoch tick interval.
+    pub const EPOCH_TICK: Duration = DEFAULT_EPOCH_TICK;
+
+    /// Construct an engine with default configuration.
+    pub fn new() -> Result<Self, wasmtime::Error> {
+        Self::with_config(EngineConfig::default())
+    }
+
+    /// Construct an engine with explicit configuration.
+    pub fn with_config(cfg: EngineConfig) -> Result<Self, wasmtime::Error> {
+        let mut wt_cfg = Config::new();
+        wt_cfg.async_support(true);
+        wt_cfg.epoch_interruption(true);
+        wt_cfg.consume_fuel(false);
+        wt_cfg.wasm_component_model(cfg.component_model);
+        wt_cfg.strategy(cfg.strategy);
+
+        match cfg.backend {
+            MemoryBackend::UnifiedBuffer => {
+                let memory_creator = Arc::new(TensorWasmMemoryCreator::default());
+                wt_cfg.with_host_memory(memory_creator);
+                wt_cfg.guard_before_linear_memory(false);
+                wt_cfg.static_memory_maximum_size(0);
+                wt_cfg.dynamic_memory_guard_size(0);
+            }
+            MemoryBackend::PoolingMpk {
+                max_memories,
+                memory_bytes,
+            } => {
+                // Pooling owns the memory backing — do NOT install a host
+                // memory creator, and leave Wasmtime's default guard sizes
+                // in place (the pooling allocator depends on them).
+                let mut pooling = PoolingAllocationConfig::default();
+                pooling.total_memories(max_memories);
+                pooling.max_memory_size(memory_bytes);
+                pooling.memory_protection_keys(MpkEnabled::Auto);
+                wt_cfg.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
+            }
+        }
+
+        let engine = Engine::new(&wt_cfg)?;
+        Ok(Self {
+            engine,
+            ticker_handle: None,
+            config: cfg,
+        })
+    }
+
+    /// Borrow the underlying wasmtime Engine. Cheap (it's `Arc`-shaped internally).
+    pub fn inner(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// Borrow the engine config used at construction.
+    pub fn config(&self) -> &EngineConfig {
+        &self.config
+    }
+
+    /// Spawn a background Tokio task that periodically increments the engine
+    /// epoch counter. Must be called from inside a Tokio runtime.
+    ///
+    /// Idempotent: if a ticker is already running this is a no-op.
+    pub fn spawn_epoch_ticker(&mut self) {
+        if self.ticker_handle.is_some() {
+            return;
+        }
+        let engine = self.engine.clone();
+        let tick = self.config.epoch_tick;
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tick).await;
+                engine.increment_epoch();
+                // No per-tick trace event: at the default 10 ms cadence this
+                // floods structured-logging backends. Operators wanting to
+                // verify the ticker is alive should look at engine span
+                // counts or use `TensorWasmEngine::tick` from a probe.
+            }
+        });
+        self.ticker_handle = Some(handle);
+    }
+
+    /// Stop the epoch ticker if one is running.
+    pub fn stop_epoch_ticker(&mut self) {
+        if let Some(h) = self.ticker_handle.take() {
+            h.abort();
+        }
+    }
+
+    /// Increment the epoch once manually. Useful for tests that do not want
+    /// to wait for the background ticker.
+    pub fn tick(&self) {
+        self.engine.increment_epoch();
+    }
+}
+
+impl Drop for TensorWasmEngine {
+    fn drop(&mut self) {
+        self.stop_epoch_ticker();
+    }
+}
+
+impl Default for TensorWasmEngine {
+    fn default() -> Self {
+        Self::new().expect("default TensorWasmEngine construction")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn engine_constructs() {
+        let _engine = TensorWasmEngine::new().expect("construct");
+    }
+
+    #[tokio::test]
+    async fn ticker_is_idempotent() {
+        let mut engine = TensorWasmEngine::new().unwrap();
+        engine.spawn_epoch_ticker();
+        engine.spawn_epoch_ticker();
+        engine.stop_epoch_ticker();
+        engine.stop_epoch_ticker();
+    }
+
+    #[tokio::test]
+    async fn manual_tick() {
+        let engine = TensorWasmEngine::new().unwrap();
+        engine.tick();
+        engine.tick();
+        // No assertions on the engine's internal epoch counter — wasmtime does
+        // not expose it. We only verify the call doesn't panic.
+    }
+
+    #[test]
+    fn default_config_values() {
+        let c = EngineConfig::default();
+        assert_eq!(c.max_memory_bytes, 256 * 1024 * 1024);
+        assert_eq!(c.epoch_tick, Duration::from_millis(10));
+        assert!(c.component_model);
+        assert!(matches!(c.backend, MemoryBackend::UnifiedBuffer));
+    }
+
+    #[tokio::test]
+    async fn engine_constructs_with_unified_backend() {
+        let cfg = EngineConfig {
+            backend: MemoryBackend::UnifiedBuffer,
+            ..EngineConfig::default()
+        };
+        let engine = TensorWasmEngine::with_config(cfg);
+        assert!(
+            engine.is_ok(),
+            "engine should construct: {:?}",
+            engine.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_constructs_with_pooling_mpk_backend() {
+        let cfg = EngineConfig {
+            backend: MemoryBackend::PoolingMpk {
+                max_memories: 32,
+                memory_bytes: 64 * 1024,
+            },
+            ..EngineConfig::default()
+        };
+        let engine = TensorWasmEngine::with_config(cfg);
+        assert!(
+            engine.is_ok(),
+            "engine should construct: {:?}",
+            engine.err()
+        );
+    }
+}

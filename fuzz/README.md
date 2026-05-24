@@ -1,13 +1,13 @@
-# bali-fuzz
+# tensor-wasm-fuzz
 
-`cargo-fuzz` targets for Project Bali. Three targets, each running through
+`cargo-fuzz` targets for Craton TensorWasm. Three targets, each running through
 `libfuzzer-sys` against the corresponding subsystem.
 
 | Target | Subsystem | Invariant |
 |---|---|---|
 | `fuzz_wasm_compile` | wasmtime::Module::from_binary | host process never crashes on arbitrary bytes |
-| `fuzz_ptx_emit` | bali-jit ptx_emit::emit | emitter never panics on arbitrary blueprints |
-| `fuzz_snapshot_restore` | bali-snapshot SnapshotReader::restore | restore returns Err, not panic, on malformed input |
+| `fuzz_ptx_emit` | tensor-wasm-jit ptx_emit::emit | emitter never panics on arbitrary blueprints |
+| `fuzz_snapshot_restore` | tensor-wasm-snapshot SnapshotReader::restore | restore returns Err, not panic, on malformed input |
 
 ## Running locally
 

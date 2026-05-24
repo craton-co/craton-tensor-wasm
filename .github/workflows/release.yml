@@ -32,43 +32,92 @@ jobs:
           echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
       - name: cargo publish --dry-run (every member)
         run: |
-          for crate in bali-core bali-mem bali-exec bali-wasi-gpu bali-jit bali-snapshot bali-tenant bali-api bali-cli; do
+          for crate in tensor-wasm-core tensor-wasm-mem tensor-wasm-exec tensor-wasm-wasi-gpu tensor-wasm-jit tensor-wasm-snapshot tensor-wasm-tenant tensor-wasm-api tensor-wasm-cli; do
             echo "::group::cargo publish --dry-run -p $crate"
             cargo publish --dry-run -p "$crate" --allow-dirty
             echo "::endgroup::"
           done
 
-  linux-binary:
-    runs-on: ubuntu-latest
+  release-binary:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            bin: tensor-wasm
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            bin: tensor-wasm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            bin: tensor-wasm.exe
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-03-15
+          targets: ${{ matrix.target }}
           components: rustfmt, clippy, rust-src, llvm-tools-preview
+
       - uses: Swatinem/rust-cache@v2
-      - name: Install CUDA stub libraries
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install CUDA stub libraries (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo mkdir -p /usr/local/cuda/lib64
           sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
           echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
           echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+
       - name: Build release binary
-        run: cargo build --release --bin bali
-      - name: Package
+        run: cargo build -p tensor-wasm-cli --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
           mkdir -p dist
           VERSION="${GITHUB_REF#refs/tags/v}"
-          tar -C target/release -czf "dist/bali-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" bali
-          (cd dist && sha256sum "bali-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" > "bali-${VERSION}-x86_64-unknown-linux-gnu.tar.gz.sha256")
+          if [ "$VERSION" = "$GITHUB_REF" ]; then
+            # Not a tag build (workflow_dispatch). Use commit SHA so artifacts
+            # are still uniquely named.
+            VERSION="${GITHUB_SHA::8}"
+          fi
+          ARCHIVE="tensor-wasm-${VERSION}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${ARCHIVE}" "${{ matrix.bin }}"
+          (cd dist && shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256")
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $version = $env:GITHUB_REF -replace '^refs/tags/v', ''
+          if ($version -eq $env:GITHUB_REF) {
+            $version = $env:GITHUB_SHA.Substring(0, 8)
+          }
+          $archive = "tensor-wasm-$version-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin }}" -DestinationPath "dist/$archive"
+          $hash = (Get-FileHash "dist/$archive" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Out-File -FilePath "dist/$archive.sha256" -Encoding ascii
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bali-linux-x86_64
+          name: tensor-wasm-${{ matrix.target }}
           path: dist/
 
   github-release:
-    needs: [publish-dry-run, linux-binary]
+    needs: [publish-dry-run, release-binary]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -77,13 +126,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: bali-linux-x86_64
+          pattern: tensor-wasm-*
           path: dist/
+          merge-multiple: true
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
           body_path: CHANGELOG.md
           generate_release_notes: false

@@ -1,0 +1,22 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+assertion_line: 65
+expression: "help(&[\"snapshot\", \"restore\", \"--help\"])"
+---
+Restore an instance from a `.tensor-wasm` archive via the API
+
+Usage: tensor-wasm snapshot restore [OPTIONS] --input <INPUT> --as-instance <AS_INSTANCE> --server <SERVER>
+
+Options:
+      --input <INPUT>
+          Path to the `.tensor-wasm` archive to upload
+      --tenant <TENANT>
+          Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
+      --as-instance <AS_INSTANCE>
+          Identifier to assign to the restored instance
+      --server <SERVER>
+          Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
+      --max-decompressed <MAX_DECOMPRESSED>
+          Maximum decompressed snapshot size we'll accept, in bytes. Mirrors the server-side cap so the CLI rejects oversized archives without a pointless upload [default: 268435456]
+  -h, --help
+          Print help

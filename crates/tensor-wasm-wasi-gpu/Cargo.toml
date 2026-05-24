@@ -1,0 +1,43 @@
+[package]
+name = "tensor-wasm-wasi-gpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "`wasi-cuda` host bridge — explicit GPU kernel launch API for Wasm modules."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-wasi-gpu"
+readme = "README.md"
+keywords = ["wasm", "wasi", "cuda", "gpu", "wasmtime"]
+categories = ["wasm", "api-bindings"]
+
+[lib]
+
+[dependencies]
+async-trait.workspace = true
+tensor-wasm-core = { path = "../tensor-wasm-core" }
+tensor-wasm-mem = { path = "../tensor-wasm-mem" }
+dashmap.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+wasmtime.workspace = true
+cust = { workspace = true, optional = true }
+
+[dev-dependencies]
+wat.workspace = true
+tokio-test.workspace = true
+tempfile.workspace = true
+
+[features]
+default = []
+cuda = ["dep:cust"]
+
+# docs.rs build: deliberately disable `cuda` so the CUDA driver libs aren't
+# required on the docs.rs builders. The published docs cover the no-CUDA
+# stubs and the public ABI surface.
+[package.metadata.docs.rs]
+features = []

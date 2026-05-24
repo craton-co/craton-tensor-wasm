@@ -1,0 +1,17 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+assertion_line: 45
+expression: "help(&[\"bench\", \"--help\"])"
+---
+Benchmark local invocation latency (P50/P95/P99/max)
+
+Usage: tensor-wasm bench [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  Path to the `.wasm` file to benchmark
+
+Options:
+      --export <EXPORT>  Name of the export to call on each iteration [default: main]
+      --tenant <TENANT>  Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
+      --n <N>            Number of iterations to run. Must be >= 1 [default: 100]
+  -h, --help             Print help

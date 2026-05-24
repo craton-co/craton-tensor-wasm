@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
+//
+// wasi:cuda/host@0.1.0 — TensorWasm's explicit GPU kernel-launch API for Wasm
+// guests. The on-the-wire ABI is currently the function-import form
+// described in `crates/tensor-wasm-wasi-gpu/src/abi.rs`; this WIT is the
+// Component-Model equivalent and is the authoritative description of the
+// interface for tooling that consumes WIT (wit-bindgen, jco, etc.).
+//
+// Keep this file and `crates/tensor-wasm-wasi-gpu/src/abi.rs` in lockstep — every
+// constant, every function signature, every error code must match.
+
+package wasi:cuda@0.1.0;
+
+interface host {
+  /// Negative i32 error codes returned by every host call. Numeric values
+  /// match `tensor_wasm_wasi_gpu::abi::AbiError`.
+  enum abi-error {
+    /// CUDA is not available on this host (no toolkit / no driver).
+    not-available,
+    /// A pointer / length pair pointed outside the caller's linear memory.
+    invalid-pointer,
+    /// Wasi-cuda was passed a kernel-id that is not registered (or that
+    /// belongs to another instance).
+    invalid-kernel,
+    /// `load-ptx` was called with bytes that ptxas rejected.
+    malformed-ptx,
+    /// The CUDA driver returned an error during a launch / sync.
+    launch-failed,
+    /// Resource limits (max kernels per instance, etc.) were exceeded.
+    quota-exceeded,
+    /// Generic internal error.
+    internal,
+    /// Launch grid / block dimensions exceeded hardware caps or were
+    /// non-positive.
+    invalid-dimensions,
+    /// Caller passed a structurally invalid argument that is neither a
+    /// memory-region issue nor a dimensions issue.
+    invalid-args,
+    /// Caller passed a well-formed, in-bounds kernel-argument buffer,
+    /// but the host's dynamic-argv marshalling lane is not yet wired
+    /// through `cuLaunchKernel`. v0.1.0 limitation; see
+    /// `docs/RISKS.md` (Kernel-args marshalling, v0.1.0). Distinct
+    /// from `invalid-args` so guests can tell "your input is fine but
+    /// unsupported" from "your input is malformed."
+    kernel-args-unsupported,
+  }
+
+  /// Opaque handle to a compiled PTX kernel. Scoped to the calling
+  /// instance — reusing a `kernel-id` across instances is rejected with
+  /// `invalid-kernel`.
+  type kernel-id = u64;
+
+  /// Compile a PTX module and return a handle.
+  ///
+  /// `ptx` is the full PTX source, `entry` is the name of the kernel
+  /// entry point symbol inside that source.
+  ///
+  /// Hard caps enforced by the host (see `tensor_wasm_wasi_gpu::abi`):
+  ///   * `MAX_PTX_BYTES` = 8 MiB per call.
+  ///   * `MAX_KERNELS_PER_INSTANCE` = 256 live kernels per instance.
+  ///   * `MAX_TOTAL_PTX_BYTES` = 64 * `MAX_PTX_BYTES` aggregate per
+  ///     instance.
+  /// Exceeding any cap returns `quota-exceeded`.
+  load-ptx: func(ptx: list<u8>, entry: string) -> result<kernel-id, abi-error>;
+
+  /// Launch a previously-loaded kernel.
+  ///
+  /// Grid and block dimensions must be positive and obey the hardware
+  /// caps:
+  ///   * each block dimension <= 1024;
+  ///   * `block-x * block-y * block-z` <= 1024 (threads per block);
+  ///   * each grid dimension <= 2^31 - 1.
+  /// Out-of-range values return `invalid-dimensions` before any driver
+  /// call is made.
+  ///
+  /// `args` is an opaque byte blob containing the kernel's parameter
+  /// struct, packed by the guest to match the PTX `.param` block.
+  ///
+  /// **v0.1.0 limitation:** only zero-argument launches reach the CUDA
+  /// driver. A non-empty `args` list is bounds-checked (so pointer
+  /// bugs still surface as `invalid-pointer`) but then rejected with
+  /// `kernel-args-unsupported` — `cust 0.3.x`'s `launch!` macro takes
+  /// statically-typed parameters, so dynamic argv marshalling needs
+  /// the BAL-422 effort that drops to raw `cuLaunchKernel`. Guests
+  /// that need parameters today must track BAL-422; see
+  /// `docs/RISKS.md` for the contract.
+  launch: func(
+    kernel: kernel-id,
+    grid: tuple<u32, u32, u32>,
+    block: tuple<u32, u32, u32>,
+    shared-mem: u32,
+    args: list<u8>,
+  ) -> result<_, abi-error>;
+
+  /// Block until all outstanding GPU work on the calling context has
+  /// finished. On no-CUDA hosts this is a no-op.
+  sync: func() -> result<_, abi-error>;
+
+  /// Most recent error message recorded by any wasi-cuda call on this
+  /// instance, as a UTF-8 string. Empty string means no error recorded.
+  ///
+  /// (The raw ABI splits this into `last-error-len` + `last-error-copy`
+  /// to fit the i32-only function-import shape — the Component-Model
+  /// binding can use a single `string` return because the canonical ABI
+  /// already handles the length-prefix.)
+  last-error: func() -> string;
+}
+
+world tensor-wasm-wasi-cuda {
+  import host;
+}
