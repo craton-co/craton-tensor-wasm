@@ -86,7 +86,11 @@ fn bench_snapshot_restore(c: &mut Criterion) {
                 registers: &regs,
             })
             .expect("pre-capture");
-        let reader = SnapshotReader::new();
+        // Bench snapshots are trusted (constructed in-process), so lift the
+        // 256 MiB decompression-bomb guard to cover the 512 MiB top size.
+        // The override is the canonical escape hatch documented in
+        // `SnapshotReader::with_max_decompressed`.
+        let reader = SnapshotReader::new().with_max_decompressed(size + 4096);
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
             &captured,

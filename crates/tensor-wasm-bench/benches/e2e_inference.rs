@@ -22,8 +22,10 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn wasm_header_b64() -> String {
-    // Wasm magic + version + a zero byte so length >= 8 and head matches.
-    let bytes = [0x00u8, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00];
+    // The 8-byte empty module: Wasm magic + version, no sections. This is
+    // structurally valid per `wasmparser::validate`, which the create-function
+    // route runs at deploy time.
+    let bytes = [0x00u8, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
