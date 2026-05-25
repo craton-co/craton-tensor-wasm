@@ -175,7 +175,7 @@ impl std::future::Future for DispatchFuture {
     type Output = ();
     fn poll(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         // Enter the dispatch span for the duration of this poll so the
         // trace stays attached to the originating `wasi_cuda.launch`
@@ -190,30 +190,32 @@ impl std::future::Future for DispatchFuture {
         #[cfg(feature = "cuda")]
         {
             if let Some(ev) = self.event.as_ref() {
-                // `query()` returns `Ok(())` when the event has completed
-                // and a recoverable error when it has not. On any other
-                // error we treat the dispatch as finished so the
-                // wasmtime fiber doesn't hang forever — the host's
-                // launch path will surface the real error to the guest
-                // separately via `last_error`.
                 // cust 0.3.2's Event::query returns CudaResult<EventStatus>;
                 // the enum is { Ready, NotReady }. EventStatus::Ready means the
                 // GPU work has completed (equivalent to Event::synchronize for
                 // Unified Memory per the cust docs).
+                //
+                // On NotReady / Err we DO NOT call `waker.wake_by_ref()`
+                // immediately — that creates a busy-spin loop that pins
+                // the Tokio worker at 100% CPU until the event finishes
+                // (every poll re-wakes synchronously). Instead, we clone
+                // the waker, spawn a 50 µs sleep, and have THAT task wake
+                // us up. The worker is free to schedule other tasks in
+                // the meantime. 50 µs is a reasonable poll interval for
+                // GPU events: most kernels take longer than that, so we
+                // miss at most one quantum of post-completion latency,
+                // and the worker spends ≈ 50 µs / quantum doing other
+                // work instead of spinning. v0.4 cuda-async work (see
+                // RFC 0001 + F3 bench scaffold) replaces this with a
+                // proper `cuStreamAddCallback`-driven waker.
                 return match ev.query() {
                     Ok(cust::event::EventStatus::Ready) => std::task::Poll::Ready(()),
-                    Ok(cust::event::EventStatus::NotReady) => {
-                        _cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    }
-                    Err(_e) => {
-                        // Not done yet — wake immediately so the
-                        // executor re-polls. This is a busy-poll but
-                        // matches the existing `spawn_blocking`-driven
-                        // synchronization the launch path uses; the
-                        // dispatch future is currently advisory and not
-                        // on the launch critical path.
-                        _cx.waker().wake_by_ref();
+                    Ok(cust::event::EventStatus::NotReady) | Err(_) => {
+                        let waker = cx.waker().clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                            waker.wake();
+                        });
                         std::task::Poll::Pending
                     }
                 };
