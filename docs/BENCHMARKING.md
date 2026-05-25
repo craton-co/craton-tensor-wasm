@@ -194,7 +194,30 @@ your competitor harness or the comparison is meaningless:
   retried on a quieter host before publishing.
 - **CV target.** Coefficient of variation < 5 %. Above 5 %, fix the
   noise source (background process, thermal throttling, page-cache
-  warmth) before publishing.
+  warmth) before publishing. The repo ships
+  [`scripts/run-quiet-bench.sh`](../scripts/run-quiet-bench.sh)
+  (+ a `.ps1` Windows equivalent) that raises the Criterion
+  sample-count from 100 to 500, pins the CPU governor to performance,
+  and drops the page cache between groups. It's the "usable middle
+  ground" — full publishable noise reduction also requires the
+  isolcpus / Turbo / SMT / Defender steps listed in "Hardware and OS
+  normalization" below.
+
+  **Disclosure for committed bench numbers (audit Problem #9).** The
+  `bench-results/baseline.json`, `bench-results/tail-latency.json`,
+  and `bench-results/dispatch-future-backends.json` numbers were
+  captured on a developer Windows 11 host with Defender running, IDE
+  open, and other ambient processes — **CV typically > 5 %** per
+  metric. They are committed as **noise-floor measurements suitable
+  for regression-gate tripping** (a 2× drift will fire even at this
+  noise level) but NOT as the numbers to quote in an external
+  comparison. The S22 self-hosted runner (audit Problem #8 →
+  [`.github/workflows/cuda.yml`](../.github/workflows/cuda.yml) +
+  [`docs/runbooks/self-hosted-cuda-runner.md`](runbooks/self-hosted-cuda-runner.md))
+  will produce the publication-grade numbers once it lands; until
+  then operators evaluating TensorWasm should run the quiet script
+  on their own hardware and compare with their own production
+  baseline.
 - **Distribution shape.** Report P50, P95, P99 — **never just mean**.
   Latency distributions in async runtimes are long-tailed; the mean
   hides the tail.
