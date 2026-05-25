@@ -261,6 +261,17 @@ impl ApiError {
         }
     }
 
+    /// Construct a `403 Forbidden` with the given `kind` and `message`. Used
+    /// by per-tenant authorization to return `kind = "tenant_scope_denied"`
+    /// when the caller's bearer token does not cover the bound tenant.
+    pub fn forbidden(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            kind: kind.into(),
+            message: message.into(),
+        }
+    }
+
     /// Construct a `404 Not Found` with `kind = "not_found"`.
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
@@ -504,8 +515,18 @@ pub async fn invoke_function(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<crate::rate_limit::AuthContext>>,
     _args: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    // Tenant-scope check: reject before doing any per-tenant work (function
+    // lookup, executor spawn, …). Absent AuthContext only happens in
+    // configurations that bypass `bearer_auth` entirely (e.g. ad-hoc test
+    // routers); we degrade to dev-mode wildcard there.
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        ctx.authorize_tenant(tenant)?;
+    }
+
     // Snapshot the Wasm bytes under the DashMap shard lock, then drop the
     // guard before we hit any `.await`. `Arc::clone` is a single refcount
     // bump regardless of payload size.
@@ -514,7 +535,6 @@ pub async fn invoke_function(
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
 
-    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
     let value = run_invoke(&state.executor, &wasm_bytes, tenant, id).await?;
     Ok(Json(value))
 }
@@ -530,13 +550,17 @@ pub async fn invoke_function_async(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<crate::rate_limit::AuthContext>>,
     _args: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        ctx.authorize_tenant(tenant)?;
+    }
     let wasm_bytes = match state.functions.get(&id) {
         Some(entry) => Arc::clone(&entry.value().wasm_bytes),
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
-    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
 
     let job_id = Uuid::new_v4();
     state.jobs.insert(

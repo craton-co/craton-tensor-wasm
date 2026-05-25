@@ -9,6 +9,7 @@
 //! makes them easy to reuse in integration tests and benchmarks where a custom
 //! stack is desired.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,8 @@ use tower::limit::ConcurrencyLimitLayer;
 use tower_http::classify::{ServerErrorsAsFailures, SharedClassifier};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
+
+use crate::token_scope::{parse_tokens_env, TokenScope};
 
 /// Default per-request timeout used by [`crate::server::build_router`].
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -87,56 +90,102 @@ pub fn body_limit_layer(max_bytes: usize) -> axum::extract::DefaultBodyLimit {
 /// Snapshot of authentication configuration loaded from the process
 /// environment at server start. Cloned cheaply into each request.
 ///
-/// `tokens` is empty in dev mode (no `TENSOR_WASM_API_TOKENS` set or env empty),
-/// in which case [`bearer_auth`] passes every request through unchecked.
+/// `scopes` is empty in dev mode (no `TENSOR_WASM_API_TOKENS` set or env
+/// empty), in which case [`bearer_auth`] passes every request through
+/// unchecked. Otherwise each allowlisted bearer token maps to the
+/// [`TokenScope`] that came out of [`parse_tokens_env`] at startup.
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
-    /// Allowlisted bearer tokens. Empty = dev mode (pass-through).
-    pub tokens: Arc<Vec<String>>,
+    /// Allowlisted bearer tokens → tenant scope. Empty = dev mode
+    /// (pass-through with startup warning).
+    pub scopes: Arc<HashMap<String, TokenScope>>,
+    /// Count of entries that used the legacy bare-token shape. The server
+    /// emits a single deprecation warning at startup if this is nonzero.
+    pub deprecated_count: usize,
 }
 
 impl AuthConfig {
-    /// Load the allowlist from `$TENSOR_WASM_API_TOKENS`. Unset or empty means
-    /// "no auth" (dev mode). Logs a one-shot warning in dev mode.
+    /// Load the allowlist from `$TENSOR_WASM_API_TOKENS`. Unset or empty
+    /// means "no auth" (dev mode). Logs a one-shot warning in dev mode and
+    /// a one-shot deprecation warning whenever any legacy bare entries were
+    /// observed.
     pub fn from_env() -> Self {
         let raw = std::env::var(ENV_API_TOKENS).unwrap_or_default();
-        let tokens: Vec<String> = raw
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect();
-        if tokens.is_empty() {
+        let parsed = parse_tokens_env(&raw);
+        if parsed.token_scopes.is_empty() {
             tracing::warn!(
                 target: "tensor_wasm_api::middleware",
                 env = ENV_API_TOKENS,
                 "TENSOR_WASM_API_TOKENS empty; API accepts all requests (dev mode)",
             );
         }
+        if parsed.deprecated_count > 0 {
+            tracing::warn!(
+                target: "tensor_wasm_api::middleware",
+                env = ENV_API_TOKENS,
+                count = parsed.deprecated_count,
+                "bare bearer tokens in {} are deprecated; switch to \
+                 `token:tenant=...` (or `token:tenant=*` for the current \
+                 wildcard behaviour) — bare entries are scheduled for \
+                 removal in v1.0",
+                ENV_API_TOKENS,
+            );
+        }
         Self {
-            tokens: Arc::new(tokens),
+            scopes: Arc::new(parsed.token_scopes),
+            deprecated_count: parsed.deprecated_count,
         }
     }
 
-    /// Construct directly from an explicit allowlist. Used by tests.
+    /// Construct directly from an explicit allowlist. Each token gets the
+    /// wildcard scope — preserves backwards-compatible behaviour for tests
+    /// that pre-date scoped tokens. For tests that need a non-wildcard
+    /// scope, build the map directly or use [`AuthConfig::from_scopes`].
     pub fn from_tokens<I, S>(iter: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let mut scopes: HashMap<String, TokenScope> = HashMap::new();
+        for s in iter {
+            scopes.insert(s.into(), TokenScope::all());
+        }
         Self {
-            tokens: Arc::new(iter.into_iter().map(Into::into).collect()),
+            scopes: Arc::new(scopes),
+            deprecated_count: 0,
+        }
+    }
+
+    /// Construct from an explicit token → scope map. Used by integration
+    /// tests that drive scoped-token paths directly.
+    pub fn from_scopes<I, S>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = (S, TokenScope)>,
+        S: Into<String>,
+    {
+        let mut scopes: HashMap<String, TokenScope> = HashMap::new();
+        for (k, v) in iter {
+            scopes.insert(k.into(), v);
+        }
+        Self {
+            scopes: Arc::new(scopes),
+            deprecated_count: 0,
         }
     }
 
     /// `true` if the supplied bearer token is allowlisted.
     pub fn accepts(&self, token: &str) -> bool {
-        self.tokens.iter().any(|t| t == token)
+        self.scopes.contains_key(token)
+    }
+
+    /// Resolve `token` to its [`TokenScope`] if allowlisted.
+    pub fn scope_for(&self, token: &str) -> Option<&TokenScope> {
+        self.scopes.get(token)
     }
 
     /// `true` if no allowlist was configured (dev mode).
     pub fn is_dev_mode(&self) -> bool {
-        self.tokens.is_empty()
+        self.scopes.is_empty()
     }
 }
 
@@ -206,16 +255,19 @@ pub async fn bearer_auth(mut req: Request, next: Next) -> Response {
         }
     };
 
-    if !cfg.accepts(&token) {
-        return envelope(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "bearer token is not allowlisted",
-        );
-    }
+    let scope = match cfg.scope_for(&token) {
+        Some(s) => s.clone(),
+        None => {
+            return envelope(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "bearer token is not allowlisted",
+            );
+        }
+    };
 
     req.extensions_mut()
-        .insert(crate::rate_limit::AuthContext::for_token(&token));
+        .insert(crate::rate_limit::AuthContext::with_scope(&token, scope));
     next.run(req).await
 }
 
@@ -387,6 +439,28 @@ mod tests {
         assert!(cfg.accepts("foo"));
         assert!(cfg.accepts("bar"));
         assert!(!cfg.accepts("baz"));
+    }
+
+    #[test]
+    fn auth_config_from_tokens_defaults_to_wildcard_scope() {
+        let cfg = AuthConfig::from_tokens(["foo"]);
+        let scope = cfg.scope_for("foo").expect("scope present");
+        assert!(scope.tenants.is_all(), "from_tokens must default to wildcard");
+    }
+
+    #[test]
+    fn auth_config_from_scopes_round_trips() {
+        let cfg = AuthConfig::from_scopes([
+            ("foo", crate::token_scope::TokenScope::from_tenants([TenantId(1)])),
+            ("bar", crate::token_scope::TokenScope::all()),
+        ]);
+        assert!(cfg.accepts("foo"));
+        assert!(cfg.accepts("bar"));
+        let foo = cfg.scope_for("foo").expect("foo");
+        assert!(foo.allows(TenantId(1)));
+        assert!(!foo.allows(TenantId(2)));
+        let bar = cfg.scope_for("bar").expect("bar");
+        assert!(bar.allows(TenantId(99)));
     }
 
     #[test]

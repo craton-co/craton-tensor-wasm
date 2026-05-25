@@ -42,6 +42,76 @@ export TENSOR_WASM_API_TOKENS=secret-prod-token,canary-token
 curl -H 'Authorization: Bearer secret-prod-token' http://localhost:8080/healthz
 ```
 
+#### Per-tenant scopes (`TENSOR_WASM_API_TOKENS` entry forms)
+
+Each entry in `TENSOR_WASM_API_TOKENS` carries an optional `:tenant=...`
+clause that restricts the token to a subset of tenants. Three entry shapes
+are accepted in the same env var; mixing forms is allowed.
+
+| Entry shape                       | Meaning                                                  | Status                                          |
+|-----------------------------------|----------------------------------------------------------|-------------------------------------------------|
+| `token`                           | Bare token; coerced to wildcard scope (`tenant=*`).      | **Deprecated**, scheduled for removal in v1.0.  |
+| `token:tenant=*`                  | Explicit wildcard scope — addresses every tenant.        | Stable.                                         |
+| `token:tenant=1,2,3`              | Token may address tenants `1`, `2`, or `3` only.         | Stable.                                         |
+
+Comma-separated tenant ids may include surrounding whitespace; the parser
+splits on commas at the top level and re-glues continuation lists back into
+the owning entry. Tenant ids that are neither a `u64` nor `*` (e.g.
+`tenant=1,foo`) cause that single entry to be dropped at startup with a
+`tracing::warn!`; the remaining entries continue to work.
+
+When a route that binds to a tenant receives a request whose token is not
+scoped to the bound tenant, the gateway returns:
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{ "error": { "kind": "tenant_scope_denied", "message": "bearer token is not scoped to tenant 7; extend the token's tenant= clause in TENSOR_WASM_API_TOKENS" } }
+```
+
+Tenant scoping is enforced inside the route handlers (after middleware
+auth + rate-limit pass), so 403 is returned with no Wasm spawn, no
+executor work, and no metrics charged for the rejected invocation.
+
+The routes that perform a tenant-scope check are the per-tenant
+invocation paths:
+
+* `POST /functions/{id}/invoke`
+* `POST /functions/{id}/invoke-async`
+
+Routes that do not bind to a tenant (`POST /functions`, `DELETE
+/functions/{id}`, `GET /jobs/{id}`, `GET /healthz`, `GET /metrics`)
+do not perform the check — they are allowed for any token that passes
+the bearer-auth allowlist.
+
+#### Migration from bare tokens
+
+Bare entries are accepted for backwards compatibility and emit a one-shot
+deprecation warning at startup, naming the count of bare entries observed:
+
+```
+WARN  tensor_wasm_api::middleware: bare bearer tokens in TENSOR_WASM_API_TOKENS are deprecated; switch to `token:tenant=...` (or `token:tenant=*` for the current wildcard behaviour) — bare entries are scheduled for removal in v1.0
+```
+
+To migrate, append `:tenant=*` to each entry to preserve current
+behaviour:
+
+```diff
+- export TENSOR_WASM_API_TOKENS=secret-prod-token,canary-token
++ export TENSOR_WASM_API_TOKENS=secret-prod-token:tenant=*,canary-token:tenant=*
+```
+
+Or take advantage of the new surface to issue per-tenant tokens:
+
+```bash
+export TENSOR_WASM_API_TOKENS=prod-tenant-7:tenant=7,prod-tenant-8:tenant=8,admin:tenant=*
+```
+
+Bare entries are scheduled for removal in **v1.0**; configurations that
+still rely on them at v1.0 will fail to start. The deprecation period
+opens in v0.4 with this release.
+
 ### Tenant scoping
 
 Every request may carry an `X-TensorWasm-Tenant: <u64>` header. The value is parsed
@@ -126,6 +196,7 @@ may change between patch releases. Known `kind` values:
 | `missing_export`   | 400  | Module is missing both `_start` and `main`.                              |
 | `missing_tenant`   | 400  | `X-TensorWasm-Tenant` header missing/garbled when required.                    |
 | `unauthorized`     | 401  | Missing or unrecognised bearer token.                                    |
+| `tenant_scope_denied` | 403 | Bearer token is not scoped to the `X-TensorWasm-Tenant` named in the request. |
 | `not_found`        | 404  | Requested function or job id does not exist.                             |
 | `body_too_large`   | 413  | Inbound body exceeds the 64 MiB cap (often rendered as bare 413).        |
 | `rate_limited`     | 429  | Per-token QPS + burst exceeded; response carries `Retry-After: <secs>`.  |
@@ -349,8 +420,13 @@ Every route is wrapped in the standard tower stack assembled by
   requests process-wide. Per-tenant buckets land in a follow-up release.
 * [`bearer_auth`](src/middleware.rs) — enforces `TENSOR_WASM_API_TOKENS`. Dev
   mode pass-through when the allowlist is empty. On success inserts an
-  `AuthContext { token_id }` into the request extensions for downstream
-  middleware to consume.
+  `AuthContext { token_id, scope }` into the request extensions for
+  downstream middleware and handlers to consume. The `scope` field is the
+  per-tenant [`TokenScope`](src/token_scope.rs) parsed from the
+  `token:tenant=...` clause; bare entries get the wildcard scope with a
+  one-shot startup deprecation warning. Routes that bind to a tenant call
+  `AuthContext::authorize_tenant` and return `403 tenant_scope_denied`
+  when the scope does not cover the bound tenant.
 * [`tenant_scope`](src/middleware.rs) — parses `X-TensorWasm-Tenant` into a
   `TenantId` extension and applies the `TENSOR_WASM_API_REQUIRE_TENANT` policy.
 * [`rate_limit`](src/rate_limit.rs) — token-bucket per `AuthContext.token_id`.

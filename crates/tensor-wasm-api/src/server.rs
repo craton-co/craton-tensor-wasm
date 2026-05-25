@@ -29,6 +29,11 @@ use crate::routes::{
 /// from the process environment. Empty / unset `TENSOR_WASM_API_TOKENS` puts
 /// the gateway in dev mode (auth disabled with a startup warning); unset
 /// or zero rate-limit knobs disable the limiter (pass-through).
+///
+/// If any bare (unscoped) entries are present in `TENSOR_WASM_API_TOKENS`,
+/// `AuthConfig::from_env` emits a one-shot deprecation warning naming the
+/// count — scoped tokens (`token:tenant=...`) are the supported form going
+/// forward and bare entries are scheduled for removal in v1.0.
 pub fn build_router(state: Arc<AppState>) -> Router {
     let auth = AuthConfig::from_env();
     let tenant = TenantConfig::from_env();

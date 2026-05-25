@@ -66,6 +66,10 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use dashmap::DashMap;
 use serde_json::json;
+use tensor_wasm_core::types::TenantId;
+
+use crate::routes::ApiError;
+use crate::token_scope::TokenScope;
 
 /// Stable identifier for a bearer token within a single process lifetime.
 ///
@@ -107,26 +111,67 @@ impl TokenId {
 /// Per-request authentication context inserted into [`axum::http::Extensions`]
 /// by [`crate::middleware::bearer_auth`] after a successful auth check.
 ///
-/// Downstream middleware (rate limiting, audit logging) consume this rather
-/// than re-parsing the `Authorization` header.
-#[derive(Debug, Clone, Copy)]
+/// Downstream middleware (rate limiting, audit logging) and route handlers
+/// (tenant-scope authorization) consume this rather than re-parsing the
+/// `Authorization` header.
+#[derive(Debug, Clone)]
 pub struct AuthContext {
     /// Stable identifier for the authenticated bearer token. See [`TokenId`].
     pub token_id: TokenId,
+    /// Tenants this token is authorised to address. Populated by the bearer
+    /// auth middleware from the parsed [`crate::token_scope::ParsedTokens`]
+    /// map. Dev-mode contexts default to [`TokenScope::all`].
+    ///
+    /// Handlers that bind to a tenant call [`AuthContext::authorize_tenant`]
+    /// before doing per-tenant work.
+    pub scope: TokenScope,
 }
 
 impl AuthContext {
-    /// Construct an [`AuthContext`] for a successfully-authenticated token.
+    /// Construct an [`AuthContext`] for a successfully-authenticated token,
+    /// defaulting the scope to wildcard. Retained as a back-compat helper
+    /// for tests that pre-date scoped tokens; production code goes through
+    /// [`AuthContext::with_scope`].
     pub fn for_token(token: &str) -> Self {
         Self {
             token_id: TokenId::from_bearer(token),
+            scope: TokenScope::all(),
         }
     }
 
-    /// Construct the dev-mode pass-through context.
+    /// Construct an [`AuthContext`] with an explicit scope.
+    pub fn with_scope(token: &str, scope: TokenScope) -> Self {
+        Self {
+            token_id: TokenId::from_bearer(token),
+            scope,
+        }
+    }
+
+    /// Construct the dev-mode pass-through context. Dev mode always grants
+    /// the wildcard scope — the operator already opted out of auth by
+    /// leaving the allowlist empty, so per-tenant gating would be theatre.
     pub fn dev() -> Self {
         Self {
             token_id: TokenId::DEV,
+            scope: TokenScope::all(),
+        }
+    }
+
+    /// Return `Ok(())` if this token may address `tenant`, otherwise an
+    /// [`ApiError`] with `kind: "tenant_scope_denied"`. Routes that bind to
+    /// a tenant call this before doing any per-tenant work.
+    pub fn authorize_tenant(&self, tenant: TenantId) -> Result<(), ApiError> {
+        if self.scope.allows(tenant) {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden(
+                "tenant_scope_denied",
+                format!(
+                    "bearer token is not scoped to tenant {}; \
+                     extend the token's tenant= clause in TENSOR_WASM_API_TOKENS",
+                    tenant.0,
+                ),
+            ))
         }
     }
 }
@@ -418,7 +463,6 @@ pub async fn rate_limit(req: Request, next: Next) -> Response {
     let token = req
         .extensions()
         .get::<AuthContext>()
-        .copied()
         .map(|c| c.token_id)
         // Defensive: if the auth middleware was somehow bypassed, fold all
         // un-authed requests into the dev bucket so they still face the

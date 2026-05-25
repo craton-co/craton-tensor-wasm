@@ -16,6 +16,12 @@
 //! * **Bearer auth.** Reads `TENSOR_WASM_API_TOKENS` (comma-separated allowlist)
 //!   at startup. Empty/unset means dev mode (pass-through with warning);
 //!   otherwise requests must carry `Authorization: Bearer <token>`.
+//! * **Scoped tokens.** Each entry in `TENSOR_WASM_API_TOKENS` may carry a
+//!   `:tenant=` scope clause (`token:tenant=1,2,3` or `token:tenant=*`).
+//!   Routes that bind to a tenant return `403 tenant_scope_denied` when the
+//!   caller's bearer token is not scoped to that tenant. Bare entries are
+//!   treated as wildcard with a one-shot deprecation warning at startup
+//!   (removal targeted for v1.0). See [`token_scope`].
 //! * **Tenant scoping.** The `X-TensorWasm-Tenant: <u64>` header is parsed and
 //!   threaded through to the executor. Set `TENSOR_WASM_API_REQUIRE_TENANT=1`
 //!   to make the header mandatory.
@@ -33,6 +39,7 @@ pub mod middleware;
 pub mod rate_limit;
 pub mod routes;
 pub mod server;
+pub mod token_scope;
 
 pub use middleware::{
     AuthConfig, TenantConfig, ENV_API_TOKENS, ENV_REQUIRE_TENANT, HEADER_TENANT,
@@ -41,3 +48,6 @@ pub use middleware::{
 pub use rate_limit::{AuthContext, RateLimitConfig, RateLimiter, TokenId};
 pub use routes::{ApiError, AppState, FunctionRecord, JobRecord, JobStatus};
 pub use server::{build_router, build_router_with_config, build_router_with_full_config, serve};
+pub use token_scope::{
+    parse_token_entry, parse_tokens_env, ParsedTokens, ScopeParseError, TenantScope, TokenScope,
+};
