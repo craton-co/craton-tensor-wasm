@@ -30,6 +30,8 @@ jobs:
           - fuzz_snapshot_restore
           - fuzz_wasm_compile
           - fuzz_wasi_cuda_abi
+          - token_scope_parser
+          - audit_json_round_trip
     steps:
       - name: Checkout
         uses: actions/checkout@v4
