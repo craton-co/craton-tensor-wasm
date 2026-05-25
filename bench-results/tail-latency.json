@@ -1,0 +1,10 @@
+{
+  "// generated": "P99.9 tail-latency snapshot (see crates/tensor-wasm-bench/benches/tail_latency.rs).",
+  "// algorithm": "nearest-rank percentile per ISO/IEC 25062 over 10000 sorted samples per metric",
+  "metrics": [
+    {"metric":"dispatch/serial/100","samples":10000,"p50_ns":16400,"p95_ns":17200,"p99_ns":21700,"p99_9_ns":34200,"max_ns":320900},
+    {"metric":"dispatch/concurrent_cap64/100","samples":10000,"p50_ns":76600,"p95_ns":97900,"p99_ns":172600,"p99_9_ns":251500,"max_ns":589700},
+    {"metric":"e2e/healthz/get","samples":10000,"p50_ns":6700,"p95_ns":16700,"p99_ns":18900,"p99_9_ns":35600,"max_ns":158500},
+    {"metric":"e2e/invoke_not_found/post","samples":10000,"p50_ns":28100,"p95_ns":34800,"p99_ns":43800,"p99_9_ns":151300,"max_ns":364200}
+  ]
+}
