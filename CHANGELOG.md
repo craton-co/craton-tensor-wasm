@@ -255,8 +255,94 @@ path landed (C1 + C8 close on first registration / first registry
 provisioning respectively; both have the operator-side procedure
 documented). 0 audit problems remain open as of v0.3.4.
 
+## [0.3.5] - 2026-05-25
+
+The "pre-stage the blocked" wave (D1-D6). The user asked us to take
+the v0.4 + v0.5 forward-work list — items I'd previously labeled
+"blocked on cuda-oxide v0.2 / hardware / sponsor procurement / BD" —
+and proceed. The honest landing: real code where implementable, real
+operator-facing runbooks + RFP for items where the blocker is
+external action. Two items declared out-of-scope-with-rationale rather
+than ship vapor.
+
+### Added (code)
+- `UnifiedBuffer::try_grow_in_place(new_size)` scaffold — returns
+  the documented `"in-place grow not yet wired"` sentinel until v0.4
+  cutover wires `cuMemAddressReserve + cuMemMap`. Rationale: ~300-500
+  LOC of careful unsafe FFI that needs `concurrentManagedAccess`-
+  capable hardware (Linux datacenter GPU) to verify. Scaffold gives
+  the v0.4 author a target signature + the four known constraints
+  rather than a blank canvas. `supports_in_place_grow()` const fn
+  returns `false` today; flips at v0.4. New test pins the sentinel
+  string (D1).
+- `Backing::Cudarc(CudarcUnifiedBuffer)` — third `UnifiedBuffer`
+  backing under `--features cudarc-backend` (when `unified-memory`
+  is off). Precedence: `unified-memory` wins if both. Expands the
+  module-level precedence table from 2 to 4 rows; `is_uvm_backed()`
+  now true for cust + cudarc + future cuda-oxide; only the
+  default `Box<[u8]>` returns false. New test
+  `cudarc_unified_buffer_smoke.rs` exercises the path on real
+  silicon (D2).
+
+### Added (operator-facing artifacts for blocked items)
+- `docs/CUDA-OXIDE-CUTOVER.md` — 680-line cutover runbook for the
+  day cuda-oxide v0.2 ships. 8 numbered steps from dependency bump
+  through default flip. Gated on four pre-conditions; if any fails
+  cudarc-backend remains v0.5 default per RFC 0001 Option C
+  contingent-no path. Longest step (Pliron-dialect lowering
+  implementation): ~3 days / 200-400 LOC implementing the first 4
+  of O3's 23 mapping rows (D3).
+- `docs/runbooks/ghcr-registry-provisioning.md` — 449-line sponsor-
+  side runbook to provision `ghcr.io/craton-co/tensor-wasm`. 7-step
+  procedure. Includes the `release.yml` matrix snippet operators
+  paste in (4 image variants: "", cust, cudarc, cuda-oxide). Audit
+  Problem #13 closes the moment this runbook is executed (D4).
+- `docs/SECURITY-AUDIT-RFP.md` — 479-line procurement-grade RFP a
+  sponsor can send to Trail of Bits / NCC Group / Cure53 /
+  Doyensec today (PATH-TO-V1 Open Decision #5) after filling in 11
+  `[bracketed]` placeholders. v0.5 PATH-TO-V1 "External pen-test
+  commissioned" gate is now sponsor-procurement-bound rather than
+  code-bound (D5).
+- `docs/DESIGN-PARTNER-PROGRAM.md` — 586-line outreach + program kit
+  for recruiting v0.5 design partners (PATH-TO-V1 Open Decision #6).
+  8 sponsor deliverables vs 7 partner asks. Application template
+  (Section 10) is copy-pasteable BEGIN/END-marked form. Sponsor
+  maintainer-sync MUST sign off on §6.4 before the kit ships to
+  candidates: it explicitly REFUSES to promise a faster severity-1
+  SLA than `SECURITY.md` backport policy (creating a partner-tier
+  SLA better than ordinary users' would corrode trust). Instead
+  promises "priority queue position within the published policy" (D6).
+
+### Out of scope (D7 — declared, not implemented)
+- **Pliron-dialect actual lowering** — implementable in principle,
+  but committing 2-3 weeks of careful Rust to a dialect-mir shape
+  that may change in cuda-oxide v0.2 is high-risk. The O3 scaffold
+  defines the trait + 23-row mapping table; the v0.4 cutover
+  runbook (D3 Step 4) is the right place to implement the first 4
+  rows once v0.2 ships. Re-evaluate when cuda-oxide v0.2 lands.
+- **Cross-version snapshot compat matrix expansion** — W1.3 already
+  covers v0.1.0 → current with golden fixtures + 4 active tests.
+  The matrix expands when format-bumping releases ship; there is
+  exactly one format version today, so the "matrix" is structurally
+  done. The W1.3 framework auto-extends when v0.2 format ships; no
+  pre-work would add value.
+
+### v0.5 PATH-TO-V1 status after D wave
+
+Two of the four "blocked on external action" v0.5 gates now have a
+sendable artifact: the security-audit RFP (D5) ready to send to
+firms; the design-partner kit (D6) ready to hand to candidate orgs.
+The remaining two gates — actually commissioning the pen-test and
+recruiting partners — are sponsor-procurement / BD work that AI
+agents cannot do.
+
+The cuda-oxide v0.2 cutover (D3) is similarly pre-staged: an
+executable 8-step runbook ready for the maintainer who runs `git
+checkout` the day v0.2 ships.
+
 ## [Unreleased]
 _No entries yet — open the next PR adding one._
+
 
 
 
