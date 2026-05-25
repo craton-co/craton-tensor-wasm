@@ -130,6 +130,8 @@ Full taxonomy: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Documentation
 
+For the complete sitemap (every Markdown doc in this repo, grouped by purpose with one-sentence summaries and wave tags) see [`docs/INDEX.md`](docs/INDEX.md).
+
 ### Architecture & reference
 | Doc | Subject |
 |---|---|
