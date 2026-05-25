@@ -1,53 +1,23 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tensor-wasm-snapshot 1  "tensor-wasm-snapshot "
+.TH tensor-wasm-snapshot 1  "tensor-wasm-snapshot " 
 .SH NAME
 tensor\-wasm\-snapshot \- Save or restore an instance snapshot
 .SH SYNOPSIS
-\fBtensor\-wasm snapshot save\fR \fB\-\-instance\fR=\fIINSTANCE\fR \fB\-\-output\fR=\fIOUTPUT\fR \fB\-\-server\fR=\fISERVER\fR [\fB\-\-tenant\fR=\fITENANT\fR] [\fB\-h\fR|\fB\-\-help\fR]
-.PP
-\fBtensor\-wasm snapshot restore\fR \fB\-\-input\fR=\fIINPUT\fR \fB\-\-as\-instance\fR=\fIAS_INSTANCE\fR \fB\-\-server\fR=\fISERVER\fR [\fB\-\-max\-decompressed\fR=\fIMAX_DECOMPRESSED\fR] [\fB\-\-tenant\fR=\fITENANT\fR] [\fB\-h\fR|\fB\-\-help\fR]
+\fBtensor\-wasm\-snapshot\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
 .SH DESCRIPTION
-Capture or restore an instance's state to/from a \fB.tensor-wasm\fR archive via the TensorWasm HTTP API. Local\-side validation happens before any network call so the user gets a fast, clear error for the common "wrong path / unwritable output / file too big" cases without waiting on a server round\-trip.
-.SS SUB-ACTIONS
+Save or restore an instance snapshot
+.SH OPTIONS
 .TP
-\fBsave\fR
-Capture the state of a running instance into a \fB.tensor-wasm\fR file via the API.
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
 .TP
-\fBrestore\fR
-Restore an instance from a \fB.tensor-wasm\fR archive via the API.
-.SS SAVE OPTIONS
+tensor\-wasm\-snapshot\-save(1)
+Capture the state of a running instance into a `.tensor\-wasm` file via the API
 .TP
-\fB\-\-instance\fR=\fIINSTANCE\fR
-Identifier of the running instance to snapshot.
+tensor\-wasm\-snapshot\-restore(1)
+Restore an instance from a `.tensor\-wasm` archive via the API
 .TP
-\fB\-\-output\fR=\fIOUTPUT\fR
-Output path for the resulting \fB.tensor-wasm\fR archive.
-.TP
-\fB\-\-server\fR=\fISERVER\fR
-Base URL of the target TensorWasm server.
-.SS RESTORE OPTIONS
-.TP
-\fB\-\-input\fR=\fIINPUT\fR
-Path to the \fB.tensor-wasm\fR archive to upload.
-.TP
-\fB\-\-as\-instance\fR=\fIAS_INSTANCE\fR
-Identifier to assign to the restored instance.
-.TP
-\fB\-\-server\fR=\fISERVER\fR
-Base URL of the target TensorWasm server.
-.TP
-\fB\-\-max\-decompressed\fR=\fIMAX_DECOMPRESSED\fR [default: 268435456]
-Maximum decompressed snapshot size we will accept, in bytes (256 MiB default).
-.SH EXIT STATUS
-.TP
-0
-Success.
-.TP
-2
-Local validation failed (bad path, file too big, empty identifier).
-.TP
-3
-Feature not yet exposed by the API (server returned 404 on the snapshot route).
-.SH "SEE ALSO"
-tensor\-wasm(1)
+tensor\-wasm\-snapshot\-help(1)
+Print this message or the help of the given subcommand(s)

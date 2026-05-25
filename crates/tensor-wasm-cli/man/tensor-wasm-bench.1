@@ -1,34 +1,22 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tensor-wasm-bench 1  "tensor-wasm-bench "
+.TH tensor-wasm-bench 1  "tensor-wasm-bench " 
 .SH NAME
 tensor\-wasm\-bench \- Benchmark local invocation latency (P50/P95/P99/max)
 .SH SYNOPSIS
-\fBtensor\-wasm bench\fR [\fB\-\-export\fR=\fIEXPORT\fR] [\fB\-\-n\fR=\fIN\fR] [\fB\-\-tenant\fR=\fITENANT\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIFILE\fR>
+\fBtensor\-wasm\-bench\fR [\fB\-\-export\fR] [\fB\-\-n\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIFILE\fR> 
 .SH DESCRIPTION
-Loads a \fB.wasm\fR file, spawns a fresh instance per iteration, invokes the named export, records the wall\-clock duration, and prints a table with P50/P95/P99 and max latencies. The bench measures end\-to\-end \fBspawn + call + terminate\fR so it captures cold\-start cost as well.
+Benchmark local invocation latency (P50/P95/P99/max)
 .SH OPTIONS
 .TP
-\fB\-\-export\fR=\fIEXPORT\fR [default: main]
-Name of the export to call on each iteration.
+\fB\-\-export\fR \fI<EXPORT>\fR [default: main]
+Name of the export to call on each iteration
 .TP
-\fB\-\-n\fR=\fIN\fR [default: 100]
-Number of iterations to run. Must be at least 1.
-.TP
-\fB\-\-tenant\fR=\fITENANT\fR [default: 0]
-Tenant id (currently unused by the local bench path; retained for parity with HTTP\-shaped subcommands).
+\fB\-\-n\fR \fI<N>\fR [default: 100]
+Number of iterations to run. Must be >= 1
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
 .TP
-[\fIFILE\fR]
-Path to the \fB.wasm\fR file to benchmark.
-.SH EXAMPLES
-.PP
-.RS 4
-.nf
-tensor\-wasm bench tests/wasm\-fixtures/vector_add.wasm \-\-export add \-\-n 1000
-.fi
-.RE
-.SH "SEE ALSO"
-tensor\-wasm(1), tensor\-wasm\-run(1)
+<\fIFILE\fR>
+Path to the `.wasm` file to benchmark

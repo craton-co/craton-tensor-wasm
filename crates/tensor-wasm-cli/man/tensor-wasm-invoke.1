@@ -1,31 +1,22 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tensor-wasm-invoke 1  "tensor-wasm-invoke "
+.TH tensor-wasm-invoke 1  "tensor-wasm-invoke " 
 .SH NAME
 tensor\-wasm\-invoke \- Invoke a previously deployed function by id
 .SH SYNOPSIS
-\fBtensor\-wasm invoke\fR \fB\-\-server\fR=\fISERVER\fR [\fB\-\-args\fR=\fIARGS\fR] [\fB\-\-tenant\fR=\fITENANT\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIID\fR>
+\fBtensor\-wasm\-invoke\fR <\fB\-\-server\fR> [\fB\-\-args\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIID\fR> 
 .SH DESCRIPTION
-POSTs \fB{server}/functions/{id}/invoke\fR with a JSON body. When \fB\-\-args\fR is supplied it is parsed and validated to be a JSON array, then forwarded as the request body; otherwise an empty object is sent. The successful response body is pretty\-printed to stdout. A non\-2xx response is rendered through the shared error\-envelope helper and the process exits non\-zero.
+Invoke a previously deployed function by id
 .SH OPTIONS
 .TP
-\fB\-\-server\fR=\fISERVER\fR
-Base URL of the target TensorWasm server (e.g. \fBhttp://localhost:8080\fR).
+\fB\-\-server\fR \fI<SERVER>\fR
+Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
 .TP
-\fB\-\-args\fR=\fIARGS\fR
-Arguments forwarded to the function, encoded as a JSON array.
-.TP
-\fB\-\-tenant\fR=\fITENANT\fR [default: 0]
-Tenant id to advertise on outbound API requests.
+\fB\-\-args\fR \fI<ARGS>\fR
+Arguments forwarded to the function, encoded as a JSON array
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
 .TP
-[\fIID\fR]
-Identifier of the deployed function to invoke.
-.SH ENVIRONMENT
-.TP
-\fBTENSOR_WASM_TOKEN\fR
-Bearer token attached as \fBAuthorization: Bearer ...\fR on the outbound request when set.
-.SH "SEE ALSO"
-tensor\-wasm(1), tensor\-wasm\-deploy(1)
+<\fIID\fR>
+Identifier of the deployed function to invoke

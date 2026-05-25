@@ -1,38 +1,37 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tensor-wasm-completions 1  "tensor-wasm-completions "
+.TH tensor-wasm-completions 1  "tensor-wasm-completions " 
 .SH NAME
 tensor\-wasm\-completions \- Emit shell completion scripts for the named shell
 .SH SYNOPSIS
-\fBtensor\-wasm completions\fR [\fB\-\-out\-dir\fR=\fIOUT_DIR\fR] [\fB\-\-tenant\fR=\fITENANT\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fISHELL\fR>
+\fBtensor\-wasm\-completions\fR [\fB\-\-out\-dir\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fISHELL\fR> 
 .SH DESCRIPTION
-Uses \fBclap_complete::generate\fR against the CLI command tree to produce a completion script for the requested shell. By default the script is written to stdout; \fB\-\-out\-dir\fR writes it to a conventional filename inside the named directory so callers (or CI) can regenerate the committed scaffolding under \fBcrates/tensor-wasm-cli/completions/\fR in one pass.
+Emit shell completion scripts for the named shell.
+.PP
+By default the script is written to stdout. Pass `\-\-out\-dir <dir>` to write it to a conventional filename inside `<dir>` instead — used by `crates/tensor\-wasm\-cli/completions/` regeneration.
 .SH OPTIONS
 .TP
-\fB\-\-out\-dir\fR=\fIOUT_DIR\fR
-Optional output directory. When provided, the script is written to \fB<dir>/<conventional-name>\fR (e.g. \fBtensor-wasm.bash\fR, \fB_tensor-wasm\fR for zsh, \fBtensor-wasm.fish\fR).
-.TP
-\fB\-\-tenant\fR=\fITENANT\fR [default: 0]
-Tenant id (inherited from the top\-level flag; unused by this subcommand).
+\fB\-\-out\-dir\fR \fI<OUT_DIR>\fR
+Optional output directory. When provided, the script is written to `<dir>/<conventional\-name>` (e.g. `tensor\-wasm.bash`, `_tensor\-wasm` for zsh, `tensor\-wasm.fish`)
 .TP
 \fB\-h\fR, \fB\-\-help\fR
-Print help
+Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
-[\fISHELL\fR]
-Target shell. One of: \fBbash\fR, \fBzsh\fR, \fBfish\fR, \fBpowershell\fR, \fBelvish\fR.
-.SH EXAMPLES
-.PP
-.RS 4
-.nf
-tensor\-wasm completions bash > /etc/bash_completion.d/tensor-wasm
-tensor\-wasm completions zsh  > ~/.zsh/completions/_tensor-wasm
-tensor\-wasm completions fish > ~/.config/fish/completions/tensor-wasm.fish
+<\fISHELL\fR>
+Target shell (bash, zsh, fish, powershell, elvish)
+.br
 
-# Regenerate all three committed copies at once
-tensor\-wasm completions bash \-\-out\-dir crates/tensor-wasm-cli/completions
-tensor\-wasm completions zsh  \-\-out\-dir crates/tensor-wasm-cli/completions
-tensor\-wasm completions fish \-\-out\-dir crates/tensor-wasm-cli/completions
-.fi
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+bash
+.IP \(bu 2
+elvish
+.IP \(bu 2
+fish
+.IP \(bu 2
+powershell
+.IP \(bu 2
+zsh
 .RE
-.SH "SEE ALSO"
-tensor\-wasm(1), tensor\-wasm\-man(1)

@@ -14,10 +14,10 @@ _tensor-wasm() {
     fi
 
     local context curcontext="$curcontext" state line
-    _arguments "${_arguments_options[@]}" \
-'--tenant=[Tenant id to advertise on outbound API requests]:TENANT: ' \
-'-h[Print help]' \
-'--help[Print help]' \
+    _arguments "${_arguments_options[@]}" : \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
 '--version[Print version]' \
 ":: :_tensor-wasm_commands" \
@@ -30,115 +30,222 @@ _tensor-wasm() {
         curcontext="${curcontext%:*:*}:tensor-wasm-command-$line[1]:"
         case $line[1] in
             (run)
-_arguments "${_arguments_options[@]}" \
-'--export=[Name of the exported function to call]:EXPORT: ' \
-'--args=[Arguments to pass to the export, encoded as a JSON array]:ARGS: ' \
-'--tenant=[Tenant id]:TENANT: ' \
-'-h[Print help]' \
-'--help[Print help]' \
-':file -- Path to the .wasm file to execute:_files' \
+_arguments "${_arguments_options[@]}" : \
+'--export=[Name of the exported function to call. Defaults to \`main\`]:EXPORT:_default' \
+'--args=[Arguments to pass to the export, encoded as a JSON array]:ARGS:_default' \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':file -- Path to the `.wasm` file to execute:_files' \
 && ret=0
 ;;
-            (deploy)
-_arguments "${_arguments_options[@]}" \
-'--server=[Base URL of the target TensorWasm server]:SERVER: ' \
-'--name=[Tenant-supplied display name]:NAME: ' \
-'--tenant=[Tenant id]:TENANT: ' \
+(deploy)
+_arguments "${_arguments_options[@]}" : \
+'--server=[Base URL of the target TensorWasm server (e.g. \`http\://localhost\:8080\`)]:SERVER:_default' \
+'--name=[Tenant-supplied display name. Defaults to the file stem when omitted]:NAME:_default' \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
-':file -- Path to the .wasm file to deploy:_files' \
+':file -- Path to the `.wasm` file to deploy:_files' \
 && ret=0
 ;;
-            (invoke)
-_arguments "${_arguments_options[@]}" \
-'--server=[Base URL of the target TensorWasm server]:SERVER: ' \
-'--args=[Arguments forwarded to the function, encoded as a JSON array]:ARGS: ' \
-'--tenant=[Tenant id]:TENANT: ' \
+(invoke)
+_arguments "${_arguments_options[@]}" : \
+'--server=[Base URL of the target TensorWasm server (e.g. \`http\://localhost\:8080\`)]:SERVER:_default' \
+'--args=[Arguments forwarded to the function, encoded as a JSON array]:ARGS:_default' \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
-':id -- Identifier of the deployed function to invoke:' \
+':id -- Identifier of the deployed function to invoke:_default' \
 && ret=0
 ;;
-            (bench)
-_arguments "${_arguments_options[@]}" \
-'--export=[Name of the export to call on each iteration]:EXPORT: ' \
-'--n=[Number of iterations to run]:N: ' \
-'--tenant=[Tenant id]:TENANT: ' \
+(bench)
+_arguments "${_arguments_options[@]}" : \
+'--export=[Name of the export to call on each iteration]:EXPORT:_default' \
+'--n=[Number of iterations to run. Must be >= 1]:N:_default' \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
-':file -- Path to the .wasm file to benchmark:_files' \
+':file -- Path to the `.wasm` file to benchmark:_files' \
 && ret=0
 ;;
-            (snapshot)
-_arguments "${_arguments_options[@]}" \
-'--tenant=[Tenant id]:TENANT: ' \
+(snapshot)
+_arguments "${_arguments_options[@]}" : \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
-":: :_tensor-wasm__snapshot_commands" \
+":: :_tensor-wasm__subcmd__snapshot_commands" \
 "*::: :->snapshot" \
 && ret=0
-case $state in
-(snapshot)
-    words=($line[1] "${words[@]}")
-    (( CURRENT += 1 ))
-    curcontext="${curcontext%:*:*}:tensor-wasm-snapshot-command-$line[1]:"
-    case $line[1] in
-        (save)
-_arguments "${_arguments_options[@]}" \
-'--instance=[Identifier of the running instance to snapshot]:INSTANCE: ' \
-'--output=[Output path for the resulting .tensor-wasm archive]:OUTPUT:_files' \
-'--server=[Base URL of the target TensorWasm server]:SERVER: ' \
+
+    case $state in
+    (snapshot)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tensor-wasm-snapshot-command-$line[1]:"
+        case $line[1] in
+            (save)
+_arguments "${_arguments_options[@]}" : \
+'--instance=[Identifier of the running instance to snapshot]:INSTANCE:_default' \
+'--output=[Output path for the resulting \`.tensor-wasm\` archive]:OUTPUT:_files' \
+'--server=[Base URL of the target TensorWasm server (e.g. \`http\://localhost\:8080\`)]:SERVER:_default' \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
 ;;
-        (restore)
-_arguments "${_arguments_options[@]}" \
-'--input=[Path to the .tensor-wasm archive to upload]:INPUT:_files' \
-'--as-instance=[Identifier to assign to the restored instance]:AS_INSTANCE: ' \
-'--server=[Base URL of the target TensorWasm server]:SERVER: ' \
-'--max-decompressed=[Maximum decompressed snapshot size, in bytes]:MAX_DECOMPRESSED: ' \
+(restore)
+_arguments "${_arguments_options[@]}" : \
+'--input=[Path to the \`.tensor-wasm\` archive to upload]:INPUT:_files' \
+'--as-instance=[Identifier to assign to the restored instance]:AS_INSTANCE:_default' \
+'--server=[Base URL of the target TensorWasm server (e.g. \`http\://localhost\:8080\`)]:SERVER:_default' \
+'--max-decompressed=[Maximum decompressed snapshot size we'\''ll accept, in bytes. Mirrors the server-side cap so the CLI rejects oversized archives without a pointless upload]:MAX_DECOMPRESSED:_default' \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
 ;;
-    esac
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_tensor-wasm__subcmd__snapshot__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tensor-wasm-snapshot-help-command-$line[1]:"
+        case $line[1] in
+            (save)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
 ;;
+(restore)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
 esac
 ;;
-            (metrics)
-_arguments "${_arguments_options[@]}" \
-'--server=[Base URL of the target TensorWasm server]:SERVER: ' \
-'--tenant=[Tenant id]:TENANT: ' \
+        esac
+    ;;
+esac
+;;
+(metrics)
+_arguments "${_arguments_options[@]}" : \
+'--server=[Base URL of the target TensorWasm server (e.g. \`http\://localhost\:8080\`)]:SERVER:_default' \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
 ;;
-            (observe)
-_arguments "${_arguments_options[@]}" \
-'--addr=[Base URL of the target TensorWasm server]:ADDR: ' \
-'--interval=[Refresh interval, in seconds]:INTERVAL: ' \
-'--tenant=[Tenant id]:TENANT: ' \
+(observe)
+_arguments "${_arguments_options[@]}" : \
+'--addr=[Base URL of the target TensorWasm server. Defaults to \`http\://localhost\:8080\`]:ADDR:_default' \
+'--interval=[Refresh interval, in seconds. Must be at least 1]:INTERVAL:_default' \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
 ;;
-            (completions)
-_arguments "${_arguments_options[@]}" \
-'--out-dir=[Optional output directory]:OUT_DIR:_files -/' \
-'--tenant=[Tenant id]:TENANT: ' \
-'-h[Print help]' \
-'--help[Print help]' \
-':shell -- Target shell:(bash zsh fish powershell elvish)' \
+(completions)
+_arguments "${_arguments_options[@]}" : \
+'--out-dir=[Optional output directory. When provided, the script is written to \`<dir>/<conventional-name>\` (e.g. \`tensor-wasm.bash\`, \`_tensor-wasm\` for zsh, \`tensor-wasm.fish\`)]:OUT_DIR:_files' \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':shell -- Target shell (bash, zsh, fish, powershell, elvish):(bash elvish fish powershell zsh)' \
 && ret=0
 ;;
-            (man)
-_arguments "${_arguments_options[@]}" \
-'--out-dir=[Output directory for the per-subcommand .1 files]:OUT_DIR:_files -/' \
-'--tenant=[Tenant id]:TENANT: ' \
+(man)
+_arguments "${_arguments_options[@]}" : \
+'--out-dir=[Output directory. When omitted, only the root \`tensor-wasm.1\` page is emitted to stdout. When provided, every subcommand gets its own page written as \`<binary>-<subcommand>.1\` (matching the established convention used by \`git-status.1\`, \`cargo-build.1\`, etc.)]:OUT_DIR:_files' \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_tensor-wasm__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tensor-wasm-help-command-$line[1]:"
+        case $line[1] in
+            (run)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(deploy)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(invoke)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(bench)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(snapshot)
+_arguments "${_arguments_options[@]}" : \
+":: :_tensor-wasm__subcmd__help__subcmd__snapshot_commands" \
+"*::: :->snapshot" \
+&& ret=0
+
+    case $state in
+    (snapshot)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tensor-wasm-help-snapshot-command-$line[1]:"
+        case $line[1] in
+            (save)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(restore)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(metrics)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(observe)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(completions)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(man)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
 ;;
         esac
     ;;
@@ -151,25 +258,177 @@ _tensor-wasm_commands() {
 'run:Run a Wasm module locally against the in-process TensorWasm engine' \
 'deploy:Upload a Wasm module to a TensorWasm server' \
 'invoke:Invoke a previously deployed function by id' \
-'bench:Benchmark local invocation latency' \
+'bench:Benchmark local invocation latency (P50/P95/P99/max)' \
 'snapshot:Save or restore an instance snapshot' \
 'metrics:Fetch and pretty-print Prometheus metrics from a TensorWasm server' \
-'observe:Live operator dashboard over /healthz + /metrics' \
+'observe:Live operator dashboard over \`/healthz\` + \`/metrics\` (refreshes in place)' \
 'completions:Emit shell completion scripts for the named shell' \
 'man:Generate roff(7) man pages from the clap command tree' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'tensor-wasm commands' commands "$@"
 }
-
-(( $+functions[_tensor-wasm__snapshot_commands] )) ||
-_tensor-wasm__snapshot_commands() {
+(( $+functions[_tensor-wasm__subcmd__bench_commands] )) ||
+_tensor-wasm__subcmd__bench_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm bench commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__completions_commands] )) ||
+_tensor-wasm__subcmd__completions_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm completions commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__deploy_commands] )) ||
+_tensor-wasm__subcmd__deploy_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm deploy commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help_commands] )) ||
+_tensor-wasm__subcmd__help_commands() {
     local commands; commands=(
-'save:Capture the state of a running instance into a .tensor-wasm file via the API' \
-'restore:Restore an instance from a .tensor-wasm archive via the API' \
+'run:Run a Wasm module locally against the in-process TensorWasm engine' \
+'deploy:Upload a Wasm module to a TensorWasm server' \
+'invoke:Invoke a previously deployed function by id' \
+'bench:Benchmark local invocation latency (P50/P95/P99/max)' \
+'snapshot:Save or restore an instance snapshot' \
+'metrics:Fetch and pretty-print Prometheus metrics from a TensorWasm server' \
+'observe:Live operator dashboard over \`/healthz\` + \`/metrics\` (refreshes in place)' \
+'completions:Emit shell completion scripts for the named shell' \
+'man:Generate roff(7) man pages from the clap command tree' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'tensor-wasm help commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__bench_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__bench_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm help bench commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__completions_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__completions_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm help completions commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__deploy_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__deploy_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm help deploy commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__help_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm help help commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__invoke_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__invoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm help invoke commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__man_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__man_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm help man commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__metrics_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__metrics_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm help metrics commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__observe_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__observe_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm help observe commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__run_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__run_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm help run commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__snapshot_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__snapshot_commands() {
+    local commands; commands=(
+'save:Capture the state of a running instance into a \`.tensor-wasm\` file via the API' \
+'restore:Restore an instance from a \`.tensor-wasm\` archive via the API' \
+    )
+    _describe -t commands 'tensor-wasm help snapshot commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__snapshot__subcmd__restore_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__snapshot__subcmd__restore_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm help snapshot restore commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__snapshot__subcmd__save_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__snapshot__subcmd__save_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm help snapshot save commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__invoke_commands] )) ||
+_tensor-wasm__subcmd__invoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm invoke commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__man_commands] )) ||
+_tensor-wasm__subcmd__man_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm man commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__metrics_commands] )) ||
+_tensor-wasm__subcmd__metrics_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm metrics commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__observe_commands] )) ||
+_tensor-wasm__subcmd__observe_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm observe commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__run_commands] )) ||
+_tensor-wasm__subcmd__run_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm run commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__snapshot_commands] )) ||
+_tensor-wasm__subcmd__snapshot_commands() {
+    local commands; commands=(
+'save:Capture the state of a running instance into a \`.tensor-wasm\` file via the API' \
+'restore:Restore an instance from a \`.tensor-wasm\` archive via the API' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'tensor-wasm snapshot commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__snapshot__subcmd__help_commands] )) ||
+_tensor-wasm__subcmd__snapshot__subcmd__help_commands() {
+    local commands; commands=(
+'save:Capture the state of a running instance into a \`.tensor-wasm\` file via the API' \
+'restore:Restore an instance from a \`.tensor-wasm\` archive via the API' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'tensor-wasm snapshot help commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__snapshot__subcmd__help__subcmd__help_commands] )) ||
+_tensor-wasm__subcmd__snapshot__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm snapshot help help commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__snapshot__subcmd__help__subcmd__restore_commands] )) ||
+_tensor-wasm__subcmd__snapshot__subcmd__help__subcmd__restore_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm snapshot help restore commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__snapshot__subcmd__help__subcmd__save_commands] )) ||
+_tensor-wasm__subcmd__snapshot__subcmd__help__subcmd__save_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm snapshot help save commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__snapshot__subcmd__restore_commands] )) ||
+_tensor-wasm__subcmd__snapshot__subcmd__restore_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm snapshot restore commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__snapshot__subcmd__save_commands] )) ||
+_tensor-wasm__subcmd__snapshot__subcmd__save_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm snapshot save commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_tensor-wasm" ]; then

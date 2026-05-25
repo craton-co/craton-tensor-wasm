@@ -1,39 +1,19 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tensor-wasm-observe 1  "tensor-wasm-observe "
+.TH tensor-wasm-observe 1  "tensor-wasm-observe " 
 .SH NAME
-tensor\-wasm\-observe \- Live operator dashboard over /healthz + /metrics (refreshes in place)
+tensor\-wasm\-observe \- Live operator dashboard over `/healthz` + `/metrics` (refreshes in place)
 .SH SYNOPSIS
-\fBtensor\-wasm observe\fR [\fB\-\-addr\fR=\fIADDR\fR] [\fB\-\-interval\fR=\fIINTERVAL\fR] [\fB\-\-tenant\fR=\fITENANT\fR] [\fB\-h\fR|\fB\-\-help\fR]
+\fBtensor\-wasm\-observe\fR [\fB\-\-addr\fR] [\fB\-\-interval\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Polls \fBGET /healthz\fR and \fBGET /metrics\fR against the target server on a fixed cadence and rewrites a single screen with the most actionable signals. Intended for on\-call incident triage when neither a browser nor a Grafana session is available.
-.PP
-The refresh loop exits cleanly on Ctrl\-C; per\-tick fetch failures (network blips, server restart) are rendered into the board rather than aborting the loop.
+Live operator dashboard over `/healthz` + `/metrics` (refreshes in place)
 .SH OPTIONS
 .TP
-\fB\-\-addr\fR=\fIADDR\fR [default: http://localhost:8080]
-Base URL of the target TensorWasm server. Must use \fBhttp://\fR or \fBhttps://\fR and have a non\-empty host.
+\fB\-\-addr\fR \fI<ADDR>\fR [default: http://localhost:8080]
+Base URL of the target TensorWasm server. Defaults to `http://localhost:8080`
 .TP
-\fB\-\-interval\fR=\fIINTERVAL\fR [default: 2]
-Refresh interval, in seconds. Must be at least 1.
-.TP
-\fB\-\-tenant\fR=\fITENANT\fR [default: 0]
-Tenant id to advertise on outbound API requests.
+\fB\-\-interval\fR \fI<INTERVAL>\fR [default: 2]
+Refresh interval, in seconds. Must be at least 1
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
-.SH ENVIRONMENT
-.TP
-\fBTENSOR_WASM_TOKEN\fR
-Bearer token attached as \fBAuthorization: Bearer ...\fR on each /healthz and /metrics fetch when set.
-.SH EXAMPLES
-.PP
-.RS 4
-.nf
-TENSOR_WASM_TOKEN=devtoken tensor\-wasm observe \-\-addr https://tensor\-wasm.example.com \-\-interval 5
-.fi
-.RE
-.SH NOTES
-Cells render as \fB?\fR (for counts) or \fBn/a\fR (for percentages, latencies) when the underlying Prometheus series is absent from the scrape. The dashboard never substitutes a misleading zero.
-.SH "SEE ALSO"
-tensor\-wasm(1), tensor\-wasm\-metrics(1)

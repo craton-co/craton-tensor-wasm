@@ -1,87 +1,99 @@
-# Fish completion for `tensor-wasm`. Regenerate with:
-#   tensor-wasm completions fish --out-dir crates/tensor-wasm-cli/completions
+# Print an optspec for argparse to handle cmd's options that are independent of any subcommand.
+function __fish_tensor_wasm_global_optspecs
+	string join \n tenant= h/help V/version
+end
 
-# Top-level: global flags and subcommand names.
-complete -c tensor-wasm -n "__fish_use_subcommand" -l tenant -d 'Tenant id to advertise on outbound API requests' -r
-complete -c tensor-wasm -n "__fish_use_subcommand" -s h -l help -d 'Print help'
-complete -c tensor-wasm -n "__fish_use_subcommand" -s V -l version -d 'Print version'
-complete -c tensor-wasm -n "__fish_use_subcommand" -f -a "run" -d 'Run a Wasm module locally against the in-process TensorWasm engine'
-complete -c tensor-wasm -n "__fish_use_subcommand" -f -a "deploy" -d 'Upload a Wasm module to a TensorWasm server'
-complete -c tensor-wasm -n "__fish_use_subcommand" -f -a "invoke" -d 'Invoke a previously deployed function by id'
-complete -c tensor-wasm -n "__fish_use_subcommand" -f -a "bench" -d 'Benchmark local invocation latency'
-complete -c tensor-wasm -n "__fish_use_subcommand" -f -a "snapshot" -d 'Save or restore an instance snapshot'
-complete -c tensor-wasm -n "__fish_use_subcommand" -f -a "metrics" -d 'Fetch and pretty-print Prometheus metrics from a TensorWasm server'
-complete -c tensor-wasm -n "__fish_use_subcommand" -f -a "observe" -d 'Live operator dashboard over /healthz + /metrics'
-complete -c tensor-wasm -n "__fish_use_subcommand" -f -a "completions" -d 'Emit shell completion scripts for the named shell'
-complete -c tensor-wasm -n "__fish_use_subcommand" -f -a "man" -d 'Generate roff(7) man pages from the clap command tree'
-complete -c tensor-wasm -n "__fish_use_subcommand" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+function __fish_tensor_wasm_needs_command
+	# Figure out if the current invocation already has a command.
+	set -l cmd (commandline -opc)
+	set -e cmd[1]
+	argparse -s (__fish_tensor_wasm_global_optspecs) -- $cmd 2>/dev/null
+	or return
+	if set -q argv[1]
+		# Also print the command, so this can be used to figure out what it is.
+		echo $argv[1]
+		return 1
+	end
+	return 0
+end
 
-# tensor-wasm run
-complete -c tensor-wasm -n "__fish_seen_subcommand_from run" -l export -d 'Name of the exported function to call' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from run" -l args -d 'Arguments to pass to the export, encoded as a JSON array' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from run" -l tenant -d 'Tenant id' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from run" -s h -l help -d 'Print help'
+function __fish_tensor_wasm_using_subcommand
+	set -l cmd (__fish_tensor_wasm_needs_command)
+	test -z "$cmd"
+	and return 1
+	contains -- $cmd[1] $argv
+end
 
-# tensor-wasm deploy
-complete -c tensor-wasm -n "__fish_seen_subcommand_from deploy" -l server -d 'Base URL of the target TensorWasm server' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from deploy" -l name -d 'Tenant-supplied display name' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from deploy" -l tenant -d 'Tenant id' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from deploy" -s h -l help -d 'Print help'
-
-# tensor-wasm invoke
-complete -c tensor-wasm -n "__fish_seen_subcommand_from invoke" -l server -d 'Base URL of the target TensorWasm server' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from invoke" -l args -d 'Arguments forwarded to the function, encoded as a JSON array' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from invoke" -l tenant -d 'Tenant id' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from invoke" -s h -l help -d 'Print help'
-
-# tensor-wasm bench
-complete -c tensor-wasm -n "__fish_seen_subcommand_from bench" -l export -d 'Name of the export to call on each iteration' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from bench" -l n -d 'Number of iterations to run' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from bench" -l tenant -d 'Tenant id' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from bench" -s h -l help -d 'Print help'
-
-# tensor-wasm snapshot
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and not __fish_seen_subcommand_from save restore help" -l tenant -d 'Tenant id' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and not __fish_seen_subcommand_from save restore help" -s h -l help -d 'Print help'
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and not __fish_seen_subcommand_from save restore help" -f -a "save" -d 'Capture the state of a running instance into a .tensor-wasm file via the API'
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and not __fish_seen_subcommand_from save restore help" -f -a "restore" -d 'Restore an instance from a .tensor-wasm archive via the API'
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and not __fish_seen_subcommand_from save restore help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-
-# tensor-wasm snapshot save
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and __fish_seen_subcommand_from save" -l instance -d 'Identifier of the running instance to snapshot' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and __fish_seen_subcommand_from save" -l output -d 'Output path for the resulting .tensor-wasm archive' -r -F
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and __fish_seen_subcommand_from save" -l server -d 'Base URL of the target TensorWasm server' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and __fish_seen_subcommand_from save" -s h -l help -d 'Print help'
-
-# tensor-wasm snapshot restore
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and __fish_seen_subcommand_from restore" -l input -d 'Path to the .tensor-wasm archive to upload' -r -F
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and __fish_seen_subcommand_from restore" -l as-instance -d 'Identifier to assign to the restored instance' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and __fish_seen_subcommand_from restore" -l server -d 'Base URL of the target TensorWasm server' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and __fish_seen_subcommand_from restore" -l max-decompressed -d 'Maximum decompressed snapshot size, in bytes' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from snapshot; and __fish_seen_subcommand_from restore" -s h -l help -d 'Print help'
-
-# tensor-wasm metrics
-complete -c tensor-wasm -n "__fish_seen_subcommand_from metrics" -l server -d 'Base URL of the target TensorWasm server' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from metrics" -l tenant -d 'Tenant id' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from metrics" -s h -l help -d 'Print help'
-
-# tensor-wasm observe
-complete -c tensor-wasm -n "__fish_seen_subcommand_from observe" -l addr -d 'Base URL of the target TensorWasm server' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from observe" -l interval -d 'Refresh interval, in seconds' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from observe" -l tenant -d 'Tenant id' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from observe" -s h -l help -d 'Print help'
-
-# tensor-wasm completions
-complete -c tensor-wasm -n "__fish_seen_subcommand_from completions; and not __fish_seen_subcommand_from bash zsh fish powershell elvish" -f -a "bash" -d 'Bourne Again SHell (bash)'
-complete -c tensor-wasm -n "__fish_seen_subcommand_from completions; and not __fish_seen_subcommand_from bash zsh fish powershell elvish" -f -a "zsh" -d 'Z SHell (zsh)'
-complete -c tensor-wasm -n "__fish_seen_subcommand_from completions; and not __fish_seen_subcommand_from bash zsh fish powershell elvish" -f -a "fish" -d 'Friendly Interactive SHell (fish)'
-complete -c tensor-wasm -n "__fish_seen_subcommand_from completions; and not __fish_seen_subcommand_from bash zsh fish powershell elvish" -f -a "powershell" -d 'PowerShell'
-complete -c tensor-wasm -n "__fish_seen_subcommand_from completions; and not __fish_seen_subcommand_from bash zsh fish powershell elvish" -f -a "elvish" -d 'Elvish'
-complete -c tensor-wasm -n "__fish_seen_subcommand_from completions" -l out-dir -d 'Optional output directory' -r -F
-complete -c tensor-wasm -n "__fish_seen_subcommand_from completions" -l tenant -d 'Tenant id' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from completions" -s h -l help -d 'Print help'
-
-# tensor-wasm man
-complete -c tensor-wasm -n "__fish_seen_subcommand_from man" -l out-dir -d 'Output directory for the per-subcommand .1 files' -r -F
-complete -c tensor-wasm -n "__fish_seen_subcommand_from man" -l tenant -d 'Tenant id' -r
-complete -c tensor-wasm -n "__fish_seen_subcommand_from man" -s h -l help -d 'Print help'
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -l tenant -d 'Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -s V -l version -d 'Print version'
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -f -a "run" -d 'Run a Wasm module locally against the in-process TensorWasm engine'
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -f -a "deploy" -d 'Upload a Wasm module to a TensorWasm server'
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -f -a "invoke" -d 'Invoke a previously deployed function by id'
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -f -a "bench" -d 'Benchmark local invocation latency (P50/P95/P99/max)'
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -f -a "snapshot" -d 'Save or restore an instance snapshot'
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -f -a "metrics" -d 'Fetch and pretty-print Prometheus metrics from a TensorWasm server'
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -f -a "observe" -d 'Live operator dashboard over `/healthz` + `/metrics` (refreshes in place)'
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -f -a "completions" -d 'Emit shell completion scripts for the named shell'
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -f -a "man" -d 'Generate roff(7) man pages from the clap command tree'
+complete -c tensor-wasm -n "__fish_tensor_wasm_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand run" -l export -d 'Name of the exported function to call. Defaults to `main`' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand run" -l args -d 'Arguments to pass to the export, encoded as a JSON array' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand run" -l tenant -d 'Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand run" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand deploy" -l server -d 'Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand deploy" -l name -d 'Tenant-supplied display name. Defaults to the file stem when omitted' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand deploy" -l tenant -d 'Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand deploy" -s h -l help -d 'Print help'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand invoke" -l server -d 'Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand invoke" -l args -d 'Arguments forwarded to the function, encoded as a JSON array' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand invoke" -l tenant -d 'Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand invoke" -s h -l help -d 'Print help'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand bench" -l export -d 'Name of the export to call on each iteration' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand bench" -l n -d 'Number of iterations to run. Must be >= 1' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand bench" -l tenant -d 'Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand bench" -s h -l help -d 'Print help'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and not __fish_seen_subcommand_from save restore help" -l tenant -d 'Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and not __fish_seen_subcommand_from save restore help" -s h -l help -d 'Print help'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and not __fish_seen_subcommand_from save restore help" -f -a "save" -d 'Capture the state of a running instance into a `.tensor-wasm` file via the API'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and not __fish_seen_subcommand_from save restore help" -f -a "restore" -d 'Restore an instance from a `.tensor-wasm` archive via the API'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and not __fish_seen_subcommand_from save restore help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from save" -l instance -d 'Identifier of the running instance to snapshot' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from save" -l output -d 'Output path for the resulting `.tensor-wasm` archive' -r -F
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from save" -l server -d 'Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from save" -l tenant -d 'Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from save" -s h -l help -d 'Print help'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from restore" -l input -d 'Path to the `.tensor-wasm` archive to upload' -r -F
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from restore" -l as-instance -d 'Identifier to assign to the restored instance' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from restore" -l server -d 'Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from restore" -l max-decompressed -d 'Maximum decompressed snapshot size we\'ll accept, in bytes. Mirrors the server-side cap so the CLI rejects oversized archives without a pointless upload' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from restore" -l tenant -d 'Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from restore" -s h -l help -d 'Print help'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from help" -f -a "save" -d 'Capture the state of a running instance into a `.tensor-wasm` file via the API'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from help" -f -a "restore" -d 'Restore an instance from a `.tensor-wasm` archive via the API'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand snapshot; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand metrics" -l server -d 'Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand metrics" -l tenant -d 'Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand metrics" -s h -l help -d 'Print help'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand observe" -l addr -d 'Base URL of the target TensorWasm server. Defaults to `http://localhost:8080`' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand observe" -l interval -d 'Refresh interval, in seconds. Must be at least 1' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand observe" -l tenant -d 'Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand observe" -s h -l help -d 'Print help'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand completions" -l out-dir -d 'Optional output directory. When provided, the script is written to `<dir>/<conventional-name>` (e.g. `tensor-wasm.bash`, `_tensor-wasm` for zsh, `tensor-wasm.fish`)' -r -F
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand completions" -l tenant -d 'Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand completions" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand man" -l out-dir -d 'Output directory. When omitted, only the root `tensor-wasm.1` page is emitted to stdout. When provided, every subcommand gets its own page written as `<binary>-<subcommand>.1` (matching the established convention used by `git-status.1`, `cargo-build.1`, etc.)' -r -F
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand man" -l tenant -d 'Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility' -r
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand man" -s h -l help -d 'Print help'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand help; and not __fish_seen_subcommand_from run deploy invoke bench snapshot metrics observe completions man help" -f -a "run" -d 'Run a Wasm module locally against the in-process TensorWasm engine'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand help; and not __fish_seen_subcommand_from run deploy invoke bench snapshot metrics observe completions man help" -f -a "deploy" -d 'Upload a Wasm module to a TensorWasm server'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand help; and not __fish_seen_subcommand_from run deploy invoke bench snapshot metrics observe completions man help" -f -a "invoke" -d 'Invoke a previously deployed function by id'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand help; and not __fish_seen_subcommand_from run deploy invoke bench snapshot metrics observe completions man help" -f -a "bench" -d 'Benchmark local invocation latency (P50/P95/P99/max)'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand help; and not __fish_seen_subcommand_from run deploy invoke bench snapshot metrics observe completions man help" -f -a "snapshot" -d 'Save or restore an instance snapshot'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand help; and not __fish_seen_subcommand_from run deploy invoke bench snapshot metrics observe completions man help" -f -a "metrics" -d 'Fetch and pretty-print Prometheus metrics from a TensorWasm server'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand help; and not __fish_seen_subcommand_from run deploy invoke bench snapshot metrics observe completions man help" -f -a "observe" -d 'Live operator dashboard over `/healthz` + `/metrics` (refreshes in place)'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand help; and not __fish_seen_subcommand_from run deploy invoke bench snapshot metrics observe completions man help" -f -a "completions" -d 'Emit shell completion scripts for the named shell'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand help; and not __fish_seen_subcommand_from run deploy invoke bench snapshot metrics observe completions man help" -f -a "man" -d 'Generate roff(7) man pages from the clap command tree'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand help; and not __fish_seen_subcommand_from run deploy invoke bench snapshot metrics observe completions man help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand help; and __fish_seen_subcommand_from snapshot" -f -a "save" -d 'Capture the state of a running instance into a `.tensor-wasm` file via the API'
+complete -c tensor-wasm -n "__fish_tensor_wasm_using_subcommand help; and __fish_seen_subcommand_from snapshot" -f -a "restore" -d 'Restore an instance from a `.tensor-wasm` archive via the API'

@@ -1,32 +1,16 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tensor-wasm-man 1  "tensor-wasm-man "
+.TH tensor-wasm-man 1  "tensor-wasm-man " 
 .SH NAME
 tensor\-wasm\-man \- Generate roff(7) man pages from the clap command tree
 .SH SYNOPSIS
-\fBtensor\-wasm man\fR [\fB\-\-out\-dir\fR=\fIOUT_DIR\fR] [\fB\-\-tenant\fR=\fITENANT\fR] [\fB\-h\fR|\fB\-\-help\fR]
+\fBtensor\-wasm\-man\fR [\fB\-\-out\-dir\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Walks the clap \fBCommand\fR tree, renders one \fB.1\fR page per node via \fBclap_mangen::Man\fR, and writes the resulting groff sources either to a caller\-supplied directory or to stdout (root page only). Used to regenerate the committed scaffolding under \fBcrates/tensor-wasm-cli/man/\fR.
+Generate roff(7) man pages from the clap command tree
 .SH OPTIONS
 .TP
-\fB\-\-out\-dir\fR=\fIOUT_DIR\fR
-Output directory. When omitted, only the root \fBtensor-wasm.1\fR page is emitted to stdout. When provided, every subcommand gets its own page written as \fB<binary>-<subcommand>.1\fR (matching the established convention used by \fBgit-status(1)\fR, \fBcargo-build(1)\fR, etc.).
-.TP
-\fB\-\-tenant\fR=\fITENANT\fR [default: 0]
-Tenant id (inherited from the top\-level flag; unused by this subcommand).
+\fB\-\-out\-dir\fR \fI<OUT_DIR>\fR
+Output directory. When omitted, only the root `tensor\-wasm.1` page is emitted to stdout. When provided, every subcommand gets its own page written as `<binary>\-<subcommand>.1` (matching the established convention used by `git\-status.1`, `cargo\-build.1`, etc.)
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
-.SH EXAMPLES
-.PP
-.RS 4
-.nf
-# Regenerate every committed man page in one pass
-tensor\-wasm man \-\-out\-dir crates/tensor-wasm-cli/man
-
-# Pipe the root page to stdout for ad\-hoc preview
-tensor\-wasm man | man \-l \-
-.fi
-.RE
-.SH "SEE ALSO"
-tensor\-wasm(1), tensor\-wasm\-completions(1)
