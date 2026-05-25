@@ -75,6 +75,36 @@ pub struct HttpInFlightLabels {
     pub method: String,
 }
 
+/// Label set for `tensor_wasm_build_info`.
+///
+/// Standard Prometheus "info-style metric" labels: a gauge that is always
+/// `1` and whose interesting payload is the label values themselves. The
+/// label set is fixed for the lifetime of the process — there is exactly
+/// one series, primed at registry construction — so cardinality is
+/// trivially bounded. The values come from compile-time `env!()` lookups
+/// driven by `tensor-wasm-core/build.rs`; see that script for the
+/// source-of-truth contract per field.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BuildInfoLabels {
+    /// Crate / binary semver, taken from `CARGO_PKG_VERSION` at compile
+    /// time (the workspace-wide `[workspace.package] version` pin).
+    pub version: String,
+    /// `git rev-parse HEAD` at build time, or `"unknown"` for source
+    /// tarballs and hermetic builds without `git` on `PATH`.
+    pub git_sha: String,
+    /// First line of `rustc --version` at build time, or `"unknown"` if
+    /// the build script could not invoke `rustc`.
+    pub rustc_version: String,
+    /// Cargo profile the binary was compiled under (`debug`, `release`,
+    /// `bench`, …), or `"unknown"` if the build script could not read
+    /// `PROFILE` from its environment.
+    pub profile: String,
+    /// Rust target triple the binary was compiled for (e.g.
+    /// `x86_64-unknown-linux-gnu`), or `"unknown"` if the build script
+    /// could not read `TARGET` from its environment.
+    pub target: String,
+}
+
 /// All TensorWasm metrics collected behind a single [`Registry`].
 ///
 /// Clone metric handles into call sites — they are cheap atomic-shared
@@ -102,6 +132,44 @@ struct TensorWasmMetricsInner {
     http_requests_total: Family<HttpRequestLabels, Counter<u64>>,
     http_request_duration_seconds: Family<HttpRequestLabels, Histogram, HttpDurationCtor>,
     http_requests_in_flight: Family<HttpInFlightLabels, Gauge<i64, AtomicI64>>,
+    build_info: Family<BuildInfoLabels, Gauge<i64, AtomicI64>>,
+}
+
+/// Compile-time crate version, from `CARGO_PKG_VERSION`. Public so callers
+/// outside this crate (e.g. the CLI's `--version` flag) can share one
+/// source of truth with the `tensor_wasm_build_info` gauge.
+pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Git commit SHA the crate was built from, or `"unknown"` for tarball
+/// builds. Populated by `tensor-wasm-core/build.rs`.
+pub const BUILD_GIT_SHA: &str = env!("TENSOR_WASM_GIT_SHA");
+
+/// `rustc --version` output captured at build time, or `"unknown"` if
+/// the build script could not invoke `rustc`. Populated by
+/// `tensor-wasm-core/build.rs`.
+pub const BUILD_RUSTC_VERSION: &str = env!("TENSOR_WASM_RUSTC_VERSION");
+
+/// Cargo profile the crate was compiled under (`debug`, `release`, …),
+/// or `"unknown"` if the build script could not read `PROFILE`.
+/// Populated by `tensor-wasm-core/build.rs`.
+pub const BUILD_PROFILE: &str = env!("TENSOR_WASM_PROFILE");
+
+/// Rust target triple the crate was compiled for, or `"unknown"` if the
+/// build script could not read `TARGET`. Populated by
+/// `tensor-wasm-core/build.rs`.
+pub const BUILD_TARGET: &str = env!("TENSOR_WASM_TARGET");
+
+/// Build the [`BuildInfoLabels`] tuple from the compile-time constants
+/// above. Exposed so test code and the CLI can produce the same labels
+/// the metric carries without re-stating each `env!()` lookup.
+pub fn current_build_info_labels() -> BuildInfoLabels {
+    BuildInfoLabels {
+        version: BUILD_VERSION.to_string(),
+        git_sha: BUILD_GIT_SHA.to_string(),
+        rustc_version: BUILD_RUSTC_VERSION.to_string(),
+        profile: BUILD_PROFILE.to_string(),
+        target: BUILD_TARGET.to_string(),
+    }
 }
 
 /// Histogram constructor that captures the configured HTTP-duration bucket
@@ -206,6 +274,15 @@ impl TensorWasmMetrics {
             });
         let http_requests_in_flight: Family<HttpInFlightLabels, Gauge<i64, AtomicI64>> =
             Family::default();
+        let build_info: Family<BuildInfoLabels, Gauge<i64, AtomicI64>> = Family::default();
+        // Prime the single build-info series so it is observable on the
+        // very first scrape (Family<...> emits nothing until at least
+        // one label tuple has been touched). The value is `1` per the
+        // Prometheus "info-style metric" convention — the payload is the
+        // label set, not the number.
+        build_info
+            .get_or_create(&current_build_info_labels())
+            .set(1);
 
         registry.register(
             "tensor_wasm_active_instances",
@@ -265,6 +342,14 @@ impl TensorWasmMetrics {
              route template and method",
             http_requests_in_flight.clone(),
         );
+        registry.register(
+            "tensor_wasm_build_info",
+            "Constant `1` gauge whose labels identify the binary build \
+             (version, git_sha, rustc_version, profile, target). Prometheus \
+             info-style metric: aggregate other series against it to label \
+             dashboards with the live binary identity",
+            build_info.clone(),
+        );
 
         Self {
             inner: Arc::new(TensorWasmMetricsInner {
@@ -280,6 +365,7 @@ impl TensorWasmMetrics {
                 http_requests_total,
                 http_request_duration_seconds,
                 http_requests_in_flight,
+                build_info,
             }),
         }
     }
@@ -354,6 +440,20 @@ impl TensorWasmMetrics {
     /// reported honestly rather than wrapping silently.
     pub fn http_requests_in_flight(&self) -> &Family<HttpInFlightLabels, Gauge<i64, AtomicI64>> {
         &self.inner.http_requests_in_flight
+    }
+
+    /// `tensor_wasm_build_info` info-style gauge family.
+    ///
+    /// Always carries a single primed sample with value `1` and the
+    /// labels in [`current_build_info_labels`]. Operators aggregate
+    /// other series against this gauge to surface the running binary's
+    /// identity on dashboards and alert annotations:
+    ///
+    /// ```promql
+    /// sum by (version, git_sha) (tensor_wasm_build_info)
+    /// ```
+    pub fn build_info(&self) -> &Family<BuildInfoLabels, Gauge<i64, AtomicI64>> {
+        &self.inner.build_info
     }
 
     /// Snapshot every gauge and counter into a plain struct with one
@@ -644,5 +744,84 @@ mod tests {
                 offload_fallback_total: 0,
             }
         );
+    }
+
+    // --- tensor_wasm_build_info -------------------------------------------
+    //
+    // The info-style gauge is primed at registry construction with the
+    // compile-time build identity. These tests pin the three contracts
+    // the rest of the stack (dashboards, alerts, UPGRADE.md verification)
+    // depends on: the series name appears in scrape output, the value is
+    // exactly `1`, and every documented label key is present.
+
+    #[test]
+    fn build_info_appears_in_encoded_text() {
+        let m = TensorWasmMetrics::new();
+        let s = m.encode_text();
+        assert!(
+            s.contains("tensor_wasm_build_info"),
+            "missing tensor_wasm_build_info in:\n{s}"
+        );
+    }
+
+    #[test]
+    fn build_info_value_is_one() {
+        let m = TensorWasmMetrics::new();
+        let labels = current_build_info_labels();
+        // Sanity: the primed handle reads back the value we set.
+        assert_eq!(m.build_info().get_or_create(&labels).get(), 1);
+        // And the Prometheus exposition agrees. The encoded line ends in
+        // ` 1` after the closing brace of the label set.
+        let s = m.encode_text();
+        let line = s
+            .lines()
+            .find(|l| l.starts_with("tensor_wasm_build_info{"))
+            .unwrap_or_else(|| panic!("no tensor_wasm_build_info sample line in:\n{s}"));
+        assert!(
+            line.ends_with(" 1"),
+            "expected build_info value of 1, got line: {line}"
+        );
+    }
+
+    #[test]
+    fn build_info_carries_expected_label_keys() {
+        let m = TensorWasmMetrics::new();
+        let s = m.encode_text();
+        // Each documented label key must appear in the exposition.
+        // OpenMetrics renders `key="value"`; matching on `key="` is
+        // robust against the substituted value (which depends on the
+        // host running the test).
+        for key in ["version", "git_sha", "rustc_version", "profile", "target"] {
+            let needle = format!("{}=\"", key);
+            assert!(
+                s.contains(&needle),
+                "missing label key `{key}` on tensor_wasm_build_info in:\n{s}"
+            );
+        }
+        // The `version` label must reflect CARGO_PKG_VERSION verbatim.
+        let version_needle = format!("version=\"{}\"", env!("CARGO_PKG_VERSION"));
+        assert!(
+            s.contains(&version_needle),
+            "expected `{version_needle}` in:\n{s}"
+        );
+    }
+
+    #[test]
+    fn build_info_constants_match_labels() {
+        // The helper and the public constants are two paths to the same
+        // truth; if they diverge the dashboards lie. Pin them together.
+        let labels = current_build_info_labels();
+        assert_eq!(labels.version, BUILD_VERSION);
+        assert_eq!(labels.git_sha, BUILD_GIT_SHA);
+        assert_eq!(labels.rustc_version, BUILD_RUSTC_VERSION);
+        assert_eq!(labels.profile, BUILD_PROFILE);
+        assert_eq!(labels.target, BUILD_TARGET);
+        // None of the values are empty — the build script substitutes
+        // "unknown" rather than the empty string on failure.
+        assert!(!labels.version.is_empty());
+        assert!(!labels.git_sha.is_empty());
+        assert!(!labels.rustc_version.is_empty());
+        assert!(!labels.profile.is_empty());
+        assert!(!labels.target.is_empty());
     }
 }

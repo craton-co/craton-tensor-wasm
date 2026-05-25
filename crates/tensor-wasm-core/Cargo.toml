@@ -12,6 +12,7 @@ readme = "README.md"
 description = "Foundational types, errors, metrics, and telemetry shared by every TensorWasm crate."
 keywords = ["wasm", "gpu", "runtime", "telemetry", "observability"]
 categories = ["wasm", "development-tools"]
+build = "build.rs"
 
 [lib]
 

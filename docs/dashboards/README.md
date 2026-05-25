@@ -96,6 +96,28 @@ The grid is 24 columns wide. Rows from top to bottom:
 - `invoke P95 (5m)` — ≤ 100 ms host-only / ≤ 500 ms with GPU dispatch
 - `dispatch P95 (5m)` — ≤ 50 µs host-only; CUDA-host TBD (v0.4)
 
+### Build identity (header row, stat panel)
+
+- `Binary version` — Stat panel reading the `tensor_wasm_build_info`
+  info-style gauge. Recommended PromQL — render the gauge's
+  `version` label directly with no aggregation, so a heterogeneous
+  fleet shows one row per running binary:
+
+  ```promql
+  tensor_wasm_build_info
+  ```
+
+  In Grafana, set the panel's value mapping to the `version` label
+  via **Value options → Fields → Labels → version** (or use
+  `label_values(tensor_wasm_build_info, version)` in a templated
+  caption). The same metric carries `git_sha`, `rustc_version`,
+  `profile`, and `target` labels; surface whichever are useful as
+  secondary stat panels or as the panel tooltip. The gauge is
+  always `1` — the payload is the label set, not the number. Useful
+  during an upgrade window to confirm every replica reports the
+  expected version; cross-references the `tensor_wasm_build_info`
+  check in `docs/UPGRADE.md` §6.
+
 ### HTTP traffic
 
 - `Requests/sec by route` — timeseries
@@ -159,6 +181,11 @@ import:
   landed in W2.3)
 - `tensor_wasm_http_requests_in_flight{route,method}` (gauge,
   landed in W2.3; capacity panel only, not an SLI)
+- `tensor_wasm_build_info{version,git_sha,rustc_version,profile,target}`
+  (info-style gauge, value always `1`; landed in W4.9). Powers the
+  **Build identity** stat panel and is referenced by the UPGRADE.md
+  post-upgrade verification step that confirms every replica reports
+  the expected `version` after a rolling deploy.
 
 Caveat: the gauges and counters listed above are emitted today as
 **aggregates with no `tenant` label**. The Tenant-row panels query

@@ -38,6 +38,7 @@
 
 use std::sync::Once;
 
+#[allow(unused_imports)] // referenced indirectly via the global propagator registration
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 

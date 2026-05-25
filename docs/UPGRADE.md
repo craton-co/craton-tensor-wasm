@@ -334,8 +334,17 @@ and fail under load.
       documented in
       [`docs/SLO.md` §8](SLO.md#8-disclosure-measured-vs-modeled)
       is the canary that the gateway started and processed a request.
-      If a future release adds a `tensor_wasm_version` label, verify
-      it reflects the new release.
+- [ ] **Binary identity.** Confirm the binary identity:
+      `curl -s http://<host>:8080/metrics | grep tensor_wasm_build_info`
+      should show `version=<new-version>` (and matching `git_sha`,
+      `rustc_version`, `profile`, `target` labels). The
+      `tensor_wasm_build_info` gauge is the W4.9 info-style metric
+      primed at process start; the value is always `1` and the
+      payload is the label set. Run this against every replica
+      (k8s: loop over `kubectl -n tensor-wasm get pods -l
+      app.kubernetes.io/name=tensor-wasm -o name`) — a single replica
+      reporting the old version is the canary that the rolling
+      restart skipped a pod.
 - [ ] **Dashboard + SLO sanity.** Open the dashboard
       ([`docs/dashboards/README.md`](dashboards/README.md)) and watch
       for 15 minutes. The
