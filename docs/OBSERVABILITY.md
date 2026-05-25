@@ -111,3 +111,7 @@ This file documents traces only; for metrics see `tensor_wasm_core::metrics::Ten
 - `docs/PERFORMANCE.md` for performance impact of the OTLP exporter
 
 _Status: S20 of the plan. Re-baseline span schema before v0.2 — span names are part of the public observability contract._
+
+## Reference Grafana dashboard
+
+The metrics half of this story is rendered by the reference Grafana dashboard committed at [`docs/dashboards/tensor-wasm-overview.json`](dashboards/tensor-wasm-overview.json), with import instructions and the full metric inventory in [`docs/dashboards/README.md`](dashboards/README.md). The dashboard renders the five SLIs defined in [`docs/SLO.md`](SLO.md) as a top-row stat strip, then drills into HTTP traffic, per-tenant capacity, snapshot capture/restore, JIT cache hit ratio, and back-pressure permit utilization. It targets a generic Prometheus datasource via the `${DS_PROMETHEUS}` variable so a single JSON file imports cleanly into any Grafana — no Mimir/Cortex-specific features. Panels whose backing metric is in the TODO column (per the dashboard README) render "No data" until W2.3 ships the HTTP request counter and duration histogram; tenant-row panels degrade to a single aggregate series until per-tenant labelling lands on the existing gauges.

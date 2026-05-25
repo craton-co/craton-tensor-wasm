@@ -713,3 +713,21 @@ _Status: v0.3 gate. Targets are conservative pre-1.0 commitments and
 will tighten once production telemetry exists. The CUDA-host
 dispatch SLO is intentionally left TBD pending the S22 runner;
 prefer "TBD" to a guess._
+
+---
+
+**Dashboards.** The reference Grafana dashboard described in
+[Section 6](#6-dashboards) is committed at
+[`docs/dashboards/tensor-wasm-overview.json`](dashboards/tensor-wasm-overview.json)
+with an importer-facing companion at
+[`docs/dashboards/README.md`](dashboards/README.md). The dashboard's
+top row renders the five SLIs defined in
+[Section 2](#2-sli-definitions) — `availability_http`,
+`error_rate_invoke`, `latency_http_healthz_P95`,
+`latency_http_invoke_P95`, and `latency_dispatch_serial_P95` — as
+Stat panels with thresholds matching the targets in
+[Section 3](#3-slo-targets). Panels whose backing metric is in the
+"TODO" column of the dashboard's metric inventory (HTTP request
+counter, HTTP duration histogram, snapshot histograms, JIT cache
+counters, back-pressure gauges) render "No data" until W2.3 lands;
+no dashboard edit is required to bring them online.
