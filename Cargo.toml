@@ -43,7 +43,14 @@ cranelift-codegen = "0.111"
 # CUDA — gated by per-crate feature flags. Workspace deps cannot carry
 # `optional = true` themselves; the individual crate `[dependencies]` tables
 # add `optional = true` and a corresponding feature in their `[features]` table.
-cust = { version = "0.3", default-features = false }
+# cust 0.3.2 has a known bug at src/memory/device/device_buffer.rs:9 where
+# `pub use bytemuck;` is unconditional (the `cfg_attr(docsrs, ...)` only
+# sets docs metadata). Enabling the bytemuck feature pulls the optional
+# dep in for real, sidestepping the "no external crate `bytemuck`" build
+# error on hosts that actually exercise the cust path. The bytemuck-related
+# DeviceBuffer methods are unused by TensorWasm so the additional surface is
+# cost-free.
+cust = { version = "0.3", default-features = false, features = ["bytemuck"] }
 ptx-builder = "0.5"
 # cudarc — actively maintained alternative to `cust`. Pinned at 0.13 (latest
 # 0.13.x as of 2026-05). Driver-only feature set keeps the build script light;

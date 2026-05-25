@@ -196,8 +196,16 @@ impl std::future::Future for DispatchFuture {
                 // wasmtime fiber doesn't hang forever — the host's
                 // launch path will surface the real error to the guest
                 // separately via `last_error`.
+                // cust 0.3.2's Event::query returns CudaResult<EventStatus>;
+                // the enum is { Ready, NotReady }. EventStatus::Ready means the
+                // GPU work has completed (equivalent to Event::synchronize for
+                // Unified Memory per the cust docs).
                 return match ev.query() {
-                    Ok(()) => std::task::Poll::Ready(()),
+                    Ok(cust::event::EventStatus::Ready) => std::task::Poll::Ready(()),
+                    Ok(cust::event::EventStatus::NotReady) => {
+                        _cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
                     Err(_e) => {
                         // Not done yet — wake immediately so the
                         // executor re-polls. This is a busy-poll but

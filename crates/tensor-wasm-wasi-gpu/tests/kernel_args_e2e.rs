@@ -131,8 +131,13 @@ async fn scalar_argv_round_trips_through_launch_path() {
         .expect("typed func");
     let rc = f.call_async(&mut store, ()).await.expect("call");
 
-    // No-CUDA path returns NotAvailable; the CUDA path returns 0 (and the
-    // CUDA-only kernel-correctness assertion lives in the ignored test).
+    // No-CUDA path: launch reports NotAvailable after parsing argv.
+    // CUDA path: the stub kernel has no PTX module behind it (see
+    // register_stub_kernel), so the launch correctly fails with
+    // InvalidKernel rather than the optimistic `0` the test originally
+    // claimed. The argv-parsing assertion below is the real property the
+    // test pins. A real-PTX launch-success assertion lives in the
+    // #[ignore = "requires CUDA hardware"] test at the bottom of the file.
     #[cfg(not(feature = "cuda"))]
     assert_eq!(
         rc,
@@ -140,7 +145,11 @@ async fn scalar_argv_round_trips_through_launch_path() {
         "no-CUDA host: launch reports NotAvailable after parsing argv"
     );
     #[cfg(feature = "cuda")]
-    assert_eq!(rc, 0, "CUDA host: launch must succeed for valid argv");
+    assert_eq!(
+        rc,
+        AbiError::InvalidKernel.code(),
+        "CUDA host: stub kernel has no PTX module; launch rejects with InvalidKernel"
+    );
 
     // The parsed args must be visible regardless of CUDA-vs-stub.
     let recorded = store.data().wasi_cuda().last_lowered_args();
@@ -195,10 +204,14 @@ async fn pointer_argv_round_trips_through_launch_path() {
         .expect("typed func");
     let rc = f.call_async(&mut store, ()).await.expect("call");
 
+    // Same reasoning as scalar_argv_round_trips_through_launch_path: the
+    // CUDA path correctly rejects the stub kernel with InvalidKernel
+    // because no PTX module is loaded. The argv-parsing assertion below
+    // is the property the test pins.
     #[cfg(not(feature = "cuda"))]
     assert_eq!(rc, AbiError::NotAvailable.code());
     #[cfg(feature = "cuda")]
-    assert_eq!(rc, 0);
+    assert_eq!(rc, AbiError::InvalidKernel.code());
 
     let recorded = store.data().wasi_cuda().last_lowered_args();
     assert_eq!(recorded.len(), 3, "expected three lowered args");

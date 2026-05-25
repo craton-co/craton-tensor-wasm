@@ -668,6 +668,21 @@ async fn launch_impl_async<T: HasWasiCuda>(
         Vec::new()
     };
 
+    // Stash the parsed argv for observability BEFORE the kernel-handle
+    // lookup. Tests inspect `last_lowered_args` to confirm the
+    // marshalling round-trip held; surfacing it only after the launch
+    // synchronizes (or after the CUDA branch's many error paths) means
+    // a missing-PTX or stream-failure case loses the parse signal,
+    // which is the more valuable data point for diagnostics. The CUDA
+    // and no-CUDA branches further down both overwrite this slot on
+    // their own happy path, so the duplication is intentional.
+    *caller
+        .data()
+        .wasi_cuda()
+        .last_lowered_args
+        .lock()
+        .expect("last_lowered_args poisoned") = lowered_args.clone();
+
     // Eagerly take a strong, owned handle to the kernel (Arc-wrapped on
     // CUDA builds). This both validates `kid` and frees the registry's
     // dashmap entry before we cross any await boundary, eliminating the
@@ -758,7 +773,9 @@ async fn launch_impl_async<T: HasWasiCuda>(
         use cust::sys as cuda_sys;
         let launch_status = unsafe {
             cuda_sys::cuLaunchKernel(
-                func.as_raw(),
+                // cust 0.3.2 exposes the raw CUfunction handle via `to_raw()`
+                // (NOT `as_raw()`); the spike originally guessed wrong.
+                func.to_raw(),
                 grid_x as u32,
                 grid_y as u32,
                 grid_z as u32,
