@@ -19,11 +19,18 @@
 //! * **Tenant scoping.** The `X-TensorWasm-Tenant: <u64>` header is parsed and
 //!   threaded through to the executor. Set `TENSOR_WASM_API_REQUIRE_TENANT=1`
 //!   to make the header mandatory.
+//! * **Per-token rate limiting.** Configurable QPS + burst per bearer token,
+//!   enforced behind bearer auth. Reads
+//!   `TENSOR_WASM_API_RATE_LIMIT_QPS` and `TENSOR_WASM_API_RATE_LIMIT_BURST`;
+//!   either zero or unset disables the limiter. Rejections return
+//!   `429 Too Many Requests` with a `Retry-After` header. See
+//!   [`rate_limit`].
 //!
 //! See [`API.md`](../API.md) for the wire-format contract.
 #![deny(missing_docs)]
 
 pub mod middleware;
+pub mod rate_limit;
 pub mod routes;
 pub mod server;
 
@@ -31,5 +38,6 @@ pub use middleware::{
     AuthConfig, TenantConfig, ENV_API_TOKENS, ENV_REQUIRE_TENANT, HEADER_TENANT,
     MAX_REQUEST_BODY_BYTES,
 };
+pub use rate_limit::{AuthContext, RateLimitConfig, RateLimiter, TokenId};
 pub use routes::{ApiError, AppState, FunctionRecord, JobRecord, JobStatus};
-pub use server::{build_router, build_router_with_config, serve};
+pub use server::{build_router, build_router_with_config, build_router_with_full_config, serve};

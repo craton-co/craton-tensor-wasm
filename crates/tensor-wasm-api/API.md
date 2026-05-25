@@ -61,6 +61,46 @@ Every inbound request body is capped at **64 MiB** by
 `413 Payload Too Large` before any handler runs. The cap is global; it is
 not user-tunable in this release.
 
+### Per-token rate limiting
+
+The gateway applies a per-bearer-token QPS + burst rate limit using an
+in-process token bucket. The limit is configured via two environment
+variables read at startup:
+
+| Env var                              | Default | Meaning                                             |
+|--------------------------------------|---------|-----------------------------------------------------|
+| `TENSOR_WASM_API_RATE_LIMIT_QPS`     | unset   | Steady-state requests per second admitted per token.|
+| `TENSOR_WASM_API_RATE_LIMIT_BURST`   | unset   | Bucket capacity per token (maximum burst).          |
+
+* If **either** variable is unset, `0`, or unparseable, the limiter is
+  **disabled** — equivalent to v0.1 behaviour.
+* If one variable is set but the other is not, the missing knob defaults
+  to `qps=100` / `burst=200` respectively.
+* When enabled, a missing or unauthenticated request never consumes a
+  permit — the rate-limit layer runs *after* bearer auth.
+* In dev mode (empty allowlist) every request shares a single synthetic
+  bucket; the limiter still throttles the total dev-mode request rate.
+
+Rejected requests return `429 Too Many Requests` with the standard
+`{ "error": { "kind": "rate_limited", "message": ... } }` envelope and a
+`Retry-After` header. Per RFC 9110 §10.2.3 we emit the value as a
+non-negative integer number of seconds (never a date). The integer is the
+ceiling of `(1 - bucket_tokens) / qps`, clamped to at least `1` so even
+high-QPS configurations produce an actionable back-off.
+
+Example response:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 1
+
+{ "error": { "kind": "rate_limited", "message": "per-token rate limit exceeded; retry after 1s" } }
+```
+
+Buckets are per-token, sharded by `dashmap`, and recover on a lazy
+refill-on-take schedule. No external store (Redis, etc.) is required.
+
 ### Error envelope
 
 Every non-2xx response carries the same JSON envelope:
@@ -88,6 +128,7 @@ may change between patch releases. Known `kind` values:
 | `unauthorized`     | 401  | Missing or unrecognised bearer token.                                    |
 | `not_found`        | 404  | Requested function or job id does not exist.                             |
 | `body_too_large`   | 413  | Inbound body exceeds the 64 MiB cap (often rendered as bare 413).        |
+| `rate_limited`     | 429  | Per-token QPS + burst exceeded; response carries `Retry-After: <secs>`.  |
 | `invoke_timeout`   | 504  | Invocation exceeded its per-call deadline.                               |
 | `instance_not_found` | 404 | Executor lost track of an instance mid-call (rare).                     |
 | `wasmtime`         | 500  | Underlying wasmtime call failed (trap, host error, etc.).                |
@@ -307,9 +348,15 @@ Every route is wrapped in the standard tower stack assembled by
 * [`concurrency_limit_layer(64)`](src/middleware.rs) — caps in-flight
   requests process-wide. Per-tenant buckets land in a follow-up release.
 * [`bearer_auth`](src/middleware.rs) — enforces `TENSOR_WASM_API_TOKENS`. Dev
-  mode pass-through when the allowlist is empty.
+  mode pass-through when the allowlist is empty. On success inserts an
+  `AuthContext { token_id }` into the request extensions for downstream
+  middleware to consume.
 * [`tenant_scope`](src/middleware.rs) — parses `X-TensorWasm-Tenant` into a
   `TenantId` extension and applies the `TENSOR_WASM_API_REQUIRE_TENANT` policy.
+* [`rate_limit`](src/rate_limit.rs) — token-bucket per `AuthContext.token_id`.
+  Reads `TENSOR_WASM_API_RATE_LIMIT_QPS` and `TENSOR_WASM_API_RATE_LIMIT_BURST`;
+  no-op when either is unset or zero. Returns `429` + `Retry-After` on
+  bucket-empty.
 
 The stack composition lives in `server.rs` so individual middleware can be
 re-used by integration tests and benchmarks. See

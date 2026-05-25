@@ -170,11 +170,15 @@ fn envelope(status: StatusCode, kind: &str, message: &str) -> Response {
 /// Bearer-token authentication middleware.
 ///
 /// If the allowlist is empty the request passes through (dev mode — already
-/// warned at startup). Otherwise the `Authorization: Bearer <token>` header
-/// must match one of the allowlisted tokens; missing or mismatched headers
-/// produce `401 Unauthorized` with the standard error envelope and
-/// `kind: "unauthorized"`.
-pub async fn bearer_auth(req: Request, next: Next) -> Response {
+/// warned at startup) and a synthetic [`AuthContext::dev`] is inserted into
+/// the request extensions. Otherwise the `Authorization: Bearer <token>`
+/// header must match one of the allowlisted tokens; missing or mismatched
+/// headers produce `401 Unauthorized` with the standard error envelope and
+/// `kind: "unauthorized"`. On success an [`AuthContext`] keyed by the
+/// stable [`crate::rate_limit::TokenId`] derived from the bearer token is
+/// inserted into the request extensions for downstream middleware (rate
+/// limiting, audit) to consume.
+pub async fn bearer_auth(mut req: Request, next: Next) -> Response {
     let cfg = req
         .extensions()
         .get::<AuthConfig>()
@@ -182,6 +186,7 @@ pub async fn bearer_auth(req: Request, next: Next) -> Response {
         .unwrap_or_default();
 
     if cfg.is_dev_mode() {
+        req.extensions_mut().insert(crate::rate_limit::AuthContext::dev());
         return next.run(req).await;
     }
 
@@ -209,6 +214,8 @@ pub async fn bearer_auth(req: Request, next: Next) -> Response {
         );
     }
 
+    req.extensions_mut()
+        .insert(crate::rate_limit::AuthContext::for_token(&token));
     next.run(req).await
 }
 
