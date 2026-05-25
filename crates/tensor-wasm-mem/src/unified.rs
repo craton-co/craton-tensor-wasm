@@ -69,10 +69,33 @@ mod backing_impl {
         Cuda(cust::memory::UnifiedBuffer<u8>),
     }
 
+    /// Process-wide CUDA context init via cust::quick_init. cust 0.3
+    /// uses an implicit primary-context model -- without this, any
+    /// allocation returns `CUDA_ERROR_NOT_INITIALIZED` because `cuInit(0)`
+    /// was never called. The result is held in a `OnceLock` so subsequent
+    /// allocations are init-free. We only need to keep the `Context` alive
+    /// for the rest of the process; nothing here ever drops it.
+    fn ensure_cuda_init() -> Result<(), UnifiedError> {
+        use std::sync::OnceLock;
+        static CTX: OnceLock<Result<cust::context::Context, String>> = OnceLock::new();
+        let r = CTX.get_or_init(|| {
+            cust::quick_init().map_err(|e| format!("cust::quick_init: {e:?}"))
+        });
+        match r {
+            Ok(_) => Ok(()),
+            Err(msg) => Err(UnifiedError::Cuda(msg.clone())),
+        }
+    }
+
     impl Backing {
         pub(crate) fn allocate(size: usize) -> Result<(NonNull<u8>, Self), UnifiedError> {
-            // Lazily initialise CUDA. Real call site wires this in S5 onwards.
-            let buf = cust::memory::UnifiedBuffer::new(&0u8, size)
+            // Ensure cuInit(0) + a primary context have run before the first
+            // cuMemAllocManaged. Idempotent and cheap on subsequent calls.
+            ensure_cuda_init()?;
+            // `as_raw_mut` is a `&mut self` method on cust's UnifiedPointer,
+            // so the buffer must be bound mutably even though we only read it
+            // once to derive the raw pointer.
+            let mut buf = cust::memory::UnifiedBuffer::new(&0u8, size)
                 .map_err(|e| UnifiedError::Cuda(format!("{e:?}")))?;
             // SAFETY: cust returns a non-null aligned pointer to the allocation.
             let ptr = NonNull::new(buf.as_unified_ptr().as_raw_mut() as *mut u8)
@@ -163,25 +186,29 @@ impl UnifiedBuffer {
 
     /// Suggest to the runtime that the buffer should be migrated to the device.
     /// No-op when `unified-memory` is disabled.
+    ///
+    /// **Implementation status:** under `--features unified-memory`, this is
+    /// currently an advisory no-op. cust 0.3.2's `MemoryAdvise::prefetch_to_device`
+    /// requires a `&Stream` + `&Device` (rather than the bare `i32` ordinal this
+    /// signature accepts), and the unified-memory subsystem does not yet thread
+    /// a `Stream` through the public surface. On Windows WDDM the equivalent
+    /// `cuMemPrefetchAsync` call returns `CUDA_ERROR_INVALID_DEVICE` anyway
+    /// because consumer Turing cards don't expose `concurrentManagedAccess`,
+    /// so the user-visible behavior is the same. The `cudarc_backend` path
+    /// (see `cudarc_backend.rs`) does call the driver fn directly via
+    /// `cudarc::driver::sys::lib().cuMemPrefetchAsync`, where the
+    /// platform support story is the same.
+    ///
+    /// TODO(v0.4): thread a `Stream` through `UnifiedBuffer` and wire this
+    /// against `cust::memory::MemoryAdvise::prefetch_to_device(&stream, &device)`.
     pub fn prefetch_to_device(&self) -> Result<(), UnifiedError> {
-        #[cfg(feature = "unified-memory")]
-        {
-            let Backing::Cuda(buf) = &self.backing;
-            buf.prefetch_to_device(self.device_id.0 as i32)
-                .map_err(|e| UnifiedError::Cuda(format!("{e:?}")))?;
-        }
         Ok(())
     }
 
     /// Suggest to the runtime that the buffer should be migrated back to host
-    /// memory. No-op when `unified-memory` is disabled.
+    /// memory. Currently an advisory no-op for the same reasons as
+    /// [`Self::prefetch_to_device`].
     pub fn prefetch_to_host(&self) -> Result<(), UnifiedError> {
-        #[cfg(feature = "unified-memory")]
-        {
-            let Backing::Cuda(buf) = &self.backing;
-            buf.prefetch_to_host()
-                .map_err(|e| UnifiedError::Cuda(format!("{e:?}")))?;
-        }
         Ok(())
     }
 }
