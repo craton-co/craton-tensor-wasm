@@ -8,28 +8,30 @@
 
 > A GPU-accelerated serverless WebAssembly runtime.
 
-**Status: v0.1.0 — preview release, with the v0.2-v0.4 hardening waves
-(W1-W4) landed on `main` ahead of the next tagged cut.**
+**Status: v0.3.0 — released 2026-05-25.** Consolidates the implementable
+items from the v0.2 / v0.3 / v0.4 PATH-TO-V1 milestones into a single
+shipped version.
 
 Craton TensorWasm runs untrusted Wasm modules with explicit (and, opt-in via the
 `auto-offload` feature, implicit) GPU kernel dispatch on CUDA. It's built
-on Wasmtime + Tokio + cust, exposes an HTTP API, and ships with a developer
-CLI, a snapshot subsystem for fast cold-starts, and OpenTelemetry tracing
-out of the box.
+on Wasmtime + Tokio + cust (with a cudarc backend spike opt-in), exposes
+an HTTP API, and ships with a developer CLI, a snapshot subsystem for fast
+cold-starts, and OpenTelemetry tracing wired end-to-end.
 
 ## Status
 
-**v0.1.0** — the scaffold release. Every subsystem in the architecture is
-present and tested on a CUDA-free host; the CUDA-bound paths (real
-`cudaMallocManaged`, real PTX `ptxas` validation, real kernel launches) are
-gated behind `--features unified-memory` and exercised by the CUDA self-
-hosted CI runner. See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for
-honest numbers.
+**v0.3.0** — auth, observability, ops, and supply-chain hardening shipped.
+The host-only execution path is solid (≈ 150 tests across 10 crates, all
+green on a CUDA-free developer laptop). CUDA-bound paths (real
+`cudaMallocManaged`, real PTX `ptxas` validation, real kernel launches)
+are gated behind `--features unified-memory` and exercised by the CUDA
+self-hosted runner once it lands (see `docs/CUDARC-SPIKE.md` for the
+concrete compile-friction status as of the 0.3.0 cut). See
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) and
+[`bench-results/tail-latency.json`](bench-results/tail-latency.json) for
+the honest measured numbers.
 
-Several subsystems have matured on `main` since 0.1.0 cut — the work that
-advances v0.2 ("Real CUDA"), v0.3 ("Production observability") and v0.4
-("API hardening") is staged in the `[Unreleased]` section of
-[`CHANGELOG.md`](CHANGELOG.md). Highlights:
+What 0.3.0 ships on top of 0.1.0:
 
 - **Auth & multi-tenancy.** Per-tenant scoped bearer tokens (W2.1) with
   `tenant_scope_denied` 403s; structured audit log opt-in via

@@ -5,7 +5,42 @@ All notable changes to Craton TensorWasm will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - dev
+## [0.3.0] - 2026-05-25
+
+This release consolidates the v0.2, v0.3 and v0.4 PATH-TO-V1 milestones'
+implementable items into a single shipped version. CUDA-hardware-bound
+items (S22 runner, measured GPU dispatch numbers, MPS production
+validation) and external-party items (pen-test, design-partner
+deployments) remain deferred — see `docs/PATH-TO-V1.md` for the
+ongoing roadmap.
+
+### Upgrade notes
+
+- **Bare-token entries in `TENSOR_WASM_API_TOKENS` are deprecated.**
+  Rewrite as `token:tenant=*` (preserves current behavior) or
+  `token:tenant=1,2,3` (per-tenant scope). Removal target: 1.0.
+- **Per-tenant scope enforcement on `/invoke`.** Calls that worked
+  under 0.1 with a bare token now require `:tenant=*` or an explicit
+  scope match; out-of-scope calls return `403 tenant_scope_denied`.
+- **Audit log emission on state-mutating routes.** Default sink is
+  stdout; disable with `TENSOR_WASM_API_AUDIT_LOG=none` if undesired.
+- **Per-token rate limiting** subject to
+  `TENSOR_WASM_API_RATE_LIMIT_QPS` and `_BURST`. Disabled when either
+  is unset/zero (matches pre-0.3 behavior).
+- **HTTP request metrics** now emitted under
+  `tensor_wasm_http_requests_total`, `*_duration_seconds`, and
+  `*_in_flight`. Dashboards that previously had TODO markers for these
+  series now have real data.
+- **Snapshot reader** still enforces the 256 MiB decompression-bomb cap
+  by default; trusted-snapshot callers should opt in via
+  `SnapshotReader::with_max_decompressed`.
+
+See `docs/MIGRATION-v0-to-v1.md` for the full deprecation /
+behavioral-change table.
+
+## [Unreleased]
+_No entries yet — open the next PR adding one._
+
 ### Security
 - Repository ownership transferred to Craton Software Company
 - Added LICENSE / NOTICE files (Apache-2.0)
