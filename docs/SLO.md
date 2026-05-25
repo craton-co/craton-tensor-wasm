@@ -68,9 +68,9 @@ priority signal.
 Each SLI is a single Prometheus expression returning a unitless
 ratio (for availability and error-rate) or a duration in seconds (for
 latency). The expressions assume the standard Prometheus scrape
-interval (15 s) and standard tower-http instrumentation. Where a
-referenced metric does not yet exist in the codebase, it is flagged
-with a TODO comment naming the proposed metric.
+interval (15 s) and standard tower-http instrumentation. As of W2.3,
+every metric referenced below is emitted by the gateway — the PromQL
+runs as-is against a live `/metrics` scrape.
 
 The metrics that **do** exist today, audited against
 `crates/tensor-wasm-core/src/metrics.rs`, are:
@@ -87,13 +87,12 @@ The metrics that **do** exist today, audited against
 
 The HTTP-level metrics referenced below
 (`tensor_wasm_http_requests_total`,
-`tensor_wasm_http_request_duration_seconds`) are **not yet emitted**
-by `tensor-wasm-api` and must be added before any of the
-HTTP-keyed SLOs in this document become enforceable. The proposed
-labels are `method` (`GET`, `POST`, `DELETE`), `route` (the matched
-axum route template, e.g. `/functions/:id/invoke`, never the
-substituted value), and `status` (the numeric HTTP status code as a
-string). Tracking issue: see TODOs inline.
+`tensor_wasm_http_request_duration_seconds`) are emitted by the
+`tensor_wasm_api::http_metrics` middleware as of W2.3. Labels are
+`method` (`GET`, `POST`, `DELETE`), `route` (the matched axum route
+template, e.g. `/functions/:id/invoke`, never the substituted value),
+and `status` (the numeric HTTP status code as a string). The
+PromQL expressions below are executable against a running gateway.
 
 ### 2.1 `availability_http`
 
@@ -101,7 +100,6 @@ Ratio of non-5xx HTTP responses to all HTTP responses over the
 trailing 30 days.
 
 ```promql
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}, currently absent
 sum(rate(tensor_wasm_http_requests_total{status!~"5.."}[30d]))
   /
 sum(rate(tensor_wasm_http_requests_total[30d]))
@@ -118,7 +116,6 @@ rate limiter doing its job is not a service failure.
 P95 latency of `GET /healthz` over the trailing 5 minutes.
 
 ```promql
-# TODO: emit tensor_wasm_http_request_duration_seconds_bucket{route,method,status}, currently absent
 histogram_quantile(
   0.95,
   sum by (le) (
@@ -142,7 +139,6 @@ trailing 5 minutes. The 30-second per-call deadline (see
 is far tighter than that for the common path.
 
 ```promql
-# TODO: emit tensor_wasm_http_request_duration_seconds_bucket{route,method,status}, currently absent
 histogram_quantile(
   0.95,
   sum by (le) (
@@ -195,7 +191,6 @@ failure to meet its own deadline) all roll up under "5xx for the
 purposes of this SLI".
 
 ```promql
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}, currently absent
 (
   sum(rate(tensor_wasm_http_requests_total{
     route="/functions/:id/invoke",
@@ -387,7 +382,6 @@ and a 1-hour window. At this rate, the monthly budget is gone in
 50 hours.
 
 ```promql
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}, currently absent
 (
   sum(rate(tensor_wasm_http_requests_total{status=~"5.."}[1h]))
     /
@@ -412,7 +406,6 @@ Catches a degradation that is not fast enough to trigger the
 14.4× page but is bleeding the monthly budget over a working day.
 
 ```promql
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}, currently absent
 (
   sum(rate(tensor_wasm_http_requests_total{status=~"5.."}[6h]))
     /
@@ -438,7 +431,6 @@ a "you are using all of your budget" warning rather than an
 emergency. Files a ticket, does not page.
 
 ```promql
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}, currently absent
 (
   sum(rate(tensor_wasm_http_requests_total{status=~"5.."}[3d]))
     /
@@ -466,7 +458,6 @@ noise).
 #### Fast latency-burn on `/invoke` (page)
 
 ```promql
-# TODO: emit tensor_wasm_http_request_duration_seconds_bucket{route,method,status}, currently absent
 histogram_quantile(
   0.95,
   sum by (le) (
@@ -497,7 +488,6 @@ Severity: page. Runbook: [`docs/runbooks/invoke-latency-spike.md`](runbooks/invo
 #### Sustained latency-burn on `/healthz` (ticket)
 
 ```promql
-# TODO: emit tensor_wasm_http_request_duration_seconds_bucket{route,method,status}, currently absent
 histogram_quantile(
   0.95,
   sum by (le) (
@@ -623,20 +613,32 @@ grounded in measurement, extrapolation, or guess.
 | `latency_dispatch_serial_P95` CUDA-host | **TBD.** No measurement exists. | S22 runner produces a measured baseline → number set in v0.4 SLO update. Until then, the column reads "TBD". |
 | `error_rate_invoke` (1.0%) | **Modeled.** No production telemetry. Chosen to align with the availability budget at finer time resolution. | Re-evaluate against design-partner data before v1.0. |
 
-**Metrics needed but not yet emitted** (TODOs in this document):
+**Metrics landed in W2.3** (`crates/tensor-wasm-api/src/http_metrics.rs`,
+shipped alongside this document under the v0.3 milestone):
 
 - `tensor_wasm_http_requests_total{route,method,status}` (counter)
 - `tensor_wasm_http_request_duration_seconds_bucket{route,method,status}` (histogram)
+- `tensor_wasm_http_requests_in_flight{route,method}` (gauge — capacity panel only, not an SLI)
 
-The proposed instrumentation point is `tensor-wasm-api`'s tower
-middleware stack (`crates/tensor-wasm-api/src/middleware.rs`), adjacent
-to the existing `trace_layer_with_propagation`. Until these metrics
-exist, the HTTP-keyed alerts in Section 5 cannot fire — they are
-written as code documentation of what the alerts will look like
-once the metrics land.
+The instrumentation point is a tower middleware (`http_metrics_middleware`)
+wired into `build_router` *outside* `bearer_auth`, so `401` responses
+are also counted — consistent with `availability_http` and the
+burn-rate alerts in [Section 5](#5-burn-rate-alerts), which evaluate
+the ratio over every HTTP response. The `route` label always carries
+the axum route template (e.g. `/functions/:id/invoke`); the substituted
+UUID is never emitted as a label value, and any unmatched path collapses
+to `route="unknown"`. Cardinality is bounded by a runtime allow-list
+initialised at startup from the route templates registered in
+`build_router_with_audit`; adding a new route to that builder requires
+adding the same template to `tensor_wasm_api::http_metrics::DEFAULT_ROUTE_ALLOWLIST`
+or the panel falls through to `route="unknown"`. The PromQL above is
+therefore executable today; the alerts in [Section 5](#5-burn-rate-alerts)
+can be loaded into Prometheus and will fire once production traffic
+exists to exercise them.
 
 **Metrics confirmed present today** (audited against
-`crates/tensor-wasm-core/src/metrics.rs`):
+`crates/tensor-wasm-core/src/metrics.rs` and
+`crates/tensor-wasm-api/src/http_metrics.rs`):
 
 - `tensor_wasm_active_instances`
 - `tensor_wasm_gpu_memory_used_bytes`
@@ -646,11 +648,15 @@ once the metrics land.
 - `tensor_wasm_instance_terminations_total`
 - `tensor_wasm_offload_success_total`
 - `tensor_wasm_offload_fallback_total`
+- `tensor_wasm_http_requests_total{route,method,status}` (counter, W2.3)
+- `tensor_wasm_http_request_duration_seconds{route,method,status}` (histogram, W2.3)
+- `tensor_wasm_http_requests_in_flight{route,method}` (gauge, W2.3)
 
-The `latency_dispatch_serial_P95` SLO and its alert in
-Section 5.5 are enforceable today because they sit on the existing
-`tensor_wasm_kernel_latency_seconds` histogram. Every other SLO in
-this document is gated on the HTTP-metric work.
+Every SLO in this document is now enforceable against the metrics the
+gateway emits. The `latency_dispatch_serial_P95` SLO sits on
+`tensor_wasm_kernel_latency_seconds`; the four HTTP-keyed SLOs
+(`availability_http`, `latency_http_healthz`, `latency_http_invoke`,
+`error_rate_invoke`) sit on the HTTP families landed in W2.3.
 
 ---
 
@@ -727,7 +733,9 @@ top row renders the five SLIs defined in
 `latency_http_invoke_P95`, and `latency_dispatch_serial_P95` — as
 Stat panels with thresholds matching the targets in
 [Section 3](#3-slo-targets). Panels whose backing metric is in the
-"TODO" column of the dashboard's metric inventory (HTTP request
-counter, HTTP duration histogram, snapshot histograms, JIT cache
-counters, back-pressure gauges) render "No data" until W2.3 lands;
-no dashboard edit is required to bring them online.
+"TODO" column of the dashboard's metric inventory (snapshot
+histograms, JIT cache counters, back-pressure gauges, per-tenant
+labelling on existing series) render "No data" until those follow-ups
+land; no dashboard edit is required to bring them online. The HTTP
+request counter, HTTP duration histogram, and HTTP in-flight gauge
+landed in W2.3 and render real data today.

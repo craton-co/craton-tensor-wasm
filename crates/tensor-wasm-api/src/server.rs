@@ -12,6 +12,7 @@ use axum::Router;
 use tower::ServiceBuilder;
 
 use crate::audit::{audit_log_middleware, AuditConfig};
+use crate::http_metrics::{http_metrics_middleware, HttpMetricsLayerConfig, RouteAllowList};
 use crate::middleware::{
     bearer_auth, body_limit_layer, concurrency_limit_layer, tenant_scope, timeout_layer,
     trace_layer_with_propagation, AuthConfig, TenantConfig, MAX_REQUEST_BODY_BYTES,
@@ -97,6 +98,17 @@ pub fn build_router_with_audit(
     limiter: RateLimiter,
     audit: AuditConfig,
 ) -> Router {
+    // HTTP metrics middleware sits OUTSIDE bearer_auth so 401 responses
+    // are counted as well — the SLO doc (`docs/SLO.md` §2.1
+    // `availability_http`) defines the SLI as a ratio over *every* HTTP
+    // response, including auth rejections, and the burn-rate alerts in
+    // §5 rely on that. Placing it inside the auth gate would drop ~all
+    // probe traffic from the rate panels in the reference dashboard.
+    let http_metrics_cfg = HttpMetricsLayerConfig {
+        metrics: Arc::clone(&state.metrics),
+        routes: RouteAllowList::new_default(),
+    };
+
     let global_layers = ServiceBuilder::new()
         .layer(trace_layer_with_propagation())
         .layer(body_limit_layer(MAX_REQUEST_BODY_BYTES))
@@ -109,6 +121,11 @@ pub fn build_router_with_audit(
         .layer(axum::Extension(tenant))
         .layer(axum::Extension(limiter))
         .layer(axum::Extension(audit))
+        .layer(axum::Extension(http_metrics_cfg))
+        // Metrics emission wraps every downstream layer (including
+        // bearer_auth) so 401s, 429s, and handler responses all get
+        // counted — see the comment block above.
+        .layer(axum::middleware::from_fn(http_metrics_middleware))
         .layer(axum::middleware::from_fn(bearer_auth))
         .layer(axum::middleware::from_fn(tenant_scope))
         .layer(axum::middleware::from_fn(rate_limit))

@@ -130,8 +130,9 @@ The grid is 24 columns wide. Rows from top to bottom:
 
 ## Metric inventory
 
-Audited against `crates/tensor-wasm-core/src/metrics.rs` (the source
-of truth for currently-emitted metrics).
+Audited against `crates/tensor-wasm-core/src/metrics.rs` and
+`crates/tensor-wasm-api/src/http_metrics.rs` (the sources of truth
+for currently-emitted metrics).
 
 ### Exists today
 
@@ -149,6 +150,15 @@ import:
 - `tensor_wasm_instance_terminations_total` (counter)
 - `tensor_wasm_offload_success_total` (counter)
 - `tensor_wasm_offload_fallback_total` (counter)
+- `tensor_wasm_http_requests_total{route,method,status}` (counter,
+  landed in W2.3 via `tensor_wasm_api::http_metrics`)
+- `tensor_wasm_http_request_duration_seconds_bucket` /
+  `tensor_wasm_http_request_duration_seconds_count` /
+  `tensor_wasm_http_request_duration_seconds_sum` (histogram, 12
+  buckets spanning 1 ms to 10 s, labels `route`/`method`/`status`,
+  landed in W2.3)
+- `tensor_wasm_http_requests_in_flight{route,method}` (gauge,
+  landed in W2.3; capacity panel only, not an SLI)
 
 Caveat: the gauges and counters listed above are emitted today as
 **aggregates with no `tenant` label**. The Tenant-row panels query
@@ -156,19 +166,15 @@ Caveat: the gauges and counters listed above are emitted today as
 per-tenant labeling lands. That is intentional — the panel layout
 should not change when the labels appear, only the number of series.
 
-### TODO, will fill in when W2.3 lands
+### TODO, will fill in when remaining follow-ups land
 
 These metrics are referenced by panels but are **not yet emitted** by
 the code. The corresponding panels will show "No data" / "N/A" until
-W2.3 ("HTTP request metrics") and its follow-ups ship the missing
-instrumentation. Each is flagged inline in the panel description.
+the listed follow-up ships the missing instrumentation. Each is
+flagged inline in the panel description.
 
-HTTP gateway metrics (proposed instrumentation point: tower middleware
-in `crates/tensor-wasm-api/src/middleware.rs`, adjacent to the existing
-`trace_layer_with_propagation`):
-
-- `tensor_wasm_http_requests_total{route,method,status}` (counter)
-- `tensor_wasm_http_request_duration_seconds_bucket{route,method,status}` (histogram)
+(The HTTP gateway counter / duration / in-flight metrics that were
+previously in this list landed in W2.3 — see [Exists today](#exists-today).)
 
 Tenant labeling on existing metrics (a relabeling, not a new metric):
 
@@ -229,6 +235,8 @@ Grafana's UI:
 
 ---
 
-_Status: v0.3 gate. Several panels will read "No data" until W2.3
-("HTTP request metrics") ships the underlying instrumentation; see
-[Metric inventory](#metric-inventory) for the per-metric breakdown._
+_Status: v0.3 gate. HTTP request rate, error rate, and latency panels
+render real data as of W2.3. The remaining "No data" panels
+(snapshot histograms, JIT cache counters, back-pressure gauges, and
+per-tenant labeling on existing series) are tracked in
+[Metric inventory](#metric-inventory)._

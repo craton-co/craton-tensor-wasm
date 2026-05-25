@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 
 use prometheus_client::encoding::text::encode;
+use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
@@ -25,6 +27,53 @@ use prometheus_client::registry::Registry;
 pub const DEFAULT_KERNEL_LATENCY_BUCKETS_SECONDS: [f64; 14] = [
     0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0,
 ];
+
+/// Default histogram buckets for HTTP request duration, in seconds.
+///
+/// Standard `[1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]`
+/// shape — covers the expected operating range of the API gateway, from the
+/// ~30 µs floor of `GET /healthz` (with a single 1 ms first bucket as a
+/// generous P99 ceiling for liveness probes) up to the 30 s per-request
+/// timeout enforced by `tensor-wasm-api`'s middleware stack. Override by
+/// constructing [`TensorWasmMetrics`] with [`TensorWasmMetrics::with_http_buckets`]
+/// (or the combined [`TensorWasmMetrics::with_all_buckets`] constructor) if a
+/// deployment needs finer/coarser resolution for its workload mix.
+pub const DEFAULT_HTTP_DURATION_BUCKETS_SECONDS: [f64; 12] = [
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// Label set for `tensor_wasm_http_requests_total` and
+/// `tensor_wasm_http_request_duration_seconds`.
+///
+/// Cardinality is bounded by the caller — the HTTP middleware in
+/// `tensor-wasm-api` initialises a runtime allow-list of route templates at
+/// startup and substitutes `"unknown"` for any unmatched path. `method` is
+/// drawn from the small set of HTTP verbs the router accepts (`GET`, `POST`,
+/// `DELETE`). `status` is the numeric status code rendered as a string —
+/// also bounded by HTTP's three-digit code space.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct HttpRequestLabels {
+    /// Axum route template that matched the request (e.g. `/functions/:id/invoke`).
+    /// Never the substituted value — see crate-level docs on cardinality.
+    pub route: String,
+    /// HTTP method (`GET`, `POST`, `DELETE`).
+    pub method: String,
+    /// Numeric HTTP status code rendered as decimal (e.g. `"200"`, `"401"`).
+    pub status: String,
+}
+
+/// Label set for `tensor_wasm_http_requests_in_flight`.
+///
+/// Drops `status` (in-flight requests have not produced a status yet) and
+/// keeps `route` + `method` for the same cardinality bound as
+/// [`HttpRequestLabels`].
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct HttpInFlightLabels {
+    /// Axum route template that matched the request.
+    pub route: String,
+    /// HTTP method (`GET`, `POST`, `DELETE`).
+    pub method: String,
+}
 
 /// All TensorWasm metrics collected behind a single [`Registry`].
 ///
@@ -50,6 +99,24 @@ struct TensorWasmMetricsInner {
     instance_terminations_total: Counter<u64>,
     offload_success_total: Counter<u64>,
     offload_fallback_total: Counter<u64>,
+    http_requests_total: Family<HttpRequestLabels, Counter<u64>>,
+    http_request_duration_seconds: Family<HttpRequestLabels, Histogram, HttpDurationCtor>,
+    http_requests_in_flight: Family<HttpInFlightLabels, Gauge<i64, AtomicI64>>,
+}
+
+/// Histogram constructor that captures the configured HTTP-duration bucket
+/// list. Stored alongside the [`Family`] so newly-observed label combinations
+/// produce a histogram with the same buckets as every other series in the
+/// family.
+#[derive(Clone, Debug)]
+pub struct HttpDurationCtor {
+    buckets: Arc<[f64]>,
+}
+
+impl prometheus_client::metrics::family::MetricConstructor<Histogram> for HttpDurationCtor {
+    fn new_metric(&self) -> Histogram {
+        Histogram::new(self.buckets.iter().copied())
+    }
 }
 
 /// Snapshot of every numeric counter and gauge in [`TensorWasmMetrics`].
@@ -90,23 +157,55 @@ impl Default for TensorWasmMetrics {
 impl TensorWasmMetrics {
     /// Construct a fresh metrics registry with default histogram buckets.
     pub fn new() -> Self {
-        Self::with_buckets(DEFAULT_KERNEL_LATENCY_BUCKETS_SECONDS.iter().copied())
+        Self::with_all_buckets(
+            DEFAULT_KERNEL_LATENCY_BUCKETS_SECONDS.iter().copied(),
+            DEFAULT_HTTP_DURATION_BUCKETS_SECONDS.iter().copied(),
+        )
     }
 
-    /// Construct a fresh metrics registry with caller-supplied histogram buckets.
+    /// Construct a fresh metrics registry with caller-supplied kernel-latency
+    /// histogram buckets. The HTTP-duration histogram keeps the default
+    /// [`DEFAULT_HTTP_DURATION_BUCKETS_SECONDS`] bucket list.
     ///
     /// Buckets must be sorted ascending and finite; behaviour with unsorted or
     /// non-finite values is implementation-defined by `prometheus-client`.
     pub fn with_buckets(buckets: impl IntoIterator<Item = f64>) -> Self {
+        Self::with_all_buckets(buckets, DEFAULT_HTTP_DURATION_BUCKETS_SECONDS.iter().copied())
+    }
+
+    /// Construct a fresh metrics registry with caller-supplied HTTP-duration
+    /// histogram buckets. The kernel-latency histogram keeps the default
+    /// [`DEFAULT_KERNEL_LATENCY_BUCKETS_SECONDS`] bucket list.
+    pub fn with_http_buckets(http_buckets: impl IntoIterator<Item = f64>) -> Self {
+        Self::with_all_buckets(
+            DEFAULT_KERNEL_LATENCY_BUCKETS_SECONDS.iter().copied(),
+            http_buckets,
+        )
+    }
+
+    /// Construct a fresh metrics registry with caller-supplied buckets for
+    /// both the kernel-latency and HTTP-duration histograms.
+    pub fn with_all_buckets(
+        kernel_buckets: impl IntoIterator<Item = f64>,
+        http_buckets: impl IntoIterator<Item = f64>,
+    ) -> Self {
         let mut registry = Registry::default();
         let active_instances: Gauge<i64, AtomicI64> = Gauge::default();
         let gpu_memory_used_bytes: Gauge<u64, AtomicU64> = Gauge::default();
         let kernel_dispatches_total: Counter<u64> = Counter::default();
-        let kernel_latency_seconds = Histogram::new(buckets.into_iter());
+        let kernel_latency_seconds = Histogram::new(kernel_buckets.into_iter());
         let instance_spawns_total: Counter<u64> = Counter::default();
         let instance_terminations_total: Counter<u64> = Counter::default();
         let offload_success_total: Counter<u64> = Counter::default();
         let offload_fallback_total: Counter<u64> = Counter::default();
+        let http_requests_total: Family<HttpRequestLabels, Counter<u64>> = Family::default();
+        let http_buckets_arc: Arc<[f64]> = http_buckets.into_iter().collect();
+        let http_request_duration_seconds: Family<HttpRequestLabels, Histogram, HttpDurationCtor> =
+            Family::new_with_constructor(HttpDurationCtor {
+                buckets: http_buckets_arc,
+            });
+        let http_requests_in_flight: Family<HttpInFlightLabels, Gauge<i64, AtomicI64>> =
+            Family::default();
 
         registry.register(
             "tensor_wasm_active_instances",
@@ -148,6 +247,24 @@ impl TensorWasmMetrics {
             "Cumulative count of GPU offloads that deopted to the CPU fallback path",
             offload_fallback_total.clone(),
         );
+        registry.register(
+            "tensor_wasm_http_requests",
+            "Cumulative count of HTTP requests served by the API gateway, \
+             labelled by axum route template, method, and numeric status code",
+            http_requests_total.clone(),
+        );
+        registry.register(
+            "tensor_wasm_http_request_duration_seconds",
+            "Histogram of HTTP request duration in seconds, labelled by axum \
+             route template, method, and numeric status code",
+            http_request_duration_seconds.clone(),
+        );
+        registry.register(
+            "tensor_wasm_http_requests_in_flight",
+            "Number of HTTP requests currently being served, labelled by axum \
+             route template and method",
+            http_requests_in_flight.clone(),
+        );
 
         Self {
             inner: Arc::new(TensorWasmMetricsInner {
@@ -160,6 +277,9 @@ impl TensorWasmMetrics {
                 instance_terminations_total,
                 offload_success_total,
                 offload_fallback_total,
+                http_requests_total,
+                http_request_duration_seconds,
+                http_requests_in_flight,
             }),
         }
     }
@@ -202,6 +322,38 @@ impl TensorWasmMetrics {
     /// Cumulative count of GPU offloads that deopted to CPU (counter).
     pub fn offload_fallback_total(&self) -> &Counter<u64> {
         &self.inner.offload_fallback_total
+    }
+
+    /// Per-(route, method, status) HTTP request counter family.
+    ///
+    /// Increment via
+    /// `metrics.http_requests_total().get_or_create(&labels).inc()`. Cardinality
+    /// is bounded by the caller: see [`HttpRequestLabels`] for the contract
+    /// (route is always the axum template, never the resolved id).
+    pub fn http_requests_total(&self) -> &Family<HttpRequestLabels, Counter<u64>> {
+        &self.inner.http_requests_total
+    }
+
+    /// Per-(route, method, status) HTTP request duration histogram family.
+    ///
+    /// Observe via
+    /// `metrics.http_request_duration_seconds().get_or_create(&labels).observe(secs)`.
+    /// Buckets are the [`DEFAULT_HTTP_DURATION_BUCKETS_SECONDS`] unless the
+    /// registry was constructed via [`Self::with_http_buckets`] /
+    /// [`Self::with_all_buckets`].
+    pub fn http_request_duration_seconds(
+        &self,
+    ) -> &Family<HttpRequestLabels, Histogram, HttpDurationCtor> {
+        &self.inner.http_request_duration_seconds
+    }
+
+    /// Per-(route, method) in-flight HTTP request gauge family.
+    ///
+    /// Increment on request entry, decrement on response. Backed by an
+    /// `AtomicI64` so a brief negative reading during shutdown races is
+    /// reported honestly rather than wrapping silently.
+    pub fn http_requests_in_flight(&self) -> &Family<HttpInFlightLabels, Gauge<i64, AtomicI64>> {
+        &self.inner.http_requests_in_flight
     }
 
     /// Snapshot every gauge and counter into a plain struct with one
@@ -252,9 +404,73 @@ mod tests {
             "tensor_wasm_instance_terminations",
             "tensor_wasm_offload_success",
             "tensor_wasm_offload_fallback",
+            "tensor_wasm_http_requests",
+            "tensor_wasm_http_request_duration_seconds",
+            "tensor_wasm_http_requests_in_flight",
         ] {
             assert!(s.contains(name), "missing metric {name} in:\n{s}");
         }
+    }
+
+    #[test]
+    fn http_request_families_observable() {
+        let m = TensorWasmMetrics::new();
+        let labels = HttpRequestLabels {
+            route: "/healthz".to_string(),
+            method: "GET".to_string(),
+            status: "200".to_string(),
+        };
+        m.http_requests_total().get_or_create(&labels).inc();
+        m.http_request_duration_seconds()
+            .get_or_create(&labels)
+            .observe(0.002);
+        let in_flight_labels = HttpInFlightLabels {
+            route: "/healthz".to_string(),
+            method: "GET".to_string(),
+        };
+        m.http_requests_in_flight()
+            .get_or_create(&in_flight_labels)
+            .inc();
+        m.http_requests_in_flight()
+            .get_or_create(&in_flight_labels)
+            .dec();
+
+        let s = m.encode_text();
+        // Counter renders with `_total` suffix per OpenMetrics convention.
+        assert!(
+            s.contains("tensor_wasm_http_requests_total{route=\"/healthz\",method=\"GET\",status=\"200\"} 1"),
+            "missing labelled counter sample in:\n{s}"
+        );
+        // Histogram count series carries the same labels.
+        assert!(
+            s.contains("tensor_wasm_http_request_duration_seconds_count"),
+            "missing histogram count series in:\n{s}"
+        );
+        // In-flight gauge resolves to zero after balanced inc/dec.
+        assert!(
+            s.contains("tensor_wasm_http_requests_in_flight{route=\"/healthz\",method=\"GET\"} 0"),
+            "missing in-flight gauge sample in:\n{s}"
+        );
+        // The expected `0.025` bucket is present (HTTP default bucket list).
+        assert!(s.contains("le=\"0.025\""), "missing 0.025 bucket in:\n{s}");
+    }
+
+    #[test]
+    fn http_request_buckets_overridable() {
+        let m = TensorWasmMetrics::with_http_buckets([0.5f64, 1.0, 2.0]);
+        let labels = HttpRequestLabels {
+            route: "/x".to_string(),
+            method: "GET".to_string(),
+            status: "200".to_string(),
+        };
+        m.http_request_duration_seconds()
+            .get_or_create(&labels)
+            .observe(0.75);
+        let s = m.encode_text();
+        assert!(s.contains("le=\"0.5\""), "got:\n{s}");
+        assert!(s.contains("le=\"1.0\""), "got:\n{s}");
+        // Default HTTP bucket `0.025` must NOT appear under the custom list.
+        assert!(!s.contains("le=\"0.025\""), "got:\n{s}");
     }
 
     #[test]

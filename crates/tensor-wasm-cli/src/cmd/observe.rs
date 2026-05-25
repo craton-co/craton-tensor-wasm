@@ -31,6 +31,14 @@
 //! (percentages, latencies) rather than producing a misleading zero. The
 //! orchestrator should verify which of these are wired before claiming the
 //! v0.3 exit criterion as met. See `docs/CLI.md` for the documented surface.
+//!
+//! As of W2.3, the per-endpoint request rate and latency cells *do* render
+//! real values: the `tensor_wasm_http_requests_total{route,method,status}`
+//! counter and the `tensor_wasm_http_request_duration_seconds_bucket{route,method,status}`
+//! histogram are emitted by the `tensor_wasm_api::http_metrics` middleware.
+//! The label name is `route` (axum route template), not `path` — handled by
+//! [`Snapshot::from_metrics`] and [`histogram_quantile`] without altering
+//! the wider parser surface.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -218,12 +226,19 @@ impl Snapshot {
         let mut http_requests = HashMap::new();
         if let Some(series) = m.get("tensor_wasm_http_requests_total") {
             for s in series {
-                let path = s
+                // W2.3 emits the axum route template under the `route` label
+                // (e.g. `/functions/:id/invoke`). Earlier ad-hoc fixtures
+                // used `path`; keep that as a fallback so the historical
+                // text-format snapshot tests still parse. The aggregation
+                // sums across status codes so the operator-facing rate
+                // covers 2xx + 4xx + 5xx for the endpoint.
+                let route = s
                     .labels
-                    .get("path")
+                    .get("route")
+                    .or_else(|| s.labels.get("path"))
                     .cloned()
                     .unwrap_or_else(|| "<unlabelled>".to_string());
-                *http_requests.entry(path).or_insert(0.0) += s.value;
+                *http_requests.entry(route).or_insert(0.0) += s.value;
             }
         }
         Self {
@@ -486,26 +501,47 @@ fn scalar(metrics: &Metrics, name: &str) -> Option<f64> {
 
 /// Linear interpolation across histogram buckets, à la `histogram_quantile()`
 /// in PromQL. Returns `None` when fewer than two buckets are observed for the
-/// requested `path` label or when the requested rank cannot be localised.
+/// requested route label or when the requested rank cannot be localised.
+///
+/// The `route` argument is matched against either a `route` label (W2.3
+/// HTTP histograms emit this) or a legacy `path` label (still consulted as
+/// a fallback so older fixtures stay parseable). Samples that carry the
+/// matching label *and* extra dimensions (e.g. `status`, `method`) are
+/// aggregated by summing the cumulative bucket counts — the operator-facing
+/// quantile is intentionally per-route, not per-status.
 fn histogram_quantile(
     metrics: &Metrics,
     base_name: &str,
-    path: &str,
+    route: &str,
     q: f64,
 ) -> Option<f64> {
     let bucket_name = format!("{base_name}_bucket");
     let series = metrics.get(&bucket_name)?;
-    let mut buckets: Vec<(f64, f64)> = series
-        .iter()
-        .filter(|s| s.labels.get("path").map(|p| p == path).unwrap_or(false))
-        .filter_map(|s| {
-            let le = s.labels.get("le")?;
+    // First filter to the samples that name our route, then collapse
+    // across the other dimensions (status, method) by summing counts
+    // bucket-by-bucket. This mirrors the dashboard's
+    // `sum by (le) (rate(... {route="..."}[5m]))` pattern.
+    let mut by_le: HashMap<String, f64> = HashMap::new();
+    for s in series.iter().filter(|s| {
+        s.labels
+            .get("route")
+            .or_else(|| s.labels.get("path"))
+            .map(|p| p == route)
+            .unwrap_or(false)
+    }) {
+        if let Some(le) = s.labels.get("le") {
+            *by_le.entry(le.clone()).or_insert(0.0) += s.value;
+        }
+    }
+    let mut buckets: Vec<(f64, f64)> = by_le
+        .into_iter()
+        .filter_map(|(le, count)| {
             let upper = if le == "+Inf" {
                 f64::INFINITY
             } else {
                 le.parse::<f64>().ok()?
             };
-            Some((upper, s.value))
+            Some((upper, count))
         })
         .collect();
     if buckets.len() < 2 {

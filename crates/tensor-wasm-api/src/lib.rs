@@ -36,11 +36,20 @@
 //!   emits a structured JSON record to the sink selected by
 //!   `TENSOR_WASM_API_AUDIT_LOG` (default: stdout). Read-only routes
 //!   emit nothing. See [`audit`] and `docs/AUDIT-LOG.md`.
+//! * **HTTP request metrics.** A tower middleware emits
+//!   `tensor_wasm_http_requests_total`,
+//!   `tensor_wasm_http_request_duration_seconds`, and
+//!   `tensor_wasm_http_requests_in_flight` per `(route, method, status)`,
+//!   labelled with the axum route template (never the substituted id).
+//!   The layer sits OUTSIDE bearer auth so `401`/`429` responses are
+//!   counted too — required by the `availability_http` SLI in
+//!   `docs/SLO.md`. See [`http_metrics`].
 //!
 //! See [`API.md`](../API.md) for the wire-format contract.
 #![deny(missing_docs)]
 
 pub mod audit;
+pub mod http_metrics;
 pub mod middleware;
 pub mod rate_limit;
 pub mod routes;
@@ -51,6 +60,10 @@ pub use audit::{
     audit_log_middleware, AuditAction, AuditActor, AuditActorKind, AuditConfig, AuditOutcome,
     AuditRecord, AuditResource, AuditSink, FileJsonSink, NoopSink, StdoutJsonSink,
     TokenScopeView, ENV_AUDIT_LOG,
+};
+pub use http_metrics::{
+    http_metrics_middleware, HttpMetricsLayerConfig, RouteAllowList, DEFAULT_ROUTE_ALLOWLIST,
+    UNKNOWN_ROUTE,
 };
 pub use middleware::{
     AuthConfig, TenantConfig, ENV_API_TOKENS, ENV_REQUIRE_TENANT, HEADER_TENANT,
