@@ -56,3 +56,30 @@ harness = false
 [[bench]]
 name = "tail_latency"
 harness = false
+
+[[bench]]
+# F3 — RFC 0001 Unresolved question #3 harness. Compares the existing
+# busy-poll `DispatchFuture` path against a future cuda-async-backed
+# alternative. The cuda-async backend is a documented stub in v0.3.x and
+# emits a skip line until the v0.4 cuda-oxide port wires it. See
+# `crates/tensor-wasm-bench/benches/dispatch_future_backends.rs` for the
+# wiring contract.
+name = "dispatch_future_backends"
+harness = false
+
+[features]
+# Default off so the existing `cargo bench -p tensor-wasm-bench` pipeline
+# stays cuda-toolkit-free on CI runners and developer laptops.
+default = []
+# Forwards to `tensor-wasm-wasi-gpu/cuda`. Required to compile the real
+# body of `benches/dispatch_future_backends.rs`; without it the bench
+# emits two skip lines and exits cleanly so `cargo bench --bench
+# dispatch_future_backends` still works as a sanity check.
+cuda = ["tensor-wasm-wasi-gpu/cuda"]
+# Forwards to `tensor-wasm-mem/cuda-oxide-backend`. Required (in addition
+# to `cuda`) once the v0.4 port wires the cuda-async path; v0.3.x doesn't
+# need it because the scaffold deliberately carries no `cuda-async` use
+# statement. Listed here so a v0.4 reviewer can flip both features in one
+# `cargo bench --features cuda,cuda-oxide-backend` invocation and get
+# real numbers instead of a skip line. See RFC 0001 (rfcs/0001-cuda-oxide-integration.md).
+cuda-oxide-backend = ["tensor-wasm-mem/cuda-oxide-backend"]
