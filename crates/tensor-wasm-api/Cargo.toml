@@ -48,10 +48,17 @@ uuid.workspace = true
 wasmparser.workspace = true
 
 [dev-dependencies]
+futures = { workspace = true }
 http-body-util = "0.1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-test.workspace = true
 tower = { workspace = true, features = ["util"] }
+# tracing-subscriber: pulled in for the concurrent-load tracing test
+# (`tests/trace_concurrent_load_test.rs`), which installs a custom
+# `Layer` that counts `on_new_span` callbacks to verify W4.1's
+# `Instrument::instrument` wrap around `tokio::spawn` does not
+# double-instrument the async-invoke job span (audit Problem #11).
+tracing-subscriber = { workspace = true }
 wat.workspace = true
 
 [package.metadata.docs.rs]

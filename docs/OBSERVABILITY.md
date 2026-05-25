@@ -143,6 +143,17 @@ one additional hop, `async_invoke.job`, between the route handler and
 trace id carries across the spawn boundary; without that the executor
 spans would orphan from the inbound HTTP request.
 
+Verified under N=64 concurrent async-invoke requests on a 4-worker-thread
+runtime (`crates/tensor-wasm-api/tests/trace_concurrent_load_test.rs`):
+the four W4.1 named spans (`http.request`, `http.invoke_function_async`,
+`async_invoke.job`, `invoke.run`) each fire exactly once per request
+(total = 4 × N) with no orphan parent ids and no `x-trace-id` header
+collisions across the response set. The test guards against two failure
+modes the v0.3.2 audit (Problem #11) flagged: the `Instrument` wrap on
+`tokio::spawn` double-instrumenting the spawned future (would surface as
+count > 4 × N), and `#[instrument]` macros silently dropping spans under
+contention (count < 4 × N).
+
 ### Cross-crate propagation example
 
 A single invocation that reaches the GPU produces a connected trace across
