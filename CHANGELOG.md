@@ -5,18 +5,67 @@ All notable changes to Craton TensorWasm will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] - dev
 ### Security
 - Repository ownership transferred to Craton Software Company
 - Added LICENSE / NOTICE files (Apache-2.0)
+- `tensor-wasm-api` now supports per-tenant scoped bearer tokens via the
+  `token:tenant=N,M` syntax in `TENSOR_WASM_API_TOKENS`; cross-tenant access
+  is refused with a `tenant_scope_denied` 403 (W2.1, advances v0.3).
+- Structured audit log for state-mutating routes, opt-in via
+  `TENSOR_WASM_API_AUDIT_LOG`; format and rotation guidance in
+  `docs/AUDIT-LOG.md` (W2.2, advances v0.3).
+- `docs/DEPLOYMENT.md` gains an mTLS section covering both self-terminated
+  TLS and reverse-proxy fronting (W2.8, advances v0.3).
 ### Added
 - CONTRIBUTING.md, CODE_OF_CONDUCT.md, MAINTAINERS.md, docs/RISKS.md
 - GitHub issue/PR templates and dependabot configuration
+- `tensor-wasm-wasi-gpu` — typed argv lowering for scalar and pointer kernel
+  arguments; `KernelArgsUnsupported` is now reserved for sanity-cap
+  rejections rather than the missing-marshaller case (W1.1, advances v0.2).
+- `tensor-wasm-mem` — cudarc backend spike behind the new
+  `--features cudarc-backend` flag; `cust` remains the default backend
+  (W1.2, advances v0.2).
+- `tensor-wasm-snapshot` — cross-version compatibility test framework with
+  golden fixtures under `crates/tensor-wasm-snapshot/tests/fixtures/`
+  (W1.3, advances v0.2).
+- `tensor-wasm-api` — per-token QPS rate limiting middleware configured via
+  `TENSOR_WASM_API_RATE_LIMIT_QPS` and `TENSOR_WASM_API_RATE_LIMIT_BURST`;
+  retires the global `ConcurrencyLimitLayer(64)` workaround called out in
+  the 0.1.0 known limitations (W1.4, advances v0.2).
+- `tensor-wasm-api` — HTTP request metrics middleware exporting
+  `tensor_wasm_http_requests_total`, a request-duration histogram, and an
+  `in_flight` gauge (W2.3, advances v0.3).
+- `tensor-wasm-cli` — `tensor-wasm observe` subcommand for live metrics
+  tailing (W1.5, advances v0.2).
+- `tensor-wasm-cli` — generated shell completions and man pages, plus a
+  `tensor-wasm man` subcommand that prints them at runtime (W2.4, advances
+  v0.3).
+- `deploy/` — Kubernetes manifests and a Helm chart for the API gateway
+  (W2.7, advances v0.3).
+- `docs/CUDA-SETUP.md` rewritten end-to-end with no hedging language
+  (W1.6, advances v0.2).
+- `rfcs/` — lightweight RFC process with template and index
+  (W1.7, advances v0.2).
+- `GOVERNANCE.md` — project governance scaffold (W1.8, advances v0.2).
+- `docs/SLO.md` — SLO definitions and burn-rate alert recipes
+  (W1.9, advances v0.2).
+- `docs/dashboards/` — reference Grafana dashboard JSON
+  (W2.5, advances v0.3).
+- `docs/runbooks/` — per-alert operator runbooks keyed to the SLO alerts
+  (W2.6, advances v0.3).
+- `docs/WASMTIME-FORK.md` — wasmtime upgrade cadence policy
+  (W2.9, advances v0.4).
 ### Changed
 - Workspace authors and repository metadata updated to craton-co/craton-tensor-wasm
 - Bumped `prometheus-client` from `0.22` to `0.24` so `tensor_wasm_gpu_memory_used_bytes`
   can use the native `Gauge<u64, AtomicU64>` (added upstream in 0.23.0 via
   prometheus/client_rust#226) instead of the previous signed-int workaround.
+### Deprecated
+- Bare-token entries in `TENSOR_WASM_API_TOKENS` (tokens without a
+  `:tenant=...` scope clause) are deprecated in favour of the scoped form
+  introduced in W2.1. Unscoped tokens still authenticate but are logged
+  with a deprecation warning; targeted for removal in v1.0.
 
 ## [0.1.0] — 2026-05-23
 
