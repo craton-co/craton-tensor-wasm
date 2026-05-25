@@ -375,22 +375,25 @@ target.
 
 ### SBOM generation
 
-We generate a CycloneDX SBOM for every release. Two tools are
-acceptable:
+We generate a CycloneDX SBOM for every release and attach it to the
+GitHub Release page alongside the binaries. The contract, the
+file-naming convention (`tensor-wasm-cdx-v<version>.json`), the
+"what's in it / what's not" boundaries, and the local-regeneration
+recipe all live in [`SBOM.md`](SBOM.md) — that document is the
+authoritative reference.
+
+In short, the generation step is:
 
 ```sh
-# Option A: cargo-cyclonedx (Rust-native)
-cargo install cargo-cyclonedx --locked
-cargo cyclonedx --format json --output-pattern sbom
-
-# Option B: syft (works on the built binary, not just the source)
-syft target/release/tensor-wasm -o cyclonedx-json > sbom.cdx.json
+cargo install cargo-cyclonedx --version "~0.5" --locked
+cargo cyclonedx --format json --output-pattern bom --top-level
 ```
 
-Both produce the same component list for our workspace as of v1.0;
-the choice is per-release-engineer preference. The release workflow
-attaches `sbom.cdx.json` to every GitHub release alongside the
-binaries.
+and CI in [`.github/workflows/sbom.yml`](../.github/workflows/sbom.yml)
+runs the same command on every release tag (and on pushes to `dev`
+for verification). The pinned `cargo-cyclonedx` version is what makes
+the output reproducible in the same sense the rest of this document
+defines.
 
 ### SLSA Level 3 target
 
@@ -476,6 +479,9 @@ normalisation noted above.
 
 - [`BUILD.md`](BUILD.md) — the standard (non-reproducibility-focused)
   build matrix and feature flag reference
+- [`SBOM.md`](SBOM.md) — the CycloneDX SBOM contract, filename
+  convention, and local-regeneration recipe; the other half of the
+  supply-chain story
 - [`PATH-TO-V1.md`](PATH-TO-V1.md) — the v1.0 gate that this document
   satisfies
 - [`GOVERNANCE.md`](../GOVERNANCE.md) — release engineering, key
