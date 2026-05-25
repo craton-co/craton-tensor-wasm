@@ -142,7 +142,7 @@ fuzz_target!(|data: &[u8]| {
         let mut store = wasmtime::Store::new(
             &engine,
             Store {
-                cuda: WasiCudaContext::new(InstanceId(0xfu22_u128)),
+                cuda: WasiCudaContext::new(InstanceId(0xf_u128)),
             },
         );
         let instance = match linker.instantiate_async(&mut store, &module).await {
