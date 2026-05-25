@@ -3102,7 +3102,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-api"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3130,7 +3130,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-bench"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "base64",
@@ -3150,7 +3150,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3174,7 +3174,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "opentelemetry",
@@ -3193,7 +3193,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-exec"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3215,7 +3215,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-jit"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "blake3",
  "cranelift-codegen 0.111.9",
@@ -3233,7 +3233,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-mem"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "cuda-async",
@@ -3254,7 +3254,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-snapshot"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -3269,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-tenant"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "criterion",
  "cust",
@@ -3286,7 +3286,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-wasi-gpu"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "cust",

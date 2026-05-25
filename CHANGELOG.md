@@ -38,8 +38,54 @@ ongoing roadmap.
 See `docs/MIGRATION-v0-to-v1.md` for the full deprecation /
 behavioral-change table.
 
+## [0.3.1] - 2026-05-25
+
+Additive cuda-oxide scaffolding release. No breaking changes; default
+workspace build untouched. Three new opt-in landings under the
+new `cuda-oxide-backend` feature flag.
+
+### Added
+- `rfcs/0001-cuda-oxide-integration.md` — first real RFC under the
+  W1.7 process. Proposes Option C (three backends side-by-side from
+  v0.3.1 through v0.4; default flips to cuda-oxide at v0.5 contingent
+  on cuda-oxide reaching v0.2.0; cudarc-backend is the documented
+  fallback if it doesn't). Advances PATH-TO-V1 Open Decision #1 (O1).
+- `tensor-wasm-mem`: new `cuda-oxide-backend` feature flag and
+  `cuda_oxide_backend` scaffold module (`CudaOxideUnifiedBuffer`,
+  stubbed `allocate` / `apply_advice`, `Drop` with tracing). Workspace
+  deps for `cuda-host`, `cuda-core`, `cuda-async` pinned via git rev
+  pointing at github.com/NVlabs/cuda-oxide (NOT yet on crates.io as of
+  2026-05-25; the crates.io `cuda-oxide` name is a different,
+  unrelated 2018-era project). Coexists with `unified-memory` (cust)
+  and `cudarc-backend` (W1.2); the three are independent (O2).
+- `tensor-wasm-jit`: new `cuda-oxide-backend` feature flag and
+  `pliron_dialect` scaffold module (the future `cranelift_to_dialect_mir`
+  lowering pass that targets cuda-oxide's Pliron-based IR). Includes a
+  23-row mapping table from Cranelift IR ops to Pliron `dialect-mir`
+  ops so the v0.4 author has a concrete target (O3).
+- `docs/CUDA-KERNELS.md`: new Section 5 — "Path C: Rust kernels via
+  cuda-oxide". Decision table for picking among Path A (hand-PTX),
+  Path B (.cu via nvcc), and Path C (Rust via cuda-oxide) (O4).
+
+### Changed
+- `docs/RISKS.md`: cust EOL row cross-references RFC 0001 + cuda-oxide
+  as the third option (O5).
+- `docs/CUDARC-SPIKE.md`: Version-chosen table gains a `cuda-host`
+  row; cudarc recommendation still valid as v0.3.x default + v0.5
+  fallback (O5).
+- `docs/PATH-TO-V1.md`: Open Decision #1 gains an inline 2026-05-25
+  update line cross-linking RFC 0001 (O5).
+
+### Toolchain note (NOT changed)
+- Workspace pin remains `nightly-2026-03-15`. Enabling the new
+  `cuda-oxide-backend` feature requires a local override to
+  `nightly-2026-04-03+` (cuda-oxide's pin). The workspace default
+  bump is scheduled for v0.4 per RFC 0001 "Toolchain plan" step 3
+  and PATH-TO-V1 Open Decision #8 (quarterly cadence).
+
 ## [Unreleased]
 _No entries yet — open the next PR adding one._
+
 
 ### Security
 - Repository ownership transferred to Craton Software Company
