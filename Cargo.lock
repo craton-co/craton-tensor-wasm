@@ -2962,6 +2962,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "opentelemetry",
+ "opentelemetry_sdk",
  "serde",
  "serde_json",
  "tensor-wasm-core",

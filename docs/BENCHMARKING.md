@@ -19,7 +19,7 @@ If you only read one section: skip to [Anti-cheating checklist](#anti-cheating-c
 2. [The five dimensions TensorWasm competes on](#the-five-dimensions-tensor-wasm-competes-on)
 3. [Choosing your competitor set](#choosing-your-competitor-set)
 4. [Hardware and OS normalization](#hardware-and-os-normalization)
-5. [Methodology](#methodology)
+5. [Methodology](#methodology) — includes [Tail latency](#tail-latency)
 6. [Workload corpus](#workload-corpus)
 7. [Per-competitor recipes](#per-competitor-recipes)
 8. [Bench-ID to competitor-metric map](#bench-id-to-competitor-metric-map)
@@ -210,6 +210,47 @@ the `lower_bound` / `upper_bound` fields. Report them alongside the
 median. A useful rule of thumb: if the 95 % CIs of two competitors
 overlap, the comparison is **inconclusive** and should be stated as
 such, not as a win.
+
+### Tail latency
+
+Criterion's default reporter publishes mean, std-dev and median per metric;
+it does **not** publish P99 or P99.9 out of the box, and its default ~100
+samples per metric is too coarse to resolve a stable P99.9 anyway. For the
+v0.3 ["Production observability"](PATH-TO-V1.md#v030--production-observability)
+milestone we need a long-tail floor on the dispatch path and the HTTP
+gateway path, so the dedicated bench file
+[`crates/tensor-wasm-bench/benches/tail_latency.rs`](../crates/tensor-wasm-bench/benches/tail_latency.rs)
+runs a hand-rolled sampling loop alongside the Criterion suite.
+
+- **Sample count:** 10 000 raw `Duration` observations per metric (warm-up
+  1 000 iterations, un-counted). This places the P99.9 sample at sorted
+  rank 9 990 (the tenth-worst observation) — large enough to sit inside
+  the population tail rather than at the global max.
+- **Percentile algorithm:** nearest-rank (`samples[ceil(p * n) - 1]`),
+  matching `hdrhistogram` and the Tigerbeetle / Datadog tail-tracking
+  references. Linear interpolation would change the numbers by at most one
+  inter-sample gap, which is well inside the per-sample noise floor on a
+  µs-scale dispatch metric.
+- **Metrics covered:** `dispatch/serial/100`, `dispatch/concurrent_cap64/100`,
+  `e2e/healthz/get`, `e2e/invoke_not_found/post`. Each metric re-uses the
+  same setup helpers as the corresponding Criterion bench so the P50
+  numbers line up by construction.
+- **Tracing overhead:** the W4.1 OpenTelemetry spans add a constant
+  ~50-150 ns to every e2e request even with no subscriber attached. This
+  raises the floor (P50 and P99.9 by the same amount) but does **not**
+  distort the `p99_9 - p50` tail gap, so the published numbers are kept
+  raw — they reflect what an operator actually sees. To isolate the
+  tracing tax, set `TENSOR_WASM_TRACING=off` and re-run; the delta is
+  the cost.
+- **Output:** one JSON line per metric to stdout (CI-grep prefix
+  `TAIL_LATENCY `) plus a sidecar at `bench-results/tail-latency.json`
+  when the bench is run from the workspace root. The file is **not**
+  consumed by the regression gate — see
+  [`bench-results/README.md#tail-latency-artefact`](../bench-results/README.md#tail-latency-artefact).
+
+```sh
+cargo bench -p tensor-wasm-bench --bench tail_latency
+```
 
 ### Cold vs warm
 

@@ -18,6 +18,11 @@
 //! - `benches/e2e_inference.rs` — full axum router round-trip through
 //!   `tensor-wasm-api` for the healthz, create-function, and invoke-not-found
 //!   paths.
+//! - `benches/tail_latency.rs` — hand-rolled 10 000-sample loop that
+//!   captures P50/P95/P99/**P99.9**/max for `dispatch/serial/100`,
+//!   `dispatch/concurrent_cap64/100`, `e2e/healthz/get`, and
+//!   `e2e/invoke_not_found/post`. Output goes to stdout and (when run
+//!   from the workspace root) to `bench-results/tail-latency.json`.
 //!
 //! See [`docs/PERFORMANCE.md`](../../../docs/PERFORMANCE.md) for the
 //! published bench inventory, reference numbers, and the regression-gate

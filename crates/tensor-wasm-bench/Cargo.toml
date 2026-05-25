@@ -52,3 +52,7 @@ harness = false
 [[bench]]
 name = "e2e_inference"
 harness = false
+
+[[bench]]
+name = "tail_latency"
+harness = false

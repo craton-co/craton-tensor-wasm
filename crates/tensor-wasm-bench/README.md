@@ -17,6 +17,7 @@ files); all the action lives in [`benches/`](./benches/).
 | `benches/memory_bandwidth.rs` | Host-side `copy_from_slice` over a `GuardedHostBuffer` in both sequential and fixed-stride access patterns. | Becomes `cudaMemcpyAsync` device-to-device throughput, bounded by HBM bandwidth. |
 | `benches/jit_compile.rs` | PTX text-emit latency for representative kernels (vector_add, matmul, conv2d), blueprint fingerprint cost, and `KernelCache` hit-vs-miss latency. | Adds `ptxas` (10-50 ms / kernel) and, eventually, `nvrtc` once that path lands. |
 | `benches/e2e_inference.rs` | Full axum router round-trip through `tensor-wasm-api` driven via `tower::ServiceExt::oneshot`. Healthz, POST /functions, and invoke-not-found. | Unchanged — this measures the HTTP/serde floor, independent of GPU work. |
+| `benches/tail_latency.rs` | Hand-rolled 10 000-sample loop capturing P50/P95/P99/**P99.9**/max for `dispatch/serial/100`, `dispatch/concurrent_cap64/100`, `e2e/healthz/get`, `e2e/invoke_not_found/post`. Sidesteps Criterion's statistical pipeline because Criterion does not surface P99.9 and its default sample count is too small to resolve it. | Same as the underlying benches — dispatch metrics become real launch-to-completion latency on a CUDA host; e2e metrics are HTTP/serde-floor regardless. |
 
 On a non-CUDA host (developer laptop, local CI) the dispatch/memory/JIT
 benches degenerate to host-side measurements: dispatch futures resolve
@@ -37,6 +38,7 @@ cargo bench -p tensor-wasm-bench --bench kernel_dispatch
 cargo bench -p tensor-wasm-bench --bench memory_bandwidth
 cargo bench -p tensor-wasm-bench --bench jit_compile
 cargo bench -p tensor-wasm-bench --bench e2e_inference
+cargo bench -p tensor-wasm-bench --bench tail_latency
 
 # Compile-only sanity check:
 cargo bench -p tensor-wasm-bench --no-run
