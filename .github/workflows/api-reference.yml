@@ -36,7 +36,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # Pinned tool versions. Match ci.yml's openapi job for Redocly.
-  RUST_TOOLCHAIN: "nightly-2026-03-15"
+  RUST_TOOLCHAIN: "nightly-2026-04-03"
   REDOCLY_CLI_VERSION: "1"
   NODE_VERSION: "20"
 

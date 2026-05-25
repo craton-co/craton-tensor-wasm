@@ -27,7 +27,7 @@ jobs:
         # llvm-tools-preview component used by cargo-llvm-cov is present.
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-03-15
+          toolchain: nightly-2026-04-03
           components: rustfmt, clippy, rust-src, llvm-tools-preview
 
       - name: Cache cargo

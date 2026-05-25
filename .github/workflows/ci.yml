@@ -23,7 +23,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-03-15
+          toolchain: nightly-2026-04-03
           components: rustfmt, clippy, rust-src, llvm-tools-preview
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -38,7 +38,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-03-15
+          toolchain: nightly-2026-04-03
           components: rustfmt, clippy, rust-src, llvm-tools-preview
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -59,7 +59,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-03-15
+          toolchain: nightly-2026-04-03
           components: rustfmt, clippy, rust-src, llvm-tools-preview
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -91,7 +91,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-03-15
+          toolchain: nightly-2026-04-03
           components: rustfmt, clippy, rust-src, llvm-tools-preview
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -109,7 +109,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-03-15
+          toolchain: nightly-2026-04-03
           components: rustfmt, clippy, rust-src, llvm-tools-preview
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -134,6 +134,34 @@ jobs:
         with:
           fail_level: error
 
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    # Enforces the workspace deny.toml posture: unknown-git = "deny" +
+    # unknown-registry = "deny" + the two allow-git entries
+    # (NVlabs/cuda-oxide and vaivaswatha/pliron at the pinned revs).
+    # Lands per F2 follow-up to RFC 0001; the policy without
+    # enforcement was the gap the v0.3.2 audit flagged.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Run cargo-deny
+        # check = advisories + bans + licenses + sources. The sources
+        # subcheck is the one that enforces deny.toml's allow-git
+        # entries; the others are belt-and-braces against unrelated
+        # supply-chain drift.
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
   openapi:
     name: openapi-validate
     runs-on: ubuntu-latest
@@ -143,7 +171,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-03-15
+          toolchain: nightly-2026-04-03
           components: rustfmt, clippy, rust-src, llvm-tools-preview
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
