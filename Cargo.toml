@@ -45,6 +45,12 @@ cranelift-codegen = "0.111"
 # add `optional = true` and a corresponding feature in their `[features]` table.
 cust = { version = "0.3", default-features = false }
 ptx-builder = "0.5"
+# cudarc — actively maintained alternative to `cust`. Pinned at 0.13 (latest
+# 0.13.x as of 2026-05). Driver-only feature set keeps the build script light;
+# `cuda-12000` selects CUDA 12.0+ headers (matches the toolkit on the S22
+# runner). Currently behind the per-crate `cudarc-backend` feature flag while
+# the cust → cudarc migration spike (see `docs/CUDARC-SPIKE.md`) lands.
+cudarc = { version = "0.13", default-features = false, features = ["driver", "cuda-12000"] }
 
 # HTTP / API
 axum = { version = "0.7", features = ["macros", "tracing"] }

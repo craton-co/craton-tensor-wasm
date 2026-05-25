@@ -20,6 +20,8 @@
 #![deny(missing_docs)]
 
 pub mod advise;
+#[cfg(feature = "cudarc-backend")]
+pub mod cudarc_backend;
 pub mod isolation;
 pub mod pinned_host;
 pub mod pool;

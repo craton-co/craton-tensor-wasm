@@ -24,6 +24,7 @@ thiserror.workspace = true
 tracing.workspace = true
 wasmtime.workspace = true
 cust = { workspace = true, optional = true }
+cudarc = { workspace = true, optional = true }
 
 [dev-dependencies]
 wat.workspace = true
@@ -38,6 +39,12 @@ tracing-subscriber.workspace = true
 # once stub libraries are provisioned.
 default = []
 unified-memory = ["dep:cust"]
+# `cudarc-backend` is the cust → cudarc migration spike. When enabled it
+# pulls in the `cudarc` crate and exposes a parallel `UnifiedBuffer`
+# implementation under `crate::cudarc_backend`. The cust path remains the
+# default; both backends coexist for the v0.2 spike. See
+# `docs/CUDARC-SPIKE.md` for the API mapping and cutover plan.
+cudarc-backend = ["dep:cudarc"]
 
 [package.metadata.docs.rs]
 all-features = false
