@@ -8,15 +8,24 @@ the plain YAML manifests at `../../k8s/`.
 | Field | Value |
 |---|---|
 | Chart version | `0.1.0` |
-| App version | `0.1.0` |
-| Default image | `ghcr.io/craton-co/tensor-wasm:0.1.0` |
+| App version | `0.3.3` |
+| Default image | `ghcr.io/craton-co/tensor-wasm:0.3.3` (host-only); `…:0.3.3-cust` / `…-cudarc` / `…-cuda-oxide` when `image.backend` is set |
 | Kubernetes | `>= 1.23` |
 
-> **Image registry is a placeholder.** The `ghcr.io/craton-co/*` registry is
-> not yet provisioned (v0.1.0 era). Build and push from
-> `../../docker/tensor-wasm-api.Dockerfile` and override
-> `--set image.repository=my-registry/tensor-wasm` until the public registry
-> exists.
+> **Image registry is not yet provisioned.** The `ghcr.io/craton-co/*` path is
+> aspirational as of v0.3.3 — operators must build + push locally until the
+> v0.4 release-engineering pipeline lands. The repo root [`Dockerfile`](../../../Dockerfile)
+> produces all four variants via `--build-arg BACKEND={"",cust,cudarc,cuda-oxide}`.
+> Override `--set image.repository=my-registry/tensor-wasm` to point the chart
+> at your registry until the public one exists.
+>
+> Build commands (run from repo root):
+> ```sh
+> docker build                                  -t my-registry/tensor-wasm:0.3.3            .
+> docker build --build-arg BACKEND=cust         -t my-registry/tensor-wasm:0.3.3-cust       .
+> docker build --build-arg BACKEND=cudarc       -t my-registry/tensor-wasm:0.3.3-cudarc     .
+> docker build --build-arg BACKEND=cuda-oxide   -t my-registry/tensor-wasm:0.3.3-cuda-oxide .
+> ```
 
 ## Install
 
