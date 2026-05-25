@@ -6,8 +6,8 @@
 //! The `tensor-wasm` binary exposes the developer-facing surface of the TensorWasm
 //! runtime: local execution (`run`), remote deployment (`deploy`), invocation
 //! of deployed functions (`invoke`), latency benchmarking (`bench`), snapshot
-//! save/restore (`snapshot`), Prometheus scraping (`metrics`), and shell
-//! completion (`completions`).
+//! save/restore (`snapshot`), Prometheus scraping (`metrics`), shell
+//! completion (`completions`), and man-page generation (`man`).
 //!
 //! Subcommand implementations live under [`cmd`]. Each command parses its
 //! arguments via `clap` derive, runs to completion, and returns an
@@ -22,6 +22,8 @@
 //! * `TENSOR_WASM_LOG` — `tracing-subscriber` `EnvFilter` directive. Defaults to
 //!   `warn`.
 #![deny(missing_docs)]
+
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -71,10 +73,21 @@ pub enum Command {
     /// Live operator dashboard over `/healthz` + `/metrics` (refreshes in place).
     Observe(cmd::observe::ObserveArgs),
     /// Emit shell completion scripts for the named shell.
+    ///
+    /// By default the script is written to stdout. Pass `--out-dir <dir>` to
+    /// write it to a conventional filename inside `<dir>` instead — used by
+    /// `crates/tensor-wasm-cli/completions/` regeneration.
     Completions {
         /// Target shell (bash, zsh, fish, powershell, elvish).
         shell: Shell,
+        /// Optional output directory. When provided, the script is written to
+        /// `<dir>/<conventional-name>` (e.g. `tensor-wasm.bash`,
+        /// `_tensor-wasm` for zsh, `tensor-wasm.fish`).
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
     },
+    /// Generate roff(7) man pages from the clap command tree.
+    Man(cmd::man::ManArgs),
 }
 
 #[tokio::main]
@@ -100,7 +113,8 @@ async fn main() {
         Command::Snapshot { action } => cmd::snapshot::run(action, &ctx).await,
         Command::Metrics(args) => cmd::metrics::run(args, &ctx).await,
         Command::Observe(args) => cmd::observe::run(args, &ctx).await,
-        Command::Completions { shell } => cmd::completions::run(shell),
+        Command::Completions { shell, out_dir } => cmd::completions::run(shell, out_dir),
+        Command::Man(args) => cmd::man::run(args),
     };
 
     if let Err(e) = result {

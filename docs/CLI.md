@@ -130,9 +130,11 @@ Cells render as `?` (for counts) or `n/a` (for percentages, latencies) when the 
 
 Prometheus parsing is done in-process with a small inline parser; no extra dependency is pulled in for the dashboard. The histogram percentiles use linear interpolation across the `_bucket` series, matching PromQL's `histogram_quantile()` for buckets that share a `path` label.
 
-### `tensor-wasm completions <shell>`
+### `tensor-wasm completions <shell> [--out-dir <dir>]`
 
-Emit a shell-completion script on stdout for the named shell. Supported values match `clap_complete::Shell`: `bash`, `zsh`, `fish`, `elvish`, `powershell`.
+Emit a shell-completion script for the named shell. Supported values match `clap_complete::Shell`: `bash`, `zsh`, `fish`, `elvish`, `powershell`.
+
+By default the script is written to stdout. Pass `--out-dir <dir>` to write it to a conventional filename inside `<dir>` instead — used to regenerate the committed scaffolding under [`crates/tensor-wasm-cli/completions/`](../crates/tensor-wasm-cli/completions/).
 
 Wire-up examples:
 
@@ -148,7 +150,66 @@ tensor-wasm completions fish > ~/.config/fish/completions/tensor-wasm.fish
 
 # PowerShell, current session
 tensor-wasm completions powershell | Out-String | Invoke-Expression
+
+# Regenerate the committed scaffolding
+tensor-wasm completions bash --out-dir crates/tensor-wasm-cli/completions
+tensor-wasm completions zsh  --out-dir crates/tensor-wasm-cli/completions
+tensor-wasm completions fish --out-dir crates/tensor-wasm-cli/completions
 ```
+
+### `tensor-wasm man [--out-dir <dir>]`
+
+Generate roff(7) man pages for `tensor-wasm` and every subcommand, sourced from
+the same clap definitions the help output uses. With no flags, the root page
+is written to stdout. With `--out-dir <dir>`, the root page plus one
+`tensor-wasm-<sub>.1` per subcommand is written under `<dir>` (this is how the
+committed scaffolding under [`crates/tensor-wasm-cli/man/`](../crates/tensor-wasm-cli/man/)
+is regenerated).
+
+```bash
+# Regenerate all committed man pages in one pass
+tensor-wasm man --out-dir crates/tensor-wasm-cli/man
+
+# Quick preview without committing
+tensor-wasm man | man -l -
+```
+
+## Shell completions
+
+Pre-generated completion scripts for bash, zsh, and fish live under
+[`crates/tensor-wasm-cli/completions/`](../crates/tensor-wasm-cli/completions/).
+That directory's [`README.md`](../crates/tensor-wasm-cli/completions/README.md)
+covers per-OS install paths (system-wide vs per-user, Linux vs macOS, the
+zsh `$fpath` story, and the fish `~/.config/fish/completions/` convention).
+
+Short version:
+
+| Shell | File                                                  | Install path (per-user)                          |
+|-------|-------------------------------------------------------|--------------------------------------------------|
+| bash  | `crates/tensor-wasm-cli/completions/tensor-wasm.bash` | `~/.local/share/bash-completion/completions/tensor-wasm` |
+| zsh   | `crates/tensor-wasm-cli/completions/_tensor-wasm`     | `~/.zsh/completions/_tensor-wasm` (on `$fpath`)  |
+| fish  | `crates/tensor-wasm-cli/completions/tensor-wasm.fish` | `~/.config/fish/completions/tensor-wasm.fish`    |
+
+Regenerate after any clap-flag change with `tensor-wasm completions <shell>
+--out-dir crates/tensor-wasm-cli/completions`.
+
+## Man pages
+
+Pre-generated `.1` man pages live under
+[`crates/tensor-wasm-cli/man/`](../crates/tensor-wasm-cli/man/):
+
+- `tensor-wasm.1` — root command + global flags
+- `tensor-wasm-run.1`, `tensor-wasm-deploy.1`, `tensor-wasm-invoke.1`,
+  `tensor-wasm-bench.1`, `tensor-wasm-snapshot.1`, `tensor-wasm-metrics.1`,
+  `tensor-wasm-observe.1`, `tensor-wasm-completions.1`, `tensor-wasm-man.1` —
+  one per top-level subcommand
+
+That directory's [`README.md`](../crates/tensor-wasm-cli/man/README.md) covers
+per-OS install paths (Linux man-db, macOS, WSL on Windows) and the
+`mandb` reindex step.
+
+Regenerate after any clap-flag change with `tensor-wasm man --out-dir
+crates/tensor-wasm-cli/man`.
 
 ## Cross-references
 

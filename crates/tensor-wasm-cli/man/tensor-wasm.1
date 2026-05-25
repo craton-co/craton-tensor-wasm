@@ -1,0 +1,76 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm 1  "tensor-wasm "
+.SH NAME
+tensor\-wasm \- Developer CLI for Craton TensorWasm
+.SH SYNOPSIS
+\fBtensor\-wasm\fR [\fB\-\-tenant\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Run, deploy, invoke, bench, snapshot, and inspect TensorWasm Wasm workloads.
+.SH OPTIONS
+.TP
+\fB\-\-tenant\fR=\fITENANT\fR [default: 0]
+Tenant id to advertise on outbound API requests via X\-TensorWasm\-Tenant. Zero (the default) suppresses the header for backwards compatibility.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+tensor\-wasm\-run(1)
+Run a Wasm module locally against the in\-process TensorWasm engine
+.TP
+tensor\-wasm\-deploy(1)
+Upload a Wasm module to a TensorWasm server
+.TP
+tensor\-wasm\-invoke(1)
+Invoke a previously deployed function by id
+.TP
+tensor\-wasm\-bench(1)
+Benchmark local invocation latency (P50/P95/P99/max)
+.TP
+tensor\-wasm\-snapshot(1)
+Save or restore an instance snapshot
+.TP
+tensor\-wasm\-metrics(1)
+Fetch and pretty\-print Prometheus metrics from a TensorWasm server
+.TP
+tensor\-wasm\-observe(1)
+Live operator dashboard over /healthz + /metrics (refreshes in place)
+.TP
+tensor\-wasm\-completions(1)
+Emit shell completion scripts for the named shell
+.TP
+tensor\-wasm\-man(1)
+Generate roff(7) man pages from the clap command tree
+.TP
+tensor\-wasm\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH ENVIRONMENT
+.TP
+\fBTENSOR_WASM_TOKEN\fR
+If set, sent as \fBAuthorization: Bearer <token>\fR on every outbound API request.
+.TP
+\fBTENSOR_WASM_LOG\fR
+\fBtracing-subscriber\fR EnvFilter directive. Defaults to \fBwarn\fR.
+.SH EXIT STATUS
+.TP
+0
+Success.
+.TP
+1
+Generic failure (network error, validation, etc.).
+.TP
+2
+Local validation failed (snapshot subcommand only).
+.TP
+3
+Feature requested by the CLI is not yet exposed by the server (snapshot subcommand only).
+.SH "SEE ALSO"
+tensor\-wasm\-run(1), tensor\-wasm\-deploy(1), tensor\-wasm\-invoke(1), tensor\-wasm\-bench(1), tensor\-wasm\-snapshot(1), tensor\-wasm\-metrics(1), tensor\-wasm\-observe(1), tensor\-wasm\-completions(1), tensor\-wasm\-man(1)
+.SH VERSION
+v0.1.0
+.SH AUTHORS
+Craton Software Company <security@craton.com.ar>

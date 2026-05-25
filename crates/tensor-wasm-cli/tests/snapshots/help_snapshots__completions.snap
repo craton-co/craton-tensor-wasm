@@ -5,11 +5,24 @@ expression: "help(&[\"completions\", \"--help\"])"
 ---
 Emit shell completion scripts for the named shell
 
+By default the script is written to stdout. Pass `--out-dir <dir>` to write it to a conventional filename inside `<dir>` instead — used by `crates/tensor-wasm-cli/completions/` regeneration.
+
 Usage: tensor-wasm completions [OPTIONS] <SHELL>
 
 Arguments:
-  <SHELL>  Target shell (bash, zsh, fish, powershell, elvish) [possible values: bash, elvish, fish, powershell, zsh]
+  <SHELL>
+          Target shell (bash, zsh, fish, powershell, elvish)
+
+          [possible values: bash, elvish, fish, powershell, zsh]
 
 Options:
-      --tenant <TENANT>  Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
-  -h, --help             Print help
+      --out-dir <OUT_DIR>
+          Optional output directory. When provided, the script is written to `<dir>/<conventional-name>` (e.g. `tensor-wasm.bash`, `_tensor-wasm` for zsh, `tensor-wasm.fish`)
+
+      --tenant <TENANT>
+          Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility
+
+          [default: 0]
+
+  -h, --help
+          Print help (see a summary with '-h')

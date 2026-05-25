@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm-metrics 1  "tensor-wasm-metrics "
+.SH NAME
+tensor\-wasm\-metrics \- Fetch and pretty\-print Prometheus metrics from a TensorWasm server
+.SH SYNOPSIS
+\fBtensor\-wasm metrics\fR \fB\-\-server\fR=\fISERVER\fR [\fB\-\-tenant\fR=\fITENANT\fR] [\fB\-h\fR|\fB\-\-help\fR]
+.SH DESCRIPTION
+Issues \fBGET {server}/metrics\fR and prints the response body verbatim. Prometheus text exposition is plain UTF\-8 by design, so no extra formatting is applied. A non\-2xx response is rendered through the shared error\-envelope helper and the process exits non\-zero.
+.PP
+Pipe to \fBgrep '^tensor_wasm_'\fR to filter to TensorWasm's own series.
+.SH OPTIONS
+.TP
+\fB\-\-server\fR=\fISERVER\fR
+Base URL of the target TensorWasm server (e.g. \fBhttp://localhost:8080\fR).
+.TP
+\fB\-\-tenant\fR=\fITENANT\fR [default: 0]
+Tenant id to advertise on outbound API requests.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH ENVIRONMENT
+.TP
+\fBTENSOR_WASM_TOKEN\fR
+Bearer token attached as \fBAuthorization: Bearer ...\fR on the outbound request when set.
+.SH "SEE ALSO"
+tensor\-wasm(1), tensor\-wasm\-observe(1)

@@ -1,0 +1,36 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm-run 1  "tensor-wasm-run "
+.SH NAME
+tensor\-wasm\-run \- Run a Wasm module locally against the in\-process TensorWasm engine
+.SH SYNOPSIS
+\fBtensor\-wasm run\fR [\fB\-\-export\fR=\fIEXPORT\fR] [\fB\-\-args\fR=\fIARGS\fR] [\fB\-\-tenant\fR=\fITENANT\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIFILE\fR>
+.SH DESCRIPTION
+Spawns a TensorWasmExecutor over a default TensorWasmEngine, instantiates the supplied \fB.wasm\fR file under TenantId(1), invokes the requested export (default \fBmain\fR), and prints \fBok\fR on success or the error chain otherwise.
+.PP
+Arguments destined for the guest are accepted as a JSON array via \fB\-\-args\fR; today the executor's call_export only supports the \fB() -> ()\fR signature, so non\-empty argument lists are validated then ignored.
+.SH OPTIONS
+.TP
+\fB\-\-export\fR=\fIEXPORT\fR [default: main]
+Name of the exported function to call.
+.TP
+\fB\-\-args\fR=\fIARGS\fR
+Arguments to pass to the export, encoded as a JSON array (e.g. \fB\(aq[1.0, 2.0]\(aq\fR).
+.TP
+\fB\-\-tenant\fR=\fITENANT\fR [default: 0]
+Tenant id to advertise on outbound API requests (inherited from the top\-level flag).
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+[\fIFILE\fR]
+Path to the \fB.wasm\fR file to execute.
+.SH EXAMPLES
+.PP
+.RS 4
+.nf
+tensor\-wasm run tests/wasm\-fixtures/vector_add.wasm \-\-export add \-\-args \(aq[1.0, 2.0]\(aq
+.fi
+.RE
+.SH "SEE ALSO"
+tensor\-wasm(1), tensor\-wasm\-bench(1), tensor\-wasm\-invoke(1)

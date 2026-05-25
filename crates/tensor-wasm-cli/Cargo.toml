@@ -22,6 +22,7 @@ path = "src/main.rs"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 clap.workspace = true
 clap_complete.workspace = true
+clap_mangen = "0.2"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

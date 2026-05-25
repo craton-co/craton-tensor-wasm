@@ -1,0 +1,38 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm-completions 1  "tensor-wasm-completions "
+.SH NAME
+tensor\-wasm\-completions \- Emit shell completion scripts for the named shell
+.SH SYNOPSIS
+\fBtensor\-wasm completions\fR [\fB\-\-out\-dir\fR=\fIOUT_DIR\fR] [\fB\-\-tenant\fR=\fITENANT\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fISHELL\fR>
+.SH DESCRIPTION
+Uses \fBclap_complete::generate\fR against the CLI command tree to produce a completion script for the requested shell. By default the script is written to stdout; \fB\-\-out\-dir\fR writes it to a conventional filename inside the named directory so callers (or CI) can regenerate the committed scaffolding under \fBcrates/tensor-wasm-cli/completions/\fR in one pass.
+.SH OPTIONS
+.TP
+\fB\-\-out\-dir\fR=\fIOUT_DIR\fR
+Optional output directory. When provided, the script is written to \fB<dir>/<conventional-name>\fR (e.g. \fBtensor-wasm.bash\fR, \fB_tensor-wasm\fR for zsh, \fBtensor-wasm.fish\fR).
+.TP
+\fB\-\-tenant\fR=\fITENANT\fR [default: 0]
+Tenant id (inherited from the top\-level flag; unused by this subcommand).
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+[\fISHELL\fR]
+Target shell. One of: \fBbash\fR, \fBzsh\fR, \fBfish\fR, \fBpowershell\fR, \fBelvish\fR.
+.SH EXAMPLES
+.PP
+.RS 4
+.nf
+tensor\-wasm completions bash > /etc/bash_completion.d/tensor-wasm
+tensor\-wasm completions zsh  > ~/.zsh/completions/_tensor-wasm
+tensor\-wasm completions fish > ~/.config/fish/completions/tensor-wasm.fish
+
+# Regenerate all three committed copies at once
+tensor\-wasm completions bash \-\-out\-dir crates/tensor-wasm-cli/completions
+tensor\-wasm completions zsh  \-\-out\-dir crates/tensor-wasm-cli/completions
+tensor\-wasm completions fish \-\-out\-dir crates/tensor-wasm-cli/completions
+.fi
+.RE
+.SH "SEE ALSO"
+tensor\-wasm(1), tensor\-wasm\-man(1)

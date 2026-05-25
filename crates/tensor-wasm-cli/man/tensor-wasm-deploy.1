@@ -1,0 +1,33 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm-deploy 1  "tensor-wasm-deploy "
+.SH NAME
+tensor\-wasm\-deploy \- Upload a Wasm module to a TensorWasm server
+.SH SYNOPSIS
+\fBtensor\-wasm deploy\fR \fB\-\-server\fR=\fISERVER\fR [\fB\-\-name\fR=\fINAME\fR] [\fB\-\-tenant\fR=\fITENANT\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIFILE\fR>
+.SH DESCRIPTION
+Reads the file, base64\-encodes the bytes, and POSTs \fB{ "name": ..., "wasm_b64": ... }\fR to \fB{server}/functions\fR. On success the server\-assigned identifier is printed to stdout. On any non\-2xx response the structured error envelope is rendered as a human\-readable error and the process exits non\-zero.
+.PP
+The on\-wire body is capped at 64 MiB so a misconfigured path cannot silently OOM the CLI.
+.SH OPTIONS
+.TP
+\fB\-\-server\fR=\fISERVER\fR
+Base URL of the target TensorWasm server (e.g. \fBhttp://localhost:8080\fR). Must use \fBhttp://\fR or \fBhttps://\fR and have a non\-empty host.
+.TP
+\fB\-\-name\fR=\fINAME\fR
+Tenant\-supplied display name. Defaults to the file stem when omitted.
+.TP
+\fB\-\-tenant\fR=\fITENANT\fR [default: 0]
+Tenant id to advertise on outbound API requests.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+[\fIFILE\fR]
+Path to the \fB.wasm\fR file to deploy.
+.SH ENVIRONMENT
+.TP
+\fBTENSOR_WASM_TOKEN\fR
+Bearer token attached as \fBAuthorization: Bearer ...\fR on the outbound request when set.
+.SH "SEE ALSO"
+tensor\-wasm(1), tensor\-wasm\-invoke(1)
