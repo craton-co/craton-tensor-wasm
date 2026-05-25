@@ -86,7 +86,12 @@ fn render_tree(root: &Command, out_dir: &Path) -> Result<Vec<PathBuf>> {
         // Re-build a Command with a display name that includes the parent
         // segment so SYNOPSIS reads `tensor-wasm run [OPTIONS]` rather than
         // bare `run [OPTIONS]`.
-        let display_name = format!("{root_name}-{sub_name}");
+        // clap's `Command::name` accepts `impl Into<Str>`, and `Str` only
+        // implements `From<&'static str>` (not `From<String>`), so we leak
+        // the per-subcommand display name. The set is small and bounded by
+        // the subcommand count, so the leak is constant-bounded.
+        let display_name: &'static str =
+            Box::leak(format!("{root_name}-{sub_name}").into_boxed_str());
         let composed = sub.clone().name(display_name);
         write_page(composed, &path)?;
         out.push(path);

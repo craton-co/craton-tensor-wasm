@@ -124,12 +124,25 @@ async fn create_function_post_emits_counter_and_histogram() {
         body.contains("tensor_wasm_http_request_duration_seconds_count{route=\"/functions\",method=\"POST\",status=\"200\"} 1"),
         "missing /functions histogram count sample in:\n{body}"
     );
-    // At least one bucket line must be present for the same labels (the
-    // first default bucket, 0.001 s, is virtually guaranteed to receive
-    // the observation since the handler runs in-process with no I/O).
+    // At least one bucket line must be present for the same labels.
+    // prometheus-client renders the histogram `le` label first, so the
+    // realized line shape is `..._bucket{le="<bound>",route=...,method=...,
+    // status=...}` -- assert each label appears on the bucket line in
+    // whatever order the encoder chose.
+    let bucket_line = body
+        .lines()
+        .find(|line| {
+            line.starts_with("tensor_wasm_http_request_duration_seconds_bucket{")
+                && line.contains("route=\"/functions\"")
+                && line.contains("method=\"POST\"")
+                && line.contains("status=\"200\"")
+        })
+        .unwrap_or_else(|| {
+            panic!("missing /functions histogram bucket sample in:\n{body}")
+        });
     assert!(
-        body.contains("tensor_wasm_http_request_duration_seconds_bucket{route=\"/functions\",method=\"POST\",status=\"200\""),
-        "missing /functions histogram bucket sample in:\n{body}"
+        bucket_line.contains("le=\""),
+        "histogram bucket line is missing `le` label: {bucket_line}"
     );
 }
 

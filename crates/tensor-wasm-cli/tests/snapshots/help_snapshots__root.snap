@@ -22,7 +22,7 @@ Commands:
 Options:
       --tenant <TENANT>
           Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility
-
+          
           [default: 0]
 
   -h, --help

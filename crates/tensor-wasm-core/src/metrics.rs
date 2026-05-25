@@ -393,7 +393,14 @@ mod tests {
     #[test]
     fn construct_default() {
         let m = TensorWasmMetrics::new();
-        // Initial counters are zero; encoding should mention every registered metric name.
+        // Initial counters are zero; encoding should mention every registered
+        // metric name. NOTE: prometheus-client `Family<...>` metrics emit no
+        // HELP/TYPE/sample lines until at least one label tuple has been
+        // observed, so the three HTTP families
+        // (`tensor_wasm_http_requests`, `tensor_wasm_http_request_duration_seconds`,
+        // `tensor_wasm_http_requests_in_flight`) are deliberately excluded here
+        // and covered by `http_request_families_observable` below, which
+        // primes a label tuple before scraping.
         let s = m.encode_text();
         for name in [
             "tensor_wasm_active_instances",
@@ -404,9 +411,6 @@ mod tests {
             "tensor_wasm_instance_terminations",
             "tensor_wasm_offload_success",
             "tensor_wasm_offload_fallback",
-            "tensor_wasm_http_requests",
-            "tensor_wasm_http_request_duration_seconds",
-            "tensor_wasm_http_requests_in_flight",
         ] {
             assert!(s.contains(name), "missing metric {name} in:\n{s}");
         }

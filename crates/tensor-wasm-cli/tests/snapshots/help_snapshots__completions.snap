@@ -3,7 +3,7 @@ source: crates/tensor-wasm-cli/tests/help_snapshots.rs
 assertion_line: 73
 expression: "help(&[\"completions\", \"--help\"])"
 ---
-Emit shell completion scripts for the named shell
+Emit shell completion scripts for the named shell.
 
 By default the script is written to stdout. Pass `--out-dir <dir>` to write it to a conventional filename inside `<dir>` instead — used by `crates/tensor-wasm-cli/completions/` regeneration.
 
@@ -12,7 +12,7 @@ Usage: tensor-wasm completions [OPTIONS] <SHELL>
 Arguments:
   <SHELL>
           Target shell (bash, zsh, fish, powershell, elvish)
-
+          
           [possible values: bash, elvish, fish, powershell, zsh]
 
 Options:
@@ -21,7 +21,7 @@ Options:
 
       --tenant <TENANT>
           Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility
-
+          
           [default: 0]
 
   -h, --help
