@@ -83,8 +83,47 @@ new `cuda-oxide-backend` feature flag.
   bump is scheduled for v0.4 per RFC 0001 "Toolchain plan" step 3
   and PATH-TO-V1 Open Decision #8 (quarterly cadence).
 
+## [0.3.2] - 2026-05-25
+
+cuda-oxide v0.4-prep wave. Four follow-ups to v0.3.1's scaffolding.
+Builds clean on the bumped nightly with default features; CUDA tests
+(W1.1 kernel_args_e2e, W5.9 cudarc_smoke) still pass on real RTX 2060.
+
+### Added
+- `deploy/helm/tensor-wasm/values.yaml` + Nomad job specs gain
+  `image.backend` (cust | cudarc | cuda-oxide | "") toggle. Build-time
+  selection via image-tag suffix. Same shape mirrored as a manual-swap
+  comment in `deploy/k8s/20-deployment.yaml`. Resolves RFC 0001
+  Unresolved question #4 (F1).
+- `deny.toml` at workspace root. Posture: deny all unknown git +
+  registry sources. Two `allow-git` allowlist entries — NVlabs/cuda-oxide
+  and vaivaswatha/pliron — each with rationale and cross-ref to
+  RFC 0001 (F2).
+- `docs/REPRODUCIBLE-BUILDS.md` "Git-pinned sources" subsection +
+  audit-trail table (Crate / Repository / Pinned rev / Rationale) (F2).
+- `crates/tensor-wasm-bench/benches/dispatch_future_backends.rs` —
+  new tail-latency bench comparing the busy-poll DispatchFuture
+  against a stubbed cuda-async backend. First baseline numbers
+  committed to `bench-results/dispatch-future-backends.json`
+  (busy-poll P50 400 ns, P99.9 1.8 µs on RTX 2060 / WDDM).
+  cuda-async slot returns the documented "not yet wired" sentinel
+  until the v0.4 port. Resolves RFC 0001 Unresolved question #3 (F3).
+
+### Changed
+- `Cargo.toml`: cuda-host / cuda-core / cuda-async git deps switch
+  from `branch = "main"` to the v0.1.0 tag SHA
+  `4a56e4220aab8ce5d085a411e7f806cebb647d14`. Reproducible +
+  dependabot-blind + auditable (F2).
+- `rust-toolchain.toml`: bumped from `nightly-2026-03-15` to
+  `nightly-2026-04-03` to match cuda-oxide's pin. Per RFC 0001
+  Toolchain plan step 3 / PATH-TO-V1 Open Decision #8 (quarterly
+  cadence). Workspace + benches + tests compile clean on the new
+  pin. Rollback is a one-character revert if anything downstream
+  breaks (F4).
+
 ## [Unreleased]
 _No entries yet — open the next PR adding one._
+
 
 
 ### Security
