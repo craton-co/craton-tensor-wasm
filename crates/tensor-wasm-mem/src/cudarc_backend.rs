@@ -137,8 +137,12 @@ impl CudarcUnifiedBuffer {
         const CU_MEM_ATTACH_GLOBAL: u32 = 1;
         // SAFETY: `raw` is a valid out-parameter; `size > 0`; the device above
         // ensures the primary context is current on this thread.
+        // cudarc 0.13.x exposes CUDA driver functions as methods on a Lib
+        // struct, accessed via cudarc::driver::sys::lib(). Free-function
+        // imports like cust uses are not available; CudaDevice::new above
+        // primed the OnceLock so this lib() call cannot panic.
         let res = unsafe {
-            cuda_sys::cuMemAllocManaged(
+            cuda_sys::lib().cuMemAllocManaged(
                 &mut raw as *mut cuda_sys::CUdeviceptr,
                 size,
                 CU_MEM_ATTACH_GLOBAL,
@@ -215,7 +219,7 @@ impl CudarcUnifiedBuffer {
         // SAFETY: ptr/size are derived from a valid live allocation; passing
         // the null stream (handle 0) requests prefetch on the default stream.
         let res = unsafe {
-            cuda_sys::cuMemPrefetchAsync(
+            cuda_sys::lib().cuMemPrefetchAsync(
                 self.ptr.as_ptr() as cuda_sys::CUdeviceptr,
                 self.size,
                 self.device_id.0 as i32,
@@ -241,7 +245,7 @@ impl CudarcUnifiedBuffer {
         const CU_DEVICE_CPU: i32 = -1;
         // SAFETY: see `prefetch_to_device`.
         let res = unsafe {
-            cuda_sys::cuMemPrefetchAsync(
+            cuda_sys::lib().cuMemPrefetchAsync(
                 self.ptr.as_ptr() as cuda_sys::CUdeviceptr,
                 self.size,
                 CU_DEVICE_CPU,
@@ -273,7 +277,7 @@ impl Drop for CudarcUnifiedBuffer {
         // SAFETY: `ptr` was returned by `cuMemAllocManaged` and has not been
         // freed yet; the cached `Arc<CudaDevice>` we hold ensures the primary
         // context is still alive when we call `cuMemFree_v2`.
-        let res = unsafe { cuda_sys::cuMemFree_v2(self.ptr.as_ptr() as cuda_sys::CUdeviceptr) };
+        let res = unsafe { cuda_sys::lib().cuMemFree_v2(self.ptr.as_ptr() as cuda_sys::CUdeviceptr) };
         if res != cuda_sys::cudaError_enum::CUDA_SUCCESS {
             // Drop cannot fail; surface via a trace event so post-mortem
             // tooling can spot leaks without unwinding.
@@ -318,7 +322,7 @@ pub fn apply_advice(buffer: &CudarcUnifiedBuffer, advice: Advice) -> Result<(), 
         ),
     };
     // SAFETY: ptr/size are derived from a valid live CudarcUnifiedBuffer.
-    let res = unsafe { cuda_sys::cuMemAdvise(ptr, size, advice_kind, device) };
+    let res = unsafe { cuda_sys::lib().cuMemAdvise(ptr, size, advice_kind, device) };
     if res == cuda_sys::cudaError_enum::CUDA_SUCCESS {
         Ok(())
     } else {
