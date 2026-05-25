@@ -36,6 +36,18 @@ default = []
 # Auto-offload is a runtime flag now: the pipeline is always compiled; the
 # feature gates additional CUDA-side wiring tested under `--features cuda`.
 auto-offload = []
+# cuda-oxide-backend gates the `pliron_dialect` scaffold module — the v0.5
+# cust-successor lever tracked in `rfcs/0001-cuda-oxide-integration.md`
+# (step 4, "Pliron lever and the auto-offload pipeline"). The feature is
+# deliberately dep-less today: the v0.3.1 landing is pure-Rust scaffolding
+# that fixes the trait surface + Cranelift→dialect-mir mapping table the
+# v0.4 author needs as a target. The real Pliron crate dependency (git pin,
+# per RFC 0001 "Drawbacks") gets added in the v0.4 implementation PR once
+# the workspace toolchain bumps to a nightly that satisfies cuda-oxide's
+# `nightly-2026-04-03` pin. Mirrors the `cuda-oxide-backend` feature on
+# `tensor-wasm-mem` so a single `--features cuda-oxide-backend` invocation
+# at the workspace root selects the full opt-in stack.
+cuda-oxide-backend = []
 
 [package.metadata.docs.rs]
 all-features = true

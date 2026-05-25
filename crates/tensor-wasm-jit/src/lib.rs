@@ -10,3 +10,6 @@ pub mod detector;
 pub mod ir;
 pub mod ptx_emit;
 pub mod rewrite;
+
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod pliron_dialect;

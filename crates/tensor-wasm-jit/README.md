@@ -33,6 +33,7 @@ The host implementation lives in [`tensor_wasm_exec::jit_dispatch`](../tensor-wa
 | Flag | Default | Description |
 |---|---|---|
 | `auto-offload` | no | Reserved for CUDA-side wiring tested under `--features cuda`. The pipeline itself is always compiled in. |
+| `cuda-oxide-backend` | no | Gates the [`pliron_dialect`](src/pliron_dialect.rs) scaffold module — the Cranelift IR → Pliron `dialect-mir` lowering surface tracked in [RFC 0001](../../rfcs/0001-cuda-oxide-integration.md) step 4. v0.3.1 ships scaffold only (`StubLowerer` + mapping table + final trait signature); the real lowering lands in v0.4 once the workspace toolchain bumps to satisfy cuda-oxide's `nightly-2026-04-03` pin. No extra deps today. |
 
 See [docs/BUILD.md](../../docs/BUILD.md) for the project-wide flag taxonomy.
 
