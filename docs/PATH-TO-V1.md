@@ -338,7 +338,9 @@ contributor can pick a stream.
 Each of these is a Y-fork that blocks at least one milestone exit
 criterion. Assign owners and resolve before the milestone they gate.
 
-### 1. `cust` successor (gates v0.2)
+### 1. `cust` successor (gates v0.5 — re-scoped 2026-05-25)
+
+**Re-scope note (2026-05-25):** the v0.1.0-era framing of this decision said "gates v0.2". [RFC 0001](../rfcs/0001-cuda-oxide-integration.md) re-scoped it to v0.5: the W1.2 cudarc spike + the O1-O6 cuda-oxide scaffolding wave + the F2 Pliron pin together let all three candidate backends ship side-by-side from v0.3.1, with the default-flip held to v0.5 pending cuda-oxide v0.2 stability. The decision below is the original options-list; the binding recommendation is Option C in RFC 0001 (three backends side-by-side, cuda-oxide default at v0.5 contingent on v0.2.0 shipping, cudarc fallback if it doesn't).
 
 `cust 0.3.x` is EOL upstream. Options:
 
@@ -411,7 +413,7 @@ Risks that could push v1.0 right or force a milestone re-cut.
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | S22 self-hosted CUDA runner delayed or unfunded | Medium | High — blocks v0.2 exit | Identify cloud GPU-host alternative (Lambda Labs, RunPod) as fallback; document cost; budget |
-| `cudarc` migration uncovers semantic gaps | Medium | Medium — slips v0.2 by 4-8 weeks | Spike before committing; have a "stay on `cust` longer + vendor it" Plan B |
+| `cudarc` (or `cuda-oxide`) migration uncovers semantic gaps | Medium | Medium — slips v0.5 default-flip by 4-8 weeks | W1.2 cudarc spike + O2 cuda-oxide-backend scaffold both already shipped (see RFC 0001 Option C). All three backends coexist; the risk is the cutover, not the spike. Plan B: hold the default at `cudarc-backend` if cuda-oxide v0.2 slips. |
 | External pen-test surfaces critical findings | High | Medium — slips v0.5 by 2-6 weeks | Budget time; plan for ≥1 round of significant remediation |
 | Wasmtime upstream breaking change between bumps | Medium | Low-Medium — costs a sprint per occurrence | Pin via Cargo.lock; only bump on documented stable releases; subscribe to wasmtime release notes |
 | No design partners willing to run a beta | Low-Medium | High — v1.0 launches without real-world validation | Start outreach at v0.3; offer integration help; allow anonymous deployment in release notes |
