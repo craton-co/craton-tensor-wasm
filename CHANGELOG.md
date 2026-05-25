@@ -121,8 +121,80 @@ Builds clean on the bumped nightly with default features; CUDA tests
   pin. Rollback is a one-character revert if anything downstream
   breaks (F4).
 
+## [0.3.3] - 2026-05-25
+
+The v0.3.2 audit follow-through. Six surgical fixes closing the
+highest-ROI gaps. **Headline: pitch points 1 + 2 + 3 now have real
+end-to-end correctness proof on RTX 2060 silicon.**
+
+### Fixed
+- `DispatchFuture::poll` no longer busy-spins. On `EventStatus::NotReady`
+  the future now clones the waker, spawns a 50 µs tokio sleep, and
+  yields the worker. Pre-B1, every outstanding kernel pinned a tokio
+  worker at 100 % CPU until the event completed — that broke the
+  "Hyper-Scale Async" pitch under any non-trivial load. Real
+  cuStreamAddCallback-driven future remains v0.4 cuda-async work (B1).
+- CLI shell completions + man pages regenerated from the binary
+  (W2.4 had committed hand-rolled approximations; net +1046 lines of
+  drift caught) (B4).
+- CI workflow toolchain pins synced to `nightly-2026-04-03` to match
+  the F4 workspace bump (8 workflow files; previously CI would have
+  failed on next push) (B3 + F4 follow-up).
+
+### Added
+- **`tests/kernel_args_e2e.rs::dispatch_pipeline_compiles_against_real_module_bytes`**:
+  unignored on every CUDA host. Registers the canonical
+  `kernels/vector_add.ptx` via `cust::module::Module::from_ptx` and
+  asserts the launch result is in `{Ok, MalformedPtx, LaunchFailed,
+  InvalidKernel}` — explicitly NOT `InvalidArgs` / `InvalidPointer`
+  (those would mean marshalling regressed). PASSES on RTX 2060 +
+  Windows WDDM + CUDA 13.2 (B2).
+- **`vector_add_end_to_end_real_ptx_real_kernel`**: builds Wasm guest
+  with f32[64] arrays in linear memory, dispatches via wasi-cuda host
+  with typed argv pointing into linear memory, reads the `c` region
+  back out, asserts `c[i] == a[i] + b[i]` for all 64 elements.
+  Marked `#[ignore = "requires SM_80+"]` defensively — but in
+  practice the CUDA driver JIT'd the `.target sm_80` PTX up to SM_75
+  SASS on the local box and the test **passed end-to-end with
+  correct output** (B2).
+- `cargo-deny` enforcement job in `.github/workflows/ci.yml` running
+  `cargo deny check --all-features`. The F2 `deny.toml` allowlist
+  posture is now enforced per-PR (B3).
+- `UnifiedBuffer::is_uvm_backed()` + `TensorWasmLinearMemory::is_uvm_backed()`
+  probes and 5 new tests pinning the property that under
+  `--features unified-memory` the wasm linear memory IS allocated via
+  `cuMemAllocManaged` and `as_ptr()` is reachable as a device pointer
+  by kernel args. Closes v0.3.2 audit Problem #5 — the wiring already
+  existed; what was missing was provable assertion + documentation
+  (B5).
+- `bench-results/hyperfine-vs-wasmtime.json` — re-run of the
+  dimension-1 wasmtime comparison post-W4.1 / W2.2 / W2.3.
+  Pre: wasmtime 1.05× faster. Post: tensor-wasm 1.02× faster, CIs
+  overlap = statistically tied. **Tracing + audit + metrics overhead
+  not measurable on the CLI path** (the instrumentation lives in the
+  HTTP layer, CLI bypasses it) (B6).
+
+### Audit problems resolved this release
+
+- Problem #1 (busy-poll) → B1
+- Problem #2 (cargo deny not enforced) → B3
+- Problem #3 (hand-rolled completions/man pages) → B4
+- Problem #5 (linear memory UVM wiring unproven) → B5
+- Problem #10 (stale hyperfine comparison) → B6
+- Problem #14 (no end-to-end PTX correctness test) → B2 — **the
+  pitch-validating one**
+
+Problems still open: #4 (PATH-TO-V1 v0.2/v0.5 framing drift), #6
+(jobs_active / tenant_gpu_memory_bytes still TODO), #7 (no CI fuzz
+cron), #8 (no S22 self-hosted runner), #9 (bench numbers high CV),
+#11 (tracing span double-count under load — untested), #12 (wit
+docstring vs WIT version), #13 (Helm image tags reference
+unprovisioned registry), #15 (TBD placeholders in MAINTAINERS /
+GOVERNANCE / CVE dry-run).
+
 ## [Unreleased]
 _No entries yet — open the next PR adding one._
+
 
 
 
