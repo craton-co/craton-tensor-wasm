@@ -57,6 +57,24 @@ spec:
           type: RuntimeDefault
       containers:
         - name: tensor-wasm-api
+          # Backend selection is a BUILD-TIME decision (a Cargo feature
+          # flag), not a runtime env var. Different backends ship as
+          # different image tags. Plain YAML has no templating, so swap
+          # the tag manually here. Conventional variants:
+          #
+          #   ghcr.io/craton-co/tensor-wasm:0.1.0              # default; no suffix
+          #   ghcr.io/craton-co/tensor-wasm:0.1.0-cust         # legacy default (EOL upstream)
+          #   ghcr.io/craton-co/tensor-wasm:0.1.0-cudarc       # W1.2 spike; v0.3.x recommended-stable
+          #   ghcr.io/craton-co/tensor-wasm:0.1.0-cuda-oxide   # v0.5 target; alpha today
+          #
+          # See ../README.md "Backend selection" for the trade-off and
+          # rfcs/0001-cuda-oxide-integration.md "Feature-flag layout"
+          # for the RFC. The runtime env-var surface in
+          # 10-configmap.yaml is identical across backends — only the
+          # binary inside the image differs. The Helm chart at
+          # ../helm/tensor-wasm/ and the Nomad specs at ../nomad/ both
+          # expose this as a values toggle / Nomad variable; the plain
+          # YAML path leaves the swap to the operator.
           image: ghcr.io/craton-co/tensor-wasm:0.1.0
           imagePullPolicy: IfNotPresent
           args:

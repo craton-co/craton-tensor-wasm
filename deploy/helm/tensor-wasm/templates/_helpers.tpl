@@ -81,8 +81,18 @@ chart-managed Secret is suppressed in that case.
 
 {{/*
 Resolve the container image reference, defaulting tag to .Chart.AppVersion.
+
+When .Values.image.backend is set (cust | cudarc | cuda-oxide) the helper
+appends "-<backend>" to the tag, matching the build-time feature-flag
+convention from RFC 0001 (rfcs/0001-cuda-oxide-integration.md "Feature-flag
+layout"). The empty default leaves the tag untouched, so existing installs
+that pin a registry without backend-suffixed tags keep working.
 */}}
 {{- define "tensor-wasm.image" -}}
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+{{- if .Values.image.backend -}}
+{{- printf "%s:%s-%s" .Values.image.repository $tag .Values.image.backend -}}
+{{- else -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- end -}}
 {{- end -}}

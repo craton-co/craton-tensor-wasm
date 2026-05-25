@@ -73,6 +73,7 @@ a high-level summary.
 |---|---|---|
 | `image.repository` | `ghcr.io/craton-co/tensor-wasm` | OCI repository. |
 | `image.tag` | `""` (uses `.Chart.AppVersion`) | |
+| `image.backend` | `""` | One of `cust` \| `cudarc` \| `cuda-oxide` \| `""`. Appends `-<backend>` to the tag. See "Backend selection". |
 | `image.pullPolicy` | `IfNotPresent` | |
 | `imagePullSecrets` | `[]` | |
 | `replicaCount` | `1` | Runtime keeps no shared state across pods. |
@@ -163,6 +164,59 @@ prometheus:
     release: prometheus   # Match your Prometheus CR's serviceMonitorSelector
 ```
 
+## Backend selection
+
+The GPU host runtime is selected at **build time** via a Cargo feature flag
+(`unified-memory` / `cudarc-backend` / `cuda-oxide-backend` — see RFC 0001
+at `../../../rfcs/0001-cuda-oxide-integration.md` "Feature-flag layout").
+Different builds ship as different image tags; the chart picks between them
+by suffixing `image.tag` with `-<image.backend>`. The runtime env-var
+surface (`rateLimit.qps`, `auth.tokens`, `cuda.arch`, …) is identical
+across backends — only the binary inside the image differs.
+
+Three values are accepted for `image.backend`:
+
+- `cust` — the legacy default through v0.2.x. `cust 0.3.x` is EOL upstream
+  (see `../../../docs/RISKS.md` "CUDA `cust` 0.3.x EOL") and the W1.2
+  spike confirmed it no longer builds against the workspace's pinned
+  nightly. Pick this only if you are pinning to a pre-v0.3 image tag for a
+  reproducibility window.
+- `cudarc` — the W1.2 spike, the **recommended-stable** choice for
+  v0.3.x. Clean-room maintained, used by `candle` / `burn` / `dfdx`. The
+  CHANGELOG `0.3.0` entry promotes this to the recommended-stable backend
+  for the v0.3.x line; the default flips to it (or to `cuda-oxide`,
+  contingent on cuda-oxide v0.2 shipping) at v0.5 per RFC 0001 "Rollout
+  (PR sequencing)".
+- `cuda-oxide` — the v0.5 target, **alpha today**. NVIDIA Labs' Rust →
+  PTX compiler + host runtime, v0.1.0 released 2026-05-09. The scaffold
+  landed in v0.3.1; parity work is v0.4; default-flip is v0.5 contingent
+  on a v0.2 stable host API. Operators evaluating the migration ahead of
+  v0.5 set `backend: cuda-oxide` and accept the alpha-churn risk
+  documented in RFC 0001 "Drawbacks".
+
+The empty default (`backend: ""`) leaves the tag untouched, so any
+out-of-tree registry that does not adopt the `-<backend>` suffix
+convention keeps working — useful while
+`ghcr.io/craton-co/tensor-wasm:<tag>-<backend>` is still aspirational
+(see the "Image registry is a placeholder" callout above; the
+backend-suffixed variants share that aspirational status).
+
+**Ambiguous case worth flagging.** The three-way pick does not encode
+hardware fit. An operator on a Linux datacenter GPU where the `cust` path
+historically worked fine may stay on `backend: cust` for a release cycle
+even though `cuda-oxide` would (post-v0.5) be the faster choice; the
+chart will happily render either, and there is no upgrade hint. Watch the
+CHANGELOG and RFC 0001 "Rollout (PR sequencing)" for the v0.5 cutover —
+once the default flips, the absence of an explicit `backend:` value lands
+you on `cuda-oxide`. If you want pinning that survives the cutover, set
+`backend:` explicitly to the value you actually want, even if it matches
+today's default.
+
+A backend flip on its own — same `image.tag`, different `image.backend`
+— still re-rolls the pod: the chart hashes the resolved image reference
+into a `checksum/image` annotation alongside the existing
+`checksum/config` and `checksum/secret` triggers.
+
 ## Notes for chart maintainers
 
 - The chart bumps version independently from the application. Chart-only
@@ -182,8 +236,13 @@ prometheus:
 ## Cross-references
 
 - `../../k8s/README.md` — Plain-YAML alternative.
+- `../../nomad/README.md` — Nomad alternative; mirrors the same
+  `image.backend` toggle as a Nomad variable.
 - `../../../crates/tensor-wasm-api/API.md` — Env vars, endpoints, error
   envelope.
 - `../../../docs/DEPLOYMENT.md` — Production topology and DR.
 - `../../../docs/SLO.md` — `/healthz` SLO; informs the probe thresholds.
 - `../../../docs/CUDA-SETUP.md` — GPU node prerequisites.
+- `../../../rfcs/0001-cuda-oxide-integration.md` — The cust → cudarc →
+  cuda-oxide rollout that motivates the `image.backend` toggle.
+- `../../../CHANGELOG.md` — Version-by-version backend-status notes.

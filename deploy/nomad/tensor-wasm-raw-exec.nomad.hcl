@@ -27,6 +27,26 @@
 # The runtime is single-host today; count = 1 is the only safe value
 # without sticky LB routing.
 
+# Release version. Override with `-var image_tag=0.3.1` on submit. Mirrors
+# the `image_tag` variable in tensor-wasm.nomad.hcl so an operator can use
+# the same -var flag for both drivers.
+variable "image_tag" {
+  type    = string
+  default = "0.1.0"
+}
+
+# GPU backend. One of "cust" | "cudarc" | "cuda-oxide" | "" (default; no
+# suffix). When non-empty the binary filename is suffixed with `-<backend>`
+# in the artifact URL, matching the build-time feature-flag layout from
+# RFC 0001 (rfcs/0001-cuda-oxide-integration.md "Feature-flag layout").
+# `cust` = legacy default, `cudarc` = the v0.3.x recommended-stable choice,
+# `cuda-oxide` = the v0.5 target (alpha today). See
+# deploy/helm/tensor-wasm/README.md "Backend selection" for the trade-off.
+variable "backend" {
+  type    = string
+  default = ""
+}
+
 job "tensor-wasm" {
   datacenters = ["dc1"]
   type        = "service"
@@ -99,7 +119,13 @@ job "tensor-wasm" {
       #       this artifact stanza with a `command = "/usr/local/bin/..."`
       #       that points at the on-disk path.
       artifact {
-        source      = "https://example.invalid/tensor-wasm/0.1.0/tensor-wasm-x86_64-linux"
+        # The backend suffix is appended only when `var.backend` is set.
+        # See the `variable "backend"` block at the top of this file and
+        # README.md "Backend selection" for the three-way trade-off. The
+        # backend choice is BUILD-TIME (a Cargo feature flag): different
+        # backends ship as different binaries published under different
+        # filenames; the runtime env-var surface below does not change.
+        source      = "https://example.invalid/tensor-wasm/${var.image_tag}/tensor-wasm-x86_64-linux${var.backend != "" ? "-${var.backend}" : ""}"
         destination = "local/tensor-wasm"
         mode        = "file"
 
@@ -107,6 +133,10 @@ job "tensor-wasm" {
           # sha256 of the binary. Replace with the real digest published
           # alongside the release (per docs/REPRODUCIBLE-BUILDS.md the
           # release process emits a sha256sums.txt for every artifact).
+          # The digest is per-binary, so each backend variant has its
+          # own checksum — override on submit:
+          #   nomad job run -var checksum=sha256:abc... \
+          #     -var backend=cudarc deploy/nomad/tensor-wasm-raw-exec.nomad.hcl
           checksum = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
         }
       }

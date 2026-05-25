@@ -28,6 +28,14 @@ spec:
         {{- if not .Values.auth.existingSecret }}
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
         {{- end }}
+        # The image reference encodes image.backend via tensor-wasm.image
+        # (see _helpers.tpl). Hash it into a dedicated annotation so a
+        # backend flip — which can land alongside an unchanged tag, e.g.
+        # `0.3.1` → `0.3.1-cudarc` — still forces a rollout. RFC 0001
+        # (rfcs/0001-cuda-oxide-integration.md) treats the backend choice
+        # as a build-time decision; the rollout trigger is what makes the
+        # build-time pick observable to the cluster.
+        checksum/image: {{ include "tensor-wasm.image" . | sha256sum }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

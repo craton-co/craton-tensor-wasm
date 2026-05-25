@@ -11,13 +11,26 @@
 #     -n tensor-wasm --create-namespace -f my-values.yaml
 
 # -- Image source. The default registry is a placeholder; ghcr.io/craton-co
-# is not yet provisioned (v0.1.0 era). Build and push from
+# is not yet provisioned (v0.1.0 era; the backend-suffixed variants below
+# are equally aspirational). Build and push from
 # docker/tensor-wasm-api.Dockerfile until the registry exists.
 image:
   # -- OCI repository.
   repository: ghcr.io/craton-co/tensor-wasm
   # -- Image tag. Defaults to .Chart.AppVersion if left empty.
   tag: ""
+  # -- GPU backend. One of `cust` | `cudarc` | `cuda-oxide`, or `""` (the
+  # default; no suffix). When non-empty the chart appends `-<backend>` to
+  # the resolved tag, e.g. tag `0.3.1` + backend `cudarc` resolves to
+  # `ghcr.io/craton-co/tensor-wasm:0.3.1-cudarc`. The choice is BUILD-TIME
+  # (a Cargo feature flag, not a runtime knob): runtime config like
+  # `rateLimit` does not change between backends — only the binary inside
+  # the image does. See RFC 0001
+  # (rfcs/0001-cuda-oxide-integration.md "Feature-flag layout") and
+  # README.md "Backend selection" for the three-way trade-off (cust =
+  # legacy default; cudarc = recommended-stable for v0.3.x; cuda-oxide =
+  # v0.5 target, alpha today).
+  backend: ""
   # -- One of Always, IfNotPresent, Never.
   pullPolicy: IfNotPresent
 

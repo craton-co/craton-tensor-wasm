@@ -345,6 +345,36 @@ nomad job stop tensor-wasm
 nomad job run deploy/nomad/tensor-wasm.nomad.hcl  # from a known-good ref
 ```
 
+## Backend selection
+
+Both job specs expose an `image_tag` and a `backend` variable at the top
+of the file. The backend choice — `cust` | `cudarc` | `cuda-oxide` | `""`
+(default; no suffix) — is a **build-time** decision (a Cargo feature
+flag, not a runtime knob), so the variable affects only which artifact
+the driver fetches: the docker driver appends `-<backend>` to the image
+tag, the raw_exec driver appends `-<backend>` to the binary filename in
+the artifact URL. The env-var surface below the variable blocks
+(`TENSOR_WASM_API_*`, `CUDA_ARCH`, …) is identical across backends.
+
+Override on submit:
+
+```bash
+nomad job run -var backend=cudarc -var image_tag=0.3.1 \
+  deploy/nomad/tensor-wasm.nomad.hcl
+```
+
+`cust` is the legacy default and is EOL upstream (see
+`../../docs/RISKS.md` "CUDA `cust` 0.3.x EOL"); `cudarc` is the W1.2
+spike and the recommended-stable choice for the v0.3.x line; `cuda-oxide`
+is the v0.5 target and is alpha today. The default flips to `cuda-oxide`
+(or to `cudarc` as fallback) at v0.5 per RFC 0001 "Rollout (PR
+sequencing)". The empty default leaves the URL untouched, so any
+self-hosted artifact endpoint that does not adopt the `-<backend>`
+suffix convention keeps working. The full trade-off, ambiguous-case
+notes, and CHANGELOG cross-references live in
+`../helm/tensor-wasm/README.md` "Backend selection"; this section is the
+Nomad-specific surface only.
+
 ## Multi-instance constraints
 
 The runtime is single-host today. Above `count = 1` requires either:
@@ -394,3 +424,6 @@ sudo rm -rf /var/lib/tensor-wasm/*
   GPU section above.
 - `../../docs/UPGRADE.md` — Single-replica rolling-update guidance
   referenced by the `update { max_parallel = 1 }` stanza.
+- `../../rfcs/0001-cuda-oxide-integration.md` — The cust → cudarc →
+  cuda-oxide rollout that motivates the `backend` variable.
+- `../../CHANGELOG.md` — Version-by-version backend-status notes.

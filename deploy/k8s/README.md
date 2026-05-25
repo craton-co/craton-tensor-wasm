@@ -142,6 +142,30 @@ kubectl -n tensor-wasm expose deployment tensor-wasm-api \
 
 Uncomment the NodePort variant in `30-service.yaml` and re-apply.
 
+## Backend selection
+
+The GPU host runtime is selected at **build time** via a Cargo feature
+flag (`unified-memory` / `cudarc-backend` / `cuda-oxide-backend`), not at
+runtime. Different backends ship as different image tags under the
+convention `ghcr.io/craton-co/tensor-wasm:<version>-<backend>` where
+`<backend>` is `cust`, `cudarc`, or `cuda-oxide`. Plain YAML has no
+templating, so swapping backends here means editing the `image:` line in
+`20-deployment.yaml` by hand — the file carries a comment block above
+the line listing the four conventional variants (default, `-cust`,
+`-cudarc`, `-cuda-oxide`).
+
+`cust` is the legacy default and is EOL upstream; `cudarc` is the W1.2
+spike and the recommended-stable choice for v0.3.x; `cuda-oxide` is the
+v0.5 target and is alpha today. The default flips to `cuda-oxide` (or to
+`cudarc` as fallback) at v0.5 per RFC 0001 "Rollout (PR sequencing)".
+The env-var surface in `10-configmap.yaml` is identical across
+backends — only the binary inside the image differs. For a templated
+backend toggle use the Helm chart at `../helm/tensor-wasm/` (the
+`image.backend` value); for Nomad use the `backend` variable in
+`../nomad/tensor-wasm.nomad.hcl`. The full trade-off, ambiguous-case
+notes, and CHANGELOG cross-references live in
+`../helm/tensor-wasm/README.md` "Backend selection".
+
 ## GPU-node prerequisite checklist
 
 The reference Deployment ships with `nvidia.com/gpu` resources commented
@@ -186,7 +210,10 @@ chart if you need durable state.
 
 ## Cross-references
 
-- `../helm/tensor-wasm/README.md` — Helm-managed alternative.
+- `../helm/tensor-wasm/README.md` — Helm-managed alternative; templated
+  `image.backend` toggle plus the canonical "Backend selection" copy.
+- `../nomad/README.md` — Nomad alternative; mirrors the same
+  build-time-not-runtime backend pick as a Nomad variable.
 - `../../crates/tensor-wasm-api/API.md` — env-var reference, endpoint
   contracts, error envelope.
 - `../../docs/DEPLOYMENT.md` — production topology, capacity planning,
@@ -195,3 +222,6 @@ chart if you need durable state.
   full SLO surface the probes correspond to.
 - `../../docs/CUDA-SETUP.md` — GPU prerequisites referenced in the
   checklist above.
+- `../../rfcs/0001-cuda-oxide-integration.md` — The cust → cudarc →
+  cuda-oxide rollout that motivates the manual backend swap above.
+- `../../CHANGELOG.md` — Version-by-version backend-status notes.

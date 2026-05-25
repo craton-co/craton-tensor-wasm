@@ -19,6 +19,27 @@
 # See docs/UPGRADE.md "Single-replica constraint" and the matching note in
 # deploy/helm/tensor-wasm/values.yaml `replicaCount`.
 
+# Image tag. Override with `-var image_tag=0.3.1` on submit. Defaults to the
+# placeholder pin documented in README.md "Image and artifact placeholders".
+variable "image_tag" {
+  type    = string
+  default = "0.1.0"
+}
+
+# GPU backend. One of "cust" | "cudarc" | "cuda-oxide" | "" (default; no
+# suffix). When non-empty the docker image reference becomes
+# `<repo>:<tag>-<backend>`, matching the build-time feature-flag layout
+# from RFC 0001 (rfcs/0001-cuda-oxide-integration.md "Feature-flag layout"):
+# `cust` = legacy default, `cudarc` = the v0.3.x recommended-stable choice,
+# `cuda-oxide` = the v0.5 target (alpha today). The env-var surface below
+# is identical across backends — only the binary inside the image differs.
+# See deploy/helm/tensor-wasm/README.md "Backend selection" for the
+# three-way trade-off and the operator-pin guidance.
+variable "backend" {
+  type    = string
+  default = ""
+}
+
 job "tensor-wasm" {
   datacenters = ["dc1"]
   type        = "service"
@@ -109,7 +130,10 @@ job "tensor-wasm" {
       driver = "docker"
 
       config {
-        image = "ghcr.io/craton-co/tensor-wasm:0.1.0"
+        # The backend suffix is appended only when `var.backend` is set.
+        # See the `variable "backend"` block at the top of this file and
+        # README.md "Backend selection" for the three-way trade-off.
+        image = "ghcr.io/craton-co/tensor-wasm:${var.image_tag}${var.backend != "" ? "-${var.backend}" : ""}"
         ports = ["http"]
 
         args = [
