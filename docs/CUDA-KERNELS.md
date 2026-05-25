@@ -13,10 +13,12 @@ pattern detection emits PTX for you), and the shared machinery they
 ride on: the W1.1 typed-argv wire format, host-side bounds checking,
 and the launch contract from [`wit/wasi-cuda.wit`](../wit/wasi-cuda.wit).
 
-Status: **v0.3 workstream**. The kernel-args lane in Section 5
+Status: **v0.3 workstream**. The kernel-args lane in Section 6
 shipped in W1.1 (March 2026). The auto-offload runtime-swap hook
-(Section 10) is still gated behind the per-block Cranelift hook
-tracked in [`docs/WASMTIME-FORK.md`](WASMTIME-FORK.md).
+(Section 11) is still gated behind the per-block Cranelift hook
+tracked in [`docs/WASMTIME-FORK.md`](WASMTIME-FORK.md). Path C
+(Section 5) is forward-looking scaffold per
+[RFC 0001](../rfcs/0001-cuda-oxide-integration.md).
 
 ## Contents
 
@@ -24,13 +26,14 @@ tracked in [`docs/WASMTIME-FORK.md`](WASMTIME-FORK.md).
 2. [Two dispatch surfaces](#2-two-dispatch-surfaces)
 3. [Writing a PTX kernel by hand](#3-writing-a-ptx-kernel-by-hand)
 4. [Compiling .cu to PTX](#4-compiling-cu-to-ptx)
-5. [Loading and launching from a wasm guest](#5-loading-and-launching-from-a-wasm-guest)
-6. [Bounds checking and pointer args](#6-bounds-checking-and-pointer-args)
-7. [Performance tips](#7-performance-tips)
-8. [Common pitfalls](#8-common-pitfalls)
-9. [Testing](#9-testing)
-10. [Auto-offload coverage](#10-auto-offload-coverage)
-11. [Related](#11-related)
+5. [Path C: Rust kernels via cuda-oxide](#5-path-c-rust-kernels-via-cuda-oxide)
+6. [Loading and launching from a wasm guest](#6-loading-and-launching-from-a-wasm-guest)
+7. [Bounds checking and pointer args](#7-bounds-checking-and-pointer-args)
+8. [Performance tips](#8-performance-tips)
+9. [Common pitfalls](#9-common-pitfalls)
+10. [Testing](#10-testing)
+11. [Auto-offload coverage](#11-auto-offload-coverage)
+12. [Related](#12-related)
 
 ---
 
@@ -44,7 +47,7 @@ Wasm module dispatched by TensorWasm. A working CUDA toolchain pinned
 per [`docs/CUDA-SETUP.md`](CUDA-SETUP.md) (12.4 on the S22 runner;
 12.0–13.2 on contributor dev boxes) is assumed. If you don't have a
 CUDA-capable host, the launch path is still exercisable against the
-no-CUDA stub (see [Section 9](#9-testing)).
+no-CUDA stub (see [Section 10](#10-testing)).
 
 You do **not** need Wasm internals beyond: a module imports
 functions, exports a linear memory, and writes bytes into it before
@@ -80,7 +83,7 @@ The guest writes nothing CUDA-aware. Plain Wasm SIMD (`v128.*`) loops
 are inspected by [`tensor_wasm_jit::detector::classify`](../crates/tensor-wasm-jit/src/detector.rs)
 at JIT-pipeline time; recognized patterns (element-wise f32, FMA
 GEMV / dot-product, tiled f16 → f32 matmul, 3x3 conv2d stencil) are
-lowered to PTX blueprints and cached. See [Section 10](#10-auto-offload-coverage)
+lowered to PTX blueprints and cached. See [Section 11](#11-auto-offload-coverage)
 and [`docs/AUTO-OFFLOAD.md`](AUTO-OFFLOAD.md). The auto-offload runtime
 swap is **not yet wired** in v0.2 — the pipeline pre-emits PTX but
 Wasmtime still dispatches the Cranelift body at runtime.
@@ -296,7 +299,198 @@ high register pressure but contended launches silently lose throughput.
 
 ---
 
-## 5. Loading and launching from a wasm guest
+## 5. Path C: Rust kernels via cuda-oxide
+
+A third authoring path: write the kernel as a `#[no_std]` Rust
+function annotated with cuda-oxide's `#[cuda_module]` macro, build it
+with `cargo oxide build`, and load the emitted PTX through the same
+`wasi_cuda_load_ptx` host fn that consumes Path A and Path B output.
+The pitch is single-language ergonomics — no `.ptx` or `.cu`
+sidecars, no nvcc-out-of-band step — paired with Rust's safety on
+the host-facing pieces of the kernel (lifetimes for pointer args,
+trait-checked numeric types) that Path A simply does not check.
+The PTX bytes Path C emits are interchangeable with the bytes Paths
+A and B emit; nothing downstream of `load_ptx` knows or cares which
+path produced them.
+
+### 5.1 Status (v0.3.1)
+
+cuda-oxide is **v0.1.0 alpha** (NVIDIA Labs, released 2026-05-09).
+The TensorWasm `cuda-oxide-backend` feature flag in `tensor-wasm-mem`
+is a scaffold — the host-runtime surface is stubbed, and the
+kernel-authoring side (`cuda-device`, `cuda-macros`) is not yet
+wired into any in-tree example. The real implementation lands in
+the v0.4 port tracked by
+[RFC 0001](../rfcs/0001-cuda-oxide-integration.md). The guidance
+below is forward-looking; anyone exercising this path against the
+v0.1.x crates today should expect API breakage at v0.2 and budget
+for rework. See
+[`crates/tensor-wasm-mem/README-cuda-oxide.md`](../crates/tensor-wasm-mem/README-cuda-oxide.md)
+for the host-runtime scaffold's current shape and feature-flag
+matrix.
+
+### 5.2 Toolchain prereqs
+
+cuda-oxide pins `nightly-2026-04-03` in its own
+`rust-toolchain.toml`. TensorWasm's workspace pins
+`nightly-2026-03-15`, so Path C requires a **local toolchain
+override** — building this path on the workspace default fails with
+a cryptic missing-feature error. Per RFC 0001 "Toolchain plan" step
+3, the workspace default bumps to a cuda-oxide-compatible nightly
+at v0.4; until then the override is the contract.
+
+```bash
+# One-shot override via env var:
+RUSTUP_TOOLCHAIN=nightly-2026-04-03 cargo oxide build --release
+
+# Or branch-local rust-toolchain.toml:
+#   [toolchain]
+#   channel = "nightly-2026-04-03"
+#   components = ["rust-src", "rustc-dev", "llvm-tools-preview"]
+```
+
+Components required on the override toolchain:
+
+- `rust-src` — cuda-oxide's codegen backend re-compiles `core` for
+  the `nvptx64-nvidia-cuda` target.
+- `rustc-dev` — cuda-oxide is a `rustc` codegen backend and links
+  against `rustc_public` internals.
+- `llvm-tools-preview` — supplies the `llvm-*` binaries the
+  `dialect-llvm` → LLVM IR → PTX stage shells out to.
+
+The `cargo oxide` subcommand is installed via cargo:
+
+```bash
+cargo install cargo-oxide  # TODO(v0.4): verify exact crate name once cuda-oxide v0.2 ships
+```
+
+### 5.3 Write a kernel in Rust
+
+Skeleton, illustrative. The exact APIs in `cuda_device::prelude` may
+shift between v0.1.x patch releases:
+
+```rust
+// src/kernels/vector_add.rs
+#![no_std]
+use cuda_device::prelude::*;
+
+#[cuda_module]
+pub mod vector_add {
+    pub unsafe fn vector_add(
+        a: *const f32,
+        b: *const f32,
+        out: *mut f32,
+        n: usize,
+    ) {
+        let i = thread::index_x() as usize;
+        if i < n {
+            *out.add(i) = *a.add(i) + *b.add(i);
+        }
+    }
+}
+// TODO(v0.4): verify against cuda-oxide v0.2 — the prelude
+// re-exports (thread::index_x, etc.) are still in flux.
+```
+
+The body mirrors the `vector_add` PTX fixture from
+[Section 3.4](#34-worked-example-vector_addptx): one thread per
+element, bounds check against `n`, single `add.f32`. The
+`#[cuda_module]` macro is what flips the inner items onto the
+`nvptx64-nvidia-cuda` codegen path; everything outside the macro
+remains a normal host-side Rust crate.
+
+### 5.4 Build to PTX
+
+```bash
+cargo oxide build --release --target nvptx64-nvidia-cuda
+# outputs target/nvptx64-nvidia-cuda/release/vector_add.ptx
+```
+
+The compiler pipeline under the hood is
+`Rust source → rustc_public Stable MIR → dialect-mir → mem2reg →
+dialect-llvm → LLVM IR → PTX`. The emitted `.ptx` is the same UTF-8
+text format Path A authors by hand and Path B emits from nvcc; the
+`.entry` symbol matches the inner-fn name (`vector_add`). Validate
+register pressure with `ptxas -v` exactly as for Path B — see
+[Section 4.3](#43-validation-and-register-usage).
+
+### 5.5 Load and dispatch from TensorWasm
+
+The PTX bytes are interchangeable with Paths A and B, so the guest
+side is the existing `load_ptx` + `launch` sequence verbatim — see
+[Section 6.2](#62-worked-example-rust-guest) for the Rust guest and
+[Section 6.3](#63-worked-example-c-guest) for the C guest. The
+five-line shape:
+
+```rust
+const PTX: &[u8] = include_bytes!(
+    "../target/nvptx64-nvidia-cuda/release/vector_add.ptx");
+let kid = unsafe { wasi_cuda_load_ptx(
+    PTX.as_ptr() as i32, PTX.len() as i32,
+    b"vector_add".as_ptr() as i32, 10) };
+// argv packing + wasi_cuda_launch unchanged from Section 6.2.
+```
+
+Argv packing (the W1.1 wire format from
+[Section 3.3](#33-calling-convention)) is unchanged: the host parses
+the same tagged byte stream regardless of how the PTX was authored.
+
+### 5.6 Limitations vs Paths A/B today
+
+- **Toolchain split** is the headline cost. Until the v0.4 workspace
+  bump, Path C lives on a different nightly than the rest of the
+  codebase; cross-cutting refactors that touch a Path C kernel and
+  any other crate require two `cargo` invocations.
+- **v0.1.0 alpha churn.** cuda-oxide explicitly warns about API
+  breakage between v0.1 patch releases. The `cuda_device::prelude`
+  surface, the `#[cuda_module]` macro inputs, and the `cargo oxide`
+  CLI flags are all candidates for renaming before v0.2.
+- **Kernel stdlib coverage.** `cuda-device` is materially smaller
+  than the CUDA C++ runtime. Atomics, warp-shuffle intrinsics,
+  cooperative-groups, and the bulk of `<cuda/std/*>` are not yet
+  exposed; kernels that need them stay on Path A or Path B.
+- **No SM_80 wmma yet.** cuda-oxide has not lowered tensor-core
+  intrinsics (`wmma.mma.sync`, `cp.async.bulk`) through its dialect
+  pipeline. Per the SM matrix in
+  [`docs/CUDA-SETUP.md`](CUDA-SETUP.md#sm-level-compatibility-matrix),
+  this rules out the wmma-blueprint matmul path; tensor-core kernels
+  stay on Path A.
+- **Pliron supply-chain footprint.** cuda-oxide pulls Pliron via a
+  `git` revision pin; `cargo-deny` and the W3.6 reproducible-builds
+  pipeline both need allowlist entries that the cust and nvcc paths
+  do not require.
+
+### 5.7 When to pick Path C vs A vs B
+
+| Pick | When |
+|---|---|
+| A (hand-PTX) | Maximum control; warp-level tuning; tensor-core intrinsics (`wmma`, `cp.async.bulk`); SM-specific micro-optimisations the higher paths cannot express. |
+| B (.cu via nvcc) | Existing CUDA C++ codebase or team CUDA expertise; full CUDA runtime headers (`<cuda/std/*>`, atomics, cooperative groups); kernels shared with non-TensorWasm consumers. |
+| C (Rust via cuda-oxide) | Rust-native team that values single-language ergonomics; safety on pointer/lifetime bookkeeping; willing to track v0.1.x alpha churn and the toolchain split until v0.4. |
+
+The choice is per kernel, not per project — the same crate can ship
+Path A wmma kernels alongside Path C element-wise kernels, loaded
+through the same `wasi_cuda_load_ptx` call site.
+
+### 5.8 Future (v0.4+)
+
+Path C exists today because v0.4 needs a documented author-side
+surface, but the longer-term direction is that **many users will
+not write CUDA kernels at all**. RFC 0001's Pliron lever (see the
+module docs in
+[`crates/tensor-wasm-jit/src/pliron_dialect.rs`](../crates/tensor-wasm-jit/src/pliron_dialect.rs))
+adds a fourth front-end to cuda-oxide's pipeline — `Wasm →
+Cranelift IR → dialect-mir` — so the auto-offload detector
+(Section 11) can lower arbitrary pure-compute Wasm loops to PTX
+through the same dialect machinery cuda-oxide uses for Rust source.
+That expands auto-offload coverage from the three hand-written
+blueprints today to anything the detector can prove safe. Path C
+remains for the kernels that benefit from being written explicitly;
+the Pliron lowering pass covers everything else.
+
+---
+
+## 6. Loading and launching from a wasm guest
 
 The three host functions declared in
 [`wit/wasi-cuda.wit`](../wit/wasi-cuda.wit):
@@ -324,7 +518,7 @@ v0.1.0 behavior (rejects non-empty `args` with
 typed argv; `kernel-args-unsupported` is reserved for sanity-cap
 busts (Section 3.3).
 
-### 5.1 Encoding the argv buffer
+### 6.1 Encoding the argv buffer
 
 The argv buffer is a flat sequence of tagged records. Both example
 guests below pack three pointer args plus a scalar count for the
@@ -333,7 +527,7 @@ The host-side helper
 [`encode_argv`](../crates/tensor-wasm-wasi-gpu/src/kernel_args.rs)
 is the canonical byte-layout reference.
 
-### 5.2 Worked example: Rust guest
+### 6.2 Worked example: Rust guest
 
 `wasm32-wasip1` guest. Build with `cargo build --target wasm32-wasip1 --release`.
 
@@ -418,7 +612,7 @@ future 64-bit memory build it would silently widen. The argv buffer
 has **no length prefix** or padding; the host walks one tag at a
 time until `args_len` bytes are consumed.
 
-### 5.3 Worked example: C guest
+### 6.3 Worked example: C guest
 
 `wasi-sdk` C guest. Build with `clang --target=wasm32-wasi -O2 guest.c -o guest.wasm`.
 
@@ -481,7 +675,7 @@ no padding. Any guest language that can write a `&[u8]` and call an
 
 ---
 
-## 6. Bounds checking and pointer args
+## 7. Bounds checking and pointer args
 
 Every pointer arg is bounds-checked before any CUDA call. Inside
 [`parse_argv`](../crates/tensor-wasm-wasi-gpu/src/kernel_args.rs),
@@ -515,7 +709,7 @@ do not hold a `LoweredArg::Ptr` across a guest-callable boundary
 
 ---
 
-## 7. Performance tips
+## 8. Performance tips
 
 The launch path is thin (parse argv → bounds-check → `cuLaunchKernel`
 → `spawn_blocking(stream.synchronize)` → return), so the usual
@@ -557,7 +751,7 @@ relate launches/sec to permit count to GPU memory budget.
 
 ---
 
-## 8. Common pitfalls
+## 9. Common pitfalls
 
 **`KernelArgsUnsupported` (`-10`)** — Reserved for sanity-cap busts
 only: argv buffer above 4 KiB or more than 128 records. The v0.1.0
@@ -596,9 +790,9 @@ returns `MalformedPtx`.
 
 ---
 
-## 9. Testing
+## 10. Testing
 
-### 9.1 Host-side mock dispatch (no GPU required)
+### 10.1 Host-side mock dispatch (no GPU required)
 
 W1.1 added `WasiCudaContext::last_lowered_args` so argv lowering can
 be tested end-to-end without a GPU. On a no-CUDA host,
@@ -628,7 +822,7 @@ Use this pattern to verify a guest's argv packer, pin the contract on
 a kernel before shipping, and regression-test parser / bounds-checker
 changes. It does not exercise the kernel itself.
 
-### 9.2 Real-GPU integration tests
+### 10.2 Real-GPU integration tests
 
 Tests needing a real CUDA device are marked
 `#[ignore = "requires CUDA hardware"]`:
@@ -651,7 +845,7 @@ unconditional so it runs on every PR.
 
 ---
 
-## 10. Auto-offload coverage
+## 11. Auto-offload coverage
 
 Pointer to [`docs/AUTO-OFFLOAD.md`](AUTO-OFFLOAD.md). The detector
 recognizes element-wise f32 vector arithmetic (vector_add), fused
@@ -671,9 +865,22 @@ custom shared-memory tiling, or intrinsics above the blueprint set.
 you'd rather write idiomatic Rust + `v128` intrinsics. **Use both**
 when the hot inner loop is a blueprint and surrounding logic is custom.
 
+**v0.4 expansion via Pliron.** The blueprint set above is the
+v0.3.x coverage ceiling because the detector emits PTX from three
+hand-written templates. The v0.4 Pliron lowering pass tracked in
+[`crates/tensor-wasm-jit/src/pliron_dialect.rs`](../crates/tensor-wasm-jit/src/pliron_dialect.rs)
+(scaffold today; real lowering per RFC 0001 step 4) replaces the
+template-emitter with a `Cranelift IR → Pliron dialect-mir → ... →
+PTX` pipeline that shares cuda-oxide's backend. Once it lands,
+coverage expands from the three blueprints to arbitrary pure-compute
+loops the detector can prove safe — see
+[RFC 0001 "Pliron lever and the auto-offload pipeline"](../rfcs/0001-cuda-oxide-integration.md#pliron-lever-and-the-auto-offload-pipeline).
+That is what shrinks Path C's audience over time: many users will
+not write CUDA kernels at all, the lowering pass auto-offloads them.
+
 ---
 
-## 11. Related
+## 12. Related
 
 - [`docs/CUDA-SETUP.md`](CUDA-SETUP.md) — toolchain, driver matrix,
   SM compatibility, troubleshooting.
@@ -693,8 +900,14 @@ when the hot inner loop is a blueprint and surrounding logic is custom.
 - [`crates/tensor-wasm-wasi-gpu/src/kernel_args.rs`](../crates/tensor-wasm-wasi-gpu/src/kernel_args.rs) — wire format, sanity caps, encoder / decoder.
 - [`crates/tensor-wasm-wasi-gpu/src/host.rs`](../crates/tensor-wasm-wasi-gpu/src/host.rs) — launch impl: validation, parsing, `cuLaunchKernel`, sync.
 - [`crates/tensor-wasm-wasi-gpu/tests/kernel_args_e2e.rs`](../crates/tensor-wasm-wasi-gpu/tests/kernel_args_e2e.rs) — e2e tests for scalar / pointer argv and the `#[ignore]` pattern.
+- [`rfcs/0001-cuda-oxide-integration.md`](../rfcs/0001-cuda-oxide-integration.md) — Path C provenance: the v0.5 cust-successor RFC that motivates the `cuda-oxide-backend` feature and the v0.4 toolchain bump.
+- [`crates/tensor-wasm-mem/README-cuda-oxide.md`](../crates/tensor-wasm-mem/README-cuda-oxide.md) — user-facing reference for the `cuda-oxide-backend` feature flag, current stub behaviour, and the `RUSTUP_TOOLCHAIN` override.
+- [`crates/tensor-wasm-jit/src/pliron_dialect.rs`](../crates/tensor-wasm-jit/src/pliron_dialect.rs) — module-doc scaffold for the v0.4 Wasm-to-`dialect-mir` lowering pass that expands auto-offload coverage beyond the three blueprints.
 
 ---
 
-_Updated for tensor-wasm v0.3 (PATH-TO-V1 W4.5). Worked examples are
-pinned to the W1.1 wire format; re-render if the tag table changes._
+_Updated for tensor-wasm v0.3.1 (PATH-TO-V1 W4.5 + RFC 0001 step 5).
+Worked examples are pinned to the W1.1 wire format; re-render if the
+tag table changes. Path C content is forward-looking against
+cuda-oxide v0.1.0 alpha and will need a refresh once cuda-oxide v0.2
+ships — see the inline `TODO(v0.4)` markers in Section 5._
