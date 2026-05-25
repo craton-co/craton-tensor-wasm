@@ -310,13 +310,23 @@ impl SnapshotWriter {
             crc32,
         };
 
-        let encoded = bincode::serialize(&snapshot_ref)
+        // Stream bincode directly into the zstd encoder so we never materialise
+        // the full uncompressed payload as an intermediate `Vec<u8>`. For large
+        // captures (hundreds of MiB) this eliminates a peak-resident copy and a
+        // redundant pass over the buffer. `bincode::config::legacy()` keeps the
+        // wire format byte-identical to bincode 1.x's default fixint+LE config.
+        let cfg = bincode::config::legacy();
+        let mut compressed: Vec<u8> = Vec::with_capacity(8 * 1024);
+        let mut encoder = zstd::stream::write::Encoder::new(&mut compressed, self.zstd_level)
+            .map_err(|e| TensorWasmError::Serialization(format!("zstd init: {e}").into()))?;
+        bincode::serde::encode_into_std_write(&snapshot_ref, &mut encoder, cfg)
             .map_err(|e| TensorWasmError::Serialization(format!("bincode encode: {e}").into()))?;
-        let compressed = zstd::encode_all(encoded.as_slice(), self.zstd_level)
-            .map_err(|e| TensorWasmError::Serialization(format!("zstd encode: {e}").into()))?;
+        encoder
+            .finish()
+            .map_err(|e| TensorWasmError::Serialization(format!("zstd finish: {e}").into()))?;
 
         debug!(
-            uncompressed = encoded.len(),
+            uncompressed = total_uncompressed_bytes,
             compressed = compressed.len(),
             "snapshot captured",
         );
@@ -378,7 +388,8 @@ mod tests {
             crc32: payload_crc32(&[], &[], &[]),
         };
         // Build a hand-rolled blob with a bad version field.
-        let encoded = bincode::serialize(&s).unwrap();
+        let cfg = bincode::config::legacy();
+        let encoded = bincode::serde::encode_to_vec(&s, cfg).unwrap();
         let compressed = zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL).unwrap();
         let err = SnapshotReader::new()
             .restore(&compressed)
@@ -386,7 +397,7 @@ mod tests {
         assert!(matches!(err, TensorWasmError::Serialization(_)));
         // Sanity: a corrected version round-trips.
         s.version = SNAPSHOT_VERSION;
-        let encoded = bincode::serialize(&s).unwrap();
+        let encoded = bincode::serde::encode_to_vec(&s, cfg).unwrap();
         let compressed = zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL).unwrap();
         SnapshotReader::new().restore(&compressed).expect("ok");
     }
@@ -407,7 +418,8 @@ mod tests {
             },
             crc32: payload_crc32(&[], &[], &[]),
         };
-        let encoded = bincode::serialize(&s).unwrap();
+        let cfg = bincode::config::legacy();
+        let encoded = bincode::serde::encode_to_vec(&s, cfg).unwrap();
         let compressed = zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL).unwrap();
         let err = SnapshotReader::new()
             .restore(&compressed)

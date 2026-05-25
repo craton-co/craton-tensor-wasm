@@ -695,8 +695,17 @@ async fn launch_impl_async<T: HasWasiCuda>(
     // the lifetime of this future — on return (success OR error) it drops
     // and the live-counter decrements, enforcing the cap regardless of
     // outcome.
+    //
+    // We use `acquire_borrowed` (not `acquire`) because this host function
+    // never moves the permit across a `tokio::spawn` boundary: the
+    // `spawn_blocking` call below moves only the CUDA stream/event/module
+    // handle, not the permit. Borrowing skips the `Arc<Semaphore>` clone
+    // the owned variant pays on every dispatch — a measurable saving on
+    // the hot path. `&BackPressure` outlives the borrow because the
+    // `WasiCudaContext` (which owns the Arc<BackPressure>) is held by the
+    // wasmtime `Caller` for the duration of this async fn.
     let bp = caller.data().wasi_cuda().back_pressure.clone();
-    let _permit = bp.acquire().await;
+    let _permit = bp.acquire_borrowed().await;
 
     #[cfg(feature = "cuda")]
     {

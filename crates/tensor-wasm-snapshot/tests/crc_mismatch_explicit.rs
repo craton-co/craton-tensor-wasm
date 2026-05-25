@@ -45,7 +45,8 @@ fn crc_mismatch_after_payload_mutation_is_rejected() {
     // field so the stored checksum is now stale relative to the actual bytes.
     snap.wasm_memory[2] ^= 0xFF;
 
-    let encoded = bincode::serialize(&snap).expect("bincode encode");
+    let cfg = bincode::config::legacy();
+    let encoded = bincode::serde::encode_to_vec(&snap, cfg).expect("bincode encode");
     let compressed = zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL).expect("zstd encode");
 
     let err = SnapshotReader::new()

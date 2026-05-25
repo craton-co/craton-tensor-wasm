@@ -32,7 +32,7 @@ zstd(
 | Layer | Library | Settings |
 |-------|---------|----------|
 | Outer | [`zstd`](https://docs.rs/zstd) | Default compression level (`DEFAULT_ZSTD_LEVEL = 3`), single frame. The reader streams via `zstd::stream::read::Decoder` capped with `Read::take`. |
-| Inner | [`bincode`](https://docs.rs/bincode) 1.x | Default config: little-endian, fixint, reject-trailing-bytes on encode. The reader uses `bincode::Options::with_limit(max_decompressed)` plus `.allow_trailing_bytes()` to refuse oversized `Vec<u8>` length-prefix abuse without crashing on benign envelope padding. |
+| Inner | [`bincode`](https://docs.rs/bincode) 2.x | `bincode::config::legacy()`: little-endian, fixint — byte-identical wire format to bincode 1.x's `DefaultOptions::new().with_fixint_encoding().with_little_endian()`. The reader uses `legacy().with_limit::<{ MAX_TOTAL_PAYLOAD_BYTES }>()` (a compile-time `const` generic ceiling, ~5 GiB) to refuse oversized `Vec<u8>` length-prefix abuse; `bincode::serde::decode_from_slice` ignores trailing bytes by default, replacing the explicit `.allow_trailing_bytes()` opt-in from 1.x. |
 | Byte blobs | [`serde_bytes`](https://docs.rs/serde_bytes) | Each of `wasm_memory`, `gpu_memory`, `registers` is serialised as a single length-prefixed byte string (`u64` LE length, then raw bytes). On the write path the bytes are borrowed via a `SnapshotRef<'a>` mirror struct so no host-side copy is made; on the read path they deserialise into owned `Vec<u8>`. The wire bytes are identical to the pre-`serde_bytes` `Vec<u8>` encoding (bincode emits `len: u64 LE` + raw bytes in both cases). |
 
 ## Size caps
@@ -43,11 +43,11 @@ violates one of them; `TensorWasmError::Serialization` is returned in every case
 | Constant | Value | Enforced where |
 |----------|-------|----------------|
 | `MAX_INPUT_BYTES` | `64 * 1024 * 1024 * 64` (~4 GiB) | Before zstd is invoked, against the raw compressed slice. |
-| `MAX_DECOMPRESSED_BYTES` | `256 * 1024 * 1024` (256 MiB) | Streaming zstd cap (`Read::take`) **and** bincode allocator cap (`Options::with_limit`). Overridable per reader via `SnapshotReader::with_max_decompressed`. |
+| `MAX_DECOMPRESSED_BYTES` | `256 * 1024 * 1024` (256 MiB) | Streaming zstd cap (`Read::take`). Overridable per reader via `SnapshotReader::with_max_decompressed`. |
 | `MAX_WASM_MEMORY_BYTES` | `1024 * 1024 * 1024` (1 GiB) | Capture (writer) and restore (reader) checks against `wasm_memory.len()`. |
 | `MAX_GPU_MEMORY_BYTES` | `4 * 1024 * 1024 * 1024` (4 GiB) | Capture and restore checks against `gpu_memory.len()`. |
 | `MAX_REGISTERS_BYTES` | `1024 * 1024` (1 MiB) | Capture and restore checks against `registers.len()`. |
-| `MAX_TOTAL_PAYLOAD_BYTES` | sum of the three blob caps + 64 KiB | Exported for callers that pre-size buffers; not enforced directly (the per-blob caps already bound it). |
+| `MAX_TOTAL_PAYLOAD_BYTES` | sum of the three blob caps + 64 KiB | Bincode 2.x allocator ceiling — passed as the `with_limit::<N>` const generic so the deserialiser refuses any single allocation past this static bound before reading the body. The per-blob caps still validate after decode. |
 
 The compressed-input and decompressed-stream caps together bound the
 allocator exposure of a single restore call. The per-blob caps catch the
