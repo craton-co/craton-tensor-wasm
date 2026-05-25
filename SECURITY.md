@@ -163,3 +163,116 @@ all `/functions/*` and `/jobs/*` routes require `Authorization: Bearer <token>`;
 
 Email `security@craton.com.ar` with a reproducer. We aim to triage within
 2 business days. Coordinated disclosure preferred.
+
+## Backport policy
+
+This section documents how Craton TensorWasm maintains released major
+versions after the next major has shipped. It is the operational
+companion to the v1.0 exit criterion in
+[`docs/PATH-TO-V1.md`](docs/PATH-TO-V1.md) ("Backport policy") and to
+the Security committee role defined in [`GOVERNANCE.md`](GOVERNANCE.md).
+
+### Window
+
+Every released major version (v1.x, v2.x, ...) receives security
+patches and severity-1 fixes for **12 months** after the next major's
+GA. The v1.0 backport window therefore opens at v1.0 GA and runs
+until 12 months after v2.0 GA. The same 12-month rule rolls forward
+for every subsequent major: when v3.0 ships, v2.x enters a 12-month
+sunset window, and so on.
+
+### What backports cover
+
+- Security patches (CVE-fixed or embargoed-fix releases handled by
+  the Security committee under the disclosure process above).
+- Severity-1 fixes, where "severity-1" means one of:
+  - Data loss (snapshot corruption, tenant memory overwrite,
+    silently dropped writes).
+  - A security regression that re-opens a previously closed CVE or
+    weakens a documented isolation boundary.
+  - Complete service outage in a documented supported configuration
+    (the runtime fails to start, panics on first request, or hangs
+    indefinitely under expected load).
+
+### What backports do NOT cover
+
+- Feature requests, including ergonomic improvements and new CLI
+  flags. New features land on the latest minor only.
+- Performance regressions of less than 2x baseline. Larger
+  regressions are evaluated case-by-case; the burden of proof is on
+  the requester to demonstrate the regression on the maintenance
+  branch with a reproducer.
+- Cosmetic, docs-only, or refactor changes. Those go in the latest
+  minor; the maintenance branch is for fixes that change behaviour
+  the user is depending on, not for tidying.
+
+### Branch model
+
+A `release-v1.x` maintenance branch tracks the latest patch of the
+v1 line; `release-v2.x` will track v2, and so on. Patches land on
+`main` first and are then cherry-picked to the maintenance branch
+by a maintainer in the relevant crate area. Direct commits to a
+maintenance branch are reserved for the rare case where the fix
+shape on the older branch genuinely differs from `main` (for
+example, because an API was renamed in a later major); in those
+cases, the branch-specific patch must reference the `main` PR that
+fixed the same issue in the trunk.
+
+### How to request a backport
+
+- **For security issues:** use the disclosure process under
+  [Reporting vulnerabilities](#reporting-vulnerabilities) above. The
+  Security committee will explicitly mark backport-eligible fixes
+  during triage and coordinate the cherry-pick alongside the public
+  release on disclosure day, per the embargoed-handling rules in
+  [`GOVERNANCE.md`](GOVERNANCE.md).
+- **For severity-1 fixes:** open a public issue tagged
+  `backport-request` that includes the affected version, the crash
+  signature or symptom, and a minimal reproducer. The maintainers
+  triage backport requests during normal review; if accepted, the
+  fix is cherry-picked from `main` once it has landed there.
+
+### Release cadence on maintenance branches
+
+Patch releases on maintenance branches are cut as needed, with no
+fixed schedule. The maintainers commit to a release within **14
+days** of a confirmed backport-eligible merge to `main`; security
+releases follow the disclosure-day timing set by the Security
+committee rather than the 14-day window. Multiple eligible fixes
+within the same 14-day window are bundled into one patch release.
+
+### Communicating EOL
+
+90 days before a maintenance branch reaches end-of-life, an EOL
+notice is posted in [`CHANGELOG.md`](CHANGELOG.md) under the next
+patch release's entry and is repeated in the release notes for that
+patch. The notice names the EOL date, the recommended target major
+to upgrade to, and a pointer to the relevant migration guide
+(`docs/MIGRATION-vN-to-vM.md`). On the EOL date itself, a final
+patch release may be cut to ship any in-flight backports; after
+that, the branch is archived and receives no further commits.
+
+### LTS / extended window
+
+v1.x is **not** marked LTS. The 12-month window above is the full
+commitment. At v2.0, the project will revisit whether to offer an
+extended LTS window (24 months has been discussed) based on
+design-partner feedback gathered during the v0.5-beta and v1.x
+cycles. This is open decision 7 in
+[`docs/PATH-TO-V1.md`](docs/PATH-TO-V1.md); the decision will be
+recorded as an RFC under [`rfcs/`](rfcs/) before v2.0 GA and, if
+accepted, reflected by an amendment to this section.
+
+### CVEs that affect only a maintenance branch
+
+A vulnerability that affects only `release-v1.x` (for example, a
+fix that landed on `main` happens to also close a CVE that never
+existed in the older branch's code, or a CVE specific to a
+deprecated code path retained on the maintenance branch) is
+reported through the same disclosure address as any other CVE. The
+Security committee replies within 72 hours and treats branch-only
+CVEs identically to main-line ones: same triage SLO, same 90-day
+fix or workaround commitment, same coordinated-disclosure
+preference. The advisory explicitly names which branches are
+affected so users on unaffected lines are not asked to upgrade
+unnecessarily.
