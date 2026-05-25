@@ -1,16 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
 //
-// wasi:cuda/host@0.1.0 — TensorWasm's explicit GPU kernel-launch API for Wasm
-// guests. The on-the-wire ABI is currently the function-import form
-// described in `crates/tensor-wasm-wasi-gpu/src/abi.rs`; this WIT is the
-// Component-Model equivalent and is the authoritative description of the
-// interface for tooling that consumes WIT (wit-bindgen, jco, etc.).
+// wasi:cuda/host@0.2.0 — TensorWasm's explicit GPU kernel-launch API for Wasm
+// guests. The on-the-wire ABI is the function-import form described in
+// `crates/tensor-wasm-wasi-gpu/src/abi.rs`; this WIT is the Component-Model
+// equivalent and is the authoritative description of the interface for
+// tooling that consumes WIT (wit-bindgen, jco, etc.).
 //
-// Keep this file and `crates/tensor-wasm-wasi-gpu/src/abi.rs` in lockstep — every
-// constant, every function signature, every error code must match.
+// Keep this file and `crates/tensor-wasm-wasi-gpu/src/abi.rs` in lockstep —
+// every constant, every function signature, every error code must match.
+//
+// Version history:
+// - 0.1.0 (v0.1.0 era): launch rejected non-empty args with
+//   kernel-args-unsupported; the dynamic-argv path was a documented stub.
+// - 0.2.0 (v0.3.x): W1.1 typed-argv lowering landed; kernel-args-unsupported
+//   is reserved for sanity-cap rejections (>4 KiB / >128 entries) only.
+//   `launch` now accepts the tag-then-value wire format described in
+//   `crates/tensor-wasm-wasi-gpu/src/kernel_args.rs`. Wire-incompatible
+//   with 0.1.0 guests that relied on the launch-with-empty-args behavior.
 
-package wasi:cuda@0.1.0;
+package wasi:cuda@0.2.0;
 
 interface host {
   /// Negative i32 error codes returned by every host call. Numeric values
