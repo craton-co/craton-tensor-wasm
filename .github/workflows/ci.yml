@@ -76,6 +76,30 @@ jobs:
       - name: Test (CUDA stub, default features)
         run: cargo test --workspace
 
+  macos-build:
+    name: macos-compile-test
+    runs-on: macos-latest
+    # macOS is a Tier 3 platform: compile-tested only, no CUDA, no MPS
+    # (CUDA-gated crates would fail to link on macOS). Tests are not
+    # run because the GitHub macos-latest runners are slow; the goal is
+    # to catch breakage in pure-CPU paths, not feature-test the stack.
+    # See docs/BUILD.md "Platform support tiers".
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build (no CUDA, release)
+        # No --all-features: CUDA-gated crates (cust linkage) are not
+        # supported on macOS. Pure release build of the default workspace.
+        run: cargo build --workspace --release
+
   doc:
     name: rustdoc
     runs-on: ubuntu-latest

@@ -71,7 +71,7 @@ crate or doc that owns the gap.
 | Security | Threat model documented; fuzz harness for snapshot + WAT parser | External pen-test; CVE disclosure pipeline exercised |
 | OSS hygiene | LICENSE / NOTICE / SPDX / CoC / CONTRIBUTING / dependabot landed (Batch A, M) | Maintainer governance model; trademark; release-signing keys |
 | Supply chain | `cargo-audit` + `cargo-deny` in CI (Batch M) | SBOM published per release; reproducible builds |
-| Platforms | Linux x86_64 primary; Windows MSVC builds and tests; macOS untested | Document support matrix; macOS at least compile-tested in CI |
+| Platforms | Linux x86_64 primary; Windows MSVC builds and tests; macOS compile-tested in CI (Tier 3 — no CUDA) | Tier matrix documented in [`BUILD.md`](BUILD.md#platform-support-tiers); broaden macOS coverage to tests post-v1.0 |
 | Dependencies | `cust 0.3.x` (EOL'd upstream — see [`RISKS.md`](RISKS.md)); `prometheus-client 0.24` (recently bumped); `wasmtime 25.0.3` | `cust` successor chosen and migrated; Wasmtime upgrade cadence policy |
 
 ---

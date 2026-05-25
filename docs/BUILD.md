@@ -97,9 +97,22 @@ Common build issues with copy-paste fixes:
 - **``could not find `Cargo.toml`​``** — run cargo commands from the workspace root (`C:/Projects/bali/` or wherever you cloned it), not a subdirectory.
 - **`error: package collision`** — `cargo clean` and rebuild; usually after a `rust-toolchain.toml` channel bump.
 
+## Platform support tiers
+
+TensorWasm classifies host platforms into tiers based on what CI exercises and what the maintainers commit to keeping green. Lower-tier platforms may work but receive less coverage; bug reports against them are accepted, but fixes are best-effort and may depend on community patches.
+
+| Tier | Platform | What CI runs | Notes |
+|---|---|---|---|
+| **Tier 1** | Linux x86_64 | Full feature matrix incl. CUDA on the S22 self-hosted runner; fmt, clippy, doc, tests with and without default features | Primary development and reference deployment target. All features supported. |
+| **Tier 2** | Windows x86_64 MSVC | Default-feature build + tests in CI; no CUDA in CI | Tested but CUDA path is not exercised on Windows runners; users with a local CUDA toolkit can opt in via `tensor-wasm-mem/unified-memory`. |
+| **Tier 3** | macOS (x86_64 / aarch64) | `cargo build --workspace --release` only (no tests, no CUDA features) | Compile-tested only. No CUDA backend (cust is Linux/Windows), no MPS, no GPU offload — pure-CPU paths only. Tests are not run because GitHub `macos-latest` runners are slow; the gate exists to catch portability breakage in the default workspace build. |
+| **Best-effort** | aarch64-linux, riscv64, FreeBSD/OpenBSD/NetBSD | Not in CI | Community-tested. Patches accepted; regressions on these targets do not block releases. |
+
+A Tier 1 break fails the build and blocks merging. A Tier 2 break fails the build. A Tier 3 break fails the build only at the compile level (test failures cannot fail because tests do not run there). Best-effort breaks are tracked in issues but do not block.
+
 ## CI parity
 
-The `.github/workflows/ci.yml` workflow runs four jobs: `fmt` (cargo fmt --check), `clippy` (with CUDA stubs on `LD_LIBRARY_PATH`, default features), `test` (CUDA stubs, runs both `cargo build --workspace`, `cargo test --workspace --no-default-features`, and `cargo test --workspace`), and `actionlint`. To approximately mirror CI locally:
+The `.github/workflows/ci.yml` workflow runs the following jobs: `fmt` (cargo fmt --check), `clippy` (with CUDA stubs on `LD_LIBRARY_PATH`, default features), `test` (CUDA stubs, runs both `cargo build --workspace`, `cargo test --workspace --no-default-features`, and `cargo test --workspace`), `macos-build` (compile-test on `macos-latest`, release profile, no CUDA features), `doc`, `openapi`, and `actionlint`. To approximately mirror CI locally:
 
 ```sh
 make ci
