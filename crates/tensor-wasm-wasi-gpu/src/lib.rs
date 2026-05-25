@@ -18,4 +18,5 @@
 pub mod abi;
 pub mod async_dispatch;
 pub mod host;
+pub mod kernel_args;
 pub mod registry;

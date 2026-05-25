@@ -37,21 +37,28 @@ Last updated: 2026-05-24 (v0.1.0)
 
 ---
 
-## Kernel-args marshalling (v0.1.0)
+## Kernel-args marshalling (v0.2)
 
-**Status:** the `wasi:cuda/host@0.1.0` `launch` host function accepts an `(args_ptr, args_len)` pair describing an opaque byte blob in the guest's linear memory. In v0.1.0 only the **zero-argument launch shape** reaches `cuLaunchKernel`; a non-empty buffer is rejected with `AbiError::KernelArgsUnsupported` (wire code `-10`) after the bounds-check passes.
+**Status:** the `wasi:cuda/host@0.1.0` `launch` host function accepts an `(args_ptr, args_len)` pair describing a tagged-argv byte blob in the guest's linear memory. As of v0.2 a non-empty buffer is parsed into a typed `Vec<LoweredArg>` (see `crates/tensor-wasm-wasi-gpu/src/kernel_args.rs`) and lowered into a `void**` parameter array that flows directly into a raw `cust::sys::cuLaunchKernel` call. The earlier v0.1.0 "all non-empty args rejected" contract is gone.
 
-**Why the restriction exists:** `cust 0.3.x`'s `launch!` macro takes statically-typed kernel parameters at the call site. Synthesizing a dynamic argv from a raw guest byte buffer requires bypassing the macro and calling `cuLaunchKernel` directly with a `void**`-style argument array — and that needs a frozen per-arg packing format (type tags, alignment rules, GPU-side pointer translation for `device_ptr` arguments) that has not yet been designed.
+**Supported argument types** (each carries a 1-byte tag + value bytes; full table in the `kernel_args` module docs):
+
+- Scalars: `i32` (tag `0x01`), `i64` (`0x02`), `f32` (`0x03`), `f64` (`0x04`), `u32` (`0x05`), `u64` (`0x06`).
+- Pointer args: `ptr` (tag `0x07`), encoded as `(u32 guest_offset, u32 byte_len)`. The host bounds-checks `[guest_offset, guest_offset + byte_len)` against the caller's linear memory and resolves the offset into a raw host pointer. Under CUDA Unified Memory that pointer doubles as a device address.
+
+**Sanity caps** (in `kernel_args::MAX_KERNEL_ARGS` / `MAX_KERNEL_ARGS_BYTES`): 128 args per launch, 4 KiB of wire-format argv per launch. Buffers above either cap surface as `AbiError::KernelArgsUnsupported` — the variant is preserved as a *fallback for size-cap rejections only*, not for "any args at all" as in v0.1.0.
 
 **Contract:**
 
-- A malformed pointer (negative, overflow, out-of-bounds) returns `AbiError::InvalidPointer` (`-2`). This check runs FIRST so a malicious guest cannot trade a `MemoryFault` for the friendlier "unsupported" code.
-- A well-formed, in-bounds, non-empty buffer returns `AbiError::KernelArgsUnsupported` (`-10`).
-- An empty (`args_len == 0`) buffer proceeds to launch normally — this is the only shape that exercises the CUDA path in v0.1.0.
+- A malformed outer pointer (negative, overflow, OOB) → `AbiError::InvalidPointer` (`-2`). This check runs FIRST so a malicious guest cannot trade a `MemoryFault` for any of the softer codes.
+- A buffer above the size or arg-count caps → `AbiError::KernelArgsUnsupported` (`-10`).
+- A buffer with an unknown tag byte or a truncated record → `AbiError::InvalidArgs` (`-9`).
+- A buffer whose pointer arg points outside guest linear memory → `AbiError::InvalidPointer` (`-2`).
+- Otherwise the parsed argv flows into `cuLaunchKernel` on CUDA builds (returning `0`) or is recorded into `WasiCudaContext::last_lowered_args` and surfaces as `AbiError::NotAvailable` on no-CUDA builds.
 
-`AbiError::KernelArgsUnsupported` is intentionally distinct from `AbiError::InvalidArgs` so guests debugging "my launch with parameters fails" see "host can't pass this to CUDA yet" rather than the misleading "your input is malformed."
+**Out of scope for v0.2:** explicit device-only allocations (the guest cannot today get a `device_ptr` from `cuMemAlloc`; all pointer args reach the kernel via UVM); structured-tag formats beyond the listed primitives (no v128 SIMD, no `struct` args, no array of pointers). Those expand the format additively and reuse the `KernelArgsUnsupported` fallback for "host doesn't accept this tag yet."
 
-**Mitigation:** dynamic argv marshalling (BAL-422) is a v0.2 effort. Tests `launch_with_inbounds_args_returns_kernel_args_unsupported` and `launch_with_oob_args_returns_invalid_pointer` in `crates/tensor-wasm-wasi-gpu/src/host.rs` pin both halves of the contract.
+**Tests:** `crates/tensor-wasm-wasi-gpu/src/kernel_args.rs::tests` cover the parser unit-by-unit; `crates/tensor-wasm-wasi-gpu/src/host.rs::tests` exercise the unknown-tag / OOB / oversized branches through the launch host fn; `crates/tensor-wasm-wasi-gpu/tests/kernel_args_e2e.rs` covers scalar + pointer + mixed argv end-to-end through wasmtime (CUDA-only assertions are `#[ignore]`).
 
 **Owner:** GPU integration maintainers.
 

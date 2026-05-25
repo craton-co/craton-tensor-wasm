@@ -33,31 +33,31 @@
 //! into `cuLaunchKernel` — the failure is reported with a structured
 //! `last_error` describing which axis tripped the cap.
 //!
-//! ## Kernel argument marshalling (v0.1.0)
+//! ## Kernel argument marshalling (v0.2)
 //!
 //! The launch host function takes `(args_ptr, args_len)` describing a
-//! byte buffer in the guest's linear memory. v0.1.0 intentionally
-//! short-circuits the dispatch path: the args region is bounds-checked
-//! and read into a host-side `Vec<u8>` (so pointer bugs surface
-//! immediately), but a non-empty buffer is rejected with
-//! [`AbiError::KernelArgsUnsupported`] because the per-arg packing
-//! format hasn't been frozen yet and `cust 0.3.x`'s `launch!` macro
-//! takes statically-typed args (synthesizing a dynamic argv from a raw
-//! byte buffer requires dropping to `cuLaunchKernel` directly, which is
-//! the BAL-422 / v0.2 effort).
+//! byte buffer in the guest's linear memory. The buffer carries a
+//! sequence of tagged records — see [`crate::kernel_args`] for the wire
+//! format. The launch path bounds-checks the buffer against the caller's
+//! linear memory, then [`crate::kernel_args::parse_argv`] turns it into a
+//! `Vec<LoweredArg>` where pointer arguments have been resolved into raw
+//! host pointers (under CUDA Unified Memory those are also valid device
+//! addresses).
 //!
-//! The distinction between [`AbiError::InvalidArgs`] (your input is
-//! malformed) and [`AbiError::KernelArgsUnsupported`] (your input is
-//! fine, the host can't pass it to CUDA yet) matters for guest
-//! debugging — see `docs/RISKS.md` for the v0.1.0 contract.
+//! On CUDA builds the parsed args flow into
+//! [`crate::kernel_args::build_kernel_param_storage`] and then into a
+//! direct `cuLaunchKernel` call — bypassing `cust::launch!` (which would
+//! force statically-typed parameters at the call site). On no-CUDA
+//! builds the parsed args are recorded on the [`WasiCudaContext`] for
+//! testing (see [`WasiCudaContext::last_lowered_args`]) and the launch
+//! returns [`AbiError::NotAvailable`].
 //!
-//! Only the zero-arg launch shape reaches `cuLaunchKernel` in this
-//! release. Richer marshalling (per-arg type tags, packed primitives,
-//! GPU-side pointer translation) lands in `BAL-422`; guests that need
-//! parameters today should track that ticket.
-//!
-//! On non-CUDA builds the args region is bounds-checked but never
-//! dereferenced — the launch returns [`AbiError::NotAvailable`] regardless.
+//! [`AbiError::KernelArgsUnsupported`] is preserved as a fallback for
+//! genuinely-unsupported argv shapes — over-long buffers and excess arg
+//! counts. Malformed argv (unknown tag bytes, truncated records)
+//! surfaces as [`AbiError::InvalidArgs`]; out-of-bounds pointer
+//! arguments surface as [`AbiError::InvalidPointer`]. The distinction
+//! keeps the error story crisp for guest debugging.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -71,6 +71,7 @@ use crate::abi::{
     MAX_BLOCK_DIM, MAX_GRID_DIM, MAX_PTX_BYTES, MAX_THREADS_PER_BLOCK, MODULE,
 };
 use crate::async_dispatch::BackPressure;
+use crate::kernel_args::{parse_argv, LoweredArg};
 use crate::registry::{KernelEntry, KernelRegistry};
 
 /// Per-instance host state passed to wasi-cuda calls.
@@ -91,6 +92,21 @@ pub struct WasiCudaContext {
     /// than a per-instance one. With [`WasiCudaContext::new`] each context
     /// still gets its own cap.
     pub back_pressure: Arc<BackPressure>,
+    /// The most recent successfully-parsed kernel argv from a `launch`
+    /// call. On the no-CUDA host-stub path this is the only place the
+    /// lowered args land — integration tests inspect it to confirm the
+    /// argv made it through bounds-checking and type-tag parsing
+    /// without actually launching a kernel. On CUDA builds it is also
+    /// populated (after the launch returns) so the same observability
+    /// works under `--features cuda`.
+    ///
+    /// HAZARD: pointer args inside [`LoweredArg::Ptr`] carry raw host
+    /// pointers into the guest's linear memory. Those pointers are
+    /// invalidated on any subsequent `memory.grow` by the same guest.
+    /// Treat this field as observation-only and snapshot it
+    /// immediately after the launch returns; do NOT cache the
+    /// pointers across guest-callable boundaries.
+    pub last_lowered_args: Mutex<Vec<LoweredArg>>,
 }
 
 impl WasiCudaContext {
@@ -102,6 +118,7 @@ impl WasiCudaContext {
             registry: Arc::new(KernelRegistry::new()),
             last_error: Mutex::new(None),
             back_pressure: Arc::new(BackPressure::new()),
+            last_lowered_args: Mutex::new(Vec::new()),
         }
     }
 
@@ -114,6 +131,7 @@ impl WasiCudaContext {
             registry: Arc::new(KernelRegistry::new()),
             last_error: Mutex::new(None),
             back_pressure: bp,
+            last_lowered_args: Mutex::new(Vec::new()),
         }
     }
 
@@ -131,6 +149,16 @@ impl WasiCudaContext {
     /// Borrow the most recent error message.
     pub fn last_error(&self) -> Option<String> {
         self.last_error.lock().expect("last_error poisoned").clone()
+    }
+
+    /// Snapshot of the args parsed by the most recent successful `launch`
+    /// call. Intended for tests; production code should not depend on
+    /// this value remaining stable across launches on the same context.
+    pub fn last_lowered_args(&self) -> Vec<LoweredArg> {
+        self.last_lowered_args
+            .lock()
+            .expect("last_lowered_args poisoned")
+            .clone()
     }
 }
 
@@ -598,35 +626,47 @@ async fn launch_impl_async<T: HasWasiCuda>(
 
     // Read the args region into a host-side buffer before the back-pressure
     // permit is acquired so a slow launch can't pin a memory borrow across
-    // an await. The buffer is moved into the CUDA branch below or
-    // discarded on the no-CUDA branch.
+    // an await. The buffer is parsed into a typed `Vec<LoweredArg>`
+    // immediately so any malformed-byte / OOB-pointer error surfaces
+    // before we touch the CUDA driver. Pointer args are resolved against
+    // the caller's current linear memory snapshot — `read_bytes` returns
+    // an owned `Vec<u8>` so the borrow does not pin the memory across the
+    // upcoming `await`, but the resolved host pointers still alias the
+    // live linear memory and are only safe to use until the next
+    // `memory.grow`. We therefore push parsing here (synchronous, no
+    // await crossed) and consume the resolved pointers in the immediate
+    // `cuLaunchKernel` call inside `spawn_blocking`, before the wasmtime
+    // fiber resumes and the guest can grow memory.
     //
-    // v0.1.0 marshalling: we read and bounds-check the buffer here, but
-    // the CUDA dispatch path below only supports the zero-arg launch
-    // shape. Non-empty args returns `KernelArgsUnsupported` so the guest
-    // can distinguish "your input is malformed" (`InvalidArgs`) from
-    // "your input is fine, but the host can't pass it to CUDA in this
-    // release" (tracked in BAL-422). The bounds-check still runs first
-    // because pointer bugs must surface regardless of whether dispatch
-    // goes through — a malicious guest cannot trade a `MemoryFault` for
-    // a `KernelArgsUnsupported`.
-    let args_buf: Vec<u8> = if args_len > 0 {
-        read_bytes(caller, args_ptr, args_len)?
+    // `KernelArgsUnsupported` is preserved as a fallback for buffers that
+    // exceed the kernel-args sanity caps — see
+    // [`crate::kernel_args::MAX_KERNEL_ARGS_BYTES`] /
+    // [`crate::kernel_args::MAX_KERNEL_ARGS`]. Genuinely-malformed argv
+    // (unknown tag, truncated record) surfaces as `InvalidArgs`; OOB
+    // pointer arg returns `InvalidPointer`. The bounds-check on the
+    // outer buffer still runs first inside `validate_launch_args`, so a
+    // malicious guest cannot trade a `MemoryFault` for the friendlier
+    // tag-byte error.
+    let lowered_args: Vec<LoweredArg> = if args_len > 0 {
+        let raw = read_bytes(caller, args_ptr, args_len)?;
+        let mem = caller
+            .get_export("memory")
+            .and_then(|e| e.into_memory())
+            .ok_or(AbiError::InvalidPointer)?;
+        let mem_data = mem.data(&caller);
+        match parse_argv(&raw, mem_data) {
+            Ok(v) => v,
+            Err(e) => {
+                caller.data().wasi_cuda().record_error(format!(
+                    "launch: kernel argv parse failed ({}); args_len={args_len}",
+                    e.name()
+                ));
+                return Err(e);
+            }
+        }
     } else {
         Vec::new()
     };
-    if !args_buf.is_empty() {
-        // TODO(v0.2): wire dynamic argv through cuLaunchKernel (BAL-422).
-        // cust 0.3.x's `launch!` macro takes statically-typed args, so
-        // we cannot synthesize a dynamic argv from a raw byte buffer
-        // without dropping to the raw driver API.
-        caller.data().wasi_cuda().record_error(format!(
-            "launch: dynamic kernel args not implemented in v0.1.0; \
-             received args_len={args_len} bytes. See docs/RISKS.md and \
-             wit/wasi-cuda.wit (BAL-422)."
-        ));
-        return Err(AbiError::KernelArgsUnsupported);
-    }
 
     // Eagerly take a strong, owned handle to the kernel (Arc-wrapped on
     // CUDA builds). This both validates `kid` and frees the registry's
@@ -647,6 +687,8 @@ async fn launch_impl_async<T: HasWasiCuda>(
     {
         use cust::event::{Event, EventFlags};
         use cust::stream::{Stream, StreamFlags};
+
+        use crate::kernel_args::build_kernel_param_storage;
 
         // The strong `Arc` we already hold keeps the module alive across
         // launch + synchronize without any raw-pointer gymnastics.
@@ -674,35 +716,67 @@ async fn launch_impl_async<T: HasWasiCuda>(
             AbiError::LaunchFailed
         })?;
 
-        // v0.1.0 args marshalling: non-empty args were already rejected
-        // above with KernelArgsUnsupported. The launch macro therefore
-        // receives an empty parameter list, matching the zero-arg
-        // kernel calling convention. Richer marshalling (per-arg
-        // tagged blob, GPU-side pointer translation) lands in BAL-422
-        // — see the TODO(v0.2) above and `docs/RISKS.md`.
-        let _ = args_buf;
+        // Build the `void**` parameter storage from the parsed argv. The
+        // storage owns the per-arg value bytes (scalars) and the
+        // pointer-of-pointer slots that `cuLaunchKernel` consumes; we
+        // keep it alive across the launch call below.
+        //
+        // For zero-arg launches `storage.as_ptr()` is still a valid
+        // pointer to an empty slot vec — `cuLaunchKernel` interprets a
+        // zero parameter count as "ignore the argv pointer."
+        let mut storage = build_kernel_param_storage(&lowered_args);
+        let param_count = storage.len();
+        // CUDA reads `kernelParams` only when the kernel's PTX `.param`
+        // block is non-empty; for zero-arg kernels we pass NULL rather
+        // than the (possibly dangling) `Vec::as_mut_ptr()` of an empty
+        // slot vec.
+        let kernel_params_ptr: *mut *mut std::ffi::c_void = if param_count == 0 {
+            std::ptr::null_mut()
+        } else {
+            storage.as_ptr()
+        };
 
-        // SAFETY: launching a kernel is inherently unsafe (no host-side
-        // proof that the kernel arguments match the kernel signature).
-        // We pass the pre-validated dims and a strong module reference;
-        // zero arg parameters means a guest that loaded a non-zero-arg
-        // PTX kernel will see an undefined-behavior launch from the
-        // driver — those guests are expected to use the BAL-422
-        // marshalling path once it ships. The host-side rejection above
-        // means well-behaved guests cannot reach this point with args.
-        unsafe {
-            cust::launch!(
-                func<<<(grid_x as u32, grid_y as u32, grid_z as u32),
-                       (block_x as u32, block_y as u32, block_z as u32),
-                       shared_mem as u32, stream>>>()
+        // Drop down to `cust::sys::cuLaunchKernel` because `cust::launch!`
+        // forces statically-typed args at the call site. The raw call
+        // takes a `*mut *mut c_void` of length `param_count` — exactly
+        // what `storage.as_ptr()` provides. We pass a null `extra`
+        // pointer because CUDA accepts either form (params XOR extra).
+        //
+        // NOTE: `cust 0.3`'s `Function` and `Stream` raw-handle
+        // accessors (`as_raw` / `as_inner`) are stable across the 0.3.x
+        // line; if a future cust bump renames them this is the only
+        // call site that needs to follow.
+        //
+        // SAFETY: launching a kernel is inherently unsafe — the host has
+        // no proof the kernel signature matches the parsed argv. The
+        // caller (the Wasm guest) is responsible for that match; we
+        // guarantee only that (a) every pointer arg points into the
+        // guest's own linear memory, (b) the dims fit the CUDA caps,
+        // and (c) the stream/function/module references are live for
+        // the duration of the call (the `Arc<Module>` clone held in
+        // `handle` keeps the module alive across the launch).
+        use cust::sys as cuda_sys;
+        let launch_status = unsafe {
+            cuda_sys::cuLaunchKernel(
+                func.as_raw(),
+                grid_x as u32,
+                grid_y as u32,
+                grid_z as u32,
+                block_x as u32,
+                block_y as u32,
+                block_z as u32,
+                shared_mem as u32,
+                stream.as_inner(),
+                kernel_params_ptr,
+                std::ptr::null_mut(),
             )
-            .map_err(|e| {
-                caller
-                    .data()
-                    .wasi_cuda()
-                    .record_error(format!("launch: cuLaunchKernel failed: {e:?}"));
-                AbiError::LaunchFailed
-            })?;
+        };
+        if launch_status != cuda_sys::CUresult::CUDA_SUCCESS {
+            caller.data().wasi_cuda().record_error(format!(
+                "launch: cuLaunchKernel failed with status {launch_status:?}; \
+                 param_count={param_count}"
+            ));
+            return Err(AbiError::LaunchFailed);
         }
 
         // Record an event on the stream so the dispatch future can poll
@@ -722,15 +796,20 @@ async fn launch_impl_async<T: HasWasiCuda>(
             AbiError::LaunchFailed
         })?;
 
-        // Move the stream + event into the blocking task so synchronize
-        // doesn't block the wasmtime fiber. Stream + Event are Send. Keep
-        // `handle` (and therefore the Arc<Module>) alive until after the
-        // synchronize completes — that's why `handle` is moved into the
-        // closure rather than `drop`ped explicitly here.
+        // Move the stream + event + arg storage into the blocking task so
+        // synchronize doesn't block the wasmtime fiber. Stream + Event
+        // are Send; `KernelParamStorage` has a Send impl that asserts
+        // its raw pointers are not concurrently shared. Keep `handle`
+        // (and therefore the Arc<Module>) alive until after synchronize
+        // completes — the storage may carry raw host pointers into the
+        // guest's linear memory which `cuLaunchKernel` has already
+        // captured, but the closure keeps the backing alive in case
+        // CUDA dereferences it again during sync.
         let handle_for_keepalive = handle.clone();
         let result = tokio::task::spawn_blocking(move || {
             let _keep_event = event;
             let _keep_module = handle_for_keepalive;
+            let _keep_storage = storage;
             stream.synchronize()
         })
         .await
@@ -745,6 +824,15 @@ async fn launch_impl_async<T: HasWasiCuda>(
                 .record_error(format!("launch: stream synchronize failed: {e:?}"));
             AbiError::LaunchFailed
         })?;
+        // Stash the parsed args for observability before releasing the
+        // handle. Tests inspect `last_lowered_args` to confirm the
+        // marshalling round-trip held.
+        *caller
+            .data()
+            .wasi_cuda()
+            .last_lowered_args
+            .lock()
+            .expect("last_lowered_args poisoned") = lowered_args;
         // `handle` is still in scope here; it (and the Arc<Module>) is
         // released by Drop now that synchronize has returned. The clone
         // moved into the blocking task may still hold the Arc briefly,
@@ -755,13 +843,21 @@ async fn launch_impl_async<T: HasWasiCuda>(
 
     #[cfg(not(feature = "cuda"))]
     {
-        // Without CUDA we can't actually run the kernel; surface
-        // `NotAvailable` so the Wasm caller knows.
-        let _ = (args_buf, handle); // suppress unused warnings on no-CUDA.
-        caller
+        // Without CUDA we can't actually run the kernel; record the
+        // parsed args (so tests can confirm the lowering held) and
+        // surface `NotAvailable` so the Wasm caller knows the launch
+        // did not run.
+        let _ = handle; // suppress unused warning on no-CUDA.
+        let parsed_count = lowered_args.len();
+        *caller
             .data()
             .wasi_cuda()
-            .record_error("launch: CUDA not available on this host");
+            .last_lowered_args
+            .lock()
+            .expect("last_lowered_args poisoned") = lowered_args;
+        caller.data().wasi_cuda().record_error(format!(
+            "launch: CUDA not available on this host (argv parsed: {parsed_count} args)"
+        ));
         Err(AbiError::NotAvailable)
     }
 }
@@ -872,11 +968,15 @@ mod tests {
         assert!(Arc::ptr_eq(a.back_pressure(), b.back_pressure()));
     }
 
-    /// A well-formed, in-bounds `args` buffer must surface as
-    /// `KernelArgsUnsupported` (NOT `InvalidArgs`, NOT `InvalidPointer`).
-    /// This is the v0.1.0 contract — see module docs and `docs/RISKS.md`.
+    /// A well-formed, in-bounds `args` buffer whose first byte is an
+    /// unknown tag must surface as `InvalidArgs` — distinct from
+    /// `KernelArgsUnsupported` (reserved for size-cap fallbacks) and
+    /// from `InvalidPointer` (reserved for OOB pointers). The 4
+    /// zero-bytes the WAT writes parse as a leading 0x00 tag, which is
+    /// not assigned. This is the v0.2 contract — see module docs and
+    /// `docs/RISKS.md`.
     #[tokio::test]
-    async fn launch_with_inbounds_args_returns_kernel_args_unsupported() {
+    async fn launch_with_inbounds_unknown_tag_returns_invalid_args() {
         let mut config = wasmtime::Config::new();
         config.async_support(true);
         let engine = wasmtime::Engine::new(&config).unwrap();
@@ -886,8 +986,9 @@ mod tests {
         // Tiny module: one page of memory (64 KiB), and an exported
         // `try_launch` that hands the host (kernel_id=0, 1x1x1 grid,
         // 1x1x1 block, shared_mem=0, args_ptr=0, args_len=4). The 4-byte
-        // region at offset 0 is in-bounds, so the bounds-check must
-        // pass and we must land on the unsupported branch.
+        // region at offset 0 is in-bounds (all zero bytes), so the
+        // bounds-check passes; the parser then sees a leading 0x00 tag
+        // and rejects it as `InvalidArgs`.
         let wat = format!(
             r#"
             (module
@@ -924,17 +1025,18 @@ mod tests {
         let rc = try_launch.call_async(&mut store, ()).await.expect("call");
         assert_eq!(
             rc,
-            AbiError::KernelArgsUnsupported.code(),
-            "in-bounds args_len > 0 must return KernelArgsUnsupported, \
-             not InvalidArgs ({}) or InvalidPointer ({})",
             AbiError::InvalidArgs.code(),
+            "unknown leading tag byte must return InvalidArgs ({}), \
+             not KernelArgsUnsupported ({}) or InvalidPointer ({})",
+            AbiError::InvalidArgs.code(),
+            AbiError::KernelArgsUnsupported.code(),
             AbiError::InvalidPointer.code(),
         );
-        // Confirm the recorded error message points to the v0.1.0 contract.
+        // Confirm the recorded error message reports the parse failure.
         let last = store.data().wasi_cuda().last_error().unwrap_or_default();
         assert!(
-            last.contains("dynamic kernel args not implemented"),
-            "expected v0.1.0-contract message, got: {last}"
+            last.contains("kernel argv parse failed"),
+            "expected argv-parse error, got: {last}"
         );
     }
 
@@ -991,6 +1093,68 @@ mod tests {
             AbiError::InvalidPointer.code(),
             "OOB args region must return InvalidPointer (memory fault), \
              not KernelArgsUnsupported — the bounds-check must run first"
+        );
+    }
+
+    /// A buffer larger than the kernel-args sanity cap surfaces as
+    /// `KernelArgsUnsupported`. The cap is enforced by `parse_argv`
+    /// before any per-record work — the host stub records the parse
+    /// error in `last_error` and returns the negative code.
+    ///
+    /// We trigger this via a launch with `args_len` greater than
+    /// `kernel_args::MAX_KERNEL_ARGS_BYTES` (the buffer itself is
+    /// in-bounds because the WAT exports 16 pages = 1 MiB of linear
+    /// memory).
+    #[tokio::test]
+    async fn launch_with_oversized_argv_returns_kernel_args_unsupported() {
+        use crate::kernel_args::MAX_KERNEL_ARGS_BYTES;
+
+        let mut config = wasmtime::Config::new();
+        config.async_support(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut linker: Linker<Dummy> = Linker::new(&engine);
+        add_to_linker(&mut linker).expect("add_to_linker");
+
+        let oversized = (MAX_KERNEL_ARGS_BYTES + 1) as i32;
+        // 16 pages = 1 MiB, comfortably larger than the cap so the
+        // outer bounds-check passes and the size-cap is what triggers.
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "{fn_name}"
+                (func $launch (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 16)
+              (func (export "try_launch") (result i32)
+                (call $launch
+                  (i64.const 0)
+                  (i32.const 1) (i32.const 1) (i32.const 1)
+                  (i32.const 1) (i32.const 1) (i32.const 1)
+                  (i32.const 0)
+                  (i32.const 0)
+                  (i32.const {oversized})))
+            )
+            "#,
+            m = MODULE,
+            fn_name = FN_LAUNCH,
+        );
+        let bytes = wat::parse_str(&wat).unwrap();
+        let module = wasmtime::Module::new(&engine, &bytes).expect("compile");
+        let mut store = wasmtime::Store::new(
+            &engine,
+            Dummy(WasiCudaContext::new(InstanceId(220))),
+        );
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+        let try_launch = instance
+            .get_typed_func::<(), i32>(&mut store, "try_launch")
+            .expect("typed func");
+        let rc = try_launch.call_async(&mut store, ()).await.expect("call");
+        assert_eq!(
+            rc,
+            AbiError::KernelArgsUnsupported.code(),
+            "argv buffer past sanity cap must return KernelArgsUnsupported"
         );
     }
 
