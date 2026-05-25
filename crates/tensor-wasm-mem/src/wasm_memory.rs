@@ -108,13 +108,17 @@ impl TensorWasmLinearMemory {
 
     /// Whether the underlying linear-memory backing is CUDA Unified Memory.
     ///
-    /// Returns `true` only when the crate was compiled with
-    /// `--features unified-memory`. This is the compile-time probe that
-    /// closes the v0.3.2 audit's "wasm linear memory not UVM-backed" gap:
-    /// a guest pointer resolved through the W1.1 wasi-cuda kernel-args
-    /// pipeline doubles as a device pointer iff this returns `true`. The
-    /// pool-backed [`PooledLinearMemory`] path also goes through
-    /// [`UnifiedBuffer`] under the hood, so it shares this property.
+    /// Returns `true` when the crate was compiled with EITHER
+    /// `--features unified-memory` (cust path) OR `--features cudarc-backend`
+    /// (the W1.2 spike, used as the `Backing::Cudarc` variant when
+    /// `unified-memory` is off — see the precedence table in
+    /// [`crate::unified`]). This is the compile-time probe that closes the
+    /// v0.3.2 audit's "wasm linear memory not UVM-backed" gap: a guest
+    /// pointer resolved through the W1.1 wasi-cuda kernel-args pipeline
+    /// doubles as a device pointer iff this returns `true`. The pool-backed
+    /// [`PooledLinearMemory`] path also goes through [`UnifiedBuffer`] under
+    /// the hood, so it shares this property regardless of which CUDA
+    /// backing feature is active.
     ///
     /// # Memory-growth semantics
     ///
@@ -547,22 +551,29 @@ mod tests {
 
     #[test]
     fn is_uvm_backed_matches_feature_flag() {
-        // Closes the v0.3.2 audit gap (Problem #5). With `--features
-        // unified-memory`, the wasm linear memory's backing IS
-        // `cuMemAllocManaged` and the host pointer doubles as a device
-        // pointer for kernel args. Without the feature, the backing is a
-        // heap `Box<[u8]>`. Either way the probe must reflect build
-        // configuration — never lie.
+        // Closes the v0.3.2 audit gap (Problem #5). With EITHER `--features
+        // unified-memory` (cust path) OR `--features cudarc-backend` (the
+        // W1.2 spike now wired in as a third `UnifiedBuffer` Backing
+        // variant, see `crate::unified` precedence table), the wasm linear
+        // memory's backing IS `cuMemAllocManaged` and the host pointer
+        // doubles as a device pointer for kernel args. Without either
+        // feature, the backing is a heap `Box<[u8]>`. Either way the probe
+        // must reflect build configuration — never lie.
         let mem = TensorWasmLinearMemory::new(64 * 1024, Some(1024 * 1024)).unwrap();
         #[cfg(feature = "unified-memory")]
         assert!(
             mem.is_uvm_backed(),
             "with --features unified-memory the wasm linear memory MUST be UVM-backed"
         );
-        #[cfg(not(feature = "unified-memory"))]
+        #[cfg(all(not(feature = "unified-memory"), feature = "cudarc-backend"))]
+        assert!(
+            mem.is_uvm_backed(),
+            "with --features cudarc-backend the wasm linear memory MUST be UVM-backed"
+        );
+        #[cfg(all(not(feature = "unified-memory"), not(feature = "cudarc-backend")))]
         assert!(
             !mem.is_uvm_backed(),
-            "without unified-memory the backing must be the heap Box<[u8]>"
+            "without any CUDA backing feature the linear memory must be the heap Box<[u8]>"
         );
     }
 

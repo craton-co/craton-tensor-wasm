@@ -2,14 +2,43 @@
 // Copyright 2026 Craton Software Company
 
 //! `UnifiedBuffer` — a region of memory that is addressable from both CPU and
-//! GPU when the `unified-memory` feature is enabled.
+//! GPU when a CUDA backing feature is enabled.
 //!
-//! Two backings:
+//! Three backings, selected at compile time:
 //! - With `unified-memory`: `cudaMallocManaged` via the `cust` crate. Pages
-//!   migrate on demand between host and device.
-//! - Without `unified-memory`: a heap-allocated `Box<[u8]>`. This compiles on
-//!   non-CUDA hosts and is what CI uses. It exposes the same API but the
-//!   `prefetch_to_device` / `prefetch_to_host` methods become no-ops.
+//!   migrate on demand between host and device. This is the v0.3 default for
+//!   any host that opts into a CUDA backing and remains the cust-backed path
+//!   the audit-closed test matrix exercises.
+//! - With `cudarc-backend` (and `unified-memory` OFF): `cuMemAllocManaged`
+//!   via the W1.2 [`crate::cudarc_backend::CudarcUnifiedBuffer`] spike.
+//!   This is the v0.5 cust-successor fallback per
+//!   [RFC 0001](../../../rfcs/0001-cuda-oxide-integration.md): once
+//!   cuda-oxide v0.2 ships its managed-memory wrapper this path can be
+//!   swapped for `CudaOxideUnifiedBuffer`; until then `cudarc-backend`
+//!   is the v0.5 default-flip candidate.
+//! - Without either: a heap-allocated `Box<[u8]>`. This compiles on non-CUDA
+//!   hosts and is what CI's no-feature build uses. It exposes the same API
+//!   but the `prefetch_to_device` / `prefetch_to_host` methods become no-ops.
+//!
+//! # Feature precedence
+//!
+//! When both `unified-memory` and `cudarc-backend` are enabled simultaneously,
+//! the cust path wins. This preserves the v0.3 default (every existing
+//! production deployment built with `--features unified-memory` keeps the
+//! exact same allocator under its feet) and lets dev boxes that have both
+//! features turned on opt to cust without a separate feature gate. To force
+//! the cudarc backing on such a host, build with
+//! `--no-default-features --features cudarc-backend` (or otherwise omit
+//! `unified-memory` from the active feature set).
+//!
+//! Precedence table:
+//!
+//! | `unified-memory` | `cudarc-backend` | Active backing             | `is_uvm_backed()` |
+//! |------------------|-------------------|----------------------------|-------------------|
+//! | on               | off               | cust `UnifiedBuffer<u8>`   | `true`            |
+//! | on               | on                | cust `UnifiedBuffer<u8>`   | `true`            |
+//! | off              | on                | `CudarcUnifiedBuffer`      | `true`            |
+//! | off              | off               | `Box<[u8]>`                | `false`           |
 
 use std::fmt;
 use std::ptr::NonNull;
@@ -46,9 +75,12 @@ pub struct UnifiedBuffer {
     ptr: NonNull<u8>,
     size: usize,
     device_id: DeviceId,
-    // Holds the underlying storage so it is freed on drop. When the
-    // `unified-memory` feature is enabled this is a wrapper around the CUDA
-    // unified pointer; otherwise it is a plain Box<[u8]>.
+    // Holds the underlying storage so it is freed on drop. Which concrete
+    // variant `Backing` resolves to is determined at compile time by the
+    // feature flags: cust `UnifiedBuffer<u8>` under `unified-memory`,
+    // `CudarcUnifiedBuffer` under `cudarc-backend` (when `unified-memory`
+    // is off), or a plain `Box<[u8]>` on the default no-feature build.
+    // See the module-level precedence table for the full matrix.
     #[allow(dead_code)]
     backing: Backing,
 }
@@ -65,8 +97,14 @@ mod backing_impl {
     use super::*;
 
     /// Compile-time constant exposed by [`super::UnifiedBuffer::is_uvm_backed`].
-    /// `true` only when the `unified-memory` Cargo feature is enabled, in which
-    /// case [`Backing::allocate`] routes through `cuMemAllocManaged` via cust.
+    ///
+    /// `true` here: the cust path routes through `cuMemAllocManaged`. By the
+    /// module-level precedence rule (see [`super`] doc), this branch wins
+    /// whenever `unified-memory` is enabled even if `cudarc-backend` is also
+    /// on, so dev hosts that toggle both features keep the v0.3 cust
+    /// allocator. Setting this constant to `true` is part of the three-way
+    /// gating documented at the module head: `unified-memory` OR
+    /// `cudarc-backend` ⇒ `true`; only the default `Box<[u8]>` path ⇒ `false`.
     pub(crate) const IS_UVM_BACKED: bool = true;
 
     #[allow(dead_code)]
@@ -110,13 +148,56 @@ mod backing_impl {
     }
 }
 
-#[cfg(not(feature = "unified-memory"))]
+#[cfg(all(not(feature = "unified-memory"), feature = "cudarc-backend"))]
+mod backing_impl {
+    use super::*;
+    use crate::cudarc_backend::CudarcUnifiedBuffer;
+
+    /// Compile-time constant exposed by [`super::UnifiedBuffer::is_uvm_backed`].
+    ///
+    /// `true` here: the cudarc path routes through `cuMemAllocManaged` via
+    /// `cudarc::driver::sys::lib().cuMemAllocManaged` (see the W1.2 spike in
+    /// [`crate::cudarc_backend`]). This branch only fires when
+    /// `unified-memory` is OFF and `cudarc-backend` is ON — the module-level
+    /// precedence rule lets cust win whenever both are enabled. Three-way
+    /// gating recap: `unified-memory` OR `cudarc-backend` ⇒ `true`; only the
+    /// default `Box<[u8]>` fallback ⇒ `false`.
+    pub(crate) const IS_UVM_BACKED: bool = true;
+
+    #[allow(dead_code)]
+    pub(crate) enum Backing {
+        Cudarc(CudarcUnifiedBuffer),
+    }
+
+    impl Backing {
+        pub(crate) fn allocate(size: usize) -> Result<(NonNull<u8>, Self), UnifiedError> {
+            // Route through the W1.2 cudarc spike. `CudarcUnifiedBuffer::new`
+            // already handles `cuInit` + primary-context retention via the
+            // cached `Arc<CudaDevice>` in `cudarc_backend.rs`, so there is no
+            // analogue of the cust path's `ensure_cuda_init()` helper here.
+            let buf = CudarcUnifiedBuffer::new(size)?;
+            // SAFETY: cudarc returns a non-null aligned pointer on success;
+            // `CudarcUnifiedBuffer::new` already verified this and would have
+            // returned `UnifiedError::Allocation` otherwise.
+            let ptr = NonNull::new(buf.as_ptr() as *mut u8)
+                .ok_or_else(|| UnifiedError::Allocation("cudarc returned null".into()))?;
+            Ok((ptr, Backing::Cudarc(buf)))
+        }
+    }
+}
+
+#[cfg(all(not(feature = "unified-memory"), not(feature = "cudarc-backend")))]
 mod backing_impl {
     use super::*;
 
     /// Compile-time constant exposed by [`super::UnifiedBuffer::is_uvm_backed`].
-    /// `false` on non-CUDA builds: [`Backing::allocate`] returns a heap
-    /// `Box<[u8]>` and the prefetch/advise helpers are no-ops.
+    ///
+    /// `false` on the no-CUDA default build: [`Backing::allocate`] returns a
+    /// heap `Box<[u8]>` and the prefetch/advise helpers are no-ops. This
+    /// branch fires only when BOTH `unified-memory` and `cudarc-backend` are
+    /// off — enabling either of the two CUDA-backing features flips the
+    /// constant to `true`. See the module-level precedence table for the
+    /// three-way gating.
     pub(crate) const IS_UVM_BACKED: bool = false;
 
     #[allow(dead_code)]
@@ -196,13 +277,19 @@ impl UnifiedBuffer {
 
     /// Whether this buffer is backed by CUDA Unified Memory (`cuMemAllocManaged`).
     ///
-    /// Returns `true` only when the crate was compiled with
-    /// `--features unified-memory`; otherwise the backing is a heap
+    /// Returns `true` when the crate was compiled with EITHER
+    /// `--features unified-memory` (cust path, the v0.3 default) OR
+    /// `--features cudarc-backend` (the W1.2 cudarc spike, used as the
+    /// `Backing::Cudarc` variant when `unified-memory` is off). Returns
+    /// `false` only on the bare default build where the backing is a heap
     /// `Box<[u8]>`. This is a compile-time property of the active backing
     /// (it does not probe the driver at runtime), and is exposed as a public
     /// probe so callers — including [`crate::wasm_memory::TensorWasmLinearMemory`]
     /// — can assert in tests that the audit-flagged "wasm linear memory not
     /// UVM-backed" gap is actually closed at build configuration time.
+    ///
+    /// See the module-level precedence table for the full feature-combination
+    /// matrix.
     pub fn is_uvm_backed(&self) -> bool {
         IS_UVM_BACKED
     }
@@ -375,14 +462,32 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "unified-memory"))]
+    #[cfg(all(not(feature = "unified-memory"), not(feature = "cudarc-backend")))]
     fn is_uvm_backed_false_without_feature() {
-        // Without the feature, the backing is a heap `Box<[u8]>`. This test
-        // pins the inverse half of the contract so a future regression that
-        // accidentally turns the probe into a runtime-always-true cannot
-        // sneak past CI's no-feature build.
+        // Without either CUDA backing feature, the backing is a heap
+        // `Box<[u8]>`. This test pins the inverse half of the contract so a
+        // future regression that accidentally turns the probe into a
+        // runtime-always-true cannot sneak past CI's no-feature build.
         let b = UnifiedBuffer::new(64).expect("alloc without feature");
         assert!(!b.is_uvm_backed(), "no-feature build must use heap backing");
+    }
+
+    #[test]
+    #[cfg(all(not(feature = "unified-memory"), feature = "cudarc-backend"))]
+    fn is_uvm_backed_true_under_cudarc_backend() {
+        // Mirrors `is_uvm_backed_true_under_feature` for the cudarc path.
+        // When `--features cudarc-backend` is on (and `unified-memory` is
+        // off), `UnifiedBuffer` routes through `cuMemAllocManaged` via
+        // cudarc per the module-level precedence rule, so the probe must
+        // report `true`. NOTE: this test allocates a real CUDA buffer and
+        // therefore requires a working driver at test time. Use the smoke
+        // test under `tests/cudarc_unified_buffer_smoke.rs` for the same
+        // contract at integration-test scope.
+        let b = UnifiedBuffer::new(64).expect("alloc under cudarc-backend");
+        assert!(
+            b.is_uvm_backed(),
+            "cudarc-backend build must use UVM backing"
+        );
     }
 
     #[test]
