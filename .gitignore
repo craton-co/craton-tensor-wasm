@@ -9,3 +9,4 @@ Cargo.lock.bak
 /coverage/
 /perf.data*
 /flamegraph.svg
+bench-out/
