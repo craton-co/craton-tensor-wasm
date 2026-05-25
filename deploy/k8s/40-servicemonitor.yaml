@@ -1,0 +1,44 @@
+---
+# ServiceMonitor for prometheus-operator.
+#
+# REQUIRES the prometheus-operator CRDs to be installed in the cluster
+# (monitoring.coreos.com/v1). If you are not running prometheus-operator
+# this manifest is harmless to leave on disk but will fail to apply; either
+# skip it with `kubectl apply -f deploy/k8s/ --prune=false` against a
+# filtered list, or rely on the pod-annotation-based scrape configured in
+# 20-deployment.yaml.
+#
+# Verify CRD availability:
+#   kubectl get crd servicemonitors.monitoring.coreos.com
+#
+# The Prometheus instance that scrapes this ServiceMonitor must have a
+# matching `serviceMonitorSelector` (commonly the `release: prometheus`
+# label, set below). Edit the label to match your operator install.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tensor-wasm-api
+  namespace: tensor-wasm
+  labels:
+    app.kubernetes.io/name: tensor-wasm
+    app.kubernetes.io/component: api
+    # Common kube-prometheus-stack selector. Change to match your Prometheus
+    # CR's `serviceMonitorSelector` if you use a different label.
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tensor-wasm
+      app.kubernetes.io/component: api
+  namespaceSelector:
+    matchNames:
+      - tensor-wasm
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      scheme: http
+      # honorLabels keeps any tenant_id / route labels the API emits intact
+      # rather than letting Prometheus overwrite them on collision.
+      honorLabels: true

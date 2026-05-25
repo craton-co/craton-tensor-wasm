@@ -1,0 +1,283 @@
+---
+# Default values for the tensor-wasm Helm chart.
+#
+# Every key is documented inline. Override on the command line:
+#   helm install tensor-wasm ./deploy/helm/tensor-wasm \
+#     -n tensor-wasm --create-namespace \
+#     --set image.tag=0.2.0 --set auth.tokens="prod:tenant=*"
+#
+# Or in a YAML overlay:
+#   helm install tensor-wasm ./deploy/helm/tensor-wasm \
+#     -n tensor-wasm --create-namespace -f my-values.yaml
+
+# -- Image source. The default registry is a placeholder; ghcr.io/craton-co
+# is not yet provisioned (v0.1.0 era). Build and push from
+# docker/tensor-wasm-api.Dockerfile until the registry exists.
+image:
+  # -- OCI repository.
+  repository: ghcr.io/craton-co/tensor-wasm
+  # -- Image tag. Defaults to .Chart.AppVersion if left empty.
+  tag: ""
+  # -- One of Always, IfNotPresent, Never.
+  pullPolicy: IfNotPresent
+
+# -- imagePullSecrets passed through to the Deployment's PodSpec.
+imagePullSecrets: []
+# - name: ghcr-pull-secret
+
+# -- Override the chart's generated name. Empty uses .Release.Name.
+nameOverride: ""
+# -- Override the chart's full-qualified name (release + chart). Empty uses
+# the default truncation logic in _helpers.tpl.
+fullnameOverride: ""
+
+# -- Number of pod replicas. The runtime keeps no shared state across pods
+# (in-process function registry, per-token rate-limiter buckets). Going
+# above 1 requires either sticky sessions at the load balancer OR
+# accepting that registry/rate-limit state is per-pod.
+replicaCount: 1
+
+# -- Deployment update strategy. Recreate is appropriate for replicaCount=1
+# and for any state that should not be double-served. Use RollingUpdate
+# when replicaCount > 1 AND the application is stateless under your
+# routing layer.
+strategy:
+  type: Recreate
+
+# -- Pod-level labels added on top of the standard chart labels.
+podLabels: {}
+
+# -- Pod-level annotations. Defaults set the plain-Prometheus scrape hints;
+# they are harmless when Prometheus Operator scrapes via ServiceMonitor.
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+# -- Pod-wide security context. Defaults run as a numeric non-root UID to
+# satisfy Pod Security Standards (Restricted).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container-level security context. Drops all caps and pins
+# readOnlyRootFilesystem. Snapshot writes go to the emptyDir or PVC mounted
+# at /var/lib/tensor-wasm; tracing scratch goes to a memory-backed /tmp.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop:
+      - ALL
+
+# -- Service configuration.
+service:
+  # -- One of ClusterIP, NodePort, LoadBalancer. ClusterIP is the
+  # production-safe default; expose externally via the ingress section
+  # or your own Ingress / LoadBalancer.
+  type: ClusterIP
+  # -- Service port (the cluster-internal one).
+  port: 8080
+  # -- nodePort value. Honored only when service.type=NodePort. Pick from
+  # 30000-32767. Leave 0 to let the API server allocate.
+  nodePort: 0
+  # -- annotations passed through to the Service object.
+  annotations: {}
+
+# -- Ingress configuration. Off by default.
+ingress:
+  enabled: false
+  # -- IngressClass name. nginx, traefik, alb, etc.
+  className: ""
+  annotations: {}
+  # -- Hosts to serve. Each host has a list of path prefixes.
+  hosts:
+    - host: tensor-wasm.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  # -- TLS configuration; empty disables.
+  tls: []
+  # - hosts:
+  #     - tensor-wasm.example.com
+  #   secretName: tensor-wasm-tls
+
+# -- Resource requests and limits. Tune to your function payload sizes; the
+# defaults are appropriate for the v0.1.0 reference workload.
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "2"
+    memory: "4Gi"
+
+# -- GPU configuration. Off by default; the reference image is host-only.
+# Enable only when the cluster has nvidia-device-plugin installed and a
+# GPU-enabled image variant is in the repository.
+gpu:
+  enabled: false
+  # -- Number of nvidia.com/gpu units to request and limit. The runtime is
+  # single-host today so values above 1 only matter on multi-GPU SKUs.
+  # NOTE: this MUST be an integer (1, 2, ...), not a string. Kubernetes
+  # rejects fractional or string GPU counts.
+  count: 1
+  # -- Node selectors restricting the pod to GPU-enabled nodes. Match the
+  # label your nvidia-device-plugin install applies.
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  # -- Tolerations for GPU node taints. The nvidia-device-plugin chart
+  # typically taints GPU nodes with nvidia.com/gpu=true:NoSchedule.
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  # -- RuntimeClass for nvidia-container-toolkit. Set to "" to use the
+  # cluster's default runtime (works if nvidia is the default runtime).
+  runtimeClassName: nvidia
+
+# -- Non-GPU pod scheduling. These apply unconditionally; if gpu.enabled is
+# true, gpu.nodeSelector / gpu.tolerations are merged in.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Bearer-token allowlist.
+auth:
+  # -- The TENSOR_WASM_API_TOKENS env value. Comma-separated, each entry
+  # of the form `token:tenant=...`; bare tokens (no `:tenant=`) are
+  # accepted with a deprecation warning. See crates/tensor-wasm-api/API.md
+  # for the full grammar.
+  #
+  # WARNING: this default value is intentionally weak. Override on every
+  # production install, ideally via auth.existingSecret below.
+  tokens: "changeme:tenant=*"
+  # -- Point at a pre-existing Secret containing TENSOR_WASM_API_TOKENS
+  # instead of letting the chart materialize one from values. The Secret
+  # must live in the release namespace and must carry exactly one key:
+  # `TENSOR_WASM_API_TOKENS`. When this is set, `auth.tokens` is ignored
+  # and the chart-managed Secret is NOT rendered.
+  existingSecret: ""
+  # -- When true, every request must carry X-TensorWasm-Tenant. See
+  # crates/tensor-wasm-api/API.md "Tenant scoping".
+  requireTenant: false
+
+# -- Per-bearer-token rate limit. Both qps and burst must be > 0 for the
+# limiter to engage. See crates/tensor-wasm-api/API.md "Per-token rate
+# limiting".
+rateLimit:
+  # -- Steady-state requests per second admitted per token.
+  qps: 100
+  # -- Bucket capacity per token (max burst).
+  burst: 200
+
+# -- OpenTelemetry exporter.
+otlp:
+  # -- OTLP collector endpoint. Empty disables OTLP export. Example:
+  # http://otel-collector.observability.svc.cluster.local:4317
+  endpoint: ""
+
+# -- Logging. tracing-subscriber EnvFilter directive.
+log:
+  # -- One of trace, debug, info, warn, error, or a per-target directive
+  # (e.g. "info,tensor_wasm_exec=debug").
+  level: "info"
+
+# -- CUDA settings consumed by GPU-enabled builds. Harmless on host-only
+# images.
+cuda:
+  # -- Target compute capability for JIT-emitted PTX. Match your node's
+  # SM level: sm_70, sm_75, sm_80, sm_86, sm_89, sm_90. See
+  # docs/CUDA-SETUP.md "SM-level compatibility matrix".
+  arch: "sm_80"
+
+# -- Liveness probe targeting /healthz. The endpoint returns 200 while the
+# axum router is serving (see docs/SLO.md sec 2.2; 10 ms P95 SLO).
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 3
+  successThreshold: 1
+  failureThreshold: 3
+
+# -- Readiness probe targeting /healthz.
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  timeoutSeconds: 2
+  successThreshold: 1
+  failureThreshold: 3
+
+# -- Startup probe gives the binary a wider window during snapshot restore.
+startupProbe:
+  enabled: true
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 12
+
+# -- Storage for /var/lib/tensor-wasm (snapshot + JIT cache).
+persistence:
+  # -- When false (default), an emptyDir is mounted. State does not survive
+  # pod restarts.
+  enabled: false
+  # -- Existing PVC name to bind. When set, the chart will not render a
+  # PVC of its own.
+  existingClaim: ""
+  # -- Size when the chart creates the PVC itself (existingClaim empty).
+  size: 10Gi
+  # -- StorageClass for the chart-managed PVC. Empty uses the cluster
+  # default.
+  storageClass: ""
+  # -- Access modes for the chart-managed PVC.
+  accessModes:
+    - ReadWriteOnce
+
+# -- Prometheus Operator integration.
+prometheus:
+  # -- When true, the chart renders a ServiceMonitor. Requires the
+  # prometheus-operator CRDs (monitoring.coreos.com/v1) to exist in the
+  # cluster.
+  enabled: false
+  # -- Scrape interval.
+  interval: 15s
+  # -- Scrape timeout. Should be less than interval.
+  scrapeTimeout: 10s
+  # -- Extra labels merged into the ServiceMonitor's metadata. Most
+  # installations need at least the label that the Prometheus CR's
+  # serviceMonitorSelector matches (kube-prometheus-stack uses
+  # `release: prometheus`).
+  additionalLabels:
+    release: prometheus
+  # -- Honor metric-level labels emitted by the API rather than letting
+  # Prometheus overwrite them on collision.
+  honorLabels: true
+
+# -- Service account.
+serviceAccount:
+  # -- When true, the chart creates a ServiceAccount.
+  create: true
+  # -- Name override. Empty defaults to the chart fullname.
+  name: ""
+  annotations: {}
+  # -- Whether the API server mounts the SA token. The runtime does not
+  # call the API server, so false is safe.
+  automountServiceAccountToken: false
+
+# -- Extra environment variables appended verbatim to the container env.
+# Useful for one-off knobs not yet promoted to a chart value.
+extraEnv: []
+# - name: SOME_OTHER_VAR
+#   value: "some-value"
+
+# -- Extra environment variables sourced from existing ConfigMaps/Secrets.
+extraEnvFrom: []
+# - secretRef:
+#     name: extra-secret

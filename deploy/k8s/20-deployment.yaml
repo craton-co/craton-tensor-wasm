@@ -1,0 +1,157 @@
+---
+# Reference Deployment for tensor-wasm-api.
+#
+# Single replica because the runtime is single-host today: the in-process
+# function registry and the per-token rate-limiter buckets are not shared
+# across pods. The Helm chart in deploy/helm/tensor-wasm exposes a
+# replicaCount value for users who deploy behind a sticky load balancer
+# (caveat: each replica is independent — no cross-replica state).
+#
+# The image tag `0.1.0` is a placeholder. The ghcr.io/craton-co/* registry
+# is not yet provisioned (v0.1.0 era); see ../README.md for the build-and-push
+# workflow you can run against your own registry until then.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tensor-wasm-api
+  namespace: tensor-wasm
+  labels:
+    app.kubernetes.io/name: tensor-wasm
+    app.kubernetes.io/component: api
+    app.kubernetes.io/version: "0.1.0"
+spec:
+  # Single-replica reference. See module-level comment.
+  replicas: 1
+  strategy:
+    # Recreate (not RollingUpdate): with replicas=1 a rolling update has no
+    # benefit and a Recreate strategy avoids two pods briefly sharing the
+    # same port if hostNetwork or hostPort were ever introduced.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tensor-wasm
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tensor-wasm
+        app.kubernetes.io/component: api
+        app.kubernetes.io/version: "0.1.0"
+      annotations:
+        # Plain-Prometheus (non-operator) scrape annotations. Harmless if the
+        # cluster uses Prometheus Operator instead; that path uses the
+        # ServiceMonitor in 40-servicemonitor.yaml.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Distribute the host-FS handle: runAsNonRoot is paired with a
+      # numeric UID so admission controllers that enforce PSS Restricted
+      # accept the pod without further hints.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: tensor-wasm-api
+          image: ghcr.io/craton-co/tensor-wasm:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "serve"
+            - "--addr"
+            - "0.0.0.0:8080"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: tensor-wasm-config
+            - secretRef:
+                # Bearer-token allowlist. Provision with:
+                #   kubectl -n tensor-wasm create secret generic tensor-wasm-tokens \
+                #     --from-literal=TENSOR_WASM_API_TOKENS='changeme:tenant=*'
+                # See ../README.md for production token guidance.
+                name: tensor-wasm-tokens
+                optional: false
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+              # GPU scheduling: uncomment when scheduling onto GPU nodes;
+              # requires nvidia-device-plugin DaemonSet installed and a
+              # GPU-enabled image variant. See docs/CUDA-SETUP.md (W1.6)
+              # for prerequisites (driver, toolkit, runtime class).
+              # nvidia.com/gpu: 1
+          # /healthz semantics per docs/SLO.md sec 2.2: the endpoint returns
+          # 200 as long as the axum router is serving. P95 SLO is 10 ms.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            successThreshold: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          # Optional: a startup probe gives the binary a generous window to
+          # load before liveness starts counting failures. Useful when the
+          # container restores a large snapshot at boot.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            # The binary writes snapshots and the JIT cache under
+            # /var/lib/tensor-wasm by default. With readOnlyRootFilesystem
+            # we mount an emptyDir there; persistent storage is a PVC swap
+            # via the Helm chart's `persistence.enabled` value.
+            - name: state
+              mountPath: /var/lib/tensor-wasm
+            # tmpfs for tracing-subscriber's rolling-file appenders and any
+            # /tmp scratch the wasmtime compilation cache touches.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: state
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+      # GPU nodes typically carry a taint; uncomment + tune to match your
+      # nvidia-device-plugin installation. See ../README.md GPU section.
+      # nodeSelector:
+      #   nvidia.com/gpu.present: "true"
+      # tolerations:
+      #   - key: nvidia.com/gpu
+      #     operator: Exists
+      #     effect: NoSchedule
+      # runtimeClassName: nvidia

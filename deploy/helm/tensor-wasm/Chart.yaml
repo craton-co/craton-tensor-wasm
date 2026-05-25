@@ -1,0 +1,42 @@
+---
+apiVersion: v2
+name: tensor-wasm
+description: |
+  Craton TensorWasm — a sandboxed Wasm runtime with WASI-CUDA host functions for
+  multi-tenant GPU compute. This chart deploys the tensor-wasm-api HTTP gateway
+  in single-replica reference form; replicaCount is exposed for users who
+  deploy behind a sticky load balancer but the runtime keeps no shared state
+  across replicas.
+type: application
+
+# Chart SemVer. Bump independently of the application; chart-only changes
+# (template fixes, new values) get a patch bump, breaking values changes get
+# a major bump.
+version: 0.1.0
+
+# Application SemVer — tracks the tensor-wasm release the chart's default
+# image points at. Keep in sync with values.yaml's image.tag.
+appVersion: "0.1.0"
+
+kubeVersion: ">=1.23.0-0"
+
+home: https://github.com/craton-co/craton-tensor-wasm
+sources:
+  - https://github.com/craton-co/craton-tensor-wasm
+
+keywords:
+  - wasm
+  - wasmtime
+  - wasi
+  - gpu
+  - cuda
+  - serverless
+  - multi-tenant
+
+maintainers:
+  - name: Craton Software Company
+    url: https://github.com/craton-co/craton-tensor-wasm
+
+annotations:
+  category: ApplicationRuntime
+  licenses: Apache-2.0
