@@ -186,6 +186,24 @@ import:
   **Build identity** stat panel and is referenced by the UPGRADE.md
   post-upgrade verification step that confirms every replica reports
   the expected `version` after a rolling deploy.
+- `tensor_wasm_jobs_active` (gauge, single series; landed in C3).
+  Incremented when `POST /functions/:id/invoke-async` records a
+  `JobRecord` in the API-layer registry, decremented when the
+  spawned task transitions the job to `Completed` or `Failed`. The
+  Async-invocation row's "Pending jobs" panel renders this series
+  directly. v0.3.x is intentionally a single series; the v0.4
+  follow-up will switch the field to a `Family<TenantLabels, ...>`
+  and the panel's PromQL will tolerate the relabel without edit.
+- `tensor_wasm_gpu_memory_bytes_per_tenant{tenant_id}` (gauge family;
+  landed in C3). Updated by `tensor-wasm-tenant` on every
+  `consume_bytes` / `release_bytes` accounting transition when the
+  context is constructed with `TenantContextBuilder::with_metrics`.
+  Additive to the pre-existing single-series total at
+  `tensor_wasm_gpu_memory_used_bytes`; `sum by ()
+  (tensor_wasm_gpu_memory_bytes_per_tenant)` is expected to track
+  that total within scrape jitter. The Tenant row's "GPU memory by
+  tenant" panel switches from the single-series total to this
+  family automatically once at least one tenant has been observed.
 
 Caveat: the gauges and counters listed above are emitted today as
 **aggregates with no `tenant` label**. The Tenant-row panels query
@@ -206,8 +224,13 @@ previously in this list landed in W2.3 — see [Exists today](#exists-today).)
 Tenant labeling on existing metrics (a relabeling, not a new metric):
 
 - `tensor_wasm_active_instances{tenant}` (add label)
-- `tensor_wasm_gpu_memory_used_bytes{tenant}` (add label)
 - `tensor_wasm_kernel_dispatches_total{tenant}` (add label)
+
+Per-tenant GPU memory has been replaced by the additive family
+`tensor_wasm_gpu_memory_bytes_per_tenant{tenant_id}` rather than a
+relabeling — see [Exists today](#exists-today). The pre-existing
+single-series `tensor_wasm_gpu_memory_used_bytes` total stays, so
+existing alerts that aggregate against it do not break.
 
 Snapshot subsystem (proposed instrumentation point: `tensor-wasm-mem`
 snapshot save/restore paths):
@@ -263,7 +286,10 @@ Grafana's UI:
 ---
 
 _Status: v0.3 gate. HTTP request rate, error rate, and latency panels
-render real data as of W2.3. The remaining "No data" panels
-(snapshot histograms, JIT cache counters, back-pressure gauges, and
-per-tenant labeling on existing series) are tracked in
-[Metric inventory](#metric-inventory)._
+render real data as of W2.3. The async-invocation "Pending jobs"
+panel and the per-tenant GPU-memory breakdown render real data as of
+C3 (`tensor_wasm_jobs_active`,
+`tensor_wasm_gpu_memory_bytes_per_tenant`). The remaining "No data"
+panels (snapshot histograms, JIT cache counters, back-pressure
+gauges, and tenant labeling on the remaining counter/gauge pair) are
+tracked in [Metric inventory](#metric-inventory)._

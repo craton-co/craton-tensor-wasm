@@ -75,6 +75,33 @@ pub struct HttpInFlightLabels {
     pub method: String,
 }
 
+/// Label set for `tensor_wasm_gpu_memory_bytes_per_tenant`.
+///
+/// Single-label family keyed by the tenant id. Cardinality is bounded
+/// by the tenant count, **not** by user input: a `tenant_id` is allocated
+/// server-side by `tensor-wasm-api` when a tenant first appears and is
+/// never recycled within the lifetime of a node (see
+/// [`crate::types::TenantId`]). The encoded label value is the
+/// `Display` form of [`crate::types::TenantId`] (e.g. `"T#42"`) — the
+/// same string the rest of the workspace uses in span attributes and
+/// audit log entries, so dashboards and traces can join on it without
+/// conversion.
+///
+/// Operators concerned about long-term cardinality growth under tenant
+/// churn should pair scrapes with a Prometheus retention policy or a
+/// recording rule that drops series for tenants absent from the
+/// registry — the gauge itself does not eagerly forget. The matching
+/// per-tenant breakdown of `tensor_wasm_jobs_active` planned for v0.4
+/// is expected to reuse this exact label shape so a single relabel rule
+/// covers both series.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TenantLabels {
+    /// Server-allocated tenant id rendered via [`crate::types::TenantId`]'s
+    /// `Display` impl (e.g. `"T#42"`). Never user-supplied — the API
+    /// layer assigns these monotonically when a tenant first appears.
+    pub tenant_id: String,
+}
+
 /// Label set for `tensor_wasm_build_info`.
 ///
 /// Standard Prometheus "info-style metric" labels: a gauge that is always
@@ -133,6 +160,16 @@ struct TensorWasmMetricsInner {
     http_request_duration_seconds: Family<HttpRequestLabels, Histogram, HttpDurationCtor>,
     http_requests_in_flight: Family<HttpInFlightLabels, Gauge<i64, AtomicI64>>,
     build_info: Family<BuildInfoLabels, Gauge<i64, AtomicI64>>,
+    /// Number of jobs currently `Pending` in the API-layer job registry.
+    /// Signed for the same balanced-inc/dec reason as `active_instances`:
+    /// brief negative readings during a shutdown race are honest
+    /// telemetry, while wrap-to-`u64::MAX` is a silent dashboard lie.
+    jobs_active: Gauge<i64, AtomicI64>,
+    /// Per-tenant GPU memory accounting (bytes currently reserved).
+    /// `u64` matches the underlying tenant counter
+    /// (`TenantContext::bytes_in_use`) and the existing single-series
+    /// total at `tensor_wasm_gpu_memory_used_bytes`.
+    gpu_memory_bytes_per_tenant: Family<TenantLabels, Gauge<u64, AtomicU64>>,
 }
 
 /// Compile-time crate version, from `CARGO_PKG_VERSION`. Public so callers
@@ -275,6 +312,9 @@ impl TensorWasmMetrics {
         let http_requests_in_flight: Family<HttpInFlightLabels, Gauge<i64, AtomicI64>> =
             Family::default();
         let build_info: Family<BuildInfoLabels, Gauge<i64, AtomicI64>> = Family::default();
+        let jobs_active: Gauge<i64, AtomicI64> = Gauge::default();
+        let gpu_memory_bytes_per_tenant: Family<TenantLabels, Gauge<u64, AtomicU64>> =
+            Family::default();
         // Prime the single build-info series so it is observable on the
         // very first scrape (Family<...> emits nothing until at least
         // one label tuple has been touched). The value is `1` per the
@@ -350,6 +390,26 @@ impl TensorWasmMetrics {
              dashboards with the live binary identity",
             build_info.clone(),
         );
+        registry.register(
+            "tensor_wasm_jobs_active",
+            "Number of async-invocation jobs currently in `Pending` state \
+             in the API-layer job registry. Incremented when \
+             `POST /functions/:id/invoke-async` accepts a job; decremented \
+             when the job transitions to `Completed` or `Failed`. \
+             v0.3.x emits a single series; per-tenant breakdown is the \
+             v0.4 follow-up and will reuse the `TenantLabels` shape",
+            jobs_active.clone(),
+        );
+        registry.register(
+            "tensor_wasm_gpu_memory_bytes_per_tenant",
+            "Per-tenant GPU memory currently reserved, in bytes. Updated \
+             by `tensor-wasm-tenant` on every `consume_bytes` / \
+             `release_bytes` accounting transition. Additive to the \
+             single-series `tensor_wasm_gpu_memory_used_bytes` total; \
+             `sum by () (tensor_wasm_gpu_memory_bytes_per_tenant)` is \
+             expected to track that total within scrape jitter",
+            gpu_memory_bytes_per_tenant.clone(),
+        );
 
         Self {
             inner: Arc::new(TensorWasmMetricsInner {
@@ -366,6 +426,8 @@ impl TensorWasmMetrics {
                 http_request_duration_seconds,
                 http_requests_in_flight,
                 build_info,
+                jobs_active,
+                gpu_memory_bytes_per_tenant,
             }),
         }
     }
@@ -456,6 +518,35 @@ impl TensorWasmMetrics {
         &self.inner.build_info
     }
 
+    /// Number of async-invocation jobs currently in `Pending` state (gauge).
+    ///
+    /// Incremented from `tensor-wasm-api`'s `invoke_function_async` handler
+    /// when a `JobRecord` is inserted into the registry; decremented from
+    /// the spawned background task once the job resolves to `Completed` or
+    /// `Failed`. Signed for the same balanced-inc/dec reason as
+    /// [`Self::active_instances`]. Single series in v0.3.x; the v0.4
+    /// follow-up will switch to a `Family<TenantLabels, ...>` mirroring
+    /// the shape of [`Self::gpu_memory_bytes_per_tenant`].
+    pub fn jobs_active(&self) -> &Gauge<i64, AtomicI64> {
+        &self.inner.jobs_active
+    }
+
+    /// Per-tenant GPU memory currently reserved, in bytes (gauge family).
+    ///
+    /// Set via
+    /// `metrics.gpu_memory_bytes_per_tenant().get_or_create(&labels).set(bytes)`
+    /// from the tenant subsystem on every `consume_bytes` /
+    /// `release_bytes` transition. Additive to the pre-existing
+    /// single-series total at
+    /// `tensor_wasm_gpu_memory_used_bytes`; the per-tenant family is the
+    /// breakdown, not a replacement. See [`TenantLabels`] for the
+    /// cardinality contract.
+    pub fn gpu_memory_bytes_per_tenant(
+        &self,
+    ) -> &Family<TenantLabels, Gauge<u64, AtomicU64>> {
+        &self.inner.gpu_memory_bytes_per_tenant
+    }
+
     /// Snapshot every gauge and counter into a plain struct with one
     /// `Relaxed` load per field.
     ///
@@ -498,9 +589,13 @@ mod tests {
         // HELP/TYPE/sample lines until at least one label tuple has been
         // observed, so the three HTTP families
         // (`tensor_wasm_http_requests`, `tensor_wasm_http_request_duration_seconds`,
-        // `tensor_wasm_http_requests_in_flight`) are deliberately excluded here
-        // and covered by `http_request_families_observable` below, which
-        // primes a label tuple before scraping.
+        // `tensor_wasm_http_requests_in_flight`,
+        // `tensor_wasm_gpu_memory_bytes_per_tenant`) are deliberately excluded
+        // here and covered by `http_request_families_observable` /
+        // `gpu_memory_per_tenant_family_observable_after_set` below, which
+        // prime a label tuple before scraping. `tensor_wasm_jobs_active`
+        // is single-series (no labels) so it does appear on the first
+        // scrape with its initial value of zero.
         let s = m.encode_text();
         for name in [
             "tensor_wasm_active_instances",
@@ -511,6 +606,7 @@ mod tests {
             "tensor_wasm_instance_terminations",
             "tensor_wasm_offload_success",
             "tensor_wasm_offload_fallback",
+            "tensor_wasm_jobs_active",
         ] {
             assert!(s.contains(name), "missing metric {name} in:\n{s}");
         }
@@ -803,6 +899,87 @@ mod tests {
         assert!(
             s.contains(&version_needle),
             "expected `{version_needle}` in:\n{s}"
+        );
+    }
+
+    // --- tensor_wasm_jobs_active + gpu_memory_bytes_per_tenant -----------
+    //
+    // The jobs_active gauge is single-series so it appears in the encoded
+    // output on the very first scrape (its initial value `0` is emitted).
+    // The per-tenant family follows the W2.3 pattern: it emits nothing
+    // until at least one label tuple has been observed, so the
+    // observable test below primes a tenant before scraping.
+
+    #[test]
+    fn jobs_active_initial_zero_in_text() {
+        let m = TensorWasmMetrics::new();
+        let s = m.encode_text();
+        assert!(
+            s.contains("tensor_wasm_jobs_active 0"),
+            "missing initial-zero jobs_active sample in:\n{s}"
+        );
+    }
+
+    #[test]
+    fn jobs_active_inc_dec_observable() {
+        let m = TensorWasmMetrics::new();
+        m.jobs_active().inc();
+        m.jobs_active().inc();
+        m.jobs_active().dec();
+        assert_eq!(m.jobs_active().get(), 1);
+        let s = m.encode_text();
+        assert!(
+            s.contains("tensor_wasm_jobs_active 1"),
+            "expected jobs_active 1 after two inc + one dec, got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn gpu_memory_per_tenant_family_observable_after_set() {
+        // Family<...> metrics emit nothing until a label tuple is touched
+        // (same contract as the W2.3 HTTP families). Prime two distinct
+        // tenants and assert both series appear with the expected values.
+        let m = TensorWasmMetrics::new();
+        let t1 = TenantLabels { tenant_id: "T#1".to_string() };
+        let t2 = TenantLabels { tenant_id: "T#2".to_string() };
+        m.gpu_memory_bytes_per_tenant().get_or_create(&t1).set(4096);
+        m.gpu_memory_bytes_per_tenant().get_or_create(&t2).set(8192);
+        let s = m.encode_text();
+        assert!(
+            s.contains("tensor_wasm_gpu_memory_bytes_per_tenant{tenant_id=\"T#1\"} 4096"),
+            "missing tenant T#1 sample in:\n{s}"
+        );
+        assert!(
+            s.contains("tensor_wasm_gpu_memory_bytes_per_tenant{tenant_id=\"T#2\"} 8192"),
+            "missing tenant T#2 sample in:\n{s}"
+        );
+    }
+
+    #[test]
+    fn gpu_memory_per_tenant_family_silent_until_observed() {
+        // Mirror W2.3 http_request_families_observable contract: the
+        // family must NOT appear in the exposition until a label tuple
+        // has been touched. This pin keeps a future "prime at startup"
+        // refactor from silently breaking the cardinality story (no
+        // empty/zero series for never-seen tenants).
+        let m = TensorWasmMetrics::new();
+        let s = m.encode_text();
+        assert!(
+            !s.contains("tensor_wasm_gpu_memory_bytes_per_tenant{"),
+            "per-tenant gauge should be silent before observation; got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn gpu_memory_per_tenant_total_existing_metric_preserved() {
+        // The new family is additive — the pre-existing single-series
+        // `tensor_wasm_gpu_memory_used_bytes` total must still appear
+        // on every scrape (dashboards built on W2.5 depend on it).
+        let m = TensorWasmMetrics::new();
+        let s = m.encode_text();
+        assert!(
+            s.contains("tensor_wasm_gpu_memory_used_bytes"),
+            "single-series total must be preserved alongside the per-tenant family; got:\n{s}"
         );
     }
 

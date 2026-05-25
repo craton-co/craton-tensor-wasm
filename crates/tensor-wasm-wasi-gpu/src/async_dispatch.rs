@@ -175,6 +175,7 @@ impl std::future::Future for DispatchFuture {
     type Output = ();
     fn poll(
         self: std::pin::Pin<&mut Self>,
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         // Enter the dispatch span for the duration of this poll so the

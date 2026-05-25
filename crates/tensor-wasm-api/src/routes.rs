@@ -619,6 +619,12 @@ pub async fn invoke_function_async(
             created_unix_ms: now_unix_ms(),
         },
     );
+    // Account the new pending job in the gauge. The matching `.dec()` lives
+    // in the spawned task below and runs exactly once per terminal-state
+    // transition (Completed | Failed). v0.3.x emits a single series; the
+    // v0.4 follow-up to break out per tenant lands as a Family swap in
+    // `tensor-wasm-core/src/metrics.rs` and a label tuple here.
+    state.metrics.jobs_active().inc();
 
     // Spawn the real invocation. The executor is cheap to clone (it's an
     // `Arc` internally) and the jobs map is `Arc<DashMap>`.
@@ -632,6 +638,7 @@ pub async fn invoke_function_async(
     // disconnected from the inbound HTTP request in the OTLP backend.
     let executor = Arc::clone(&state.executor);
     let jobs = Arc::clone(&state.jobs);
+    let metrics = Arc::clone(&state.metrics);
     let job_span = tracing::info_span!(
         "async_invoke.job",
         job_id = %job_id,
@@ -658,6 +665,16 @@ pub async fn invoke_function_async(
                         }
                     }
                 }
+                // Balanced decrement: paired with the `.inc()` issued
+                // before the spawn above. Runs once per terminal-state
+                // transition regardless of outcome (Completed | Failed)
+                // so the gauge converges back to zero on a quiescent
+                // node. NOTE: if the jobs map no longer contains the
+                // entry (e.g. an admin purge between insert and
+                // resolution) we still decrement — the contract is
+                // "one `dec` per `inc`", not "one `dec` per surviving
+                // JobRecord".
+                metrics.jobs_active().dec();
             },
             job_span,
         ),

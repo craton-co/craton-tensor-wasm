@@ -22,6 +22,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tensor_wasm_core::error::TensorWasmError;
+use tensor_wasm_core::metrics::{TenantLabels, TensorWasmMetrics};
 use tensor_wasm_core::types::TenantId;
 
 /// How aggressively a tenant's GPU work is separated from other tenants'.
@@ -98,6 +99,19 @@ pub struct TenantContext {
     #[cfg(not(feature = "cuda"))]
     #[allow(dead_code)]
     cu_context: (),
+
+    /// Optional shared metrics handle. When present, every
+    /// [`Self::consume_bytes`] / [`Self::release_bytes`] transition updates
+    /// the per-tenant series of
+    /// [`tensor_wasm_core::metrics::TensorWasmMetrics::gpu_memory_bytes_per_tenant`]
+    /// with the new total. `None` keeps the historical no-op behaviour so
+    /// embedders that construct a `TenantContext` outside the API gateway
+    /// (e.g. benches, examples) do not need to plumb a metrics registry.
+    metrics: Option<TensorWasmMetrics>,
+    /// Memoized label tuple used to address the per-tenant gauge series.
+    /// Built once at construction so the hot path of `consume_bytes` /
+    /// `release_bytes` does not allocate on every transition.
+    metrics_labels: TenantLabels,
 }
 
 impl TenantContext {
@@ -162,9 +176,27 @@ impl TenantContext {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.publish_memory_gauge(next);
+                    return Ok(());
+                }
                 Err(observed) => current = observed,
             }
+        }
+    }
+
+    /// Push the current `bytes_in_use` total into the per-tenant gauge
+    /// series, if a metrics handle was wired into this context at build
+    /// time. Centralised so [`Self::consume_bytes`] and
+    /// [`Self::release_bytes`] share one update path. The `Gauge::set`
+    /// call is a single relaxed atomic store — cheap enough to live on
+    /// the allocation hot path.
+    fn publish_memory_gauge(&self, new_total: u64) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .gpu_memory_bytes_per_tenant()
+                .get_or_create(&self.metrics_labels)
+                .set(new_total);
         }
     }
 
@@ -219,7 +251,7 @@ impl TenantContext {
     /// warning so operators can chase the bookkeeping bug upstream.
     pub fn release_bytes(&self, bytes: u64) {
         let before = self.bytes_in_use.fetch_sub(bytes, Ordering::Relaxed);
-        if before < bytes {
+        let after = if before < bytes {
             // would underflow; clamp to 0 and warn
             self.bytes_in_use.store(0, Ordering::Relaxed);
             tracing::warn!(
@@ -229,7 +261,11 @@ impl TenantContext {
                 bytes,
                 "release_bytes underflow clamped",
             );
-        }
+            0
+        } else {
+            before - bytes
+        };
+        self.publish_memory_gauge(after);
     }
 
     /// Whether this tenant owns a real `cust::context::Context`.
@@ -342,6 +378,7 @@ pub struct TenantContextBuilder {
     cuda_mem_pool_quota_bytes: Option<u64>,
     #[cfg(feature = "cuda")]
     cuda_device_index: Option<u32>,
+    metrics: Option<TensorWasmMetrics>,
 }
 
 impl TenantContextBuilder {
@@ -358,7 +395,25 @@ impl TenantContextBuilder {
             cuda_mem_pool_quota_bytes: None,
             #[cfg(feature = "cuda")]
             cuda_device_index: None,
+            metrics: None,
         }
+    }
+
+    /// Wire a shared [`TensorWasmMetrics`] registry into the context so
+    /// every [`TenantContext::consume_bytes`] /
+    /// [`TenantContext::release_bytes`] transition updates the
+    /// per-tenant series of
+    /// [`TensorWasmMetrics::gpu_memory_bytes_per_tenant`]. The handle is
+    /// cheap to clone (it shares an inner `Arc`); the caller normally
+    /// passes the same registry the API gateway exposes via
+    /// `GET /metrics`. Omitting this builder call (or passing `None`
+    /// directly into a future fallible variant) leaves the tenant's
+    /// memory accounting completely off the dashboard — useful for
+    /// benches and standalone examples that do not run a Prometheus
+    /// scrape.
+    pub fn with_metrics(mut self, metrics: TensorWasmMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Override the isolation level.
@@ -441,6 +496,9 @@ impl TenantContextBuilder {
         #[cfg(not(feature = "cuda"))]
         let cu_context = ();
 
+        let metrics_labels = TenantLabels {
+            tenant_id: self.tenant_id.to_string(),
+        };
         TenantContext {
             tenant_id: self.tenant_id,
             isolation: self.isolation,
@@ -449,6 +507,8 @@ impl TenantContextBuilder {
             bytes_in_use: AtomicU64::new(0),
             cuda_mem_pool_quota_bytes: self.cuda_mem_pool_quota_bytes,
             cu_context,
+            metrics: self.metrics,
+            metrics_labels,
         }
     }
 
@@ -600,6 +660,112 @@ mod tests {
         assert_eq!(
             ctx.cuda_mem_pool_quota_bytes(),
             Some(4 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn metrics_handle_absent_by_default_is_a_noop() {
+        // No `with_metrics(...)` — the consume/release pair must continue
+        // to work exactly as before. The point of this test is to pin the
+        // backwards-compat contract: pre-existing call sites that do not
+        // plumb a registry observe no behaviour change.
+        let ctx = TenantContext::builder(TenantId(11))
+            .with_memory_quota_bytes(8192)
+            .build();
+        ctx.consume_bytes(1024).unwrap();
+        ctx.release_bytes(512);
+        assert_eq!(ctx.bytes_in_use(), 512);
+    }
+
+    #[test]
+    fn metrics_handle_publishes_consume_and_release_totals() {
+        let metrics = TensorWasmMetrics::new();
+        let ctx = TenantContext::builder(TenantId(12))
+            .with_memory_quota_bytes(1 << 20)
+            .with_metrics(metrics.clone())
+            .build();
+        let labels = TenantLabels {
+            tenant_id: TenantId(12).to_string(),
+        };
+
+        // Consume → gauge reads the post-add total.
+        ctx.consume_bytes(4096).unwrap();
+        assert_eq!(
+            metrics
+                .gpu_memory_bytes_per_tenant()
+                .get_or_create(&labels)
+                .get(),
+            4096
+        );
+
+        // A second consume composes.
+        ctx.consume_bytes(2048).unwrap();
+        assert_eq!(
+            metrics
+                .gpu_memory_bytes_per_tenant()
+                .get_or_create(&labels)
+                .get(),
+            6144
+        );
+
+        // Release → gauge reads the post-sub total.
+        ctx.release_bytes(2048);
+        assert_eq!(
+            metrics
+                .gpu_memory_bytes_per_tenant()
+                .get_or_create(&labels)
+                .get(),
+            4096
+        );
+    }
+
+    #[test]
+    fn metrics_two_tenants_produce_two_distinct_series() {
+        // Mirrors the dashboard's expected shape: two registered tenants
+        // reserving different amounts must surface as two distinct
+        // labelled series in the Prometheus exposition.
+        let metrics = TensorWasmMetrics::new();
+        let a = TenantContext::builder(TenantId(101))
+            .with_memory_quota_bytes(1 << 20)
+            .with_metrics(metrics.clone())
+            .build();
+        let b = TenantContext::builder(TenantId(102))
+            .with_memory_quota_bytes(1 << 20)
+            .with_metrics(metrics.clone())
+            .build();
+        a.consume_bytes(4096).unwrap();
+        b.consume_bytes(8192).unwrap();
+
+        let text = metrics.encode_text();
+        assert!(
+            text.contains("tensor_wasm_gpu_memory_bytes_per_tenant{tenant_id=\"T#101\"} 4096"),
+            "missing tenant 101 sample in:\n{text}"
+        );
+        assert!(
+            text.contains("tensor_wasm_gpu_memory_bytes_per_tenant{tenant_id=\"T#102\"} 8192"),
+            "missing tenant 102 sample in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn metrics_release_underflow_publishes_clamped_zero() {
+        let metrics = TensorWasmMetrics::new();
+        let ctx = TenantContext::builder(TenantId(13))
+            .with_memory_quota_bytes(1 << 16)
+            .with_metrics(metrics.clone())
+            .build();
+        // Underflow path: release without prior consume. The counter
+        // clamps to zero and the gauge should reflect zero, not wrap.
+        ctx.release_bytes(123);
+        let labels = TenantLabels {
+            tenant_id: TenantId(13).to_string(),
+        };
+        assert_eq!(
+            metrics
+                .gpu_memory_bytes_per_tenant()
+                .get_or_create(&labels)
+                .get(),
+            0
         );
     }
 

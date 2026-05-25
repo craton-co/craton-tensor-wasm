@@ -77,6 +77,8 @@ The metrics that **do** exist today, audited against
 
 - `tensor_wasm_active_instances` (gauge)
 - `tensor_wasm_gpu_memory_used_bytes` (gauge)
+- `tensor_wasm_gpu_memory_bytes_per_tenant{tenant_id}` (gauge family,
+  C3)
 - `tensor_wasm_kernel_dispatches_total` (counter)
 - `tensor_wasm_kernel_latency_seconds` (histogram, 14 buckets,
   10 µs – 10 s)
@@ -84,6 +86,7 @@ The metrics that **do** exist today, audited against
 - `tensor_wasm_instance_terminations_total` (counter)
 - `tensor_wasm_offload_success_total` (counter)
 - `tensor_wasm_offload_fallback_total` (counter)
+- `tensor_wasm_jobs_active` (gauge, single series, C3)
 
 The HTTP-level metrics referenced below
 (`tensor_wasm_http_requests_total`,
@@ -651,6 +654,13 @@ exists to exercise them.
 - `tensor_wasm_http_requests_total{route,method,status}` (counter, W2.3)
 - `tensor_wasm_http_request_duration_seconds{route,method,status}` (histogram, W2.3)
 - `tensor_wasm_http_requests_in_flight{route,method}` (gauge, W2.3)
+- `tensor_wasm_jobs_active` (gauge, single series, C3 — number of
+  async-invocation jobs in `Pending` state in the API-layer job
+  registry; not an SLI but feeds the dashboard capacity row)
+- `tensor_wasm_gpu_memory_bytes_per_tenant{tenant_id}` (gauge family,
+  C3 — additive per-tenant breakdown of GPU memory reservation; the
+  pre-existing single-series total at
+  `tensor_wasm_gpu_memory_used_bytes` is preserved alongside)
 
 Every SLO in this document is now enforceable against the metrics the
 gateway emits. The `latency_dispatch_serial_P95` SLO sits on
