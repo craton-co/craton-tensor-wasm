@@ -2,6 +2,19 @@
 
 **Status:** spike landed for v0.2; full cutover deferred to v0.2 release cycle pending S22 runner validation. See [`RISKS.md`](RISKS.md) ("CUDA `cust` 0.3.x EOL" row) and the [Path to v1](PATH-TO-V1.md) ("Open decision #1") for the surrounding context.
 
+**Concrete frictions surfaced (W5.9 build attempt):** building `--features cudarc-backend` against `cudarc 0.13.9` on `nightly-2026-03-15` fails because the spike code references several FFI symbols at `cudarc::driver::sys` paths that the released crate does not actually export:
+
+- `cudarc::driver::sys::cuMemAllocManaged` — **not** exported at the `sys` root in 0.13.9 (the safe `CudaDevice::alloc_zeros` returns device-only memory; the managed-pointer FFI lives behind a different module path or requires the `cuda-12000` feature variant the spike picked).
+- `cudarc::driver::sys::cuMemPrefetchAsync` — same issue.
+- `cudarc::driver::sys::cuMemFree_v2` — same.
+- `cudarc::driver::sys::cuMemAdvise` — same.
+- `cudarc::driver::sys::CUmem_advise_enum` — exported under a different name in 0.13.x.
+- `cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS` — exported under `CUresult::CUDA_SUCCESS` in 0.13.x.
+
+The corollary on the `cust` side: `cust 0.3.2` itself fails to compile on `nightly-2026-03-15` because of a `bytemuck::PodCastError` reference removed in modern `bytemuck`. So **today, neither backend compiles cleanly on this host** — the spike's job was to surface this kind of friction before the cutover, and it has. The v0.2 cutover PR will need to (a) fix the symbol paths above against whatever cudarc minor we settle on, and (b) provide a smoke test that the orchestrator can run before flipping the default. Captured here so the cutover work has a starting point rather than re-deriving it.
+
+
+
 **Scope of this document:** the version chosen, an API mapping table for the operations TensorWasm actually uses today, the known gaps where `cudarc`'s surface does not match `cust`'s 1:1, and a recommended cutover plan.
 
 **Scope of the spike code:** a parallel implementation of `UnifiedBuffer` + `cuMemAdvise` + `cuMemPrefetchAsync` in `crates/tensor-wasm-mem/src/cudarc_backend.rs`, gated behind a new `cudarc-backend` feature flag. The default v0.2 build still uses `cust`; both backends coexist so a regression in one cannot mask a regression in the other.
