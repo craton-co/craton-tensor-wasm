@@ -275,6 +275,81 @@ impl UnifiedBuffer {
         self.device_id
     }
 
+    /// Attempt to grow the buffer in place to `new_size` bytes.
+    ///
+    /// **Status: scaffolded, not yet implemented.** Always returns
+    /// [`UnifiedError::Cuda`] with the documented `"in-place grow not
+    /// yet wired"` sentinel until the v0.4 cutover PR lands the real
+    /// `cuMemAddressReserve` + `cuMemMap` path. Until then,
+    /// [`crate::TensorWasmLinearMemory`] continues to follow the B5
+    /// option-(a) behavior: pre-allocate at `max-pages` and grow_to
+    /// is a logical-size bump up to the cap. See B5's
+    /// `grow_up_to_preallocated_cap_succeeds_beyond_fails` test for
+    /// the current contract.
+    ///
+    /// # Background
+    ///
+    /// `cuMemAllocManaged` returns a fixed-size allocation; there is
+    /// no in-place grow. The CUDA Driver API alternative is:
+    ///
+    /// 1. `cuMemAddressReserve(size = max-pages, align)` — reserve a
+    ///    virtual address window large enough for any future grow.
+    /// 2. `cuMemCreate(handle, initial_size, prop)` — allocate the
+    ///    initial physical backing.
+    /// 3. `cuMemMap(va, initial_size, handle)` — map physical to
+    ///    virtual.
+    /// 4. `cuMemSetAccess(va, initial_size, ReadWrite)` — grant the
+    ///    current device permission.
+    /// 5. To grow: `cuMemCreate(handle_more, delta, prop)` +
+    ///    `cuMemMap(va + initial_size, delta, handle_more)` +
+    ///    `cuMemSetAccess(va, new_size, ReadWrite)`.
+    ///
+    /// This is a v0.4 follow-up because:
+    ///
+    /// - The `cuMemAddressReserve` family is in `cust::sys` / cudarc
+    ///   `sys::lib()` but neither crate has a safe wrapper, so the
+    ///   implementation is ~300-500 LOC of careful `unsafe`.
+    /// - The path requires the GPU's
+    ///   [`concurrentManagedAccess`](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#um-concurrent-access)
+    ///   device attribute. Consumer Turing/Ampere cards in Windows
+    ///   WDDM mode do NOT expose this — same limitation that makes
+    ///   the W5.9 `cuMemPrefetchAsync` smoke test the one failure in
+    ///   the cudarc set. The v0.4 implementation needs a Linux
+    ///   datacenter GPU (the S22 self-hosted runner from C1) to
+    ///   verify, which doesn't exist yet.
+    /// - cuda-oxide v0.2 may ship a higher-level virtual-memory
+    ///   wrapper that obviates the bare driver API entirely, per
+    ///   RFC 0001's "cuda-oxide host crates" inventory; waiting one
+    ///   release cycle may save us the work.
+    ///
+    /// # Why scaffold this now
+    ///
+    /// So the v0.4 author has a concrete target signature + the four
+    /// known constraints listed above, rather than starting from a
+    /// blank canvas. The stub also lets callers (notably
+    /// `TensorWasmLinearMemory::grow_to`) feature-detect via the
+    /// returned error string instead of branching on `cfg(feature =
+    /// "in-place-grow")` ahead of time.
+    pub fn try_grow_in_place(&mut self, _new_size: usize) -> Result<(), UnifiedError> {
+        Err(UnifiedError::Cuda(
+            "in-place grow not yet wired -- see UnifiedBuffer::try_grow_in_place doc + \
+             RFC 0001 v0.4 follow-up. Until then TensorWasmLinearMemory uses the B5 \
+             option-(a) preallocate-at-max strategy."
+                .into(),
+        ))
+    }
+
+    /// Whether [`Self::try_grow_in_place`] is implemented on this
+    /// build. Currently always `false`; flips to `true` when the v0.4
+    /// `cuMemAddressReserve` path lands.
+    ///
+    /// Callers (mainly `TensorWasmLinearMemory::grow_to`) probe this
+    /// to pick between in-place-grow + max-preallocate strategies
+    /// without scraping the error string.
+    pub const fn supports_in_place_grow() -> bool {
+        false
+    }
+
     /// Whether this buffer is backed by CUDA Unified Memory (`cuMemAllocManaged`).
     ///
     /// Returns `true` when the crate was compiled with EITHER
@@ -392,6 +467,27 @@ mod tests {
     fn zero_size_rejected() {
         let err = UnifiedBuffer::new(0).expect_err("zero should be rejected");
         assert!(matches!(err, UnifiedError::ZeroSize));
+    }
+
+    #[test]
+    fn try_grow_in_place_returns_documented_sentinel() {
+        // D1 scaffold contract: until v0.4 lands the
+        // cuMemAddressReserve + cuMemMap path, try_grow_in_place
+        // returns the documented sentinel and supports_in_place_grow()
+        // returns false. Callers that branch on the feature gate get
+        // the same answer either way.
+        assert!(!UnifiedBuffer::supports_in_place_grow());
+        // On the no-feature build we can construct the buffer to
+        // probe the API; on feature builds the same probe works
+        // because allocate succeeds. The error string is the public
+        // contract callers (TensorWasmLinearMemory::grow_to v0.4) match on.
+        let mut b = UnifiedBuffer::new(64).expect("alloc");
+        let err = b.try_grow_in_place(128).expect_err("scaffold must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("in-place grow not yet wired"),
+            "sentinel string changed; v0.4 caller match site must be updated: {msg}",
+        );
     }
 
     #[test]
