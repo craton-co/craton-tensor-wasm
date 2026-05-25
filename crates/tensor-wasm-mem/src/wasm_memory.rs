@@ -106,6 +106,32 @@ impl TensorWasmLinearMemory {
         self.maximum_size
     }
 
+    /// Whether the underlying linear-memory backing is CUDA Unified Memory.
+    ///
+    /// Returns `true` only when the crate was compiled with
+    /// `--features unified-memory`. This is the compile-time probe that
+    /// closes the v0.3.2 audit's "wasm linear memory not UVM-backed" gap:
+    /// a guest pointer resolved through the W1.1 wasi-cuda kernel-args
+    /// pipeline doubles as a device pointer iff this returns `true`. The
+    /// pool-backed [`PooledLinearMemory`] path also goes through
+    /// [`UnifiedBuffer`] under the hood, so it shares this property.
+    ///
+    /// # Memory-growth semantics
+    ///
+    /// `cuMemAllocManaged` returns a fixed-size allocation that cannot be
+    /// resized in place. We therefore pre-allocate the requested
+    /// `maximum_bytes` (or [`DEFAULT_MAX_BYTES`]) at construction time and
+    /// treat [`LinearMemory::grow_to`] as a logical-size bump up to that
+    /// cap (option (a) from the v0.3.3 design tracker). This matches
+    /// Wasmtime's `static` memory model, keeps the kernel-side pointer
+    /// stable across growth events, and keeps the hot path zero-copy at
+    /// the cost of reserving the worst-case footprint up front. Growing
+    /// the *physical* allocation (option (b): allocate-copy-free) is a
+    /// v0.4 follow-up tracked in `docs/RISKS.md`.
+    pub fn is_uvm_backed(&self) -> bool {
+        self.buffer.is_uvm_backed()
+    }
+
     /// Borrow the buffer as a shared byte slice over the *current* size.
     ///
     /// # Safety contract
@@ -517,6 +543,72 @@ mod tests {
         assert_eq!(s[1], 0xAD);
         assert_eq!(s[64 * 1024], 0xBE);
         assert_eq!(s[128 * 1024 - 1], 0xEF);
+    }
+
+    #[test]
+    fn is_uvm_backed_matches_feature_flag() {
+        // Closes the v0.3.2 audit gap (Problem #5). With `--features
+        // unified-memory`, the wasm linear memory's backing IS
+        // `cuMemAllocManaged` and the host pointer doubles as a device
+        // pointer for kernel args. Without the feature, the backing is a
+        // heap `Box<[u8]>`. Either way the probe must reflect build
+        // configuration — never lie.
+        let mem = TensorWasmLinearMemory::new(64 * 1024, Some(1024 * 1024)).unwrap();
+        #[cfg(feature = "unified-memory")]
+        assert!(
+            mem.is_uvm_backed(),
+            "with --features unified-memory the wasm linear memory MUST be UVM-backed"
+        );
+        #[cfg(not(feature = "unified-memory"))]
+        assert!(
+            !mem.is_uvm_backed(),
+            "without unified-memory the backing must be the heap Box<[u8]>"
+        );
+    }
+
+    #[test]
+    fn as_ptr_returns_non_null_inside_backing_region() {
+        // The kernel-args pipeline (W1.1, see
+        // `crates/tensor-wasm-wasi-gpu/src/kernel_args.rs`) translates a
+        // guest pointer to a host pointer via `as_ptr() + guest_offset`.
+        // Under --features unified-memory that host pointer doubles as a
+        // device pointer, so two properties must hold for every backing:
+        // (1) `as_ptr()` is non-null; (2) the returned pointer lies inside
+        // the buffer's `wasm_accessible()` region, i.e. the byte at
+        // offset 0 is reachable from a kernel via the same address.
+        let mem = TensorWasmLinearMemory::new(64 * 1024, Some(1024 * 1024)).unwrap();
+        let p = LinearMemory::as_ptr(&mem);
+        assert!(!p.is_null(), "as_ptr must be non-null");
+        let r = mem.wasm_accessible();
+        let p_addr = p as usize;
+        assert!(
+            r.contains(&p_addr),
+            "as_ptr ({p_addr:#x}) must land inside wasm_accessible ({:#x}..{:#x})",
+            r.start,
+            r.end,
+        );
+    }
+
+    #[test]
+    fn grow_up_to_preallocated_cap_succeeds_beyond_fails() {
+        // Memory-growth semantics for the UVM path: pre-allocate at the
+        // requested maximum and treat grow_to as a logical-size bump up
+        // to that cap (option (a) in the task brief). This test pins
+        // both halves of that contract: grow up to the cap succeeds in
+        // a single step; one byte beyond the cap fails. It runs on both
+        // the heap and the UVM backing because the contract is the same
+        // for both; only the underlying allocator differs.
+        const MAX: usize = 256 * 1024;
+        let mut mem = TensorWasmLinearMemory::new(64 * 1024, Some(MAX)).unwrap();
+        // Step 1: grow exactly to the cap — must succeed.
+        mem.grow_to(MAX).expect("grow up to cap must succeed");
+        assert_eq!(mem.byte_size(), MAX);
+        // Step 2: anything past the cap is rejected; the pre-allocated
+        // region cannot be resized in place under `cuMemAllocManaged`.
+        let err = mem
+            .grow_to(MAX + 1)
+            .expect_err("grow past cap must fail");
+        assert!(err.to_string().contains("maximum"));
     }
 
     #[test]

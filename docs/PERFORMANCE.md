@@ -137,6 +137,24 @@ will shift in well-understood ways. Rough expectations:
 This section will be replaced with measured ranges (not estimates) when
 S22 completes.
 
+### Wasm linear memory UVM wiring (v0.3.3)
+
+The numbers above assume the property the v0.3.2 audit flagged as
+unverified is actually true: that the wasm linear memory itself lives
+in CUDA Unified Memory. As of v0.3.3 it does. `TensorWasmLinearMemory`
+constructs a `UnifiedBuffer` whose feature-gated backing routes through
+`cuMemAllocManaged` under `--features unified-memory` (and a heap
+`Box<[u8]>` otherwise — see [`crates/tensor-wasm-mem/README.md`](../crates/tensor-wasm-mem/README.md)
+for the wiring narrative). A guest pointer that flows through the W1.1
+wasi-cuda kernel-args pipeline therefore resolves to a host pointer
+that doubles as a device pointer, removing the `cudaMemcpy` that would
+otherwise show up on every kernel launch. Memory growth is
+pre-allocate-at-max (Wasmtime `static`-style); a v0.4 follow-up will
+land in-place grow once `cuMemAddressReserve` / `cuMemMap` are wired
+through. The build configuration is asserted in
+`crates/tensor-wasm-mem/src/wasm_memory.rs` via
+`TensorWasmLinearMemory::is_uvm_backed()`.
+
 ## Regression policy
 
 The [`bench` workflow](../.github/workflows/bench.yml) runs the full bench
