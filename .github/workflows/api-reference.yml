@@ -1,0 +1,241 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Craton Software Company
+#
+# Build a static API-reference bundle for every published TensorWasm
+# release. Two inputs (rustdoc HTML for the workspace public crates and
+# Redocly-rendered HTML for the OpenAPI 3.1 spec) feed one output (a
+# zipped static site uploaded as a workflow artifact and, on release
+# events, attached to the GitHub Release).
+#
+# This is the "API reference auto-generated from rustdoc + OpenAPI,
+# published per release" workstream item from docs/PATH-TO-V1.md (v0.4
+# milestone, "Documentation" stream). The publication URL convention
+# (https://craton-co.github.io/craton-tensor-wasm/<version>/...) is
+# documented in docs/API-REFERENCE.md.
+#
+# Style matches:
+#   * .github/workflows/sbom.yml  — release-asset attachment via
+#                                   softprops/action-gh-release@v2
+#   * .github/workflows/ci.yml    — Redocly CLI pin, rustdoc job shape
+#
+# Tool versions are pinned explicitly; bumps are deliberate.
+name: api-reference
+
+on:
+  release:
+    types: [published]
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned tool versions. Match ci.yml's openapi job for Redocly.
+  RUST_TOOLCHAIN: "nightly-2026-03-15"
+  REDOCLY_CLI_VERSION: "1"
+  NODE_VERSION: "20"
+
+jobs:
+  rustdoc:
+    name: build rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install CUDA stub libraries
+        # Matches the pattern used in ci.yml: the workspace links against
+        # libcuda/libcudart symbols at compile time even with CUDA features
+        # disabled; empty stub files satisfy the linker on the runner.
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+
+      - name: Build rustdoc (release, broken-link checked)
+        env:
+          # -D warnings turns any rustdoc warning into a hard error.
+          # -D rustdoc::broken_intra_doc_links catches stale `[Type]` /
+          # `[mod::Type]` references in doc comments. The nightly
+          # toolchain on which TensorWasm is pinned recognises the
+          # rustdoc:: namespace; if that ever changes we surface the
+          # failure here rather than silently shipping broken links.
+          RUSTDOCFLAGS: "-D warnings -D rustdoc::broken_intra_doc_links"
+        run: cargo doc --no-deps --workspace --release
+
+      - name: Upload rustdoc tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdoc-html
+          path: target/doc
+          if-no-files-found: error
+          retention-days: 7
+
+  openapi-html:
+    name: render OpenAPI HTML
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Redocly CLI
+        # Same pin as ci.yml's openapi-validate job (@redocly/cli@1).
+        # `build-docs` produces a single self-contained HTML file with
+        # all assets inlined — no external CDN dependency at view time.
+        run: npm install --global "@redocly/cli@${REDOCLY_CLI_VERSION}"
+
+      - name: Render OpenAPI YAML to static HTML
+        run: |
+          mkdir -p site/api
+          redocly build-docs openapi/tensor-wasm-api.yaml \
+            --output site/api/index.html
+
+      - name: Upload OpenAPI HTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-html
+          path: site/api
+          if-no-files-found: error
+          retention-days: 7
+
+  bundle:
+    name: bundle and publish
+    needs: [rustdoc, openapi-html]
+    runs-on: ubuntu-latest
+    permissions:
+      # Required for softprops/action-gh-release to attach assets to
+      # the release on `release: published` events. Matches sbom.yml.
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download rustdoc tree
+        uses: actions/download-artifact@v4
+        with:
+          name: rustdoc-html
+          path: site/rustdoc
+
+      - name: Download OpenAPI HTML
+        uses: actions/download-artifact@v4
+        with:
+          name: openapi-html
+          path: site/api
+
+      - name: Derive version label
+        id: version
+        # On release events the tag is authoritative; otherwise fall
+        # back to a short SHA so dev-branch previews are uniquely named.
+        # Matches the convention used by sbom.yml's `name` step.
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="${GITHUB_SHA::8}"
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate landing page
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        # Inline heredoc keeps the workflow self-contained — no
+        # templates/ checkout dance, no extra file to keep in sync.
+        # If this grows beyond a one-screen page, promote it to
+        # templates/index.html.tmpl and substitute with sed/envsubst.
+        run: |
+          cat > site/index.html <<EOF
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8" />
+              <meta name="viewport" content="width=device-width, initial-scale=1" />
+              <title>Craton TensorWasm API Reference (${VERSION})</title>
+              <style>
+                :root { color-scheme: light dark; }
+                body {
+                  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                               Roboto, Helvetica, Arial, sans-serif;
+                  max-width: 44rem;
+                  margin: 3rem auto;
+                  padding: 0 1.25rem;
+                  line-height: 1.55;
+                }
+                h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+                .sub { color: #666; margin-top: 0; }
+                ul { padding-left: 1.25rem; }
+                code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+                a { color: #0366d6; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+                footer { margin-top: 2rem; font-size: 0.85rem; color: #888; }
+              </style>
+            </head>
+            <body>
+              <h1>Craton TensorWasm API Reference</h1>
+              <p class="sub">Version <code>${VERSION}</code></p>
+              <ul>
+                <li><a href="rustdoc/tensor_wasm_core/index.html">Rust API (rustdoc)</a>
+                  &mdash; public items in
+                  <code>tensor-wasm-core</code>,
+                  <code>tensor-wasm-mem</code>,
+                  <code>tensor-wasm-exec</code>,
+                  <code>tensor-wasm-snapshot</code>,
+                  <code>tensor-wasm-api</code>, et al.</li>
+                <li><a href="api/index.html">HTTP API (OpenAPI 3.1)</a>
+                  &mdash; rendered from
+                  <code>openapi/tensor-wasm-api.yaml</code>.</li>
+              </ul>
+              <footer>
+                See <code>docs/API-REFERENCE.md</code> in the source
+                tree for the full publication policy and the local
+                regeneration recipe.
+              </footer>
+            </body>
+          </html>
+          EOF
+
+      - name: Package static site
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ASSET="tensor-wasm-api-reference-v${VERSION}.zip"
+          # `-r` recurses; `-q` keeps the log readable. `cd site &&` so
+          # the archive's top-level entries are index.html / rustdoc/ /
+          # api/ rather than a leading `site/` directory.
+          (cd site && zip -qr "../${ASSET}" .)
+          echo "asset=${ASSET}" >> "${GITHUB_OUTPUT}"
+          ls -la "${ASSET}"
+
+      - name: Upload static-site artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.asset }}
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+
+      - name: Attach static site to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.asset }}
+          fail_on_unmatched_files: true
