@@ -244,6 +244,7 @@ pub struct RestoredOnGpu {
 /// followed by a manual host-to-device copy.
 #[cfg(feature = "cuda")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cuda")))]
+#[instrument(skip(bytes), fields(input_len = bytes.len(), device_index = device_index))]
 pub fn restore_to_gpu(bytes: &[u8], device_index: u32) -> Result<RestoredOnGpu> {
     use cust::memory::UnifiedBuffer;
     use cust::stream::{Stream, StreamFlags};

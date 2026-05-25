@@ -415,6 +415,11 @@ async fn decode_wasm_b64(wasm_b64: String) -> Result<Vec<u8>, ApiError> {
 /// Decodes the supplied base64, runs full `wasmparser` validation, and stores
 /// the bytes refcounted via `Arc<[u8]>` so concurrent invocations do not
 /// reallocate. Returns `400 invalid_wasm` if validation fails.
+#[tracing::instrument(
+    name = "http.create_function",
+    skip(state, payload),
+    fields(function_id = tracing::field::Empty),
+)]
 pub async fn create_function(
     State(state): State<Arc<AppState>>,
     payload: Result<Json<CreateFunctionRequest>, JsonRejection>,
@@ -446,6 +451,7 @@ pub async fn create_function(
         ));
     }
     let id = Uuid::new_v4();
+    tracing::Span::current().record("function_id", tracing::field::display(id));
     state.functions.insert(
         id,
         FunctionRecord {
@@ -462,6 +468,7 @@ pub async fn create_function(
 ///
 /// Returns `204 No Content` on success and `404 Not Found` if the id is
 /// unknown.
+#[tracing::instrument(name = "http.delete_function", skip(state), fields(function_id = %id))]
 pub async fn delete_function(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -476,6 +483,15 @@ pub async fn delete_function(
 /// Drive the spawn → call(`_start`|`main`) → terminate flow against the
 /// supplied bytes/tenant. Shared by the synchronous and async invoke paths
 /// so any future fix (telemetry, retries, etc.) lands in one place.
+#[tracing::instrument(
+    name = "invoke.run",
+    skip(executor, wasm_bytes),
+    fields(
+        tenant = %tenant,
+        function_id = %function_id,
+        wasm_bytes_len = wasm_bytes.len(),
+    ),
+)]
 async fn run_invoke(
     executor: &TensorWasmExecutor,
     wasm_bytes: &[u8],
@@ -521,6 +537,14 @@ async fn run_invoke(
 ///
 /// The tenant id is sourced from the `X-TensorWasm-Tenant` middleware
 /// extension; absent it defaults to `TenantId(0)`.
+#[tracing::instrument(
+    name = "http.invoke_function",
+    skip(state, auth, _args),
+    fields(
+        function_id = %id,
+        tenant = tracing::field::Empty,
+    ),
+)]
 pub async fn invoke_function(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -529,6 +553,7 @@ pub async fn invoke_function(
     _args: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    tracing::Span::current().record("tenant", tracing::field::display(tenant));
     // Tenant-scope check: reject before doing any per-tenant work (function
     // lookup, executor spawn, …). Absent AuthContext only happens in
     // configurations that bypass `bearer_auth` entirely (e.g. ad-hoc test
@@ -556,6 +581,15 @@ pub async fn invoke_function(
 /// task updates the registry to `Completed` (with the JSON result) or
 /// `Failed` (with `{kind, message}`) on conclusion. Callers poll via
 /// `GET /jobs/{id}`.
+#[tracing::instrument(
+    name = "http.invoke_function_async",
+    skip(state, auth, _args),
+    fields(
+        function_id = %id,
+        tenant = tracing::field::Empty,
+        job_id = tracing::field::Empty,
+    ),
+)]
 pub async fn invoke_function_async(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -564,6 +598,7 @@ pub async fn invoke_function_async(
     _args: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    tracing::Span::current().record("tenant", tracing::field::display(tenant));
     if let Some(Extension(ctx)) = auth.as_ref() {
         ctx.authorize_tenant(tenant)?;
     }
@@ -573,6 +608,7 @@ pub async fn invoke_function_async(
     };
 
     let job_id = Uuid::new_v4();
+    tracing::Span::current().record("job_id", tracing::field::display(job_id));
     state.jobs.insert(
         job_id,
         JobRecord {
@@ -586,27 +622,46 @@ pub async fn invoke_function_async(
 
     // Spawn the real invocation. The executor is cheap to clone (it's an
     // `Arc` internally) and the jobs map is `Arc<DashMap>`.
+    //
+    // The spawned task is wrapped in a dedicated `async_invoke.job` span
+    // and instrumented so the active trace context (parent: the
+    // `http.invoke_function_async` span we are in right now) carries
+    // across the `tokio::spawn` boundary. Without `.instrument(...)` the
+    // task would start a fresh root span and the executor /
+    // snapshot-restore / dispatch spans it produces would appear
+    // disconnected from the inbound HTTP request in the OTLP backend.
     let executor = Arc::clone(&state.executor);
     let jobs = Arc::clone(&state.jobs);
-    tokio::spawn(async move {
-        let outcome = run_invoke(&executor, &wasm_bytes, tenant, id).await;
-        if let Some(mut entry) = jobs.get_mut(&job_id) {
-            match outcome {
-                Ok(value) => {
-                    entry.status = JobStatus::Completed;
-                    entry.result = Some(value);
+    let job_span = tracing::info_span!(
+        "async_invoke.job",
+        job_id = %job_id,
+        function_id = %id,
+        tenant = %tenant,
+    );
+    tokio::spawn(
+        tracing::Instrument::instrument(
+            async move {
+                let outcome = run_invoke(&executor, &wasm_bytes, tenant, id).await;
+                if let Some(mut entry) = jobs.get_mut(&job_id) {
+                    match outcome {
+                        Ok(value) => {
+                            entry.status = JobStatus::Completed;
+                            entry.result = Some(value);
+                        }
+                        Err(api_err) => {
+                            let (kind, message) = api_err.to_kind_message();
+                            entry.status = JobStatus::Failed;
+                            entry.result = Some(serde_json::json!({
+                                "kind": kind,
+                                "message": message,
+                            }));
+                        }
+                    }
                 }
-                Err(api_err) => {
-                    let (kind, message) = api_err.to_kind_message();
-                    entry.status = JobStatus::Failed;
-                    entry.result = Some(serde_json::json!({
-                        "kind": kind,
-                        "message": message,
-                    }));
-                }
-            }
-        }
-    });
+            },
+            job_span,
+        ),
+    );
 
     Ok((
         StatusCode::ACCEPTED,
@@ -615,6 +670,7 @@ pub async fn invoke_function_async(
 }
 
 /// `GET /jobs/{id}` — poll an async invocation.
+#[tracing::instrument(name = "http.get_job", skip(state), fields(job_id = %id))]
 pub async fn get_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,

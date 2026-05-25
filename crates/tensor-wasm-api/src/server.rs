@@ -22,6 +22,7 @@ use crate::routes::{
     create_function, delete_function, get_job, healthz, invoke_function, invoke_function_async,
     metrics, AppState,
 };
+use crate::trace_propagation::{inject_trace_id_header, install_w3c_propagator};
 
 /// Build the axum Router with all routes and middleware applied.
 ///
@@ -98,6 +99,15 @@ pub fn build_router_with_audit(
     limiter: RateLimiter,
     audit: AuditConfig,
 ) -> Router {
+    // Wire the W3C Trace Context propagator globally. Idempotent across
+    // calls; safe to invoke on every router rebuild (tests do that
+    // routinely). Without this, the tower `trace_layer_with_propagation`
+    // would silently see an empty parent context for every inbound
+    // `traceparent` header and start a fresh root span — collapsing the
+    // distributed-tracing invariant the gateway documents in
+    // `docs/OBSERVABILITY.md`.
+    install_w3c_propagator();
+
     // HTTP metrics middleware sits OUTSIDE bearer_auth so 401 responses
     // are counted as well — the SLO doc (`docs/SLO.md` §2.1
     // `availability_http`) defines the SLI as a ratio over *every* HTTP
@@ -111,6 +121,14 @@ pub fn build_router_with_audit(
 
     let global_layers = ServiceBuilder::new()
         .layer(trace_layer_with_propagation())
+        // `inject_trace_id_header` runs inside the trace layer so the
+        // current span (the one the trace layer just created with its
+        // parent already attached) is the one whose `trace_id` we surface
+        // back to the caller via the `x-trace-id` response header. This
+        // is the operator-facing handle the `docs/runbooks/trace-id.md`
+        // runbook points at; without it operators have to read journald
+        // to recover the trace id of a failed request.
+        .layer(axum::middleware::from_fn(inject_trace_id_header))
         .layer(body_limit_layer(MAX_REQUEST_BODY_BYTES))
         .layer(timeout_layer(Duration::from_secs(30)))
         .layer(concurrency_limit_layer(64))

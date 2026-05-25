@@ -322,25 +322,6 @@ pub async fn tenant_scope(mut req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// Adapter that lets the OpenTelemetry `TextMapPropagator` read from an
-/// `axum`/`http` [`HeaderMap`](axum::http::HeaderMap).
-///
-/// The propagator API is generic over an [`opentelemetry::propagation::Extractor`],
-/// which expects `get(&str) -> Option<&str>` and `keys() -> Vec<&str>` semantics.
-/// We provide the smallest possible bridge so we do not need the
-/// `opentelemetry-http` crate as an additional dependency.
-struct HeaderMapExtractor<'a>(&'a axum::http::HeaderMap);
-
-impl<'a> opentelemetry::propagation::Extractor for HeaderMapExtractor<'a> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|v| v.to_str().ok())
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(|k| k.as_str()).collect()
-    }
-}
-
 /// Returns a [`TraceLayer`] that, in addition to the per-request span,
 /// reads the W3C `traceparent` header from the incoming request and uses
 /// it as the parent context for the resulting span.
@@ -350,10 +331,13 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapExtractor<'a> {
 /// present, the span is parented to the local context as usual.
 ///
 /// The function delegates the actual parsing to the OpenTelemetry global
-/// `TextMapPropagator` (installed by `tensor-wasm-core::telemetry` under the
-/// `otlp` feature). If no propagator is installed the extraction returns
-/// an empty context and the span is parented locally — i.e. behaviour
-/// degrades gracefully.
+/// `TextMapPropagator`. [`crate::server::build_router_with_audit`] calls
+/// [`crate::trace_propagation::install_w3c_propagator`] before any
+/// request can hit this layer, so the parsing path is reliably wired
+/// regardless of whether the `otlp` feature is enabled on
+/// `tensor-wasm-core`. If for some reason no propagator is installed —
+/// e.g. in a test that bypasses the server builder — the extraction
+/// returns an empty context and the span is parented locally.
 pub fn trace_layer_with_propagation() -> tower_http::trace::TraceLayer<
     tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
     impl Fn(&axum::http::Request<axum::body::Body>) -> tracing::Span + Clone,
@@ -378,13 +362,12 @@ pub fn trace_layer_with_propagation() -> tower_http::trace::TraceLayer<
         );
 
         // Extract the parent `opentelemetry::Context` from the incoming
-        // headers via whichever `TextMapPropagator` was installed globally
-        // (typically `TraceContextPropagator` for W3C `traceparent`). Then
-        // attach it as the parent of the freshly-created tracing span via
-        // the `OpenTelemetrySpanExt::set_parent` bridge.
-        let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
-            propagator.extract(&HeaderMapExtractor(req.headers()))
-        });
+        // headers via the globally-installed `TextMapPropagator`. The
+        // `set_parent` call hooks the freshly-created tracing span into
+        // the upstream W3C trace, so subsequent `#[instrument]` spans on
+        // tenant lookup, executor spawn, snapshot restore, and dispatch
+        // all share the same `trace_id`.
+        let parent_cx = crate::trace_propagation::extract_parent_context(req.headers());
         span.set_parent(parent_cx);
 
         span

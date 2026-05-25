@@ -69,9 +69,79 @@ Then open <http://localhost:16686> to see traces. The service name defaults to `
 
 `TENSOR_WASM_LOG` accepts the full `EnvFilter` directive syntax, so `TENSOR_WASM_LOG=tensor_wasm_exec=debug,wasmtime=warn,info` is valid. When both `TENSOR_WASM_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_ENDPOINT` are set, the TensorWasm-specific variable wins.
 
+To enable OTLP export end-to-end, build the gateway with the `otlp`
+feature on `tensor-wasm-core` and set at least
+`TENSOR_WASM_OTLP_ENDPOINT`. Without the feature the gateway still
+participates in W3C propagation — inbound `traceparent` headers are
+parsed and the trace id surfaces on the `x-trace-id` response header —
+but no spans are exported to a collector, so cross-process trace
+visualisation in Jaeger / Tempo will be empty.
+
 ## Headers and W3C propagation
 
 The API gateway extracts the incoming `traceparent` header and uses it as the parent span context for the request's `http.request` span. If the header is missing or malformed, a fresh root context is created. Outgoing requests from TensorWasm back to other services should propagate `traceparent` so the trace stays connected; the v0.1 client does not do this automatically — set the header manually for now. The `tracedebug` extractor on the API surface logs the resolved context at `debug` level, which is useful when a trace seems to be silently rooting itself.
+
+Every response from the gateway carries an `x-trace-id` header whose
+value is the 32-character lowercase hex representation of the trace
+the request joined (either the inbound `traceparent` trace id, or the
+fresh root assigned by the gateway when no header was supplied). The
+header is omitted only when no `tracing_opentelemetry` subscriber is
+installed in the process (e.g. unit tests that bypass `init` /
+`init_with_otlp`); operators correlating a captured response with an
+OTLP backend should always see a populated value in production.
+
+### Propagation hop diagram
+
+The trace id flows through every layer in the request-handling stack
+and back out to the caller. Each arrow is a parent/child relationship
+in the resulting span tree:
+
+```
+caller (sends `traceparent: 00-<trace_id>-<span_id>-01`)
+   │
+   ▼
+[tower] trace_layer_with_propagation
+   │   extracts parent context via TraceContextPropagator
+   │   opens `http.request` span (parent: caller's span context)
+   ▼
+[tower] inject_trace_id_header
+   │   reads Span::current().context() on the way back out and
+   │   stamps `x-trace-id: <trace_id>` on the response
+   ▼
+[axum] http.invoke_function   (child of http.request)
+   │   fields: function_id, tenant
+   ▼
+[axum] invoke.run            (child of http.invoke_function)
+   │   fields: tenant, function_id, wasm_bytes_len
+   ▼
+[tensor-wasm-exec] tensor_wasm_exec::executor::spawn_instance
+   │   fields: tenant, instance_id
+   │
+   ├── [tensor-wasm-snapshot] SnapshotReader::restore         (when warm-starting)
+   │   fields: input_len
+   │
+   ├── [tensor-wasm-snapshot] restore_to_gpu                  (cuda only)
+   │   fields: input_len, device_index
+   │
+   └── [tensor-wasm-exec] tensor_wasm_exec::executor::call_export
+       │   fields: instance, export
+       │
+       ├── [tensor-wasm-wasi-gpu] wasi_cuda.load_ptx
+       ├── [tensor-wasm-wasi-gpu] wasi_cuda.launch
+       │   │
+       │   └── [tensor-wasm-wasi-gpu] wasi_cuda.dispatch       (DispatchFuture::poll)
+       │
+       └── [tensor-wasm-wasi-gpu] wasi_cuda.sync
+   ▼
+[axum] response  →  caller (receives `x-trace-id: <trace_id>`)
+```
+
+The async invoke path (`POST /functions/{id}/invoke-async`) inserts
+one additional hop, `async_invoke.job`, between the route handler and
+`invoke.run`. The job span is opened via
+`tracing::Instrument::instrument` on the `tokio::spawn` future so the
+trace id carries across the spawn boundary; without that the executor
+spans would orphan from the inbound HTTP request.
 
 ### Cross-crate propagation example
 

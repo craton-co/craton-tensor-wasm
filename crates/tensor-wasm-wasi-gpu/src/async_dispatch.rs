@@ -117,8 +117,24 @@ impl Drop for DispatchPermit {
 /// `event.query()` returns `Ok(())` once the GPU has finished the
 /// associated work. Until then we re-schedule via the waker so the
 /// wasmtime fiber can continue to be suspended.
+///
+/// The future carries a `tracing::Span` captured at construction time
+/// (the active span belonging to whichever host function created it,
+/// typically `wasi_cuda.launch`). Every `poll` call enters that span,
+/// so any work — including the `cust::event::Event::query` poll path —
+/// is attributed to the originating dispatch in the trace tree even
+/// though `poll` is invoked from the Tokio runtime's reactor, not from
+/// inside the host function. Without this the dispatch's poll events
+/// would be parented to the runtime worker's empty context and would
+/// disappear from the distributed trace.
 pub struct DispatchFuture {
     _permit: DispatchPermit,
+    /// Span entered on every poll so the future stays attached to the
+    /// dispatch trace context across runtime task switches. Holding a
+    /// `Span` (rather than an `EnteredSpan`) is cheap (it's a shallow
+    /// `Arc`-clone) and lets us re-enter on each poll without leaking
+    /// the guard.
+    dispatch_span: tracing::Span,
     /// On CUDA builds: a recorded event whose completion signals kernel
     /// done. We poll `event.query()` from the future. On no-CUDA builds
     /// this field is absent and the future resolves on first poll.
@@ -133,6 +149,7 @@ impl DispatchFuture {
     pub fn ready(permit: DispatchPermit) -> Self {
         Self {
             _permit: permit,
+            dispatch_span: tracing::info_span!("wasi_cuda.dispatch"),
             #[cfg(feature = "cuda")]
             event: None,
         }
@@ -148,6 +165,7 @@ impl DispatchFuture {
     pub fn with_event(permit: DispatchPermit, event: cust::event::Event) -> Self {
         Self {
             _permit: permit,
+            dispatch_span: tracing::info_span!("wasi_cuda.dispatch"),
             event: Some(event),
         }
     }
@@ -159,6 +177,12 @@ impl std::future::Future for DispatchFuture {
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
+        // Enter the dispatch span for the duration of this poll so the
+        // trace stays attached to the originating `wasi_cuda.launch`
+        // span tree regardless of which Tokio worker is running us. The
+        // returned guard is dropped at the end of this function.
+        let _entered = self.dispatch_span.enter();
+
         // On the no-CUDA path (and the `ready` constructor on CUDA hosts)
         // we resolve immediately. The permit is held until the future is
         // dropped, which provides the back-pressure semantics needed by

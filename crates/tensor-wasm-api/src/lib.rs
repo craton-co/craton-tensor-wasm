@@ -55,6 +55,7 @@ pub mod rate_limit;
 pub mod routes;
 pub mod server;
 pub mod token_scope;
+pub mod trace_propagation;
 
 pub use audit::{
     audit_log_middleware, AuditAction, AuditActor, AuditActorKind, AuditConfig, AuditOutcome,
@@ -77,4 +78,8 @@ pub use server::{
 };
 pub use token_scope::{
     parse_token_entry, parse_tokens_env, ParsedTokens, ScopeParseError, TenantScope, TokenScope,
+};
+pub use trace_propagation::{
+    current_trace_id, extract_parent_context, inject_trace_id_header, install_w3c_propagator,
+    HeaderMapExtractor, HEADER_TRACE_ID,
 };

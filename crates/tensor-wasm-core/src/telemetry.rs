@@ -230,6 +230,20 @@ pub fn init_with_otlp(
         let tracer = provider.tracer("tensor-wasm");
         opentelemetry::global::set_tracer_provider(provider);
 
+        // Install the W3C Trace Context propagator alongside the tracer
+        // provider so any embedder using `init_with_otlp` from a non-API
+        // entry point (CLI, bench harness) still extracts inbound
+        // `traceparent` headers when it sets up its own HTTP surface.
+        // The API gateway separately calls
+        // `tensor_wasm_api::install_w3c_propagator` from
+        // `build_router_with_audit`; both calls converge on the same
+        // global via OpenTelemetry's `set_text_map_propagator`, which is
+        // last-writer-wins but safe to call repeatedly with the same
+        // propagator type.
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+
         let filter = build_filter(level);
         let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
         let registry = tracing_subscriber::registry().with(filter).with(otel_layer);

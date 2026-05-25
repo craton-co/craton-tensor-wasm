@@ -24,6 +24,14 @@ base64 = "0.22"
 dashmap.workspace = true
 hyper.workspace = true
 opentelemetry = { workspace = true }
+# opentelemetry_sdk: needed only for `TraceContextPropagator` so the gateway
+# can install the W3C propagator on startup and have the trace context
+# extracted from inbound `traceparent` headers stitch correctly into the
+# tracing span tree. The SDK is already declared in `[workspace.dependencies]`
+# alongside `opentelemetry-otlp`; pulling it in unconditionally here keeps
+# the propagation path enabled without forcing every binary to also enable
+# the OTLP exporter feature on `tensor-wasm-core`.
+opentelemetry_sdk = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
