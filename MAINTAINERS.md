@@ -20,6 +20,34 @@ Company**, but maintainer status is not contingent on employment with
 the sponsor. See [`GOVERNANCE.md`](GOVERNANCE.md#maintainer) for the
 role definition.
 
+## Placeholders are by design
+
+Every `TBD` cell in this file is **intentional**, not an unfinished
+draft. Each placeholder has a documented unblock trigger:
+
+- **Lead maintainer** (1 slot): filled by internal selection from the
+  active-maintainer pool per
+  [`GOVERNANCE.md`](GOVERNANCE.md#maintainer-onboarding); see the
+  "Lead maintainer" section below for the exact recruitment flow and
+  what changes about decision-making while the slot is empty.
+- **Active maintainers** (registry): filled by the standard onboarding
+  RFC + simple-majority approval process in `GOVERNANCE.md`.
+- **Security committee** (2 slots): a subset of active maintainers;
+  filled after the active list has at least two members and the
+  committee is constituted per `SECURITY.md` §"Backport policy".
+- **Area ownership** (13 cells × 2 columns each = 26 placeholders):
+  filled as maintainers join. Until then, every area is jointly
+  reviewed; the absence of named owners is the binding rule, not a
+  documentation gap.
+
+The v0.x convention is: do not invent placeholder names. When a real
+person fills a slot, this file is amended in the same PR that adds
+them to `GOVERNANCE.md`-recognized rights (GH team, security
+mailing list, etc.). v1.0 will not ship while a quorum-blocking
+slot is still `TBD`; see `PATH-TO-V1.md` v1.0 exit criteria.
+
+
+
 ## Contact
 
 - General project mail and Code-of-Conduct reports: `security@craton.com.ar`
