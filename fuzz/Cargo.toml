@@ -12,12 +12,18 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 
 tensor-wasm-core = { path = "../crates/tensor-wasm-core" }
+tensor-wasm-api = { path = "../crates/tensor-wasm-api" }
 tensor-wasm-jit = { path = "../crates/tensor-wasm-jit" }
 tensor-wasm-snapshot = { path = "../crates/tensor-wasm-snapshot" }
 tensor-wasm-wasi-gpu = { path = "../crates/tensor-wasm-wasi-gpu" }
 wasmtime = { version = "25", default-features = false, features = ["async", "cranelift", "runtime"] }
 tokio = { version = "1.40", features = ["rt", "macros"] }
 wat = "1"
+# The audit-log round-trip target needs `Uuid: Arbitrary`, which the
+# `uuid` crate gates behind its own `arbitrary` feature.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde", "arbitrary"] }
 
 [[bin]]
 name = "fuzz_wasm_compile"
@@ -43,6 +49,20 @@ bench = false
 [[bin]]
 name = "fuzz_wasi_cuda_abi"
 path = "fuzz_targets/fuzz_wasi_cuda_abi.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "token_scope_parser"
+path = "fuzz_targets/token_scope_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_json_round_trip"
+path = "fuzz_targets/audit_json_round_trip.rs"
 test = false
 doc = false
 bench = false
