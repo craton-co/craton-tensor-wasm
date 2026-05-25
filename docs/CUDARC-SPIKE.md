@@ -26,6 +26,7 @@ The corollary on the `cust` side: `cust 0.3.2` itself fails to compile on `night
 | Crate | Version | Default features | Enabled features | Rationale |
 |---|---|---|---|---|
 | `cudarc` | `0.13` | none | `driver`, `cuda-12000` | Latest 0.13.x line on crates.io as of 2026-05; `0.13` is the stable series the maintainer has been backport-fixing since late 2025. `driver` selects the CUDA Driver API surface (mirrors what `cust::sys` exposes today). `cuda-12000` pins the bindings against CUDA 12.0 headers, which matches the toolkit on the proposed S22 self-hosted runner (CUDA 12.4) and is forward-compatible with CUDA 12.x driver releases per NVIDIA's ABI policy. The `runtime` feature is deliberately *not* enabled — TensorWasm uses the Driver API exclusively (same as `cust`) so pulling in the Runtime API would double our `dlopen` surface for no benefit. |
+| `cuda-host` (cuda-oxide) | `0.1` (alpha) | n/a | TBD per [`rfcs/0001-cuda-oxide-integration.md`](../rfcs/0001-cuda-oxide-integration.md) | Added to this table 2026-05-25. Gated behind a separate `cuda-oxide-backend` feature flag scaffolded at v0.3.1; coexists with `cudarc-backend` and the cust default through v0.4.x. Requires the `nightly-2026-04-03` toolchain override documented in `docs/CUDA-SETUP.md`. Default-pick at v0.5 is contingent on cuda-oxide reaching v0.2.0 with a stable host API; if it doesn't, `cudarc-backend` (this spike) becomes the v0.5 default. |
 
 ### Why not `0.14` / `0.15`?
 
@@ -100,6 +101,8 @@ As above (sys-level call). Once gap #1 is closed upstream, this collapses to a 1
 ---
 
 ## Recommendation: cutover plan
+
+> **Update (2026-05-25):** NVlabs published `cuda-oxide` v0.1.0 alpha on 2026-05-09, after this spike's recommendation was written. [`rfcs/0001-cuda-oxide-integration.md`](../rfcs/0001-cuda-oxide-integration.md) supersedes the v0.2-cutover suggestion below with a three-way live evaluation (`cust` / `cudarc-backend` / `cuda-oxide-backend`) across v0.3.x and v0.4.x, and a contingent default flip at v0.5. The cudarc recommendation here is **still valid as the v0.3.x default and as the v0.5 fallback if cuda-oxide isn't ready** — read the rest of this section with that framing.
 
 **Recommendation: cut over in v0.2.** The mapping is mechanical, the safety story is no worse than today, and dragging `cust` through another release is a security-patch hazard (the EOL'd dep has no upstream owner). The spike has surfaced no architectural blocker.
 

@@ -33,6 +33,8 @@ Last updated: 2026-05-24 (v0.1.0)
 - Cut the default backend over to `cudarc` in v0.2 once the S22 runner validates the spike end-to-end (see `docs/CUDARC-SPIKE.md` for the proposed cutover plan).
 - Maintain an internal fork of `cust` for security backports if the cutover slips to v0.3.
 
+A third option has appeared since W1.2 wrote the spike: NVlabs `cuda-oxide` v0.1.0 alpha (released 2026-05-09) is now under evaluation per [`rfcs/0001-cuda-oxide-integration.md`](../rfcs/0001-cuda-oxide-integration.md), which proposes a three-way live evaluation with a contingent v0.5 default flip.
+
 **Owner:** GPU integration maintainers.
 
 ---

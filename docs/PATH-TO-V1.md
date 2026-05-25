@@ -350,6 +350,8 @@ criterion. Assign owners and resolve before the milestone they gate.
 Proposed: `cudarc`. Migration is a v0.2 PR. Spike first to confirm
 WASI-GPU host-fn surface still maps cleanly.
 
+_Update (2026-05-25): see [`rfcs/0001-cuda-oxide-integration.md`](../rfcs/0001-cuda-oxide-integration.md) — `cuda-oxide` added as a third option; default-pick contingent on its v0.2 release._
+
 ### 2. Default auth model (gates v0.4)
 
 Today: bearer tokens via `TENSOR_WASM_API_TOKENS`. v1.0 options:
