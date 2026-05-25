@@ -11,6 +11,7 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use tower::ServiceBuilder;
 
+use crate::audit::{audit_log_middleware, AuditConfig};
 use crate::middleware::{
     bearer_auth, body_limit_layer, concurrency_limit_layer, tenant_scope, timeout_layer,
     trace_layer_with_propagation, AuthConfig, TenantConfig, MAX_REQUEST_BODY_BYTES,
@@ -38,7 +39,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let auth = AuthConfig::from_env();
     let tenant = TenantConfig::from_env();
     let limiter = RateLimiter::new(RateLimitConfig::from_env());
-    build_router_with_full_config(state, auth, tenant, limiter)
+    let audit = AuditConfig::from_env();
+    build_router_with_audit(state, auth, tenant, limiter, audit)
 }
 
 /// Build the router with explicit auth / tenant config and the rate limiter
@@ -61,20 +63,40 @@ pub fn build_router_with_config(
 /// Build the router with explicitly supplied auth, tenant, and rate-limit
 /// config. Used by integration tests so they can drive the gateway without
 /// poisoning the process environment.
+///
+/// The audit log defaults to the no-op sink in this constructor: existing
+/// integration tests that pre-date the audit middleware must not have
+/// their stdout polluted by audit records. Tests that exercise the audit
+/// path explicitly should call [`build_router_with_audit`].
 pub fn build_router_with_full_config(
     state: Arc<AppState>,
     auth: AuthConfig,
     tenant: TenantConfig,
     limiter: RateLimiter,
 ) -> Router {
-    // The outer ServiceBuilder is layered top-to-bottom: tracing is the
-    // outermost layer (so it covers timeouts and rejections), the body
-    // limit guards every downstream layer from oversized payloads,
-    // followed by the per-request timeout and the global concurrency cap.
-    // Auth and tenant resolution are `from_fn` middleware that run after
-    // the size cap (so a request that would be rejected with 413 does
-    // not consume an auth slot). The per-token rate limiter runs after
-    // bearer auth so it can read the AuthContext the auth layer inserts.
+    build_router_with_audit(state, auth, tenant, limiter, AuditConfig::disabled())
+}
+
+/// Build the router with full configuration including the audit sink.
+///
+/// The outer ServiceBuilder is layered top-to-bottom: tracing is the
+/// outermost layer (so it covers timeouts and rejections), the body
+/// limit guards every downstream layer from oversized payloads,
+/// followed by the per-request timeout and the global concurrency cap.
+/// Auth and tenant resolution are `from_fn` middleware that run after
+/// the size cap (so a request that would be rejected with 413 does
+/// not consume an auth slot). The per-token rate limiter runs after
+/// bearer auth so it can read the AuthContext the auth layer inserts.
+/// The audit middleware sits innermost, after every other layer has
+/// resolved the actor / tenant / scope, so the synthesised record
+/// captures the same identity the handler saw.
+pub fn build_router_with_audit(
+    state: Arc<AppState>,
+    auth: AuthConfig,
+    tenant: TenantConfig,
+    limiter: RateLimiter,
+    audit: AuditConfig,
+) -> Router {
     let global_layers = ServiceBuilder::new()
         .layer(trace_layer_with_propagation())
         .layer(body_limit_layer(MAX_REQUEST_BODY_BYTES))
@@ -86,9 +108,13 @@ pub fn build_router_with_full_config(
         .layer(axum::Extension(auth))
         .layer(axum::Extension(tenant))
         .layer(axum::Extension(limiter))
+        .layer(axum::Extension(audit))
         .layer(axum::middleware::from_fn(bearer_auth))
         .layer(axum::middleware::from_fn(tenant_scope))
-        .layer(axum::middleware::from_fn(rate_limit));
+        .layer(axum::middleware::from_fn(rate_limit))
+        // Audit emission is the innermost middleware: it sees the final
+        // status code and any AuditOutcomeExt the handler stamped.
+        .layer(axum::middleware::from_fn(audit_log_middleware));
 
     Router::new()
         .route("/healthz", get(healthz))

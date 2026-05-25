@@ -300,13 +300,23 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Snapshot the kind before moving it into the envelope so the
+        // audit middleware can recover it from the response extensions
+        // without re-parsing the JSON body.
+        let audit_kind = self.kind.clone();
         let body = ApiErrorEnvelope {
             error: ApiErrorBody {
                 kind: self.kind,
                 message: self.message,
             },
         };
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        response
+            .extensions_mut()
+            .insert(crate::audit::AuditOutcomeExt {
+                error_kind: audit_kind,
+            });
+        response
     }
 }
 

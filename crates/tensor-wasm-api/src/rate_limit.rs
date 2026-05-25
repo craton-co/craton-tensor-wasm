@@ -65,6 +65,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use dashmap::DashMap;
+use serde::Serialize;
 use serde_json::json;
 use tensor_wasm_core::types::TenantId;
 
@@ -84,7 +85,8 @@ use crate::token_scope::TokenScope;
 /// In **dev mode** (empty allowlist) every request shares [`TokenId::DEV`]
 /// so a single shared bucket throttles dev-mode traffic exactly the same way
 /// as it would a single allowlisted production token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
 pub struct TokenId(pub u64);
 
 impl TokenId {

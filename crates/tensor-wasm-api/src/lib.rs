@@ -31,23 +31,37 @@
 //!   either zero or unset disables the limiter. Rejections return
 //!   `429 Too Many Requests` with a `Retry-After` header. See
 //!   [`rate_limit`].
+//! * **Audit log.** Every state-mutating call (`POST /functions`,
+//!   `DELETE /functions/{id}`, `POST /functions/{id}/invoke[-async]`)
+//!   emits a structured JSON record to the sink selected by
+//!   `TENSOR_WASM_API_AUDIT_LOG` (default: stdout). Read-only routes
+//!   emit nothing. See [`audit`] and `docs/AUDIT-LOG.md`.
 //!
 //! See [`API.md`](../API.md) for the wire-format contract.
 #![deny(missing_docs)]
 
+pub mod audit;
 pub mod middleware;
 pub mod rate_limit;
 pub mod routes;
 pub mod server;
 pub mod token_scope;
 
+pub use audit::{
+    audit_log_middleware, AuditAction, AuditActor, AuditActorKind, AuditConfig, AuditOutcome,
+    AuditRecord, AuditResource, AuditSink, FileJsonSink, NoopSink, StdoutJsonSink,
+    TokenScopeView, ENV_AUDIT_LOG,
+};
 pub use middleware::{
     AuthConfig, TenantConfig, ENV_API_TOKENS, ENV_REQUIRE_TENANT, HEADER_TENANT,
     MAX_REQUEST_BODY_BYTES,
 };
 pub use rate_limit::{AuthContext, RateLimitConfig, RateLimiter, TokenId};
 pub use routes::{ApiError, AppState, FunctionRecord, JobRecord, JobStatus};
-pub use server::{build_router, build_router_with_config, build_router_with_full_config, serve};
+pub use server::{
+    build_router, build_router_with_audit, build_router_with_config,
+    build_router_with_full_config, serve,
+};
 pub use token_scope::{
     parse_token_entry, parse_tokens_env, ParsedTokens, ScopeParseError, TenantScope, TokenScope,
 };

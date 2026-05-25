@@ -171,6 +171,37 @@ Retry-After: 1
 Buckets are per-token, sharded by `dashmap`, and recover on a lazy
 refill-on-take schedule. No external store (Redis, etc.) is required.
 
+### Audit log
+
+Every state-mutating API call (`POST /functions`, `DELETE
+/functions/{id}`, `POST /functions/{id}/invoke`, `POST
+/functions/{id}/invoke-async`) emits a single JSON line to the audit
+sink. Read-only calls (`GET /healthz`, `GET /metrics`, `GET /jobs/{id}`)
+emit nothing — they are intentionally suppressed to keep the stream
+useful.
+
+The destination sink is selected at server startup by
+`TENSOR_WASM_API_AUDIT_LOG`:
+
+| Value                     | Resulting sink                                                |
+|---------------------------|----------------------------------------------------------------|
+| (unset) or `stdout`       | One JSON object per line on stdout (the default).             |
+| `none`                    | Audit disabled. Useful when Prometheus + OTel are sufficient. |
+| `file:/path/to/audit.log` | Append-only JSONL file at the given path.                     |
+
+Each record carries the actor (bearer-token id + scope), the action,
+the resource (function id + tenant), the outcome (status code +
+`error.kind` for non-2xx), an end-to-end latency in milliseconds, and
+a per-request UUID also stamped into the request extensions so handlers
+can correlate their own logs. When an XFCC-aware reverse proxy fronts
+the gateway (see [`docs/deployment/mtls.md`](../../docs/deployment/mtls.md)),
+the parsed `Subject` from `X-Forwarded-Client-Cert` is recorded as
+`client_cert_subject`.
+
+The wire-format schema, sample records, log-rotation guidance, latency
+budget, and the mTLS / XFCC trust boundary are documented end-to-end in
+[`docs/AUDIT-LOG.md`](../../docs/AUDIT-LOG.md).
+
 ### Error envelope
 
 Every non-2xx response carries the same JSON envelope:
@@ -433,6 +464,11 @@ Every route is wrapped in the standard tower stack assembled by
   Reads `TENSOR_WASM_API_RATE_LIMIT_QPS` and `TENSOR_WASM_API_RATE_LIMIT_BURST`;
   no-op when either is unset or zero. Returns `429` + `Retry-After` on
   bucket-empty.
+* [`audit_log_middleware`](src/audit.rs) — emits one JSON record per
+  state-mutating call to the sink selected by `TENSOR_WASM_API_AUDIT_LOG`
+  (default stdout, `file:/path` for an append-only file, `none` to
+  disable). Runs innermost so the recorded outcome reflects the final
+  status code; suppresses read-only routes via a path-shape filter.
 
 The stack composition lives in `server.rs` so individual middleware can be
 re-used by integration tests and benchmarks. See
