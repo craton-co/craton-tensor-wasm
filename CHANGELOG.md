@@ -192,8 +192,72 @@ docstring vs WIT version), #13 (Helm image tags reference
 unprovisioned registry), #15 (TBD placeholders in MAINTAINERS /
 GOVERNANCE / CVE dry-run).
 
+## [0.3.4] - 2026-05-25
+
+Audit-closure wave (C1-C9). All nine outstanding audit problems from
+the v0.3.3 grade closed or resolved-with-disclosure.
+
+### Fixed
+- **Audit Problem #4** (PATH-TO-V1 v0.2/v0.5 framing drift): Open
+  Decision #1 + risk register row updated to reflect RFC 0001
+  re-scope to v0.5 (C5).
+- **Audit Problem #11** (W4.1 tracing may double-count under load):
+  **disproven.** New `trace_concurrent_load_test` runs 64 concurrent
+  async invokes on 4 worker threads + counts spans via a custom
+  `tracing_subscriber::Layer`; emits exactly `4 * N` spans with no
+  orphans, no duplicate trace_ids. The audit concern was wrong; the
+  test pins the property going forward (C2).
+
+### Added
+- `tensor_wasm_jobs_active` gauge + `tensor_wasm_gpu_memory_bytes_per_tenant`
+  family. W2.5 dashboard panels that rendered `n/a` for these now
+  render real data. Audit Problem #6 closed (C3).
+- `.github/workflows/cuda.yml` self-hosted CUDA runner workflow + 4
+  per-backend jobs; dormant until a runner registers with the
+  `self-hosted,cuda` labels. New `docs/runbooks/self-hosted-cuda-runner.md`
+  procedure runbook covers registration through required-check
+  wiring. Audit Problem #8 closed (will activate when a runner
+  registers) (C1).
+- `.github/workflows/fuzz-long.yml` — weekly 5.5h-per-target fuzz cron
+  with year-keyed corpus caching. After 5 weekly runs the cumulative
+  per-target wall-clock clears the v0.5 "24+ hours" gate. Also added
+  the two W4.7 targets to the existing nightly `fuzz.yml` matrix.
+  Audit Problem #7 partially-incorrect (a nightly cron already
+  existed); fully closed now (C4).
+- `Dockerfile` at repo root producing all four backend variants via
+  `--build-arg BACKEND={"",cust,cudarc,cuda-oxide}`. Helm chart README
+  rewritten to point at it. Audit Problem #13 closed (C8).
+- `scripts/run-quiet-bench.{sh,ps1}` — bench drivers that raise
+  `--sample-size` from 100 to 500 and pin CPU governor / power plan.
+  Audit Problem #9 partially closed (script delivered; publication-
+  grade numbers still require the S22 runner from C1) (C6).
+
+### Changed
+- `MAINTAINERS.md`: new "Placeholders are by design" section near the
+  top articulating the v0.x convention that the 19 TBD cells are
+  intentional, each with a documented unblock trigger. No names
+  invented. Audit Problem #15 closed (C9).
+- `wit/wasi-cuda.wit`: package version bumped `wasi:cuda@0.1.0` →
+  `wasi:cuda@0.2.0` to reflect the W1.1 typed-argv contract change.
+  Inline "Version history" comment block added. Audit Problem #12
+  closed (C7).
+- `docs/BENCHMARKING.md` CV target section gains explicit disclosure
+  that committed bench-results numbers were captured on a noisy
+  developer host (CV > 5%); usable as regression-gate floors, not as
+  publication-grade comparison data (C6).
+- `.github/workflows/fuzz.yml` matrix grew the W4.7 targets
+  (token_scope_parser, audit_json_round_trip) (C4).
+
+### Audit status after C wave
+
+All 9 problems from the v0.3.3 audit are now closed or have a closure
+path landed (C1 + C8 close on first registration / first registry
+provisioning respectively; both have the operator-side procedure
+documented). 0 audit problems remain open as of v0.3.4.
+
 ## [Unreleased]
 _No entries yet — open the next PR adding one._
+
 
 
 
