@@ -19,7 +19,7 @@ name = "tensor-wasm"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 clap.workspace = true
 clap_complete.workspace = true
 anyhow.workspace = true

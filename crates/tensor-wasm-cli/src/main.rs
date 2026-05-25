@@ -68,6 +68,8 @@ pub enum Command {
     },
     /// Fetch and pretty-print Prometheus metrics from a TensorWasm server.
     Metrics(cmd::metrics::MetricsArgs),
+    /// Live operator dashboard over `/healthz` + `/metrics` (refreshes in place).
+    Observe(cmd::observe::ObserveArgs),
     /// Emit shell completion scripts for the named shell.
     Completions {
         /// Target shell (bash, zsh, fish, powershell, elvish).
@@ -97,6 +99,7 @@ async fn main() {
         Command::Bench(args) => cmd::bench::run(args).await,
         Command::Snapshot { action } => cmd::snapshot::run(action, &ctx).await,
         Command::Metrics(args) => cmd::metrics::run(args, &ctx).await,
+        Command::Observe(args) => cmd::observe::run(args, &ctx).await,
         Command::Completions { shell } => cmd::completions::run(shell),
     };
 

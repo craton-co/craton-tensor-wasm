@@ -17,6 +17,7 @@ pub mod completions;
 pub mod deploy;
 pub mod invoke;
 pub mod metrics;
+pub mod observe;
 pub mod run;
 pub mod snapshot;
 

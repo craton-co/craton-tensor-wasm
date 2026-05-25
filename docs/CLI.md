@@ -91,6 +91,45 @@ Capture or restore an instance's state from a `.tensor-wasm` archive. `tensor-wa
 
 Fetch and pretty-print the `/metrics` endpoint of a TensorWasm server. The output is the raw Prometheus text exposition; pipe to `grep '^tensor_wasm_'` to filter to TensorWasm's own series.
 
+### `tensor-wasm observe [--addr <host:port>] [--interval <secs>]`
+
+Live operator dashboard. Polls `GET /healthz` and `GET /metrics` against the target server on a fixed cadence and rewrites a single screen with the most actionable signals. Intended for on-call incident triage when neither a browser nor a Grafana session is available.
+
+- `--addr <url>`: base URL of the target server. Defaults to `http://localhost:8080`. Must use `http://` or `https://` and have a non-empty host.
+- `--interval <secs>`: refresh cadence, in seconds. Defaults to `2`. Must be at least `1`.
+
+Auth/tenant headers (`Authorization: Bearer ...`, `X-TensorWasm-Tenant`) are attached when configured, identical to every other HTTP-shaped subcommand. The refresh loop exits cleanly on Ctrl-C; per-tick fetch failures (network blips, server restart) are rendered into the board rather than aborting the loop.
+
+Example:
+
+```bash
+TENSOR_WASM_TOKEN=devtoken tensor-wasm observe --addr https://tensor-wasm.example.com --interval 5
+```
+
+Sample output:
+
+```
+Craton TensorWasm — operator dashboard
+target: http://localhost:8080   interval: 2s
+--------------------------------------------------
+liveness:   /healthz ok
+uptime:     n/a
+functions:  ?
+jobs.active:?
+instances:  3
+gpu.memory: 1.00 GiB
+--------------------------------------------------
+endpoint                  req/s     p50      p95
+/healthz                     4.50   n/a     n/a
+/invoke                     10.00  10.0ms 275.0ms
+--------------------------------------------------
+Ctrl-C to exit.
+```
+
+Cells render as `?` (for counts) or `n/a` (for percentages, latencies) when the underlying Prometheus series is absent from the scrape — for example, `tensor_wasm_functions_total` and `tensor_wasm_jobs_active` are reserved series names not yet emitted by `tensor-wasm-core::metrics`, so they show `?` against current servers until they land. The dashboard never substitutes a misleading zero.
+
+Prometheus parsing is done in-process with a small inline parser; no extra dependency is pulled in for the dashboard. The histogram percentiles use linear interpolation across the `_bucket` series, matching PromQL's `histogram_quantile()` for buckets that share a `path` label.
+
 ### `tensor-wasm completions <shell>`
 
 Emit a shell-completion script on stdout for the named shell. Supported values match `clap_complete::Shell`: `bash`, `zsh`, `fish`, `elvish`, `powershell`.
