@@ -1,0 +1,131 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Craton Software Company
+#
+# CUDA-bound CI on a self-hosted runner.
+#
+# This workflow is dormant until a runner registers with both the
+# `self-hosted` and `cuda` labels. While no such runner exists, every
+# trigger is a no-op (GitHub silently queues the job; the workflow
+# does not surface as a required check because nothing claims the job).
+# Once the runner registers, every push and PR exercises the real
+# CUDA paths (cust, cudarc, cuda-oxide-backend) against actual GPU
+# silicon — closing audit Problem #8.
+#
+# Runner registration runbook: see `docs/runbooks/self-hosted-cuda-runner.md`.
+# Per PATH-TO-V1 v0.2 milestone exit criterion ("S22 self-hosted CUDA
+# runner online in CI").
+
+name: cuda
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # No -D warnings here; some cust+nightly drift surfaces as warning
+  # noise on the CUDA path. The default `ci` workflow handles
+  # warning-strictness on the no-CUDA host build.
+  RUSTFLAGS: ""
+
+jobs:
+  cust-unified-memory:
+    name: cust + unified-memory
+    runs-on: [self-hosted, cuda]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain (workspace pin)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Confirm GPU + driver
+        run: |
+          nvidia-smi
+          nvcc --version
+      - name: Build (--features unified-memory)
+        run: cargo build -p tensor-wasm-mem --release --features unified-memory
+      - name: tensor-wasm-mem lib tests (--features unified-memory)
+        # Run single-threaded -- cust 0.3's primary-context model does
+        # not survive parallel test execution. The serial run mirrors
+        # the W5.9 / F4 / B5 workaround the dev box documented.
+        run: cargo test -p tensor-wasm-mem --release --lib --features unified-memory -- --test-threads=1
+
+  wasi-gpu-cuda:
+    name: wasi-gpu + cuda
+    runs-on: [self-hosted, cuda]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain (workspace pin)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build (--features cuda)
+        run: cargo build -p tensor-wasm-wasi-gpu --release --features cuda
+      - name: Kernel-args E2E tests (--features cuda --include-ignored)
+        # Includes the B2 vector_add_end_to_end_real_ptx_real_kernel
+        # test that proves Wasm -> wasi-cuda -> cuLaunchKernel ->
+        # readback. The dev box (SM_75 + WDDM) ran all 7 green; the
+        # self-hosted runner should match.
+        run: cargo test -p tensor-wasm-wasi-gpu --release --features cuda --test kernel_args_e2e -- --include-ignored
+
+  cudarc-backend:
+    name: cudarc-backend smoke
+    runs-on: [self-hosted, cuda]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain (workspace pin)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build (--features cudarc-backend)
+        run: cargo build -p tensor-wasm-mem --release --features cudarc-backend
+      - name: cudarc smoke (--include-ignored)
+        # 5/6 pass on Windows WDDM (the failing one is the documented
+        # concurrentManagedAccess limitation). Linux datacenter GPU
+        # should pass all 6.
+        run: cargo test -p tensor-wasm-mem --release --features cudarc-backend --test cudarc_smoke -- --include-ignored
+
+  cuda-oxide-backend:
+    name: cuda-oxide-backend scaffold
+    runs-on: [self-hosted, cuda]
+    timeout-minutes: 30
+    # cuda-oxide pins nightly-2026-04-03 (matches the workspace post-F4).
+    # The scaffold from O2 returns "not yet wired" sentinels; this job
+    # asserts compilation only. v0.4 cutover replaces with real tests.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain (workspace pin)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build (--features cuda-oxide-backend)
+        run: cargo build -p tensor-wasm-mem --release --features cuda-oxide-backend
+      - name: cuda-oxide scaffold smoke
+        run: cargo test -p tensor-wasm-mem --release --features cuda-oxide-backend --test cuda_oxide_smoke
