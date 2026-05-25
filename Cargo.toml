@@ -59,6 +59,48 @@ ptx-builder = "0.5"
 # the cust → cudarc migration spike (see `docs/CUDARC-SPIKE.md`) lands.
 cudarc = { version = "0.13", default-features = false, features = ["driver", "cuda-12000"] }
 
+# cuda-oxide — NVIDIA Labs' new Rust-to-CUDA compiler + host runtime, v0.1.0
+# alpha released 2026-05-09 (repo: github.com/NVlabs/cuda-oxide). Adopted as
+# the v0.5 cust successor per RFC 0001 (rfcs/0001-cuda-oxide-integration.md).
+# The three host-side crates we depend on here are `cuda-host` (the RAII
+# runtime: contexts, allocations, streams), `cuda-core` (the underlying
+# FFI surface that `cuda-host` wraps), and `cuda-async` (Tokio integration
+# for the back-pressure / future-sync path benchmarked in W4.6). The
+# kernel-authoring crates (`cuda-device`, `cuda-macros`) are NOT pulled in
+# here; the W4.5 "Path C" kernel-authoring surface lands in a follow-up.
+#
+# TOOLCHAIN CONFLICT: cuda-oxide pins `nightly-2026-04-03` in its own
+# rust-toolchain.toml. TensorWasm pins `nightly-2026-03-15`. The
+# `cuda-oxide-backend` feature on `tensor-wasm-mem` is opt-in for v0.3.x
+# precisely because of this gap — enabling the feature requires a local
+# toolchain bump (`RUSTUP_TOOLCHAIN=nightly-2026-04-03 cargo build
+# --features cuda-oxide-backend`) or a `rust-toolchain.toml` override on
+# the contributor's branch. The workspace default toolchain bump to a
+# nightly that satisfies cuda-oxide is scheduled for v0.4 per RFC 0001
+# "Toolchain plan" step 3. DO NOT bump rust-toolchain.toml as part of
+# adding this dependency.
+#
+# Pliron (cuda-oxide's MLIR-like IR framework) is pinned in cuda-oxide's
+# own Cargo.toml to a git revision rather than crates.io. That pin
+# transitively lands in our lockfile when the feature is enabled; see
+# docs/REPRODUCIBLE-BUILDS.md for the cargo-deny allowlist row that the
+# v0.4 PR will add.
+#
+# TODO(v0.4 / when cuda-oxide ships v0.2): re-check whether `cuda-host`,
+# `cuda-core`, `cuda-async` are still the right entry points and whether
+# Pliron has published to crates.io.
+#
+# Source: NVlabs/cuda-oxide is published on GitHub but its workspace members
+# (`cuda-host`, `cuda-core`, `cuda-async`) are NOT yet on crates.io as of
+# 2026-05-25 (the crates.io `cuda-oxide` name is a different, unrelated
+# 2018-era project). For v0.3.1 we pin via git rev so the dep is at least
+# resolvable; v0.4 should switch to crates.io versions once NVlabs publishes.
+# The rev "main" is replaced with a frozen commit hash by the v0.4 cutover PR
+# to satisfy `docs/REPRODUCIBLE-BUILDS.md`.
+cuda-host  = { git = "https://github.com/NVlabs/cuda-oxide", branch = "main", default-features = false }
+cuda-core  = { git = "https://github.com/NVlabs/cuda-oxide", branch = "main", default-features = false }
+cuda-async = { git = "https://github.com/NVlabs/cuda-oxide", branch = "main", default-features = false }
+
 # HTTP / API
 axum = { version = "0.7", features = ["macros", "tracing"] }
 tower = { version = "0.5", features = ["full"] }

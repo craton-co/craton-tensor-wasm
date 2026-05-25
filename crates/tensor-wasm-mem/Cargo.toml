@@ -25,6 +25,13 @@ tracing.workspace = true
 wasmtime.workspace = true
 cust = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
+# cuda-oxide host-runtime crates — pulled in only under the opt-in
+# `cuda-oxide-backend` feature. See RFC 0001 (rfcs/0001-cuda-oxide-integration.md)
+# for adoption rationale and the workspace Cargo.toml comment block for the
+# nightly-2026-04-03 toolchain caveat.
+cuda-host = { workspace = true, optional = true }
+cuda-core = { workspace = true, optional = true }
+cuda-async = { workspace = true, optional = true }
 
 [dev-dependencies]
 wat.workspace = true
@@ -45,6 +52,19 @@ unified-memory = ["dep:cust"]
 # default; both backends coexist for the v0.2 spike. See
 # `docs/CUDARC-SPIKE.md` for the API mapping and cutover plan.
 cudarc-backend = ["dep:cudarc"]
+# `cuda-oxide-backend` is the v0.5 cust-successor scaffold (RFC 0001 —
+# rfcs/0001-cuda-oxide-integration.md). When enabled it pulls in the
+# `cuda-host`, `cuda-core`, and `cuda-async` crates from NVIDIA Labs'
+# cuda-oxide v0.1.0 release and exposes a stub `CudaOxideUnifiedBuffer`
+# under `crate::cuda_oxide_backend`. v0.3.1 ships the FEATURE FLAG and an
+# empty module only — the unified-memory port lands at v0.4. The feature
+# is intentionally mutually compatible with `unified-memory` and
+# `cudarc-backend`; enabling all three at once is valid (and is what CI
+# will exercise once the toolchain story is settled). Enabling this
+# feature on the workspace's pinned nightly-2026-03-15 toolchain WILL
+# fail to build — see the workspace Cargo.toml comment for the
+# nightly-2026-04-03 override required by cuda-oxide.
+cuda-oxide-backend = ["dep:cuda-host", "dep:cuda-core", "dep:cuda-async"]
 
 [package.metadata.docs.rs]
 all-features = false
