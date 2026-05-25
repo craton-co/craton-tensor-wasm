@@ -1,0 +1,544 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Craton Software Company
+#
+# OpenAPI 3.1 description of the Craton TensorWasm HTTP API gateway.
+#
+# This file is the canonical machine-readable contract for the
+# tensor-wasm-api router defined in crates/tensor-wasm-api/src/server.rs and
+# handler set in crates/tensor-wasm-api/src/routes.rs. The
+# `openapi_validation_test` integration test (under the same crate's tests/
+# directory) asserts that every route registered on the live axum router
+# has a corresponding `paths` entry below and that the request body schema
+# for `POST /functions` round-trips a real `CreateFunctionRequest` Rust
+# value. CI runs the test on every PR; see .github/workflows/ci.yml job
+# `openapi`.
+#
+# Indentation is two spaces. Top-level keys (openapi, info, servers, …)
+# sit at column 0; the `paths:` map's keys (e.g. `/healthz:`) sit at
+# column 2 so the test's structural scan can pick them up. Do not
+# introduce tab characters or alternative indentation widths without
+# updating the parser in openapi_validation_test.rs.
+
+openapi: 3.1.0
+info:
+  title: TensorWasm HTTP API
+  description: |
+    REST surface of a Craton TensorWasm serverless Wasm node. Prose
+    documentation, error semantics, and the full middleware stack live in
+    crates/tensor-wasm-api/API.md.
+  version: 0.1.0
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  contact:
+    name: Craton Software Company
+    email: security@craton.com.ar
+    url: https://github.com/craton-co/craton-tensor-wasm
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+security:
+  - BearerAuth: []
+tags:
+  - name: lifecycle
+    description: Function deploy / delete
+  - name: invoke
+    description: Synchronous and asynchronous invocations
+  - name: jobs
+    description: Async-job poll API
+  - name: ops
+    description: Operator-facing endpoints (health, metrics)
+
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Liveness probe
+      operationId: healthz
+      security: []
+      responses:
+        "200":
+          description: Service is alive
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus text exposition
+      operationId: metrics
+      responses:
+        "200":
+          description: Prometheus 0.0.4 text exposition
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /functions:
+    post:
+      tags: [lifecycle]
+      summary: Deploy a new Wasm module
+      operationId: createFunction
+      parameters:
+        - $ref: "#/components/parameters/TenantHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateFunctionRequest"
+      responses:
+        "200":
+          description: Function deployed
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateFunctionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /functions/{id}:
+    delete:
+      tags: [lifecycle]
+      summary: Delete a deployed function
+      operationId: deleteFunction
+      parameters:
+        - $ref: "#/components/parameters/FunctionId"
+        - $ref: "#/components/parameters/TenantHeader"
+      responses:
+        "204":
+          description: Function removed
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /functions/{id}/invoke:
+    post:
+      tags: [invoke]
+      summary: Invoke a function synchronously
+      operationId: invokeFunction
+      parameters:
+        - $ref: "#/components/parameters/FunctionId"
+        - $ref: "#/components/parameters/TenantHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              description: |
+                Arbitrary JSON payload threaded through as the invocation
+                argument. The v0.x executor ignores the value; the field
+                is reserved for future use.
+      responses:
+        "200":
+          description: Invocation complete
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvokeResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "504":
+          $ref: "#/components/responses/InvokeTimeout"
+
+  /functions/{id}/invoke-async:
+    post:
+      tags: [invoke]
+      summary: Invoke a function asynchronously
+      operationId: invokeFunctionAsync
+      parameters:
+        - $ref: "#/components/parameters/FunctionId"
+        - $ref: "#/components/parameters/TenantHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              description: |
+                Arbitrary JSON payload, same shape as the synchronous
+                invoke endpoint.
+      responses:
+        "202":
+          description: Job accepted
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvokeAsyncResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /jobs/{id}:
+    get:
+      tags: [jobs]
+      summary: Poll an async-invocation job
+      operationId: getJob
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Current job status
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobRecord"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Bearer token from the TENSOR_WASM_API_TOKENS allowlist. Each
+        entry may carry a `:tenant=...` clause restricting the token to
+        a subset of tenants; see API.md `Per-tenant scopes`. An empty
+        allowlist puts the gateway in dev mode (auth disabled).
+
+  parameters:
+    FunctionId:
+      name: id
+      in: path
+      required: true
+      description: Server-assigned function identifier (UUIDv4).
+      schema:
+        type: string
+        format: uuid
+    TenantHeader:
+      name: X-TensorWasm-Tenant
+      in: header
+      required: false
+      description: |
+        Tenant scope (u64). Defaults to 0 if absent. Mandatory when the
+        gateway runs with `TENSOR_WASM_API_REQUIRE_TENANT=1`.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+
+  headers:
+    XRequestId:
+      description: |
+        Per-request UUID stamped by the audit middleware. Operators can
+        correlate audit records, structured logs, and trace events by
+        this id.
+      schema:
+        type: string
+        format: uuid
+    XTraceId:
+      description: |
+        W3C `trace-id` (32 lowercase hex chars) of the current span.
+        Empty string if no trace context is active.
+      schema:
+        type: string
+    RetryAfter:
+      description: |
+        Per RFC 9110 §10.2.3, integer seconds until the next request is
+        likely to succeed. Always at least 1.
+      schema:
+        type: integer
+        minimum: 1
+
+  responses:
+    BadRequest:
+      description: Validation failure
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        X-Trace-Id:
+          $ref: "#/components/headers/XTraceId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorEnvelope"
+    Unauthorized:
+      description: Missing or unrecognised bearer token
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        X-Trace-Id:
+          $ref: "#/components/headers/XTraceId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorEnvelope"
+    Forbidden:
+      description: Bearer token is not scoped to the requested tenant
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        X-Trace-Id:
+          $ref: "#/components/headers/XTraceId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorEnvelope"
+    NotFound:
+      description: Function or job id is unknown
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        X-Trace-Id:
+          $ref: "#/components/headers/XTraceId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorEnvelope"
+    PayloadTooLarge:
+      description: |
+        Request body exceeded the 64 MiB cap enforced by
+        `RequestBodyLimitLayer`. Often rendered as a bare 413 with no
+        body when the limit is hit during streaming.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        X-Trace-Id:
+          $ref: "#/components/headers/XTraceId"
+    RateLimited:
+      description: |
+        Per-token QPS + burst exceeded. The `Retry-After` header carries
+        the wait in integer seconds (RFC 9110 §10.2.3).
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        X-Trace-Id:
+          $ref: "#/components/headers/XTraceId"
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorEnvelope"
+    InternalError:
+      description: Underlying wasmtime or host failure
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        X-Trace-Id:
+          $ref: "#/components/headers/XTraceId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorEnvelope"
+    InvokeTimeout:
+      description: Invocation exceeded its per-call deadline
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        X-Trace-Id:
+          $ref: "#/components/headers/XTraceId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorEnvelope"
+
+  schemas:
+    FunctionId:
+      type: string
+      format: uuid
+      description: Server-assigned function identifier (UUIDv4).
+    JobId:
+      type: string
+      format: uuid
+      description: Server-assigned job identifier (UUIDv4).
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok]
+      required: [status]
+      additionalProperties: false
+    CreateFunctionRequest:
+      type: object
+      description: |
+        Body of `POST /functions`. Mirrors the
+        `tensor_wasm_api::routes::CreateFunctionRequest` Rust struct.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Tenant-supplied display name (free-form, non-empty).
+        wasm_b64:
+          type: string
+          minLength: 12
+          description: |
+            Base64-encoded Wasm module bytes (standard alphabet,
+            padded). Decoded value must validate as a complete Wasm
+            module via `wasmparser::validate`.
+      required: [name, wasm_b64]
+      additionalProperties: false
+    CreateFunctionResponse:
+      type: object
+      properties:
+        id:
+          $ref: "#/components/schemas/FunctionId"
+      required: [id]
+      additionalProperties: false
+    InvokeResult:
+      type: object
+      properties:
+        function_id:
+          $ref: "#/components/schemas/FunctionId"
+        result:
+          type: string
+          description: |
+            Stable string-shaped invocation result. Will widen to the
+            executor's JSON return value once that surface lands.
+      required: [function_id, result]
+      additionalProperties: false
+    InvokeAsyncResponse:
+      type: object
+      properties:
+        job_id:
+          $ref: "#/components/schemas/JobId"
+      required: [job_id]
+      additionalProperties: false
+    JobStatus:
+      type: string
+      enum: [pending, completed, failed]
+      description: |
+        Lifecycle state of an async invocation. `pending` jobs have no
+        result yet; `completed` and `failed` jobs carry a `result`
+        payload (the InvokeResult shape and the ApiErrorBody shape,
+        respectively).
+    JobRecord:
+      type: object
+      properties:
+        id:
+          $ref: "#/components/schemas/JobId"
+        function_id:
+          $ref: "#/components/schemas/FunctionId"
+        status:
+          $ref: "#/components/schemas/JobStatus"
+        result:
+          description: |
+            Present once `status` transitions out of `pending`. For
+            `completed` jobs this is the InvokeResult JSON object;
+            for `failed` jobs it is the ApiErrorBody JSON object.
+        created_unix_ms:
+          type: integer
+          format: int64
+          minimum: 0
+      required: [id, function_id, status, created_unix_ms]
+      additionalProperties: false
+    ApiErrorBody:
+      type: object
+      properties:
+        kind:
+          type: string
+          description: Stable machine-readable identifier.
+          enum:
+            - invalid_json
+            - invalid_name
+            - invalid_base64
+            - invalid_wasm
+            - missing_export
+            - missing_tenant
+            - unauthorized
+            - tenant_scope_denied
+            - not_found
+            - instance_not_found
+            - body_too_large
+            - rate_limited
+            - invoke_timeout
+            - wasmtime
+            - internal
+        message:
+          type: string
+          description: Human-readable description (not part of the contract).
+      required: [kind, message]
+      additionalProperties: false
+    ApiErrorEnvelope:
+      type: object
+      properties:
+        error:
+          $ref: "#/components/schemas/ApiErrorBody"
+      required: [error]
+      additionalProperties: false

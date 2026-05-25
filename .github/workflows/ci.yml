@@ -109,3 +109,58 @@ jobs:
         uses: reviewdog/action-actionlint@v1
         with:
           fail_level: error
+
+  openapi:
+    name: openapi-validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install CUDA stub libraries
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+      - name: Set up Node (for OpenAPI tooling)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Redocly CLI (OpenAPI 3.0 + 3.1 linter)
+        # @redocly/cli replaces the legacy swagger-cli for OpenAPI 3.1
+        # validation; the 3.1 dialect (JSON Schema 2020-12) is a first-
+        # class target. We additionally install @apidevtools/swagger-cli
+        # for the legacy 3.0 JSON copy, which Redocly also handles but
+        # we keep both for belt-and-braces coverage.
+        run: |
+          npm install --global @redocly/cli@1
+          npm install --global @apidevtools/swagger-cli@4
+      - name: Validate OpenAPI YAML (3.1)
+        # Redocly lints structural correctness AND verifies every $ref
+        # resolves. The `minimal` ruleset (see openapi/redocly.yaml)
+        # keeps the gate focused on real spec breakage; editorial style
+        # rules are intentionally off so well-formed specs are not
+        # rejected for, say, missing tag descriptions.
+        # Failures fail the job — see the `openapi` job exit criterion
+        # in docs/PATH-TO-V1.md §v0.4.
+        run: redocly lint --config openapi/redocly.yaml openapi/tensor-wasm-api.yaml
+      - name: Validate legacy OpenAPI JSON (3.0)
+        # The crate-local openapi.json predates the canonical YAML and
+        # is preserved for the API.md cross-link. Validate it with
+        # swagger-cli so any drift from the YAML is caught early.
+        run: swagger-cli validate crates/tensor-wasm-api/openapi.json
+      - name: Run OpenAPI vs live-router round-trip test
+        # Asserts every route in the live axum router has a matching
+        # `paths:` entry in the spec, that the request body for
+        # POST /functions round-trips a real Rust CreateFunctionRequest
+        # value through the documented schema, and that a synthetic
+        # POST /functions round-trip succeeds against the in-process
+        # router. See crates/tensor-wasm-api/tests/openapi_validation_test.rs.
+        run: cargo test -p tensor-wasm-api --test openapi_validation_test --no-default-features

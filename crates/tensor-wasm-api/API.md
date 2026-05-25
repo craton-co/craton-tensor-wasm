@@ -11,7 +11,11 @@ All requests and responses use JSON unless otherwise noted. Identifiers are
 [RFC 4122]: https://www.rfc-editor.org/rfc/rfc4122
 
 A machine-readable OpenAPI 3.0 description ships alongside this document at
-[`openapi.json`](openapi.json).
+[`openapi.json`](openapi.json). The canonical OpenAPI 3.1 spec — validated
+against the live router on every CI run — lives at
+[`openapi/tensor-wasm-api.yaml`](../../openapi/tensor-wasm-api.yaml); see
+`crates/tensor-wasm-api/tests/openapi_validation_test.rs` and the `openapi`
+job in `.github/workflows/ci.yml` for the parity contract.
 
 ## Conventions
 
