@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Craton Software Company
+#
+# cargo-deny configuration. Run with `cargo deny check` (advisories +
+# bans + licenses + sources) or `cargo deny check sources` for the
+# git-pinned dependency audit only.
+#
+# Default posture: deny all unknown git sources. Each git pin must be
+# explicitly allowlisted below with a rationale + the upstream RFC or
+# CHANGELOG entry that introduced it.
+
+[graph]
+all-features = false
+# Evaluate the cuda-oxide-backend feature explicitly so its transitive
+# Pliron pin shows up in the dependency graph that cargo-deny inspects.
+features = []
+
+[advisories]
+version = 2
+# Fail on yanked crates; warn on rustsec advisories so a CI run that
+# surfaces a new advisory is visible without blocking unrelated work.
+yanked = "deny"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# Explicit allowlist for crates we deliberately ship at multiple major
+# versions. Add a `# rationale: ...` comment for every entry.
+skip = []
+skip-tree = []
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.93
+
+[sources]
+# Default: refuse any git dependency that isn't on the allowlist below.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# Allowlist for git-pinned sources. Each entry pins a specific rev
+# (NOT a branch) so dependabot + downstream verifiers know exactly
+# which commit they're trusting.
+allow-git = [
+    # NVlabs/cuda-oxide v0.1.0 tag SHA. Provides the cuda-host /
+    # cuda-core / cuda-async crates consumed by the
+    # `cuda-oxide-backend` feature on tensor-wasm-mem and
+    # tensor-wasm-jit. Workspace deps live in the root Cargo.toml.
+    # Lands per RFC 0001 (rfcs/0001-cuda-oxide-integration.md).
+    # NOT yet on crates.io as of 2026-05-25. Re-evaluated at v0.4 per
+    # the RFC's "TODO(v0.4 / when cuda-oxide ships v0.2)" inline note.
+    "https://github.com/NVlabs/cuda-oxide",
+
+    # vaivaswatha/pliron rev b51e73b11648508188184451adebdcf63957b7fe.
+    # This is a TRANSITIVE dep of cuda-oxide -- we do not declare it
+    # in our own Cargo.toml. It enters the lockfile only when the
+    # cuda-oxide-backend feature is enabled. cuda-oxide's own
+    # Cargo.toml pins this exact rev; we mirror the allowlist entry
+    # here so `cargo deny check sources` accepts the build. If
+    # cuda-oxide bumps its Pliron pin, this allowlist row must be
+    # updated in the same PR that bumps the cuda-oxide rev above --
+    # see the v0.4 cutover checklist in RFC 0001.
+    "https://github.com/vaivaswatha/pliron",
+]
+
+# Note: cargo-deny matches on the URL only, not the rev. The rev pins
+# above live in Cargo.toml (cuda-host/core/async) and in cuda-oxide's
+# own Cargo.toml (pliron). The reproducible-builds workflow
+# (`.github/workflows/sbom.yml` + the CycloneDX SBOM doc) captures
+# the resolved rev hashes per release artifact.

@@ -93,13 +93,22 @@ cudarc = { version = "0.13", default-features = false, features = ["driver", "cu
 # Source: NVlabs/cuda-oxide is published on GitHub but its workspace members
 # (`cuda-host`, `cuda-core`, `cuda-async`) are NOT yet on crates.io as of
 # 2026-05-25 (the crates.io `cuda-oxide` name is a different, unrelated
-# 2018-era project). For v0.3.1 we pin via git rev so the dep is at least
-# resolvable; v0.4 should switch to crates.io versions once NVlabs publishes.
-# The rev "main" is replaced with a frozen commit hash by the v0.4 cutover PR
-# to satisfy `docs/REPRODUCIBLE-BUILDS.md`.
-cuda-host  = { git = "https://github.com/NVlabs/cuda-oxide", branch = "main", default-features = false }
-cuda-core  = { git = "https://github.com/NVlabs/cuda-oxide", branch = "main", default-features = false }
-cuda-async = { git = "https://github.com/NVlabs/cuda-oxide", branch = "main", default-features = false }
+# 2018-era project). For v0.3.1 we pin via git rev (the v0.1.0 tag SHA,
+# 4a56e4220aab8ce5d085a411e7f806cebb647d14) so the dep is reproducible
+# and dependabot can't silently flip it. v0.4 should switch to crates.io
+# versions once NVlabs publishes. Reproducibility audit-trail lives in
+# `docs/REPRODUCIBLE-BUILDS.md` §"git-pinned sources" and the matching
+# allowlist entries in `deny.toml`.
+#
+# Pliron (cuda-oxide's MLIR-like IR framework) is pinned in cuda-oxide's
+# own Cargo.toml at rev `b51e73b11648508188184451adebdcf63957b7fe`
+# (vaivaswatha/pliron). That pin transitively lands in our lockfile when
+# the cuda-oxide-backend feature is enabled; we do NOT redeclare it here
+# (cargo.lock captures it). `deny.toml` allowlists that specific rev so
+# `cargo deny check sources` doesn't reject the build.
+cuda-host  = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
+cuda-core  = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
+cuda-async = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
 
 # HTTP / API
 axum = { version = "0.7", features = ["macros", "tracing"] }

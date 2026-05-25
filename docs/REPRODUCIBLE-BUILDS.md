@@ -148,6 +148,26 @@ and `env!("HOSTNAME")` on every dependency update (cargo-deny config in
 `deny.toml`). `chrono` is pulled with `default-features = false` so
 no TZ-database lookup happens at build time.
 
+### Git-pinned sources
+
+Two crates enter the workspace via `git = ...` pins rather than from
+crates.io, both as of v0.3.1 (per [RFC 0001](../rfcs/0001-cuda-oxide-integration.md)).
+Both pins are explicit revs (NOT branches), so a `cargo update` cannot
+silently flip them and `cargo deny check sources` audits the URL +
+rev pair on every CI run:
+
+| Crate(s) | Repository | Pinned rev | Why git, not crates.io |
+|---|---|---|---|
+| `cuda-host`, `cuda-core`, `cuda-async` | `https://github.com/NVlabs/cuda-oxide` | `4a56e4220aab8ce5d085a411e7f806cebb647d14` (v0.1.0 tag) | NVlabs has not yet published these workspace members to crates.io; the crates.io `cuda-oxide` name is a different, unrelated 2018-era project. Re-evaluated at v0.4 per the RFC. |
+| `pliron`, `pliron-derive` (transitive via cuda-oxide) | `https://github.com/vaivaswatha/pliron` | `b51e73b11648508188184451adebdcf63957b7fe` | Pliron is cuda-oxide's MLIR-like Rust-native IR framework; not yet on crates.io as a stable release. Mirrored from cuda-oxide's own `Cargo.toml` pin. |
+
+`deny.toml` carries one `allow-git` entry per repository URL above with
+a comment matching the table. When cuda-oxide bumps its Pliron pin in
+a future release, the workspace `Cargo.toml` cuda-oxide rev AND the
+`deny.toml` allowlist comment for `vaivaswatha/pliron` must be updated
+in the same commit so the SBOM (`tensor-wasm-cdx-v<version>.json`) and
+this doc stay in sync.
+
 ### ELF `NT_GNU_BUILD_ID`
 
 The linker can be configured to compute the build-ID from a hash of
