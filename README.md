@@ -152,6 +152,7 @@ Full diagram in [ARCHITECTURE.md](ARCHITECTURE.md).
 - Read [ARCHITECTURE.md](ARCHITECTURE.md) for the dependency graph constraints.
 - Run `make ci` locally before pushing — it mirrors the GitHub Actions workflow.
 - Fuzz harness lives in `fuzz/`; CUDA-only tests are marked `#[ignore = "requires CUDA hardware"]`.
+- RFCs: substantive design changes go through the lightweight process in [`rfcs/README.md`](rfcs/README.md) before the implementation PR.
 - Security disclosures: see [SECURITY.md](SECURITY.md).
 
 ## Security
