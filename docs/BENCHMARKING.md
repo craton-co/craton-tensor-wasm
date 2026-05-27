@@ -270,6 +270,63 @@ runs a hand-rolled sampling loop alongside the Criterion suite.
   when the bench is run from the workspace root. The file is **not**
   consumed by the regression gate — see
   [`bench-results/README.md#tail-latency-artefact`](../bench-results/README.md#tail-latency-artefact).
+- **Backend axis (W4.4 — [RFC 0001](../rfcs/0001-cuda-oxide-integration.md)
+  Unresolved questions extension).** The bench carries a compile-time
+  `BACKEND_LABEL` that flows into the Criterion group name
+  (`tail_latency_<backend>`), every `TAIL_LATENCY` JSON line as a
+  `"backend":` field, and the rendered result file's top-level `backend`
+  field plus a per-metric `backend` field. The label is selected by
+  feature flag at bench-build time:
+
+  | `cargo bench --features ...` | `BACKEND_LABEL` | `bench-results/tail-latency.json` `backend` |
+  |---|---|---|
+  | (none, default)              | `unified-memory` | `"unified-memory"` |
+  | `cudarc-backend`             | `cudarc`         | `"cudarc"` |
+  | `cuda-oxide-backend`         | `cuda-oxide`     | `"cuda-oxide"` |
+
+  Per-backend regressions become visible only by running the bench
+  **three times**, once per backend flag, and diffing the three result
+  files. The bench file does not perform the multi-run itself — the
+  CI matrix wiring is wave-4 ops work. Manual operator recipe:
+
+  ```sh
+  # 1. unified-memory (the cust-backed historical default; on v0.4
+  #    deprecation watch per RFC 0001 Unresolved questions).
+  cargo bench -p tensor-wasm-bench --bench tail_latency
+  mv bench-results/tail-latency.json bench-results/tail-latency-unified-memory.json
+
+  # 2. cudarc (the cust → cudarc spike). The bench-layer flag is
+  #    label-only and does NOT pull in cust — see the comment in
+  #    crates/tensor-wasm-bench/Cargo.toml for why.
+  cargo bench -p tensor-wasm-bench --bench tail_latency --features cudarc-backend
+  mv bench-results/tail-latency.json bench-results/tail-latency-cudarc.json
+
+  # 3. cuda-oxide (the v0.5 cust successor scaffold from RFC 0001).
+  #    Requires libclang available to cuda-bindings' build script
+  #    (set LIBCLANG_PATH on Windows; install libclang-dev on Linux).
+  cargo bench -p tensor-wasm-bench --bench tail_latency --features cuda-oxide-backend
+  mv bench-results/tail-latency.json bench-results/tail-latency-cuda-oxide.json
+
+  # 4. Diff. Any per-backend regression shows up as a p99_9_ns drift
+  #    between two of the three files at the same `metric` key.
+  diff <(jq .metrics bench-results/tail-latency-unified-memory.json) \
+       <(jq .metrics bench-results/tail-latency-cudarc.json)
+  ```
+
+  The three files differ only in the top-level `backend` discriminator
+  and the per-metric `backend` field today — the dispatch-loop and e2e
+  router code paths under measurement are identical across labels in
+  v0.3.x. The per-backend split exists so that **once** the cuda-oxide
+  port lands at v0.4 and the per-backend dispatch surfaces are real, the
+  bench harness is already capturing them under the right label
+  without a parallel rewrite.
+
+  Enabling multiple backend flags at once is permitted (the mem crate
+  accepts the combination) but the bench picks one label by priority
+  (`cuda-oxide` > `cudarc` > `unified-memory`) and announces the choice
+  on stderr at bench startup; see the `BACKEND_LABEL` docs in
+  [`crates/tensor-wasm-bench/benches/tail_latency.rs`](../crates/tensor-wasm-bench/benches/tail_latency.rs)
+  for the rationale.
 
 ```sh
 cargo bench -p tensor-wasm-bench --bench tail_latency

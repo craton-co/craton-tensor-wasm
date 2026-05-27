@@ -83,3 +83,21 @@ cuda = ["tensor-wasm-wasi-gpu/cuda"]
 # `cargo bench --features cuda,cuda-oxide-backend` invocation and get
 # real numbers instead of a skip line. See RFC 0001 (rfcs/0001-cuda-oxide-integration.md).
 cuda-oxide-backend = ["tensor-wasm-mem/cuda-oxide-backend"]
+# W4.4 added this flag so the tail-latency bench's backend axis (RFC 0001
+# Unresolved questions — extension of the W4.6 P99.9 bench with a
+# per-backend label) can be exercised three times: default (`unified-memory`),
+# `--features cudarc-backend` (`cudarc`), and `--features cuda-oxide-backend`
+# (`cuda-oxide`). The flag is **deliberately label-only at the bench layer**
+# — it does NOT forward to `tensor-wasm-mem/cudarc-backend`. Two reasons:
+# (1) the bench's `measure()` path runs on the dispatch / e2e router and
+# does not touch CUDA memory directly, so the flag's side-effect is purely
+# in `BACKEND_LABEL`; (2) the workspace nightly-2026-04-03 currently has a
+# stable-feature-flag mismatch with `tensor-wasm-mem`'s cudarc backend
+# (`once_cell_try` is still nightly-only on that toolchain), and forwarding
+# the feature would surface that pre-existing issue on every
+# `--features cudarc-backend` bench invocation. When the mem-crate toolchain
+# story stabilises this forwarding can be added without changing the bench
+# source. See `benches/tail_latency.rs` for the `BACKEND_LABEL` constant
+# and `docs/BENCHMARKING.md` for the operator recipe (run the bench three
+# times, diff the three JSON files).
+cudarc-backend = []

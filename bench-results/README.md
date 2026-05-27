@@ -114,9 +114,12 @@ them once, and reads percentiles via the nearest-rank rule
 {
   "// generated": "P99.9 tail-latency snapshot (see crates/tensor-wasm-bench/benches/tail_latency.rs).",
   "// algorithm": "nearest-rank percentile per ISO/IEC 25062 over 10000 sorted samples per metric",
+  "// backend-axis": "W4.4 RFC 0001 extension -- run the bench once per backend (default / --features cudarc-backend / --features cuda-oxide-backend) and diff the three files; see docs/BENCHMARKING.md for the operator recipe",
+  "backend": "unified-memory",
   "metrics": [
     {
       "metric": "dispatch/serial/100",
+      "backend": "unified-memory",
       "samples": 10000,
       "p50_ns": ...,
       "p95_ns": ...,
@@ -128,14 +131,46 @@ them once, and reads percentiles via the nearest-rank rule
 }
 ```
 
+The `backend` field appears both at the top level (so a reader sees the
+compile-time slot the run targeted without scanning every metric) and on
+every per-metric entry (so a downstream parser joining many files by
+`<metric, backend>` doesn't have to reach back into the document root).
+The redundant per-metric field is intentional — wave-4 ops work
+formalises this schema and may keep both or demote the per-metric one
+once the regression-gate parser is updated. **For W4.4 the schema is
+treated as forward-compatibility-only**, and the per-W4.4 deprecation
+note in `tail_latency.rs` calls out that downstream parsers pre-dating
+W4.4 should treat `backend` as optional and fall back to
+`"unified-memory"` when the field is missing (matches the historical
+W4.6 default before the backend axis was added).
+
 ### Regenerate
 
+The bench is now backend-aware (W4.4 — RFC 0001 Unresolved questions
+extension). Running it with no features produces a `unified-memory`-
+labeled file; flip features to retarget the label:
+
 ```sh
-# Writes bench-results/tail-latency.json when cwd is the workspace root,
-# and emits one `TAIL_LATENCY {...}` JSON line per metric to stdout
-# regardless (CI captures via grep).
+# unified-memory (historical default, the cust-backed path):
 cargo bench -p tensor-wasm-bench --bench tail_latency
+
+# cudarc (label-only at the bench layer — see the bench Cargo.toml
+# comment for why this doesn't forward to tensor-wasm-mem/cudarc-backend):
+cargo bench -p tensor-wasm-bench --bench tail_latency --features cudarc-backend
+
+# cuda-oxide (the v0.5 cust successor scaffold from RFC 0001;
+# requires libclang for cuda-bindings' build script):
+cargo bench -p tensor-wasm-bench --bench tail_latency --features cuda-oxide-backend
 ```
+
+Each run overwrites `bench-results/tail-latency.json` (cwd-aware), so
+operators capturing all three backends should rename between runs —
+the documented recipe is in
+[`docs/BENCHMARKING.md#tail-latency`](../docs/BENCHMARKING.md#tail-latency).
+The bench also emits one `TAIL_LATENCY {...}` JSON line per metric to
+stdout regardless (CI captures via grep), each line carrying its own
+`"backend":` field so a single CI log can be split by backend after the
+fact.
 
 The bench is wall-clock-cheap (10 000 × ~6 µs per dispatch sample plus
 warm-up ≈ a few seconds per metric) so re-running on every observability
