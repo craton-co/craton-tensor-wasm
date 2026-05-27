@@ -63,6 +63,23 @@ pub struct EngineConfig {
     /// Linear-memory backing strategy. See [`MemoryBackend`] for the
     /// UnifiedBuffer vs PoolingMpk trade-off.
     pub backend: MemoryBackend,
+    /// Maximum number of compiled-module cache entries retained per
+    /// executor before LRU eviction kicks in. Closes exec S-5: an
+    /// unbounded `DashMap<digest, Module>` lets a misbehaving tenant
+    /// pin arbitrarily many compiled modules (each multi-MiB of host
+    /// RAM) by submitting unique wasm bytes in a loop. 1024 is enough
+    /// to hold the working set of a typical multi-tenant deployment
+    /// while bounding the worst case at ~a few GiB of compiled-code
+    /// pages.
+    pub max_module_cache_entries: usize,
+    /// Hard upper bound on the number of concurrently-live instances
+    /// the executor will admit. Closes exec S-10: an unbounded
+    /// `DashMap<InstanceId, ...>` lets a tenant spawn instances in a
+    /// loop until the host OOMs. `None` disables the cap (useful for
+    /// tests / single-tenant deployments); production callers should
+    /// keep the default ceiling. When the limit is hit `spawn_instance`
+    /// returns [`crate::executor::ExecError::CapacityExhausted`].
+    pub max_instances: Option<usize>,
 }
 
 impl Default for EngineConfig {
@@ -73,6 +90,8 @@ impl Default for EngineConfig {
             strategy: Strategy::Cranelift,
             component_model: true,
             backend: MemoryBackend::default(),
+            max_module_cache_entries: 1024,
+            max_instances: Some(10_000),
         }
     }
 }

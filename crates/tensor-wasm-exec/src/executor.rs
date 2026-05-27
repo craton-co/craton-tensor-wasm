@@ -9,13 +9,15 @@
 //! [`TensorWasmExecutor::terminate`] — all async, all driven from the calling
 //! Tokio runtime.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tensor_wasm_core::metrics::TensorWasmMetrics;
 use tensor_wasm_core::types::{InstanceId, TenantId};
 use dashmap::{mapref::entry::Entry, DashMap};
+use lru::LruCache;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
@@ -99,6 +101,24 @@ pub enum ExecError {
         /// Configured engine-wide per-instance cap in bytes.
         limit_bytes: u64,
     },
+    /// The executor refused to admit a new instance because the
+    /// engine-wide live-instance cap
+    /// ([`crate::engine::EngineConfig::max_instances`]) is already
+    /// saturated.
+    ///
+    /// Surfaced from [`TensorWasmExecutor::spawn_instance`] *before* any
+    /// compile / instantiate work; the failed spawn never consumes a
+    /// slot in the registry. Mapped to
+    /// [`tensor_wasm_core::error::TensorWasmError::MemoryExhausted`] on
+    /// the conversion boundary (the API layer surfaces it as 503).
+    #[error("instance capacity exhausted: {active} active, limit {limit}")]
+    CapacityExhausted {
+        /// Live-instance count observed at the rejection point
+        /// (post-increment, so `active > limit`).
+        active: usize,
+        /// Configured engine-wide ceiling.
+        limit: usize,
+    },
 }
 
 /// Payload for [`ExecError::Timeout`]. Carries the real elapsed and deadline
@@ -172,6 +192,10 @@ impl From<ExecError> for tensor_wasm_core::error::TensorWasmError {
             } => TensorWasmError::MemoryExhausted {
                 requested: requested_bytes,
                 limit: limit_bytes,
+            },
+            ExecError::CapacityExhausted { active, limit } => TensorWasmError::MemoryExhausted {
+                requested: active as u64,
+                limit: limit as u64,
             },
         }
     }
@@ -293,7 +317,23 @@ pub struct TensorWasmExecutor {
     /// to 8 bytes would expose a ~2⁻³² birthday-collision window across
     /// tenants (cross-tenant module-cache poisoning) that an attacker
     /// crafting modules with colliding prefixes could exploit at scale.
-    module_cache: Arc<DashMap<[u8; 32], Module>>,
+    ///
+    /// Bounded with LRU eviction (cap from
+    /// [`crate::engine::EngineConfig::max_module_cache_entries`], default
+    /// 1024) — closes exec S-5 where an unbounded `DashMap` let a
+    /// misbehaving tenant pin arbitrarily many compiled modules. The
+    /// guard is a `parking_lot::Mutex` rather than a `DashMap` because
+    /// `lru::LruCache` is not concurrency-safe (every `get` mutates the
+    /// recency list).
+    module_cache: Arc<parking_lot::Mutex<LruCache<[u8; 32], Module>>>,
+    /// Live-instance counter, used to enforce
+    /// [`crate::engine::EngineConfig::max_instances`] (exec S-10).
+    /// Atomically bumped *before* compile/instantiate in `spawn_instance`
+    /// (with rollback on failure) and decremented in `terminate`. We keep
+    /// this separate from `instances.len()` so the admission decision
+    /// commits in a single CAS rather than racing against in-flight
+    /// spawns that have already passed the check but not yet inserted.
+    instance_count: Arc<AtomicUsize>,
     /// Optional metrics handle. When `Some`, spawn/terminate operations
     /// increment the corresponding Prometheus counters / gauges.
     metrics: Option<TensorWasmMetrics>,
@@ -306,6 +346,51 @@ pub struct TensorWasmExecutor {
     /// the log). Scoped to the executor (and therefore the engine) so
     /// distinct engines in the same process each get their own warning.
     ticker_warned: Arc<OnceLock<AtomicBool>>,
+}
+
+/// Resolve a non-zero LRU cache capacity from a possibly-zero config
+/// value. We coerce 0 to 1 because `LruCache::new(NonZeroUsize)` requires
+/// a non-zero capacity, and operators who set the knob to 0 most plausibly
+/// meant "as small as possible" rather than "panic on construction".
+fn lru_cap(requested: usize) -> NonZeroUsize {
+    NonZeroUsize::new(requested).unwrap_or_else(|| NonZeroUsize::new(1).expect("1 is non-zero"))
+}
+
+/// RAII guard that rolls back a successful `instance_count.fetch_add`
+/// if the spawn path drops it without committing. `commit()` defuses
+/// the rollback once the instance has been inserted into the registry;
+/// every other exit path (`?`, panic during `Instance::new_async`,
+/// store-construction failure) leaves the guard alive and triggers a
+/// decrement on drop.
+///
+/// Without this guard, exec S-10 admission control would leak a slot
+/// for every failed spawn — a misbehaving tenant could trip an
+/// always-failing instantiation in a loop and exhaust the cap with
+/// zero live instances.
+struct InstanceSlotGuard {
+    counter: Arc<AtomicUsize>,
+    committed: bool,
+}
+
+impl InstanceSlotGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        Self { counter, committed: false }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for InstanceSlotGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Relaxed is fine here: the matching `fetch_add` used AcqRel
+            // for admission ordering; the rollback only undoes a count
+            // that no other thread depends on observing.
+            self.counter.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Walk every exported and imported [`ExternType::Memory`] in `module` and
@@ -358,11 +443,13 @@ fn check_module_memory_within_cap(module: &Module, cap_bytes: usize) -> Result<(
 impl TensorWasmExecutor {
     /// Construct an executor over the given shared engine.
     pub fn new(engine: Arc<TensorWasmEngine>) -> Self {
+        let cap = lru_cap(engine.config().max_module_cache_entries);
         Self {
             engine,
             instances: Arc::new(DashMap::new()),
             next_instance_id: Arc::new(AtomicU64::new(1)),
-            module_cache: Arc::new(DashMap::new()),
+            module_cache: Arc::new(parking_lot::Mutex::new(LruCache::new(cap))),
+            instance_count: Arc::new(AtomicUsize::new(0)),
             metrics: None,
             ticker_warned: Arc::new(OnceLock::new()),
         }
@@ -372,11 +459,13 @@ impl TensorWasmExecutor {
     /// supplied [`TensorWasmMetrics`] registry. Metric handles are cheaply cloneable;
     /// pass a clone of the process-wide registry.
     pub fn with_metrics(engine: Arc<TensorWasmEngine>, metrics: TensorWasmMetrics) -> Self {
+        let cap = lru_cap(engine.config().max_module_cache_entries);
         Self {
             engine,
             instances: Arc::new(DashMap::new()),
             next_instance_id: Arc::new(AtomicU64::new(1)),
-            module_cache: Arc::new(DashMap::new()),
+            module_cache: Arc::new(parking_lot::Mutex::new(LruCache::new(cap))),
+            instance_count: Arc::new(AtomicUsize::new(0)),
             metrics: Some(metrics),
             ticker_warned: Arc::new(OnceLock::new()),
         }
@@ -395,7 +484,24 @@ impl TensorWasmExecutor {
     /// Number of compiled modules retained in the per-executor cache.
     /// Exposed for tests and operators that want to confirm cache reuse.
     pub fn cached_module_count(&self) -> usize {
-        self.module_cache.len()
+        self.module_cache.lock().len()
+    }
+
+    /// Current number of entries held by the bounded LRU module cache.
+    /// Alias for [`Self::cached_module_count`] under the name used by the
+    /// exec S-5 admission-control bound work; both delegate to the same
+    /// underlying length so callers can pick whichever reads better at
+    /// the call site.
+    pub fn module_cache_len(&self) -> usize {
+        self.module_cache.lock().len()
+    }
+
+    /// Current number of live instances, sampled atomically. Mirrors the
+    /// counter the admission check in `spawn_instance` consults to decide
+    /// whether a new instance fits under
+    /// [`crate::engine::EngineConfig::max_instances`].
+    pub fn instances_len(&self) -> usize {
+        self.instance_count.load(Ordering::Acquire)
     }
 
     /// Generate a fresh, vacant [`InstanceId`].
@@ -433,20 +539,19 @@ impl TensorWasmExecutor {
         let digest = blake3::hash(wasm);
         // BLAKE3 outputs a fixed 32-byte digest; use it whole as the cache key.
         let key: [u8; 32] = *digest.as_bytes();
-        if let Some(m) = self.module_cache.get(&key) {
-            return Ok(m.clone());
+        // Scoped lock for the get: releasing the mutex before the
+        // potentially-expensive `Module::from_binary` call below is what
+        // lets concurrent spawns of *different* modules compile in
+        // parallel. The cost is that two spawns of the *same* fresh
+        // module may both compile it — but the second one's `put` simply
+        // overwrites the first, no correctness hazard.
+        if let Some(m) = self.module_cache.lock().get(&key).cloned() {
+            return Ok(m);
         }
         let module = Module::from_binary(self.engine.inner(), wasm)
             .map_err(ExecError::Wasmtime)?;
-        // `DashMap::entry` is racy-safe: if another task compiled the same
-        // bytes between our `get` and now, we keep the existing entry.
-        match self.module_cache.entry(key) {
-            Entry::Occupied(occupied) => Ok(occupied.get().clone()),
-            Entry::Vacant(vacant) => {
-                vacant.insert(module.clone());
-                Ok(module)
-            }
-        }
+        self.module_cache.lock().put(key, module.clone());
+        Ok(module)
     }
 
     /// Compile + instantiate a Wasm module. Returns the assigned [`InstanceId`].
@@ -456,6 +561,37 @@ impl TensorWasmExecutor {
         cfg: SpawnConfig,
         wasm: &[u8],
     ) -> Result<InstanceId, ExecError> {
+        // Admission control (exec S-10). Bump the live-instance counter
+        // BEFORE doing any compile / instantiate work; if the new total
+        // exceeds the engine cap, roll back immediately and surface a
+        // typed `CapacityExhausted` so the API layer can map it to 503.
+        //
+        // The fetch_add must precede the limit check so concurrent spawns
+        // see a consistent atomic view: if two threads both observe `N-1`
+        // active when the cap is `N`, both pre-incrementing produces
+        // `N` and `N+1` respectively — the second one fails the check
+        // and rolls back. Doing the read+check+inc separately would let
+        // both threads pass and overshoot the cap.
+        if let Some(max) = self.engine.config().max_instances {
+            let new_count = self.instance_count.fetch_add(1, Ordering::AcqRel) + 1;
+            if new_count > max {
+                self.instance_count.fetch_sub(1, Ordering::Relaxed);
+                return Err(ExecError::CapacityExhausted {
+                    active: new_count,
+                    limit: max,
+                });
+            }
+        } else {
+            // No cap configured — still bump so `instances_len` stays
+            // accurate. The drop guard below covers rollback on any
+            // subsequent error path.
+            self.instance_count.fetch_add(1, Ordering::AcqRel);
+        }
+        // Rollback guard for every failure path between here and the
+        // registry insert. `commit()` is called only after the instance
+        // is published into `self.instances`.
+        let slot_guard = InstanceSlotGuard::new(self.instance_count.clone());
+
         let id = self.allocate_instance_id();
         tracing::Span::current().record("instance_id", tracing::field::display(id));
         let max_memory_bytes = self.engine.config().max_memory_bytes;
@@ -566,11 +702,15 @@ impl TensorWasmExecutor {
                     %id,
                     "instance id race after allocation; this is a serious bug — please file an issue",
                 );
+                // slot_guard drops here → rollback counter.
                 return Err(ExecError::Wasmtime(wasmtime::Error::msg(
                     "instance id collision after allocation",
                 )));
             }
         }
+        // Instance is now live in the registry — defuse the rollback
+        // guard so the admission slot stays charged until `terminate`.
+        slot_guard.commit();
         if let Some(m) = &self.metrics {
             m.instance_spawns_total().inc();
             m.active_instances().inc();
@@ -671,6 +811,12 @@ impl TensorWasmExecutor {
     pub async fn terminate(&self, id: InstanceId) -> Result<(), ExecError> {
         match self.instances.remove(&id) {
             Some(_) => {
+                // Release the admission slot reserved at spawn time
+                // (exec S-10). The decrement only runs on successful
+                // removal — a `NotFound` terminate must not free a
+                // slot it never charged, or a tenant could double-
+                // terminate to inflate their effective cap.
+                self.instance_count.fetch_sub(1, Ordering::AcqRel);
                 if let Some(m) = &self.metrics {
                     m.instance_terminations_total().inc();
                     m.active_instances().dec();

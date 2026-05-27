@@ -21,6 +21,7 @@ tensor-wasm-mem = { workspace = true }
 blake3.workspace = true
 dashmap.workspace = true
 futures.workspace = true
+lru.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

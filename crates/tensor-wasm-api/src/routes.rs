@@ -420,6 +420,15 @@ impl From<ExecError> for ApiError {
                 kind: "module_memory_too_large".to_string(),
                 message: err.to_string(),
             },
+            // Per exec S-10: the engine-wide live-instance cap is
+            // saturated. 503 is the right code (the request is well-
+            // formed and would succeed once load drops) so clients with
+            // retry-with-backoff handling recover cleanly.
+            ExecError::CapacityExhausted { .. } => ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                kind: "capacity_exhausted".to_string(),
+                message: err.to_string(),
+            },
         }
     }
 }
