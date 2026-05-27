@@ -1,4 +1,6 @@
-# Craton TensorWasm — Security Audit (v0.1.0)
+# Security Audit — v0.1.0 (historical)
+
+For current security posture see CHANGELOG.md and SECURITY.md.
 
 _Status: completed for the v0.1 release tag. Re-run before every minor
 release. The threat model this audit grounds itself in lives in

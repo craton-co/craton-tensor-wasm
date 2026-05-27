@@ -63,13 +63,13 @@ crate or doc that owns the gap.
 | Auto-offload JIT | End-to-end working for matmul/vector_add/conv2d blueprints (Batch G); BLAKE3 cache | Broader blueprint set; coverage report on which patterns get offloaded |
 | Kernel-args marshalling | Returns `KernelArgsUnsupported` for `args_len > 0` (documented v0.1.0 contract — see [`RISKS.md`](RISKS.md)) | Full dynamic argv via `cuLaunchKernel`; v0.2 milestone |
 | Multi-tenant (TenantRegistry) | Quota gate works, MPS feature-gated | MPS production-tested; tenant-level metric isolation verified |
-| HTTP API | axum gateway with bearer auth + 64 MiB body limit (Batch J); async invoke via `JobRecord`; OpenAPI committed | Auth model that's actually useful (mTLS? OAuth? scoped tokens?); rate limits |
-| CLI | Snapshot save/restore wired against API (Batch K); 22 lib tests + 19 smoke + 10 snapshots | Production telemetry; shell completions; man pages |
+| HTTP API | axum gateway with bearer auth + 64 MiB body limit (Batch J); async invoke via `JobRecord`; OpenAPI committed; per-token QPS rate limiting (W1.4, closed); scoped bearer tokens (W2.1, closed); structured audit log (W2.2, closed) | mTLS / OIDC remain v2 considerations |
+| CLI | Snapshot save/restore wired against API (Batch K); 22 lib tests + 19 smoke + 10 snapshots; `observe` subcommand (W1.5, closed); shell completions + man pages (W2.4, closed) | None remaining for v1.0 |
 | Snapshot subsystem | Streaming zstd + bincode with hard size caps (Batch H) | Schema versioning policy; cross-version migration test matrix |
-| Observability | OpenTelemetry tracing + Prometheus metrics; OTLP opt-in | Reference dashboards (Grafana JSON); SLO definitions |
+| Observability | OpenTelemetry tracing + Prometheus metrics; OTLP opt-in; HTTP request metrics middleware (W2.3, closed); Grafana dashboards (W2.5, closed); SLO + runbooks (W1.9 / W2.6, closed) | None remaining for v1.0 |
 | Performance baseline | Hand-picked conservative ceilings in `bench-results/baseline.json` | Measured medians from S22 runner; tightened tolerances |
-| Security | Threat model documented; fuzz harness for snapshot + WAT parser | External pen-test; CVE disclosure pipeline exercised |
-| OSS hygiene | LICENSE / NOTICE / SPDX / CoC / CONTRIBUTING / dependabot landed (Batch A, M) | Maintainer governance model; trademark; release-signing keys |
+| Security | Threat model documented; fuzz harness for snapshot + WAT parser; internal code review pass (D7, closed) | External pen-test; CVE disclosure pipeline exercised |
+| OSS hygiene | LICENSE / NOTICE / SPDX / CoC / CONTRIBUTING / dependabot landed (Batch A, M); `GOVERNANCE.md` landed (W1.8, closed) | Trademark; release-signing keys |
 | Supply chain | `cargo-audit` + `cargo-deny` in CI (Batch M) | SBOM published per release; reproducible builds |
 | Platforms | Linux x86_64 primary; Windows MSVC builds and tests; macOS compile-tested in CI (Tier 3 — no CUDA) | Tier matrix documented in [`BUILD.md`](BUILD.md#platform-support-tiers); broaden macOS coverage to tests post-v1.0 |
 | Dependencies | `cust 0.3.x` (EOL'd upstream — see [`RISKS.md`](RISKS.md)); `prometheus-client 0.24` (recently bumped); `wasmtime 25.0.3` | `cust` successor chosen and migrated; Wasmtime upgrade cadence policy |
@@ -305,9 +305,10 @@ contributor can pick a stream.
 ### Operations
 
 - Reference deployment manifests: docker-compose (have), k8s
-  (v0.3), Nomad (v0.4, stretch)
-- Helm chart for k8s (v0.4)
-- Backup / restore procedure documented and tested (v0.3)
+  (W2.7, closed), Nomad (v0.4, stretch)
+- Helm chart for k8s (W2.7, closed)
+- Backup / restore procedure documented and tested (W3.7, closed)
+- Upgrade playbook (W3.3, closed)
 - Disaster-recovery runbook: lost host, lost storage, lost auth
   state (v0.4)
 

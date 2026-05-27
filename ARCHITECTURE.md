@@ -1,6 +1,6 @@
 # Craton TensorWasm — Architecture
 
-Craton TensorWasm is a GPU-accelerated serverless Wasm runtime. It runs untrusted Wasm modules with explicit (and later, auto-offloaded) GPU kernel dispatch on CUDA, built on Wasmtime and Tokio. The project is a 9-month build spanning 22 sessions across 6 phases.
+Craton TensorWasm is a GPU-accelerated serverless Wasm runtime. It runs untrusted Wasm modules with explicit (and later, auto-offloaded) GPU kernel dispatch on CUDA, built on Wasmtime and Tokio. Active development since 2025.
 
 ## Workspace layout
 
@@ -172,4 +172,4 @@ Related documents authored in later sessions:
 
 ---
 
-_Status: current as of v0.1.0 (2026-05-24). All crates wired; see CHANGELOG.md for history._
+_Status: current as of v0.3.5 (2026-05-27). All crates wired; see CHANGELOG.md for history._
