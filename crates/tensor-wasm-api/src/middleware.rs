@@ -523,19 +523,29 @@ pub fn trace_layer_with_propagation() -> tower_http::trace::TraceLayer<
 
     TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<axum::body::Body>| {
         // Surface the raw traceparent value as a span field for log-based
-        // correlation, even when no OTel propagator is installed.
-        let traceparent = req
+        // correlation, even when no OTel propagator is installed. The
+        // header is sanitised first (see `sanitise_traceparent`) so a
+        // hostile client cannot smuggle CR/LF, NUL, or megabytes of
+        // arbitrary text into every log line that touches this request.
+        let raw_tp = req
             .headers()
             .get("traceparent")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
+        let sanitised_tp = sanitise_traceparent(raw_tp);
 
+        // Record only the URI **path**, never the query string. Query
+        // parameters frequently carry tokens/secrets (e.g. an attacker
+        // probing `GET /healthz?secret=exfil`) and we MUST NOT plant
+        // them in span attributes that flow to log sinks. Handlers that
+        // legitimately need the query string read it from
+        // `req.uri().query()` themselves under their own scrubbing.
         let span = tracing::info_span!(
             "http.request",
             method = %req.method(),
-            uri = %req.uri(),
+            path = %req.uri().path(),
             version = ?req.version(),
-            traceparent = %traceparent,
+            traceparent = %sanitised_tp,
         );
 
         // Extract the parent `opentelemetry::Context` from the incoming
@@ -549,6 +559,77 @@ pub fn trace_layer_with_propagation() -> tower_http::trace::TraceLayer<
 
         span
     })
+}
+
+/// Maximum byte length a `traceparent` header value is allowed to
+/// occupy in a span attribute. The W3C Trace Context spec caps a
+/// well-formed value at 55 bytes; 64 gives a tiny margin for future
+/// versioned suffixes while still bounding the per-span log footprint
+/// to a constant. Anything longer is truncated.
+const TRACEPARENT_MAX_BYTES: usize = 64;
+
+/// Sentinel emitted in span attributes when a `traceparent` header
+/// contains characters that would corrupt log output (CR, LF, NUL).
+/// Choosing a fixed token rather than the original (filtered) value
+/// keeps grep/audit signatures stable across hostile inputs.
+const TRACEPARENT_INVALID_SENTINEL: &str = "<invalid>";
+
+/// Render an inbound `traceparent` header value as a bounded, log-safe
+/// string for use as a tracing span attribute.
+///
+/// The header is attacker-controlled, so we apply three defences:
+///
+/// 1. **Reject control characters.** Any CR, LF, or NUL byte indicates
+///    an attempt to inject a fake log line (CRLF) or terminate a C
+///    string in a downstream consumer (NUL). We collapse the entire
+///    value to the [`TRACEPARENT_INVALID_SENTINEL`] in that case rather
+///    than try to filter — partial sanitisation is exactly the kind of
+///    surface that breeds bypasses.
+/// 2. **Clamp length to 64 bytes.** The W3C grammar caps a valid value
+///    at 55 bytes; anything longer is either malformed or hostile
+///    padding. Truncation happens at a UTF-8 char boundary so we never
+///    return invalid UTF-8 to the tracing layer.
+/// 3. **Strip non-printable bytes** (anything outside `0x20..=0x7E`).
+///    Printable ASCII is the entire grammar the spec allows, and
+///    keeping span attributes plain ASCII prevents terminal-escape
+///    smuggling through log viewers.
+///
+/// When the input is already a clean ASCII-printable string short
+/// enough to fit, we return [`Cow::Borrowed`] to avoid the allocation.
+fn sanitise_traceparent(raw: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    // Defence 1: reject the whole value when control chars appear.
+    // CRLF is the classic log-injection vector; NUL the classic C
+    // boundary trick. Bail before doing any other processing so the
+    // sentinel is stable.
+    if raw.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return Cow::Owned(TRACEPARENT_INVALID_SENTINEL.to_string());
+    }
+
+    // Fast path: already short, already printable ASCII -> borrow.
+    let is_clean = raw.len() <= TRACEPARENT_MAX_BYTES
+        && raw.bytes().all(|b| (0x20..=0x7E).contains(&b));
+    if is_clean {
+        return Cow::Borrowed(raw);
+    }
+
+    // Slow path: build a filtered, clamped owned copy. Walk by char so
+    // truncation never lands mid-codepoint, and skip anything outside
+    // printable ASCII.
+    let mut out = String::with_capacity(raw.len().min(TRACEPARENT_MAX_BYTES));
+    for ch in raw.chars() {
+        let b = ch as u32;
+        if !(0x20..=0x7E).contains(&b) {
+            continue;
+        }
+        let ch_len = ch.len_utf8();
+        if out.len() + ch_len > TRACEPARENT_MAX_BYTES {
+            break;
+        }
+        out.push(ch);
+    }
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -610,6 +691,66 @@ mod tests {
     #[test]
     fn trace_layer_with_propagation_constructs() {
         let _ = trace_layer_with_propagation();
+    }
+
+    #[test]
+    fn sanitise_traceparent_passes_through_well_formed_value() {
+        // A literal example from the W3C Trace Context spec. Already
+        // printable ASCII, already under the 64-byte cap, so the
+        // helper must return the borrowed pointer (no allocation,
+        // exact byte equality).
+        let sample = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let out = sanitise_traceparent(sample);
+        assert_eq!(out.as_ref(), sample);
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "well-formed value must be borrowed, not allocated",
+        );
+    }
+
+    #[test]
+    fn sanitise_traceparent_rejects_crlf_injection() {
+        // CRLF in a header value is the classic log-injection vector;
+        // a hostile client could plant a forged "log line" into our
+        // structured output. The helper must collapse the whole value
+        // to a stable sentinel, NOT a partially-filtered string.
+        let attack = "\r\nSET-COOKIE: x=y\r\n";
+        let out = sanitise_traceparent(attack);
+        assert_eq!(out.as_ref(), "<invalid>");
+    }
+
+    #[test]
+    fn sanitise_traceparent_rejects_embedded_nul() {
+        // NUL bytes truncate C strings in downstream consumers; treat
+        // them as hostile and emit the sentinel.
+        let attack = "00-aaaa\0bbbb";
+        let out = sanitise_traceparent(attack);
+        assert_eq!(out.as_ref(), "<invalid>");
+    }
+
+    #[test]
+    fn sanitise_traceparent_truncates_oversized_input_to_64_bytes() {
+        // A 100-byte all-'a' string is printable ASCII but exceeds
+        // the 64-byte cap. The helper must clamp to exactly 64
+        // bytes — the W3C maximum is 55, so 64 already accommodates
+        // every legitimate value with room to spare.
+        let input = "a".repeat(100);
+        let out = sanitise_traceparent(&input);
+        assert_eq!(out.len(), 64);
+        assert!(out.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn sanitise_traceparent_filters_non_printable_bytes() {
+        // ESC (0x1B) is outside printable ASCII and could be used to
+        // smuggle terminal escape sequences through log viewers.
+        // The helper must strip the byte but keep the surrounding
+        // printable context.
+        let attack = "00-aaaa\x1Bbbbb-cc";
+        let out = sanitise_traceparent(attack);
+        assert!(!out.contains('\x1B'));
+        assert!(out.contains("aaaa"));
+        assert!(out.contains("bbbb"));
     }
 
     #[test]
