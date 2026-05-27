@@ -16,7 +16,7 @@ categories = ["wasm", "encoding"]
 [lib]
 
 [dependencies]
-tensor-wasm-core = { path = "../tensor-wasm-core" }
+tensor-wasm-core = { workspace = true }
 bincode.workspace = true
 crc32fast = "1"
 serde.workspace = true
