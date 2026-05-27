@@ -10,10 +10,14 @@
 //! native pointers via the `caller.get_export("memory")` call.
 //!
 //! See `wit/wasi-cuda.wit` at the workspace root for the equivalent
-//! Component-Model interface description (`wasi:cuda/host@0.1.0`).
+//! Component-Model interface description (`wasi:cuda/host@0.2.0`).
 
-/// Wasm module name to import host functions from: `wasi:cuda/host@0.1.0`.
-pub const MODULE: &str = "wasi:cuda/host@0.1.0";
+/// Wasm module name to import host functions from: `wasi:cuda/host@0.2.0`.
+///
+/// The version segment is kept in lockstep with the `package` declaration in
+/// `wit/wasi-cuda.wit`; bumping one without the other will cause guests
+/// generated from the WIT to fail to link against this host.
+pub const MODULE: &str = "wasi:cuda/host@0.2.0";
 
 /// Function name: `load_ptx(ptx_ptr, ptx_len, entry_ptr, entry_len) -> i64`
 ///
@@ -88,13 +92,18 @@ pub enum AbiError {
     /// memory-region issue nor a dimensions issue. Currently used for
     /// non-UTF8 entry names in `load_ptx`.
     InvalidArgs = -9,
-    /// Caller passed a well-formed, in-bounds kernel-argument buffer, but
-    /// the host's dynamic-argv marshalling lane is not yet wired through
-    /// `cuLaunchKernel`. Distinct from [`AbiError::InvalidArgs`] so a
-    /// guest debugging "my launch with arguments fails" sees a clear
-    /// "unsupported in this release" signal instead of "your input is
-    /// malformed." See `docs/RISKS.md` (Kernel-args marshalling, v0.1.0)
-    /// and `wit/wasi-cuda.wit` for the contract.
+    /// Caller passed a well-formed, in-bounds kernel-argument buffer
+    /// that exceeds the host's sanity caps — total argv bytes greater
+    /// than [`MAX_KERNEL_ARGS_BYTES`](crate::kernel_args::MAX_KERNEL_ARGS_BYTES)
+    /// (4 KiB) or more than
+    /// [`MAX_KERNEL_ARGS`](crate::kernel_args::MAX_KERNEL_ARGS) (128)
+    /// tagged records. Since v0.2.0 (W1.1) the typed-argv lane accepts
+    /// arbitrary scalar + pointer argv below those caps; this code is
+    /// reserved for cap busts and is kept distinct from
+    /// [`AbiError::InvalidArgs`] so a guest can tell "your input shape
+    /// is too big for the host to accept" from "your input bytes are
+    /// malformed." See `wit/wasi-cuda.wit` and
+    /// [`crate::kernel_args::parse_argv`] for the contract.
     KernelArgsUnsupported = -10,
 }
 
@@ -191,7 +200,44 @@ mod tests {
     #[test]
     fn module_string_is_versioned() {
         assert!(MODULE.contains("wasi:cuda"));
-        assert!(MODULE.contains("@0.1"));
+        assert!(MODULE.ends_with("@0.2.0"));
+    }
+
+    /// Pin the host MODULE string against drift from `wit/wasi-cuda.wit`.
+    ///
+    /// The WIT file is the authoritative spec; the host's import-module
+    /// name has to carry the same `@x.y.z` segment so guests generated
+    /// from the WIT can link. Parse the version out of the WIT
+    /// `package wasi:cuda@x.y.z;` line and compare to the suffix of
+    /// [`MODULE`]. If somebody bumps one without the other, this test
+    /// trips before the linker error reaches downstream users.
+    #[test]
+    fn module_version_matches_wit_package_decl() {
+        const WIT: &str = include_str!("../../../wit/wasi-cuda.wit");
+        // Path is relative to this source file (`crates/tensor-wasm-wasi-gpu/src/abi.rs`):
+        //   ../        -> crates/tensor-wasm-wasi-gpu/
+        //   ../../     -> crates/
+        //   ../../../  -> workspace root, where `wit/` lives.
+        let pkg_line = WIT
+            .lines()
+            .find(|l| l.trim_start().starts_with("package wasi:cuda@"))
+            .expect("wit/wasi-cuda.wit must declare `package wasi:cuda@x.y.z;`");
+        let version = pkg_line
+            .trim()
+            .trim_start_matches("package wasi:cuda@")
+            .trim_end_matches(';')
+            .trim();
+        assert!(
+            !version.is_empty(),
+            "could not parse a version out of: {pkg_line:?}"
+        );
+        let expected_suffix = format!("@{version}");
+        assert!(
+            MODULE.ends_with(&expected_suffix),
+            "MODULE ({MODULE:?}) drifted from wit/wasi-cuda.wit \
+             package version ({version:?}); update src/abi.rs::MODULE \
+             or the WIT file so they agree."
+        );
     }
 
     #[test]
