@@ -59,12 +59,15 @@
 //!   pipeline, so we get arbitrary pure-compute auto-offload coverage
 //!   instead of the three hand-written blueprints today's
 //!   [`crate::detector`] recognises (matmul, vector_add, conv2d 3x3).
-//! - A binding to the Pliron crate. Pliron is pinned to a `git` rev in
-//!   cuda-oxide's `Cargo.toml` and not yet on crates.io — see RFC 0001
-//!   "Drawbacks". Adding a `git`-pinned dep today would import the
-//!   reproducible-builds (W3.6) and `cargo-deny` allowlist burden into
-//!   `tensor-wasm-jit` before any code uses it; deferring is the right
-//!   call.
+//! - A binding to the Pliron crate. As of W3.1 (2026-05-27), pliron is
+//!   published on crates.io at 0.15.0 (the original RFC 0001 "Drawbacks"
+//!   claim that Pliron was git-only is stale and has been amended) and
+//!   `tensor-wasm-jit` depends on it directly behind the
+//!   `cuda-oxide-backend` feature. The Pliron `Operation` / `Module`
+//!   bindings themselves are still introduced in wave 3; this module
+//!   keeps the scaffold/interim-IR shape so the wave-1 lowering families
+//!   stay testable without taking the cuda-oxide nightly toolchain
+//!   override.
 //! - A `dialect-llvm` or `mem2reg` pass binding. Those live further down
 //!   the cuda-oxide pipeline; this module's contract ends at `dialect-mir`.
 //!
@@ -182,9 +185,10 @@ pub enum PlironLoweringError {
 
     /// The Pliron dialect version pinned by `tensor-wasm-jit` does not
     /// match the version actually loaded at runtime. Pre-declared today
-    /// because Pliron is `git`-pinned (RFC 0001 "Drawbacks") and the v0.4
-    /// port will need a version-check entry point as part of the dep
-    /// landing. No scaffold path returns it.
+    /// for the v0.4 port's dialect-mir version-check entry point. (Pliron
+    /// is now on crates.io at 0.15.0 per W3.1 / 2026-05-27, so the
+    /// version check operates over a regular semver-pinned dep rather
+    /// than the original git-rev pin.) No scaffold path returns it.
     #[error("pliron_dialect: dialect-mir version mismatch -- expected `{expected}`, found `{found}`")]
     DialectVersionMismatch {
         /// Pinned dialect-mir version that `tensor-wasm-jit` was built
@@ -219,7 +223,8 @@ impl PlironLoweringError {
 /// converter on top of this trait without disturbing the call sites; see
 /// RFC 0001 step 4 and the [`crate::lowered_ir`] module docs for the
 /// rationale for routing through an interim IR rather than coding directly
-/// against the alpha, git-pinned Pliron `Operation` / `Module` types.
+/// against the alpha (but now crates.io-published, since W3.1 / 2026-05-27)
+/// Pliron `Operation` / `Module` types.
 ///
 /// The wave-1 signature is final on the input side — it now takes a real
 /// [`cranelift_codegen::ir::Function`] reference rather than the v0.3.1

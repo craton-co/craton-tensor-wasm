@@ -84,10 +84,13 @@ under the wave plan in Section 3.
 A literal reading of RFC 0001 would have the Cranelift IR lower straight
 into Pliron's `Operation` type. We are not doing that yet, for two reasons.
 
-**(a) Pliron is git-pinned alpha and the API is moving.** RFC 0001's
-"Drawbacks" section calls this out: Pliron is pinned to a `git` revision
-in cuda-oxide's `Cargo.toml` and is not yet on crates.io. cuda-oxide
-itself is v0.1.0 alpha and explicitly warns of API breakage; the contingent
+**(a) Pliron is alpha and the API is moving.** RFC 0001's "Drawbacks"
+section originally framed this as "Pliron is git-pinned and not yet on
+crates.io"; W3.1 (2026-05-27) discovered Pliron has since published
+0.15.0 to crates.io, and the W3.3 work cut TensorWasm over to the
+published crate. The "alpha API is moving" half of the concern is still
+real, though: pliron 0.15 is the first public release, cuda-oxide itself
+is v0.1.0 alpha and explicitly warns of API breakage, and the contingent
 v0.5 default flip in RFC 0001 is gated on cuda-oxide reaching ≥ 0.2.0
 with a stable host API. Importing Pliron and `cuda-oxide` directly into
 the lowering passes today would mean every upstream Pliron rev forces a
@@ -179,13 +182,19 @@ stable.
 
 ### Wave 3 — add the real Pliron dep and emit PTX
 
-Wave 3 introduces the first git-pinned upstream dependency in this
-pipeline. It is gated behind the opt-in `cuda-oxide-backend` feature
-flag introduced in v0.3.1 (RFC 0001 "Rollout").
+Wave 3 introduces the first new upstream Pliron-pipeline dependency in
+this pipeline. It is gated behind the opt-in `cuda-oxide-backend`
+feature flag introduced in v0.3.1 (RFC 0001 "Rollout"). Per the W3.1
+discovery (2026-05-27) that pliron 0.15.0 is now on crates.io, this
+dep is a regular crates.io version requirement — not a git pin. The
+remaining git pin scoped to this pipeline is the cuda-oxide HOST
+crates (wave 4), not Pliron itself.
 
 - **Add Pliron + cuda-oxide as deps behind `cuda-oxide-backend`.**
-  Cargo features stay mutually compatible per RFC 0001 "Feature-flag
-  layout"; the default workspace build is unaffected.
+  `pliron` 0.15 from crates.io directly (W3.3); cuda-oxide host
+  crates via the v0.1.0 git tag pin (wave 4). Cargo features stay
+  mutually compatible per RFC 0001 "Feature-flag layout"; the default
+  workspace build is unaffected.
 - **`LoweredOp → pliron::Operation` converter.** A single module under
   `crates/tensor-wasm-jit/src/` that consumes a `LoweredFunction` and
   emits a Pliron `Module` containing `dialect-mir` ops. This is the
@@ -196,9 +205,11 @@ flag introduced in v0.3.1 (RFC 0001 "Rollout").
   loading via `cust::module::Module::from_ptx` (or its `cudarc` /
   `cuda-host` equivalents — the choice is the wave-4 backend trait's
   problem).
-- **`cargo-deny` allowlist entry.** RFC 0001 "Drawbacks" calls this
-  out: Pliron is `git`-pinned and `cargo-deny` flags such pins by
-  default. The allowlist entry is documented in
+- **`cargo-deny` allowlist entry.** The historical RFC 0001 framing —
+  Pliron itself being git-pinned and flagged by `cargo-deny` — is no
+  longer accurate after W3.1 / 2026-05-27. The remaining `allow-git`
+  entry that lands in wave 3/4 is for the NVlabs/cuda-oxide host
+  crates only. The allowlist policy is documented in
   [`REPRODUCIBLE-BUILDS.md`](REPRODUCIBLE-BUILDS.md).
 - **Reproducible-build doc update.** Add the cuda-oxide-backend build
   recipe to [`REPRODUCIBLE-BUILDS.md`](REPRODUCIBLE-BUILDS.md), pinned
@@ -289,12 +300,19 @@ the rustdoc moves and this document points at the new location.
   "Pliron lever and the auto-offload pipeline", and "Future
   possibilities". This document is the implementation companion to that
   RFC; it does not re-litigate the decision.
-- **Pliron is git-pinned, not yet on crates.io.** RFC 0001 "Drawbacks"
-  flags this as a supply-chain hazard for the
-  [reproducible-builds](REPRODUCIBLE-BUILDS.md) and `cargo-deny` work.
-  The interim `LoweredOp` IR exists in part so that hazard does not land
-  in the workspace until wave 3, when `cuda-oxide-backend` is the
-  feature flag carrying the cost.
+- **Pliron is now on crates.io (W3.1, 2026-05-27).** The original RFC
+  0001 "Drawbacks" framing flagged Pliron as a git-pinned supply-chain
+  hazard for the [reproducible-builds](REPRODUCIBLE-BUILDS.md) and
+  `cargo-deny` work. That framing is now stale: pliron 0.15.0 is on
+  crates.io and W3.3 cut TensorWasm over to depend on it directly.
+  `pliron-llvm` 0.15.0 is also published but carries a hard
+  `llvm-sys = "221"` system dep and is therefore gated behind its own
+  `pliron-llvm-backend` feature, not bundled into `cuda-oxide-backend`.
+  The remaining git-pin supply-chain hazard in this pipeline is the
+  cuda-oxide HOST crates (`cuda-host`, `cuda-core`, `cuda-device`,
+  `cuda-macros`), which arrive in wave 4 — the interim `LoweredOp`
+  IR still helps keep that hazard out of the workspace until wave 3
+  triggers the feature flag.
 - **Toolchain split is real and intentional.** The workspace default
   stays on `nightly-2026-03-15`; wave 3 adds an opt-in
   `nightly-2026-04-03` override for the `cuda-oxide-backend` feature.
@@ -321,7 +339,9 @@ the rustdoc moves and this document points at the new location.
 - [CUDA-SETUP.md](CUDA-SETUP.md): toolchain and driver expectations,
   including the wave-3 `nightly-2026-04-03` opt-in override.
 - [REPRODUCIBLE-BUILDS.md](REPRODUCIBLE-BUILDS.md): supply-chain story
-  for the wave-3 Pliron `git` pin and the `cargo-deny` allowlist entry.
+  for the wave-4 cuda-oxide HOST-crate `git` pin and the `cargo-deny`
+  allowlist entry. (Pliron itself no longer requires a git pin as of
+  W3.1 / 2026-05-27.)
 - [SNAPSHOT-COMPATIBILITY.md](SNAPSHOT-COMPATIBILITY.md): the wave-2
   `LoweredFunction` axis added to the cross-version snapshot suite.
 - Wave-1 source files:
