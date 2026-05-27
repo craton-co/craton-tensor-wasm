@@ -38,7 +38,10 @@
 pub mod context;
 pub mod registry;
 
-pub use context::{IsolationKind, TenantCapability, TenantContext, TenantContextBuilder};
+pub use context::{
+    isolation_downgrade_count, IsolationKind, TenantCapability, TenantContext,
+    TenantContextBuilder,
+};
 pub use registry::{
     MpsDecision, RegistryError, TenantRegistry, MPS_CONTROL_PATH, MPS_PIPE_DIRECTORY_ENV,
 };
