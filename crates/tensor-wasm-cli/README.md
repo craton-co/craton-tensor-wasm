@@ -30,7 +30,9 @@ A binary distribution channel (Homebrew tap, signed release tarballs) is on the 
 | `tensor-wasm snapshot save`   | Capture a running instance to a `.tensor-wasm` archive (requires API; see notes).          |
 | `tensor-wasm snapshot restore`| Restore an instance from a `.tensor-wasm` archive (requires API; see notes).               |
 | `tensor-wasm metrics`         | Fetch and print the Prometheus exposition page from a TensorWasm server.                  |
+| `tensor-wasm observe`         | Live operator dashboard over `/healthz` + `/metrics` (refreshes in place).          |
 | `tensor-wasm completions`     | Emit a shell-completion script for the named shell.                                 |
+| `tensor-wasm man`             | Generate roff(7) man pages from the clap command tree.                              |
 
 Use `tensor-wasm <subcommand> --help` for the authoritative flag list — that text is snapshot-tested with `insta` and reviewed on every change.
 

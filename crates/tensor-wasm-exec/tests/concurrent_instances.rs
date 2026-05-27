@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
+
 //! S7 integration test: 100 concurrent instances complete without deadlock,
 //! spurious timeout, or resource leak.
 

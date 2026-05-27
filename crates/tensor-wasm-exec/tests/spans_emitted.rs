@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
+
 //! S20 integration test: invoking the executor produces at least four
 //! parent-child-linked spans matching the documented schema.
 //!
