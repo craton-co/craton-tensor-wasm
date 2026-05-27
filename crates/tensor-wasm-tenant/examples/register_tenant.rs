@@ -10,7 +10,7 @@ use tensor_wasm_tenant::{IsolationKind, TenantContext, TenantRegistry};
 
 #[tokio::main]
 async fn main() {
-    let registry = TenantRegistry::new();
+    let (registry, admin_cap) = TenantRegistry::new();
 
     let ctx = TenantContext::builder(TenantId(42))
         .with_isolation(IsolationKind::StreamIsolated)
@@ -24,7 +24,7 @@ async fn main() {
     println!("registered: {}", tenant.id());
 
     let same = registry
-        .get(TenantId(42))
+        .get(TenantId(42), &admin_cap)
         .expect("just-registered tenant must be findable");
     println!("isolation: {}", same.isolation());
 

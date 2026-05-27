@@ -26,7 +26,7 @@ fn make_ctx() -> TenantContext {
 
 #[test]
 fn thirty_two_threads_contend_for_the_same_tenant_id() {
-    let reg = TenantRegistry::new();
+    let (reg, cap) = TenantRegistry::new();
     let barrier = Arc::new(Barrier::new(THREADS));
     let successes = Arc::new(AtomicUsize::new(0));
     let failures = Arc::new(AtomicUsize::new(0));
@@ -76,10 +76,12 @@ fn thirty_two_threads_contend_for_the_same_tenant_id() {
     let winners = winners.lock().unwrap();
     assert_eq!(winners.len(), 1, "exactly one winning Arc");
     let winner = &winners[0];
-    let looked_up = reg.get(TENANT).expect("registered tenant must be findable");
+    let looked_up = reg
+        .get(TENANT, &cap)
+        .expect("registered tenant must be findable");
     assert!(
         Arc::ptr_eq(winner, &looked_up),
         "lookup must return the same Arc as the winning registration",
     );
-    assert_eq!(reg.len(), 1, "no spurious registrations");
+    assert_eq!(reg.len(&cap), 1, "no spurious registrations");
 }

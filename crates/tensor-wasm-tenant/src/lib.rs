@@ -11,11 +11,18 @@
 //!
 //! # Quick start
 //!
-//! Register a tenant and account some bytes against its quota. The
-//! capability returned by [`TenantRegistry::register_with_capability`] is
-//! required to drive the quota counters — it cannot be fabricated by code
-//! outside this crate, so holding an `Arc<TenantContext>` for tenant A
-//! grants no power to mutate tenant B's accounting.
+//! Two distinct capability primitives:
+//!
+//! * [`TenantCapability`] — minted per-tenant by
+//!   [`TenantRegistry::register_with_capability`], required to drive that
+//!   tenant's quota counters (`consume_bytes_with_capability` /
+//!   `release_bytes_with_capability`). Holding an `Arc<TenantContext>` for
+//!   tenant A grants no power to mutate tenant B's accounting.
+//! * [`RegistryAdminCapability`] — minted once by [`TenantRegistry::new`],
+//!   required to invoke registry-wide admin operations
+//!   ([`TenantRegistry::get`], [`TenantRegistry::unregister`],
+//!   [`TenantRegistry::tenants`], [`TenantRegistry::len`]). Without it, any
+//!   holder of an `Arc<TenantRegistry>` could enumerate or evict tenants.
 //!
 //! ```
 //! # #[cfg(not(feature = "cuda"))]
@@ -23,12 +30,14 @@
 //! use tensor_wasm_core::types::TenantId;
 //! use tensor_wasm_tenant::{TenantContext, TenantRegistry};
 //!
-//! let reg = TenantRegistry::new();
-//! let (ctx, cap) = reg
+//! let (reg, admin_cap) = TenantRegistry::new();
+//! let (ctx, tenant_cap) = reg
 //!     .register_with_capability(TenantContext::builder(TenantId(1)).build())
 //!     .unwrap();
-//! ctx.consume_bytes_with_capability(&cap, 4096).unwrap();
+//! ctx.consume_bytes_with_capability(&tenant_cap, 4096).unwrap();
 //! assert_eq!(ctx.bytes_in_use(), 4096);
+//! // Admin cap is required to look the tenant up again by id.
+//! assert!(reg.get(TenantId(1), &admin_cap).is_some());
 //! # }
 //! # #[cfg(feature = "cuda")]
 //! # fn main() {}
@@ -43,5 +52,6 @@ pub use context::{
     TenantContextBuilder,
 };
 pub use registry::{
-    MpsDecision, RegistryError, TenantRegistry, MPS_CONTROL_PATH, MPS_PIPE_DIRECTORY_ENV,
+    MpsDecision, RegistryAdminCapability, RegistryError, TenantRegistry, MPS_CONTROL_PATH,
+    MPS_PIPE_DIRECTORY_ENV,
 };

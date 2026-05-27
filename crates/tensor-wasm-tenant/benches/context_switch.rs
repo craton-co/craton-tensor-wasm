@@ -20,11 +20,13 @@
 use std::time::Duration;
 
 use tensor_wasm_core::types::TenantId;
-use tensor_wasm_tenant::{IsolationKind, TenantContext, TenantRegistry};
+use tensor_wasm_tenant::{
+    IsolationKind, RegistryAdminCapability, TenantContext, TenantRegistry,
+};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-fn populate(n: u64) -> TenantRegistry {
-    let reg = TenantRegistry::new();
+fn populate(n: u64) -> (TenantRegistry, RegistryAdminCapability) {
+    let (reg, cap) = TenantRegistry::new();
     for i in 0..n {
         let ctx = TenantContext::builder(TenantId(i))
             .with_isolation(IsolationKind::StreamIsolated)
@@ -32,18 +34,18 @@ fn populate(n: u64) -> TenantRegistry {
             .build();
         reg.register(ctx).expect("register");
     }
-    reg
+    (reg, cap)
 }
 
 fn bench_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("tenant_registry/lookup");
     group.measurement_time(Duration::from_secs(3));
     for &n in &[1u64, 16, 256] {
-        let reg = populate(n);
+        let (reg, cap) = populate(n);
         let last = TenantId(n - 1);
         group.bench_with_input(BenchmarkId::from_parameter(n), &last, |b, &id| {
             b.iter(|| {
-                let ctx = reg.get(id).expect("present");
+                let ctx = reg.get(id, &cap).expect("present");
                 black_box(ctx);
             });
         });
@@ -54,8 +56,8 @@ fn bench_lookup(c: &mut Criterion) {
 fn bench_consume_release(c: &mut Criterion) {
     let mut group = c.benchmark_group("tenant_registry/consume_release");
     group.measurement_time(Duration::from_secs(3));
-    let reg = populate(16);
-    let ctx = reg.get(TenantId(7)).unwrap();
+    let (reg, cap) = populate(16);
+    let ctx = reg.get(TenantId(7), &cap).unwrap();
     group.bench_function("256KiB", |b| {
         b.iter(|| {
             ctx.consume_bytes(256 * 1024).unwrap();

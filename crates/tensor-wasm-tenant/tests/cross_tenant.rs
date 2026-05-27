@@ -65,23 +65,23 @@ fn distinct_tenants_have_independent_quotas() {
 
 #[test]
 fn unregister_returns_arc_option() {
-    let reg = TenantRegistry::new();
+    let (reg, cap) = TenantRegistry::new();
     reg.register(make_ctx(11, 1024)).unwrap();
     reg.register(make_ctx(12, 1024)).unwrap();
-    assert_eq!(reg.len(), 2);
+    assert_eq!(reg.len(&cap), 2);
 
     // Type assertion: unregister must return Option<Arc<TenantContext>>.
-    let removed: Option<Arc<TenantContext>> = reg.unregister(TenantId(11));
+    let removed: Option<Arc<TenantContext>> = reg.unregister(TenantId(11), &cap);
     let removed = removed.expect("tenant 11 was registered");
     assert_eq!(removed.id(), TenantId(11));
-    assert_eq!(reg.len(), 1);
+    assert_eq!(reg.len(&cap), 1);
 
     // Removing a tenant that was never present is a clean None.
-    let missing: Option<Arc<TenantContext>> = reg.unregister(TenantId(999));
+    let missing: Option<Arc<TenantContext>> = reg.unregister(TenantId(999), &cap);
     assert!(missing.is_none());
 
     // The remaining tenant is still reachable and its quota intact.
-    let twelve = reg.get(TenantId(12)).expect("tenant 12 still present");
+    let twelve = reg.get(TenantId(12), &cap).expect("tenant 12 still present");
     assert_eq!(twelve.id(), TenantId(12));
     assert_eq!(twelve.quota(), 1024);
 }
@@ -91,10 +91,10 @@ fn arc_clones_share_quota_counter() {
     // Sanity check that the `Arc<TenantContext>` semantics actually share a
     // single counter — if the registry accidentally cloned the context on
     // lookup we would silently lose quota accounting under concurrent use.
-    let reg = TenantRegistry::new();
+    let (reg, cap) = TenantRegistry::new();
     reg.register(make_ctx(21, 4096)).unwrap();
-    let a = reg.get(TenantId(21)).unwrap();
-    let b = reg.get(TenantId(21)).unwrap();
+    let a = reg.get(TenantId(21), &cap).unwrap();
+    let b = reg.get(TenantId(21), &cap).unwrap();
     assert!(Arc::ptr_eq(&a, &b));
     a.consume_bytes(1000).unwrap();
     assert_eq!(b.bytes_in_use(), 1000);

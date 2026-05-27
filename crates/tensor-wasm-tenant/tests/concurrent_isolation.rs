@@ -36,7 +36,7 @@ fn make_ctx(id: u64) -> TenantContext {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ten_tenants_concurrent_kernels_have_no_contamination() {
-    let reg = TenantRegistry::new();
+    let (reg, cap) = TenantRegistry::new();
     for i in 0..TENANTS {
         reg.register(make_ctx(i)).expect("register");
     }
@@ -44,12 +44,17 @@ async fn ten_tenants_concurrent_kernels_have_no_contamination() {
     // Per-tenant counter of "kernels launched" for the cross-check below.
     let launched: Vec<Arc<AtomicU64>> = (0..TENANTS).map(|_| Arc::new(AtomicU64::new(0))).collect();
 
+    // Hand out the per-tenant Arc up front from the admin path so spawned
+    // tasks never need the capability themselves.
+    let per_tenant: Vec<Arc<_>> = (0..TENANTS)
+        .map(|i| reg.get(TenantId(i), &cap).expect("ctx"))
+        .collect();
+
     let mut handles = Vec::new();
     for tenant_id in 0..TENANTS {
-        let reg = reg.clone();
+        let ctx = Arc::clone(&per_tenant[tenant_id as usize]);
         let launched = Arc::clone(&launched[tenant_id as usize]);
         handles.push(tokio::spawn(async move {
-            let ctx = reg.get(TenantId(tenant_id)).expect("ctx");
             for _ in 0..KERNELS_PER_TENANT {
                 ctx.consume_bytes(BYTES_PER_KERNEL).expect("consume");
                 launched.fetch_add(1, Ordering::Relaxed);
@@ -75,7 +80,7 @@ async fn ten_tenants_concurrent_kernels_have_no_contamination() {
     //    had been mis-routed to another tenant we'd see a non-zero residual
     //    in the wrong place.
     for i in 0..TENANTS {
-        let ctx = reg.get(TenantId(i)).expect("ctx");
+        let ctx = reg.get(TenantId(i), &cap).expect("ctx");
         assert_eq!(
             ctx.bytes_in_use(),
             0,
@@ -85,7 +90,7 @@ async fn ten_tenants_concurrent_kernels_have_no_contamination() {
     }
 
     // 3. Registry size is still TENANTS — no spurious registrations.
-    assert_eq!(reg.len() as u64, TENANTS);
+    assert_eq!(reg.len(&cap) as u64, TENANTS);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -93,14 +98,14 @@ async fn concurrent_overrun_is_contained_to_one_tenant() {
     // One tenant intentionally exceeds its quota; the others must complete
     // their kernels unaffected. Proves the contamination boundary holds even
     // when one tenant is misbehaving.
-    let reg = TenantRegistry::new();
+    let (reg, cap) = TenantRegistry::new();
     for i in 0..TENANTS {
         reg.register(make_ctx(i)).expect("register");
     }
 
     // The offender tries to consume 2× its quota; all others stay well below.
     let offender = 3u64;
-    let offender_ctx = reg.get(TenantId(offender)).unwrap();
+    let offender_ctx = reg.get(TenantId(offender), &cap).unwrap();
     let offender_handle = tokio::spawn(async move {
         // First fill the quota exactly.
         offender_ctx.consume_bytes(QUOTA_BYTES).unwrap();
@@ -110,14 +115,16 @@ async fn concurrent_overrun_is_contained_to_one_tenant() {
         assert!(format!("{err}").contains("memory exhausted"));
     });
 
+    // Pull out the other tenants' Arcs from the admin path here, so the
+    // spawned tasks need neither the registry nor the capability.
+    let other_ctxs: Vec<Arc<_>> = (0..TENANTS)
+        .filter(|i| *i != offender)
+        .map(|i| reg.get(TenantId(i), &cap).expect("ctx"))
+        .collect();
+
     let mut other_handles = Vec::new();
-    for tenant_id in 0..TENANTS {
-        if tenant_id == offender {
-            continue;
-        }
-        let reg = reg.clone();
+    for ctx in other_ctxs {
         other_handles.push(tokio::spawn(async move {
-            let ctx = reg.get(TenantId(tenant_id)).expect("ctx");
             for _ in 0..KERNELS_PER_TENANT {
                 ctx.consume_bytes(BYTES_PER_KERNEL).expect("consume");
                 tokio::task::yield_now().await;
@@ -133,14 +140,14 @@ async fn concurrent_overrun_is_contained_to_one_tenant() {
     }
 
     // Offender is still at quota (it failed to release after overrun).
-    let off = reg.get(TenantId(offender)).unwrap();
+    let off = reg.get(TenantId(offender), &cap).unwrap();
     assert_eq!(off.bytes_in_use(), QUOTA_BYTES);
     // Everyone else is clean.
     for i in 0..TENANTS {
         if i == offender {
             continue;
         }
-        let ctx = reg.get(TenantId(i)).unwrap();
+        let ctx = reg.get(TenantId(i), &cap).unwrap();
         assert_eq!(ctx.bytes_in_use(), 0, "tenant {i} contaminated");
     }
 }

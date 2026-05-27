@@ -9,6 +9,19 @@
 //! same tenant returns [`RegistryError::AlreadyRegistered`] rather than
 //! silently overwriting — accidentally clobbering a live tenant's context
 //! would be a stream/quota leak.
+//!
+//! # Admin capability
+//!
+//! Registry-wide operations that can enumerate or evict arbitrary tenants
+//! ([`TenantRegistry::get`], [`TenantRegistry::unregister`],
+//! [`TenantRegistry::tenants`], [`TenantRegistry::len`]) are gated behind
+//! [`RegistryAdminCapability`]. Exactly one capability is minted by
+//! [`TenantRegistry::new`] and returned alongside the registry; downstream
+//! crates that only hold an `Arc<TenantRegistry>` cannot enumerate or evict
+//! tenants because the capability's sole constructor is crate-private.
+//! Per-tenant operations (`register`) remain open: a caller that already
+//! knows a tenant's id and supplies a fresh [`TenantContext`] is not granted
+//! any additional authority over tenants it did not create.
 
 use std::sync::Arc;
 
@@ -67,20 +80,56 @@ pub const MPS_CONTROL_PATH: &str = "/tmp/nvidia-mps";
 /// it fall back to the hard-coded default.
 pub const MPS_PIPE_DIRECTORY_ENV: &str = "CUDA_MPS_PIPE_DIRECTORY";
 
+/// Unforgeable token that authorises registry-wide admin operations.
+///
+/// Holding a `&RegistryAdminCapability` is the only way to invoke
+/// [`TenantRegistry::get`], [`TenantRegistry::unregister`],
+/// [`TenantRegistry::tenants`], or [`TenantRegistry::len`]. The struct's
+/// sole field is private and its only constructor ([`Self::mint`]) is
+/// crate-private, so external crates cannot synthesise a capability — they
+/// can only borrow the one minted at [`TenantRegistry::new`] time.
+///
+/// Capabilities are not cloneable on purpose: an operator that delegates
+/// admin authority to a sub-system passes a `&RegistryAdminCapability`
+/// reference rather than handing out independent copies.
+#[derive(Debug)]
+pub struct RegistryAdminCapability {
+    _seal: (),
+}
+
+impl RegistryAdminCapability {
+    /// Mint a fresh capability. Crate-private so external crates cannot
+    /// forge admin authority over a `TenantRegistry` they did not
+    /// construct.
+    pub(crate) fn mint() -> Self {
+        Self { _seal: () }
+    }
+}
+
 /// Concurrent registry of live tenants.
 ///
 /// Cloning is cheap: the inner `DashMap` is wrapped in `Arc` so callers can
 /// share the registry across the API layer, the executor, and the JIT cache
 /// without ferrying a `&'static` reference.
+///
+/// Construction returns a tuple `(TenantRegistry, RegistryAdminCapability)`;
+/// see [`Self::new`].
 #[derive(Debug, Clone, Default)]
 pub struct TenantRegistry {
     inner: Arc<DashMap<TenantId, Arc<TenantContext>>>,
 }
 
 impl TenantRegistry {
-    /// Construct an empty registry.
-    pub fn new() -> Self {
-        Self::default()
+    /// Construct an empty registry and mint its admin capability.
+    ///
+    /// The capability is the only key that opens [`Self::get`],
+    /// [`Self::unregister`], [`Self::tenants`], and [`Self::len`]; the
+    /// operator that owns the returned cap is the only one authorised to
+    /// enumerate or evict tenants. Cloning the registry shares the inner
+    /// `DashMap`, but does NOT clone the cap — admin authority stays with
+    /// whoever the original constructor handed it to.
+    pub fn new() -> (Self, RegistryAdminCapability) {
+        (Self::default(), RegistryAdminCapability::mint())
     }
 
     /// Insert `ctx` into the registry.
@@ -130,17 +179,38 @@ impl TenantRegistry {
     }
 
     /// Look up a tenant by id. Returns `None` if no tenant is registered.
-    pub fn get(&self, tenant_id: TenantId) -> Option<Arc<TenantContext>> {
+    ///
+    /// Gated behind [`RegistryAdminCapability`] because an unrestricted
+    /// `get` lets any holder of an `Arc<TenantRegistry>` enumerate other
+    /// tenants' contexts by id and mutate their quota counters.
+    pub fn get(
+        &self,
+        tenant_id: TenantId,
+        _cap: &RegistryAdminCapability,
+    ) -> Option<Arc<TenantContext>> {
         self.inner.get(&tenant_id).map(|r| Arc::clone(r.value()))
     }
 
     /// Remove a tenant. Returns the removed context, or `None` if absent.
-    pub fn unregister(&self, tenant_id: TenantId) -> Option<Arc<TenantContext>> {
+    ///
+    /// Gated behind [`RegistryAdminCapability`]: without this, any holder
+    /// of an `Arc<TenantRegistry>` could evict arbitrary tenants from the
+    /// registry, breaking their kernel pipelines.
+    pub fn unregister(
+        &self,
+        tenant_id: TenantId,
+        _cap: &RegistryAdminCapability,
+    ) -> Option<Arc<TenantContext>> {
         self.inner.remove(&tenant_id).map(|(_, v)| v)
     }
 
     /// Number of tenants currently registered.
-    pub fn len(&self) -> usize {
+    ///
+    /// Gated behind [`RegistryAdminCapability`] because the count is a
+    /// global property of the registry that should not leak across the
+    /// tenant boundary — a tenant counting its peers is itself a
+    /// side-channel.
+    pub fn len(&self, _cap: &RegistryAdminCapability) -> usize {
         self.inner.len()
     }
 
@@ -155,7 +225,11 @@ impl TenantRegistry {
     /// iterators hold shard locks; handing one out across an `await` boundary
     /// is a deadlock waiting to happen. The snapshot is cheap — each entry is
     /// an `Arc` clone.
-    pub fn tenants(&self) -> Vec<Arc<TenantContext>> {
+    ///
+    /// Gated behind [`RegistryAdminCapability`] because the snapshot
+    /// enumerates every registered tenant — a primitive that, in the wrong
+    /// hands, defeats the whole point of multi-tenant isolation.
+    pub fn tenants(&self, _cap: &RegistryAdminCapability) -> Vec<Arc<TenantContext>> {
         self.inner.iter().map(|r| Arc::clone(r.value())).collect()
     }
 
@@ -200,53 +274,53 @@ mod tests {
 
     #[test]
     fn register_lookup_unregister() {
-        let reg = TenantRegistry::new();
+        let (reg, cap) = TenantRegistry::new();
         assert!(reg.is_empty());
         let arc = reg.register(ctx(1)).unwrap();
-        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.len(&cap), 1);
         assert_eq!(arc.id(), TenantId(1));
-        let found = reg.get(TenantId(1)).unwrap();
+        let found = reg.get(TenantId(1), &cap).unwrap();
         assert_eq!(found.id(), TenantId(1));
-        let removed = reg.unregister(TenantId(1)).unwrap();
+        let removed = reg.unregister(TenantId(1), &cap).unwrap();
         assert_eq!(removed.id(), TenantId(1));
         assert!(reg.is_empty());
-        assert!(reg.get(TenantId(1)).is_none());
+        assert!(reg.get(TenantId(1), &cap).is_none());
     }
 
     #[test]
     fn double_register_is_rejected() {
-        let reg = TenantRegistry::new();
+        let (reg, cap) = TenantRegistry::new();
         reg.register(ctx(2)).unwrap();
         let err = reg.register(ctx(2)).unwrap_err();
         assert_eq!(err, RegistryError::AlreadyRegistered(TenantId(2)));
         // First registration is still intact.
-        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.len(&cap), 1);
     }
 
     #[test]
     fn unregister_missing_returns_none() {
-        let reg = TenantRegistry::new();
-        assert!(reg.unregister(TenantId(404)).is_none());
+        let (reg, cap) = TenantRegistry::new();
+        assert!(reg.unregister(TenantId(404), &cap).is_none());
     }
 
     #[test]
     fn tenants_snapshot_lists_all() {
-        let reg = TenantRegistry::new();
+        let (reg, cap) = TenantRegistry::new();
         for i in 0..5u64 {
             reg.register(ctx(i)).unwrap();
         }
-        let mut ids: Vec<u64> = reg.tenants().iter().map(|c| c.id().get()).collect();
+        let mut ids: Vec<u64> = reg.tenants(&cap).iter().map(|c| c.id().get()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
     fn registry_clone_shares_state() {
-        let a = TenantRegistry::new();
+        let (a, cap) = TenantRegistry::new();
         let b = a.clone();
         a.register(ctx(10)).unwrap();
-        assert_eq!(b.len(), 1);
-        assert!(b.get(TenantId(10)).is_some());
+        assert_eq!(b.len(&cap), 1);
+        assert!(b.get(TenantId(10), &cap).is_some());
     }
 
     #[test]
