@@ -11,7 +11,7 @@
 //! `cust` crate via the `cuda` feature.
 //!
 //! See `wit/wasi-cuda.wit` at the workspace root for the Component-Model
-//! interface definition (`wasi:cuda/host@0.1.0`) — the WIT and the
+//! interface definition (`wasi:cuda/host@0.2.0`) — the WIT and the
 //! constants in [`abi`] are kept in lockstep.
 #![deny(missing_docs)]
 

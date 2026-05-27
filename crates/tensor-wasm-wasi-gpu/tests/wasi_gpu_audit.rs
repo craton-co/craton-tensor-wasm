@@ -101,15 +101,15 @@ fn concurrent_register_remove_stress() {
 
 const AUDIT_WAT: &str = r#"
 (module
-  (import "wasi:cuda/host@0.1.0" "wasi_cuda_load_ptx"
+  (import "wasi:cuda/host@0.2.0" "wasi_cuda_load_ptx"
       (func $load_ptx (param i32 i32 i32 i32) (result i64)))
-  (import "wasi:cuda/host@0.1.0" "wasi_cuda_launch"
+  (import "wasi:cuda/host@0.2.0" "wasi_cuda_launch"
       (func $launch (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
-  (import "wasi:cuda/host@0.1.0" "wasi_cuda_sync"
+  (import "wasi:cuda/host@0.2.0" "wasi_cuda_sync"
       (func $sync (result i32)))
-  (import "wasi:cuda/host@0.1.0" "wasi_cuda_last_error_len"
+  (import "wasi:cuda/host@0.2.0" "wasi_cuda_last_error_len"
       (func $last_err_len (result i32)))
-  (import "wasi:cuda/host@0.1.0" "wasi_cuda_last_error_copy"
+  (import "wasi:cuda/host@0.2.0" "wasi_cuda_last_error_copy"
       (func $last_err_copy (param i32 i32) (result i32)))
 
   (memory (export "memory") 1 4)
@@ -325,7 +325,7 @@ async fn load_ptx_over_max_ptx_bytes_returns_quota_exceeded() {
     let wat = format!(
         r#"
         (module
-          (import "wasi:cuda/host@0.1.0" "wasi_cuda_load_ptx"
+          (import "wasi:cuda/host@0.2.0" "wasi_cuda_load_ptx"
               (func $load_ptx (param i32 i32 i32 i32) (result i64)))
           (memory (export "memory") 1 4)
           (data (i32.const 64) "k")
@@ -369,7 +369,7 @@ async fn launch_args_region_past_end_returns_invalid_pointer() {
     let (engine, linker) = make_engine_and_linker();
     let wat = r#"
         (module
-          (import "wasi:cuda/host@0.1.0" "wasi_cuda_launch"
+          (import "wasi:cuda/host@0.2.0" "wasi_cuda_launch"
               (func $launch (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
           (memory (export "memory") 1 4)
           (func (export "overflow_launch") (result i32)

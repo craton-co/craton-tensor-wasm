@@ -52,12 +52,17 @@
 //! testing (see [`WasiCudaContext::last_lowered_args`]) and the launch
 //! returns [`AbiError::NotAvailable`].
 //!
-//! [`AbiError::KernelArgsUnsupported`] is preserved as a fallback for
-//! genuinely-unsupported argv shapes — over-long buffers and excess arg
-//! counts. Malformed argv (unknown tag bytes, truncated records)
-//! surfaces as [`AbiError::InvalidArgs`]; out-of-bounds pointer
-//! arguments surface as [`AbiError::InvalidPointer`]. The distinction
-//! keeps the error story crisp for guest debugging.
+//! [`AbiError::KernelArgsUnsupported`] is reserved for sanity-cap busts
+//! on otherwise well-formed argv — buffers longer than
+//! [`crate::kernel_args::MAX_KERNEL_ARGS_BYTES`] (4 KiB) or carrying
+//! more than [`crate::kernel_args::MAX_KERNEL_ARGS`] (128) tagged
+//! records. The W1.1 typed-argv lane (live since v0.2.0 of the WIT)
+//! lowers any scalar + pointer argv below those caps into a
+//! `cuLaunchKernel` parameter array. Malformed argv (unknown tag
+//! bytes, truncated records) surfaces as [`AbiError::InvalidArgs`];
+//! out-of-bounds pointer arguments surface as
+//! [`AbiError::InvalidPointer`]. The distinction keeps the error
+//! story crisp for guest debugging.
 
 use std::sync::Arc;
 use std::sync::Mutex;

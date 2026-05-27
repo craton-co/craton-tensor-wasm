@@ -2,7 +2,7 @@
 
 Host bridge implementing the `wasi-cuda` interface, giving Wasm guests an explicit GPU kernel launch API. Defines the `wasi_cuda_*` ABI, host-side implementations of every call, a `KernelRegistry` that caches compiled PTX modules keyed by `KernelId`, and an async dispatch layer with back-pressure to keep the GPU saturated without overwhelming it. This crate is the explicit-offload counterpart to tensor-wasm-jit's implicit offload pipeline.
 
-The Component-Model interface (`wasi:cuda/host@0.1.0`) is defined in [`wit/wasi-cuda.wit`](../../wit/wasi-cuda.wit) at the workspace root; keep that file in lockstep with `src/abi.rs`.
+The Component-Model interface (`wasi:cuda/host@0.2.0`) is defined in [`wit/wasi-cuda.wit`](../../wit/wasi-cuda.wit) at the workspace root; keep that file in lockstep with `src/abi.rs`.
 
 ## Feature flags
 
