@@ -21,7 +21,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lib]
 
 [dependencies]
-tensor-wasm-core = { path = "../tensor-wasm-core" }
+tensor-wasm-core = { workspace = true }
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

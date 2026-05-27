@@ -27,6 +27,19 @@ repository = "https://github.com/craton-co/craton-tensor-wasm"
 # default `cargo build --workspace` succeeds on hosts without CUDA libraries.
 # Enabling the `unified-memory` feature on tensor-wasm-mem (transitively) pulls them in.
 [workspace.dependencies]
+# Internal crates — both `path` (used during workspace builds) and `version`
+# (required by crates.io publish) are specified. Member crates reference these
+# via `tensor-wasm-foo = { workspace = true }`. `tensor-wasm-cli` and
+# `tensor-wasm-bench` are `publish = false`, so they are intentionally omitted.
+tensor-wasm-core = { path = "crates/tensor-wasm-core", version = "0.3.5" }
+tensor-wasm-mem = { path = "crates/tensor-wasm-mem", version = "0.3.5" }
+tensor-wasm-exec = { path = "crates/tensor-wasm-exec", version = "0.3.5" }
+tensor-wasm-wasi-gpu = { path = "crates/tensor-wasm-wasi-gpu", version = "0.3.5" }
+tensor-wasm-jit = { path = "crates/tensor-wasm-jit", version = "0.3.5" }
+tensor-wasm-snapshot = { path = "crates/tensor-wasm-snapshot", version = "0.3.5" }
+tensor-wasm-tenant = { path = "crates/tensor-wasm-tenant", version = "0.3.5" }
+tensor-wasm-api = { path = "crates/tensor-wasm-api", version = "0.3.5" }
+
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = "0.7"

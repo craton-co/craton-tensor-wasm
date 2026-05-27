@@ -16,7 +16,7 @@ categories = ["wasm", "compilers", "concurrency"]
 [lib]
 
 [dependencies]
-tensor-wasm-core = { path = "../tensor-wasm-core" }
+tensor-wasm-core = { workspace = true }
 blake3.workspace = true
 cranelift-codegen.workspace = true
 dashmap.workspace = true

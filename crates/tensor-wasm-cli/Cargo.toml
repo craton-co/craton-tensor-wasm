@@ -30,8 +30,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 base64 = "0.22"
-tensor-wasm-core = { path = "../tensor-wasm-core" }
-tensor-wasm-exec = { path = "../tensor-wasm-exec" }
+tensor-wasm-core = { workspace = true }
+tensor-wasm-exec = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

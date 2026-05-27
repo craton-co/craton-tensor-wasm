@@ -15,12 +15,12 @@ publish = false
 [lib]
 
 [dependencies]
-tensor-wasm-api = { path = "../tensor-wasm-api" }
-tensor-wasm-core = { path = "../tensor-wasm-core" }
-tensor-wasm-jit = { path = "../tensor-wasm-jit" }
-tensor-wasm-mem = { path = "../tensor-wasm-mem" }
-tensor-wasm-snapshot = { path = "../tensor-wasm-snapshot" }
-tensor-wasm-wasi-gpu = { path = "../tensor-wasm-wasi-gpu" }
+tensor-wasm-api = { workspace = true }
+tensor-wasm-core = { workspace = true }
+tensor-wasm-jit = { workspace = true }
+tensor-wasm-mem = { workspace = true }
+tensor-wasm-snapshot = { workspace = true }
+tensor-wasm-wasi-gpu = { workspace = true }
 tokio.workspace = true
 
 [dev-dependencies]

@@ -15,9 +15,9 @@ categories = ["wasm", "concurrency"]
 
 [dependencies]
 async-trait.workspace = true
-tensor-wasm-core = { path = "../tensor-wasm-core" }
-tensor-wasm-jit = { path = "../tensor-wasm-jit" }
-tensor-wasm-mem = { path = "../tensor-wasm-mem" }
+tensor-wasm-core = { workspace = true }
+tensor-wasm-jit = { workspace = true }
+tensor-wasm-mem = { workspace = true }
 blake3.workspace = true
 dashmap.workspace = true
 futures.workspace = true

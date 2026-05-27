@@ -17,7 +17,7 @@ categories = ["memory-management", "wasm"]
 
 [dependencies]
 anyhow.workspace = true
-tensor-wasm-core = { path = "../tensor-wasm-core" }
+tensor-wasm-core = { workspace = true }
 parking_lot.workspace = true
 region = "3"
 thiserror.workspace = true

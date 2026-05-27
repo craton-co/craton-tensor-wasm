@@ -18,8 +18,8 @@ categories = ["web-programming::http-server", "wasm"]
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
-tensor-wasm-core = { path = "../tensor-wasm-core" }
-tensor-wasm-exec = { path = "../tensor-wasm-exec" }
+tensor-wasm-core = { workspace = true }
+tensor-wasm-exec = { workspace = true }
 base64 = "0.22"
 dashmap.workspace = true
 hyper.workspace = true
