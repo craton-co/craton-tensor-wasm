@@ -14,8 +14,10 @@ arbitrary = { version = "1", features = ["derive"] }
 tensor-wasm-core = { path = "../crates/tensor-wasm-core" }
 tensor-wasm-api = { path = "../crates/tensor-wasm-api" }
 tensor-wasm-jit = { path = "../crates/tensor-wasm-jit" }
+tensor-wasm-mem = { path = "../crates/tensor-wasm-mem" }
 tensor-wasm-snapshot = { path = "../crates/tensor-wasm-snapshot" }
 tensor-wasm-wasi-gpu = { path = "../crates/tensor-wasm-wasi-gpu" }
+wasmparser = "0.218"
 wasmtime = { version = "25", default-features = false, features = ["async", "cranelift", "runtime"] }
 tokio = { version = "1.40", features = ["rt", "macros"] }
 wat = "1"
@@ -42,6 +44,27 @@ bench = false
 [[bin]]
 name = "fuzz_snapshot_restore"
 path = "fuzz_targets/fuzz_snapshot_restore.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parse_argv"
+path = "fuzz_targets/fuzz_parse_argv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_rewrite_wasm"
+path = "fuzz_targets/fuzz_rewrite_wasm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pool_allocate"
+path = "fuzz_targets/fuzz_pool_allocate.rs"
 test = false
 doc = false
 bench = false

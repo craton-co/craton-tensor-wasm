@@ -11,6 +11,15 @@ through `libfuzzer-sys` against the corresponding subsystem.
 | `fuzz_wasi_cuda_abi` | `tensor-wasm-wasi-gpu` host functions | host never crashes on arbitrary `(ptr, len)` from Wasm guest |
 | `token_scope_parser` | `tensor-wasm-api` `token_scope::parse_tokens_env` | parser never panics; every accepted bearer is non-empty; scope variant matches `is_all()` |
 | `audit_json_round_trip` | `tensor-wasm-api` `AuditRecord` Serialize | production JSON parses back into the documented wire-format shape (catches Serialize drift even though the type doesn't derive Deserialize) |
+| `fuzz_parse_argv` | `tensor-wasm-wasi-gpu` `kernel_args::parse_argv` | host-trust-boundary argv parser never panics; errors only as documented `AbiError::{InvalidArgs, InvalidPointer, KernelArgsUnsupported}` |
+| `fuzz_rewrite_wasm` | `tensor-wasm-jit` `rewrite::rewrite_wasm` | for any input that `wasmparser::validate` accepts, the rewritten module also validates (rewriter preserves Wasm validity) |
+| `fuzz_pool_allocate` | `tensor-wasm-mem` `pool::UnifiedMemoryPool::allocate` | bump-pointer pool never panics on arbitrary `(size, align)` — every failure mode (zero size, bad align, exhaustion, overflow) surfaces as `Err(UnifiedError)` |
+
+The wave landed alongside the existing `fuzz_snapshot_restore` target —
+together the four exercise the four largest host-trust-boundary parsers
+in the runtime: snapshot restore, kernel-args argv lowering, JIT rewrite,
+and the unified-memory bump allocator. Each one's invariant is "no
+panic on arbitrary input; documented errors only."
 
 ## Running locally
 
@@ -25,6 +34,9 @@ cargo +nightly fuzz run fuzz_snapshot_restore -- -max_total_time=300
 cargo +nightly fuzz run fuzz_wasi_cuda_abi -- -max_total_time=300
 cargo +nightly fuzz run token_scope_parser -- -max_total_time=300
 cargo +nightly fuzz run audit_json_round_trip -- -max_total_time=300
+cargo +nightly fuzz run fuzz_parse_argv -- -max_total_time=300
+cargo +nightly fuzz run fuzz_rewrite_wasm -- -max_total_time=300
+cargo +nightly fuzz run fuzz_pool_allocate -- -max_total_time=300
 
 # 24-hour soak (per the v0.5 PATH-TO-V1 security workstream:
 # "keep `fuzz/` targets running 24x7 on dedicated hardware")
