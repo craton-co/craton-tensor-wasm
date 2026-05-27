@@ -132,6 +132,45 @@ impl UnifiedMemoryPool {
         st.bump = end;
         st.live += 1;
         st.issued_total = st.issued_total.saturating_add(size as u64);
+        // Drop the lock before the (potentially large) zero-fill so other
+        // allocators aren't blocked on memset for tenants that aren't us. The
+        // bump pointer has already moved past `[aligned_bump, end)` so no
+        // concurrent allocate() can hand the same range to another caller.
+        drop(st);
+
+        // Cross-tenant data-leak mitigation (audit H1):
+        // -------------------------------------------------------------------
+        // The slab is recycled across tenants via `reset()`, which only resets
+        // the bump pointer — recycled bytes still carry the previous tenant's
+        // data. Zero the freshly-carved region before we hand the
+        // `PoolAllocation` to the caller so a guest cannot observe a peer's
+        // memory through an uninitialised read.
+        //
+        // We use `ptr::write_bytes` rather than `slice::fill(0)` for two
+        // reasons: (1) it lowers to a single `memset` intrinsic on every
+        // backend LLVM cares about, where `.fill(0)` historically optimises
+        // less reliably; (2) it sidesteps the need to construct a `&mut [u8]`
+        // alias over the slab, which is awkward to do soundly while another
+        // thread may hold a different `&mut [u8]` slice into a disjoint
+        // region of the same slab.
+        //
+        // Cost: O(size) per allocation. For a 256 MiB Wasm linear memory this
+        // is on the order of tens of milliseconds — large enough that callers
+        // doing many small allocations should batch where possible, but
+        // unavoidable for correctness given the recycle discipline. Skipping
+        // it would re-open the H1 cross-tenant disclosure window.
+        //
+        // SAFETY: `aligned_bump + size <= self.slab.len()` (checked above);
+        // the slab's pointer is non-null and points to `len()` valid bytes
+        // for the lifetime of `&self`; the bump allocator guarantees the
+        // `[aligned_bump, aligned_bump + size)` byte range is disjoint from
+        // every other live `PoolAllocation`, so this write cannot race
+        // another thread's `as_mut_slice()`.
+        unsafe {
+            let base = self.slab.as_ptr().add(aligned_bump) as *mut u8;
+            std::ptr::write_bytes(base, 0u8, size);
+        }
+
         Ok(PoolAllocation {
             pool: self,
             offset: aligned_bump,
@@ -317,5 +356,63 @@ mod tests {
         for (i, &byte) in a.as_slice().iter().enumerate() {
             assert_eq!(byte, i as u8);
         }
+    }
+
+    #[test]
+    fn recycled_allocation_reads_as_zero() {
+        // Cross-tenant data-leak regression test (audit H1):
+        // -------------------------------------------------------------------
+        // Simulates the recycle path: tenant A writes 0xAB into a pool
+        // allocation, releases it, the pool is reset, and tenant B requests
+        // an allocation that lands on the same bytes. The recycled bytes
+        // MUST read as zero — otherwise tenant B can observe tenant A's
+        // private data. This pins the `ptr::write_bytes` zero-fill added in
+        // `UnifiedMemoryPool::allocate`.
+        const SIZE: usize = 4 * 1024; // 4 KiB — large enough to detect any
+                                       // off-by-one in the memset bounds.
+        let pool = UnifiedMemoryPool::new(64 * 1024).unwrap();
+
+        // Tenant A: poison every byte with the sentinel.
+        {
+            let mut a = pool.allocate(SIZE, 64).unwrap();
+            a.as_mut_slice().fill(0xAB);
+            // sanity: poison actually went in
+            assert!(a.as_slice().iter().all(|&b| b == 0xAB));
+        }
+        // Reset the bump pointer so the same byte range is reachable again.
+        pool.reset().expect("reset after tenant A drops");
+
+        // Tenant B: ask for the same shape and assert every byte reads zero.
+        let b = pool.allocate(SIZE, 64).unwrap();
+        let leaked: Vec<usize> = b
+            .as_slice()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| if v != 0 { Some(i) } else { None })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "recycled pool allocation leaked tenant-A data at {} byte offsets (first: {:?})",
+            leaked.len(),
+            leaked.first(),
+        );
+    }
+
+    #[test]
+    fn first_allocation_reads_as_zero() {
+        // Companion to `recycled_allocation_reads_as_zero`: even the *first*
+        // allocation out of a fresh pool must read as zero. On the heap
+        // backing (`Box<[u8]>`) this is trivially true because `vec![0u8; n]`
+        // zeroes. On the cust path, `cust::memory::UnifiedBuffer::new(&0u8,
+        // size)` seeds with zero. On the cudarc path, `cuMemAllocManaged`
+        // does NOT zero — the `unified.rs` change closes that hole. Either
+        // way the contract surfaced by `UnifiedMemoryPool::allocate` must be
+        // identical across all three backings, so we test it here.
+        let pool = UnifiedMemoryPool::new(4 * 1024).unwrap();
+        let a = pool.allocate(1024, 16).unwrap();
+        assert!(
+            a.as_slice().iter().all(|&b| b == 0),
+            "first allocation out of fresh pool must read as zero"
+        );
     }
 }

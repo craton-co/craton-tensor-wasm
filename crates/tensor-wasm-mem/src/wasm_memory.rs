@@ -179,6 +179,30 @@ unsafe impl LinearMemory for TensorWasmLinearMemory {
                 self.current_size
             ));
         }
+        // Cross-tenant data-leak mitigation (audit H2):
+        // -------------------------------------------------------------------
+        // The WebAssembly spec requires bytes newly exposed by `memory.grow`
+        // to read as zero. Because we pre-allocate the entire `maximum_size`
+        // up front and only bump `current_size`, the host backing already
+        // contains *whatever the allocator left there* in the
+        // `[current_size, maximum_size)` window. Wasmtime does NOT zero
+        // host-supplied memory it didn't allocate, so without an explicit
+        // zero-fill here a guest could observe (a) the previous tenant's
+        // data if this buffer came out of a recycled `UnifiedMemoryPool`
+        // slab, or (b) uninitialised driver memory from `cuMemAllocManaged`.
+        //
+        // Zero the freshly-exposed range BEFORE the visible-size bump so a
+        // concurrent reader (e.g. host-side telemetry via `as_slice()`) that
+        // observes the new size also observes the zero bytes — never an
+        // intermediate state where `current_size` has grown but the bytes
+        // are still stale.
+        let old_size = self.current_size;
+        if new_size > old_size {
+            // `buffer.as_mut_slice()` covers `maximum_size >= new_size` bytes,
+            // so this range is in-bounds. The `&mut self` borrow on `grow_to`
+            // proves no concurrent reader can hold a `&[u8]` alias.
+            self.buffer.as_mut_slice()[old_size..new_size].fill(0);
+        }
         self.current_size = new_size;
         Ok(())
     }
@@ -261,6 +285,28 @@ unsafe impl LinearMemory for PooledLinearMemory {
                 "memory.grow cannot shrink ({new_size} < current {})",
                 self.current_size
             ));
+        }
+        // Cross-tenant data-leak mitigation (audit H2): mirror the zero-fill
+        // discipline of `TensorWasmLinearMemory::grow_to`. The carved slab
+        // region was zeroed at `UnifiedMemoryPool::allocate` time, but
+        // anything the *guest itself* scribbled into `[current_size,
+        // new_size)` (which it could legally do via OOB writes that Wasmtime
+        // bounds-checked against the OLD `current_size` only — those checks
+        // pass for offsets up to old `current_size`, not `max_size`, but a
+        // future code path or a host-side helper writing into the
+        // pre-allocated tail would still be observable on grow). Zero the
+        // newly-exposed window before bumping the visible size so the spec's
+        // "newly accessible bytes read as zero" guarantee holds end-to-end.
+        let old_size = self.current_size;
+        if new_size > old_size {
+            // SAFETY: `base_ptr` points to `size >= new_size` valid bytes
+            // (size == max_size; new_size <= max_size checked above); the
+            // bump allocator guarantees the carved region is disjoint from
+            // every other `PoolAllocation`, and `&mut self` proves no
+            // concurrent reader observes this `PooledLinearMemory`.
+            unsafe {
+                std::ptr::write_bytes(self.base_ptr.add(old_size), 0u8, new_size - old_size);
+            }
         }
         self.current_size = new_size;
         Ok(())
@@ -620,6 +666,115 @@ mod tests {
             .grow_to(MAX + 1)
             .expect_err("grow past cap must fail");
         assert!(err.to_string().contains("maximum"));
+    }
+
+    #[test]
+    fn grow_to_zero_fills_newly_exposed_bytes() {
+        // Cross-tenant data-leak regression test (audit H2):
+        // -------------------------------------------------------------------
+        // The wasm spec requires bytes newly exposed by `memory.grow` to read
+        // as zero. Because `TensorWasmLinearMemory` pre-allocates the entire
+        // `maximum_size` up front and only bumps a `current_size`, the host
+        // backing already contains *whatever was previously written* in the
+        // `[current_size, max)` window. This test scribbles 0xCD into a band
+        // that sits in the pre-allocated tail (past `current_size`), then
+        // grows past that band and asserts every newly-exposed byte reads
+        // zero — including the previously-poisoned range.
+        const MIN: usize = 64 * 1024;
+        const MAX: usize = 4 * 64 * 1024; // four wasm pages
+        const POISON_START: usize = MIN + 4096;
+        const POISON_END: usize = MIN + 8192;
+        const GROW_TO: usize = MAX;
+
+        let mut mem = TensorWasmLinearMemory::new(MIN, Some(MAX)).unwrap();
+
+        // Poison a band sitting in the pre-allocated tail. This simulates a
+        // stale write left over from a previous tenant or a host helper.
+        // SAFETY: we hold `&mut mem` exclusively and no guest is executing.
+        // The buffer's physical extent covers `MAX` bytes even though
+        // `current_size == MIN`, so writing into the tail is in-bounds.
+        unsafe {
+            let p = LinearMemory::as_ptr(&mem);
+            for off in POISON_START..POISON_END {
+                *p.add(off) = 0xCD;
+            }
+        }
+
+        // Grow past the poisoned region.
+        mem.grow_to(GROW_TO).expect("grow must succeed");
+        assert_eq!(mem.byte_size(), GROW_TO);
+
+        // Every byte in `[MIN, GROW_TO)` — the range newly exposed to the
+        // guest by `grow_to` — must read as zero. If the zero-fill is
+        // missing, the 0xCD band leaks straight through.
+        let s = mem.as_slice();
+        assert_eq!(s.len(), GROW_TO);
+        let leaked: Vec<usize> = s[MIN..GROW_TO]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| if v != 0 { Some(MIN + i) } else { None })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "grow_to leaked {} non-zero bytes in newly-exposed range \
+             [{MIN}, {GROW_TO}); first leak at offset {:?} (value would be 0xCD if poison)",
+            leaked.len(),
+            leaked.first(),
+        );
+    }
+
+    #[test]
+    fn pooled_grow_to_zero_fills_newly_exposed_bytes() {
+        // Mirror of `grow_to_zero_fills_newly_exposed_bytes` for the
+        // pool-backed linear memory path (`PooledLinearMemory`). The
+        // exposure surface is the same — `grow_to` only bumps a logical
+        // size against a larger physical reservation — so the zero-fill
+        // discipline must match.
+        use std::sync::Arc;
+        const MIN: usize = 64 * 1024;
+        const MAX: usize = 4 * 64 * 1024;
+        const POISON_START: usize = MIN + 4096;
+        const POISON_END: usize = MIN + 8192;
+        const GROW_TO: usize = MAX;
+
+        let pool = Arc::new(crate::pool::UnifiedMemoryPool::new(8 * 1024 * 1024).unwrap());
+        let creator = TensorWasmMemoryCreator::with_pool(DeviceId::default(), pool.clone());
+        let mt = wasmtime::MemoryType::new(1, Some(4));
+        use wasmtime::MemoryCreator;
+        let mut mem = creator
+            .new_memory(mt, MIN, Some(MAX), None, 0)
+            .expect("new_memory");
+
+        // Poison the pre-allocated tail.
+        // SAFETY: same rationale as the non-pooled test above; we hold
+        // exclusive `&mut mem` and the physical region is `MAX` bytes.
+        unsafe {
+            let p = mem.as_ptr();
+            for off in POISON_START..POISON_END {
+                *p.add(off) = 0xCD;
+            }
+        }
+
+        mem.grow_to(GROW_TO).expect("grow must succeed");
+        assert_eq!(mem.byte_size(), GROW_TO);
+
+        // Read back the entire region via `as_ptr` + raw slice (the pooled
+        // path does not expose a private `as_slice`; that's only on
+        // `TensorWasmLinearMemory`).
+        // SAFETY: no guest is executing; `as_ptr()` points to `GROW_TO`
+        // valid bytes inside the carved slab.
+        let s = unsafe { std::slice::from_raw_parts(mem.as_ptr() as *const u8, GROW_TO) };
+        let leaked: Vec<usize> = s[MIN..GROW_TO]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| if v != 0 { Some(MIN + i) } else { None })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "pooled grow_to leaked {} non-zero bytes in [{MIN}, {GROW_TO}); first at {:?}",
+            leaked.len(),
+            leaked.first(),
+        );
     }
 
     #[test]
