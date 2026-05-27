@@ -66,13 +66,18 @@ static DEFAULT_DEVICE: OnceLock<Arc<CudaDevice>> = OnceLock::new();
 /// matrix.
 fn device_for(ordinal: u32) -> Result<Arc<CudaDevice>, UnifiedError> {
     if ordinal == 0 {
-        if let Some(d) = DEFAULT_DEVICE.get() {
-            return Ok(d.clone());
-        }
-        let d = CudaDevice::new(0)
-            .map_err(|e| UnifiedError::Cuda(format!("CudaDevice::new(0): {e:?}")))?;
-        // Race-tolerant: if another thread installed first, use theirs.
-        let installed = DEFAULT_DEVICE.get_or_init(|| d);
+        // `get_or_try_init` only invokes the initialiser when this thread
+        // actually wins the install race, so the new `Arc<CudaDevice>` is
+        // never dropped *after* a winner has been installed. Dropping a
+        // losing `Arc<CudaDevice>` would call `cuDevicePrimaryCtxRelease`
+        // on the still-held primary context — invalidating every managed
+        // pointer in the process. See the audit note attached to this
+        // function's history.
+        let installed = DEFAULT_DEVICE
+            .get_or_try_init(|| {
+                CudaDevice::new(0)
+                    .map_err(|e| UnifiedError::Cuda(format!("CudaDevice::new(0): {e:?}")))
+            })?;
         Ok(installed.clone())
     } else {
         CudaDevice::new(ordinal as usize)
