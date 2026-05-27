@@ -33,3 +33,5 @@ pub mod lower_vector;
 pub mod lower_conv;
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod lowering_test_support;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod reject_list;
