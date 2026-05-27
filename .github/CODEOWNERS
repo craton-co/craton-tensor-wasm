@@ -1,0 +1,16 @@
+# CODEOWNERS for craton-co/craton-tensor-wasm
+# Lines later in this file override earlier ones.
+# Format: <path-pattern>  <space-separated github usernames or teams>
+
+# Default: any change anywhere requires a review from the maintainers team.
+*  @craton-co/maintainers
+
+# Security-sensitive files require the security committee in addition.
+SECURITY.md                @craton-co/security
+docs/SECURITY-*.md         @craton-co/security
+crates/tensor-wasm-tenant/ @craton-co/security
+crates/tensor-wasm-exec/   @craton-co/security
+
+# Release / publishing
+Cargo.toml                 @craton-co/maintainers @craton-co/release
+CHANGELOG.md               @craton-co/maintainers @craton-co/release

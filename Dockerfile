@@ -82,9 +82,12 @@ RUN groupadd -g 65532 tensor-wasm \
  && useradd -u 65532 -g 65532 -s /usr/sbin/nologin -d /var/lib/tensor-wasm -m tensor-wasm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libcuda1 \
+        ca-certificates curl libcuda1 \
     && rm -rf /var/lib/apt/lists/* \
     || true
+# `curl` is required by the HEALTHCHECK below; keeping it in the
+# runtime image also makes `kubectl debug` / `docker exec` ergonomic
+# for on-the-fly liveness checks against /healthz.
 # libcuda1 is present only on hosts with a CUDA driver installed
 # (typically via nvidia-container-toolkit injecting the host driver
 # into the container at runtime). The `|| true` keeps the build from
