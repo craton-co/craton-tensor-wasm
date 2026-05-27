@@ -4,7 +4,8 @@ HTTP serverless API gateway for Craton TensorWasm, built on axum. Exposes REST e
 
 ## Security surface
 
-- **Body limit (64 MiB).** Every inbound request is capped via `tower_http::limit::RequestBodyLimitLayer`. Larger bodies are rejected with `413 Payload Too Large` before any handler runs.
+- **Body limit (64 MiB).** Every inbound request is capped via `axum::extract::DefaultBodyLimit::max`. Larger bodies are rejected with `413 Payload Too Large` before any handler runs.
+- **CORS allowlist.** Cross-origin browser callers are rejected by default; widen via `TENSOR_WASM_API_CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com`. The layer admits `GET`/`POST`/`DELETE` and the standard `Authorization`, `Content-Type`, `X-TensorWasm-Tenant`, and `Traceparent` headers.
 - **Bearer-token auth via `TENSOR_WASM_API_TOKENS`.** A comma-separated allowlist of accepted tokens. Empty/unset puts the gateway in dev mode (warn-once on startup, requests pass through). When set, callers must send `Authorization: Bearer <token>`.
 - **Tenant scoping via `X-TensorWasm-Tenant` header.** The header is parsed as a `u64` and threaded through to the executor. Absent header defaults to tenant `0`; set `TENSOR_WASM_API_REQUIRE_TENANT=1` to make the header mandatory.
 
@@ -22,7 +23,8 @@ External crates this crate depends on (pinned at workspace root):
 - `tokio` — async runtime hosting the HTTP server.
 - `axum` — web framework providing the router and extractors.
 - `tower` — middleware abstractions stacked onto the router.
-- `tower-http` — ready-made middleware (timeout, trace, body-limit).
+- `tower-http` — ready-made middleware (timeout, trace, CORS). Body-limit uses axum's native `DefaultBodyLimit::max` rather than the tower-http layer.
+- `subtle` — constant-time byte comparison used by bearer-token allowlist lookup.
 - `hyper` — underlying HTTP/1 and HTTP/2 transport.
 - `thiserror` — derive macro for API error variants.
 - `tracing` — structured spans/events for request handling.

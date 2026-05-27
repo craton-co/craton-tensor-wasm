@@ -34,14 +34,22 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+# subtle: constant-time byte comparison for the bearer-token allowlist
+# lookup in `crate::middleware::AuthConfig::scope_for`. The previous
+# `HashMap::get` lookup short-circuits on hash mismatch and then bytes-eq
+# matching entries — both timing-leakable for token discovery. See the
+# `scope_for` docstring for the loop-and-no-break rationale.
+subtle = "2"
 thiserror.workspace = true
 tokio.workspace = true
 tower.workspace = true
 # tower-http: workspace declaration enables {trace, timeout, cors}. We
-# additionally enable `limit` here for `RequestBodyLimitLayer` so the
-# gateway can cap inbound bodies at 64 MiB. Cargo unions features across
-# the workspace, so this does not affect the workspace baseline.
-tower-http = { workspace = true, features = ["trace", "timeout", "cors", "limit"] }
+# use axum's native `DefaultBodyLimit::max` for the 64 MiB inbound body
+# cap rather than `tower_http::limit::RequestBodyLimitLayer` (which
+# rewraps the body in `Limited<Body>` and breaks composition with
+# `axum::middleware::from_fn`), so the `limit` feature is intentionally
+# not requested here.
+tower-http = { workspace = true, features = ["trace", "timeout", "cors"] }
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true }
 uuid.workspace = true

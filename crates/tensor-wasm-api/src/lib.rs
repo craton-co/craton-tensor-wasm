@@ -11,8 +11,13 @@
 //! ## Security surface
 //!
 //! * **Body limit.** Every request is capped at 64 MiB by
-//!   [`tower_http::limit::RequestBodyLimitLayer`]; oversized bodies are
+//!   [`axum::extract::DefaultBodyLimit::max`]; oversized bodies are
 //!   rejected with `413 Payload Too Large` before any handler runs.
+//! * **CORS.** The gateway installs an explicit-allowlist
+//!   [`tower_http::cors::CorsLayer`]; the allowlist is empty by default
+//!   (every cross-origin request rejected). Widen by setting
+//!   `TENSOR_WASM_API_CORS_ALLOWED_ORIGINS` to a comma-separated list of
+//!   origins. See [`middleware::CorsConfig`].
 //! * **Bearer auth.** Reads `TENSOR_WASM_API_TOKENS` (comma-separated allowlist)
 //!   at startup. Empty/unset means dev mode (pass-through with warning);
 //!   otherwise requests must carry `Authorization: Bearer <token>`.
@@ -67,8 +72,8 @@ pub use http_metrics::{
     UNKNOWN_ROUTE,
 };
 pub use middleware::{
-    AuthConfig, TenantConfig, ENV_API_TOKENS, ENV_REQUIRE_TENANT, HEADER_TENANT,
-    MAX_REQUEST_BODY_BYTES,
+    AuthConfig, CorsConfig, TenantConfig, ENV_API_TOKENS, ENV_CORS_ALLOWED_ORIGINS,
+    ENV_REQUIRE_TENANT, HEADER_TENANT, MAX_REQUEST_BODY_BYTES,
 };
 pub use rate_limit::{AuthContext, RateLimitConfig, RateLimiter, TokenId};
 pub use routes::{ApiError, AppState, FunctionRecord, JobRecord, JobStatus};

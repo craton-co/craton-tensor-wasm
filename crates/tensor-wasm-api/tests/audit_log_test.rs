@@ -28,8 +28,8 @@ use base64::Engine;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tensor_wasm_api::{
-    build_router_with_audit, AppState, AuditConfig, AuditRecord, AuditSink, AuthConfig, NoopSink,
-    RateLimitConfig, RateLimiter, TenantConfig, TokenScope, HEADER_TENANT,
+    build_router_with_audit, AppState, AuditConfig, AuditRecord, AuditSink, AuthConfig, CorsConfig,
+    NoopSink, RateLimitConfig, RateLimiter, TenantConfig, TokenScope, HEADER_TENANT,
 };
 use tensor_wasm_core::types::TenantId;
 use tower::ServiceExt;
@@ -82,6 +82,7 @@ fn router_with_audit(scopes: &[(&str, TokenScope)]) -> (axum::Router, Arc<Captur
         TenantConfig::default(),
         RateLimiter::new(RateLimitConfig::disabled()),
         audit_cfg,
+        CorsConfig::default(),
     );
     (router, sink)
 }
@@ -237,6 +238,7 @@ async fn audit_log_disabled_mode_swallows_records() {
         TenantConfig::default(),
         RateLimiter::new(RateLimitConfig::disabled()),
         audit_cfg,
+        CorsConfig::default(),
     );
 
     // Drive a state-mutating call through the disabled router.

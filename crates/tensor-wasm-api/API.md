@@ -131,7 +131,7 @@ as an unsigned 64-bit integer and forwarded to the executor as the owning
 ### Request limits
 
 Every inbound request body is capped at **64 MiB** by
-`tower_http::limit::RequestBodyLimitLayer`. Larger bodies are rejected with
+`axum::extract::DefaultBodyLimit::max`. Larger bodies are rejected with
 `413 Payload Too Large` before any handler runs. The cap is global; it is
 not user-tunable in this release.
 

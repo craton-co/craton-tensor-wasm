@@ -20,8 +20,10 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use tensor_wasm_core::types::TenantId;
 use serde_json::json;
+use subtle::ConstantTimeEq;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::classify::{ServerErrorsAsFailures, SharedClassifier};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
@@ -40,10 +42,11 @@ pub const DEFAULT_CONCURRENCY_LIMIT: usize = 64;
 /// are rejected with `413 Payload Too Large` by axum's
 /// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) at extract time
 /// (i.e., when a handler reads the body via `Bytes`, `Json`, etc.). We use
-/// axum's native limit rather than `tower_http::limit::RequestBodyLimitLayer`
-/// because the latter rewraps the request body in `Limited<Body>`, which
-/// breaks composition with `axum::middleware::from_fn` (bearer auth, tenant
-/// scope) downstream.
+/// axum's native `DefaultBodyLimit::max` rather than
+/// `tower_http::limit::RequestBodyLimitLayer`: the tower-http layer rewraps
+/// the request body in `Limited<Body>`, which breaks composition with
+/// `axum::middleware::from_fn` (bearer auth, tenant scope) downstream, and
+/// `DefaultBodyLimit::max` gives the same 413 contract without the rewrap.
 pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Environment variable carrying a comma-separated allowlist of bearer
@@ -85,6 +88,115 @@ pub fn concurrency_limit_layer(max: usize) -> ConcurrencyLimitLayer {
 /// for the rationale on using axum's native limit rather than tower-http's.
 pub fn body_limit_layer(max_bytes: usize) -> axum::extract::DefaultBodyLimit {
     axum::extract::DefaultBodyLimit::max(max_bytes)
+}
+
+/// Environment variable carrying a comma-separated allowlist of origins
+/// permitted for cross-origin requests. Empty / unset = reject all
+/// cross-origin requests.
+pub const ENV_CORS_ALLOWED_ORIGINS: &str = "TENSOR_WASM_API_CORS_ALLOWED_ORIGINS";
+
+/// HTTP headers permitted on cross-origin requests. Covers the standard
+/// `Authorization` and `Content-Type`, the TensorWasm tenant header used to
+/// scope per-tenant calls, and the W3C `traceparent` header so browser
+/// callers can stitch their own trace context into the gateway's spans.
+const CORS_ALLOWED_HEADERS: &[&str] = &[
+    "authorization",
+    "content-type",
+    "x-tensorwasm-tenant",
+    "traceparent",
+];
+
+/// Cross-origin policy snapshot loaded from the process environment.
+///
+/// `allowed_origins` is the explicit allowlist of cross-origin browser
+/// callers that may reach the API. The default is empty — i.e.
+/// **cross-origin requests are rejected** until the operator widens the
+/// allowlist. This matches the gateway's other security defaults
+/// (`TENSOR_WASM_API_TOKENS` dev mode is the only opt-out).
+///
+/// To widen, list one origin per entry exactly as the browser sends the
+/// `Origin` header (scheme + host + optional port), comma-separated:
+///
+/// ```text
+/// TENSOR_WASM_API_CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct CorsConfig {
+    /// Origins permitted for cross-origin requests. Empty = reject all.
+    pub allowed_origins: Vec<String>,
+}
+
+impl CorsConfig {
+    /// Load the allowlist from `$TENSOR_WASM_API_CORS_ALLOWED_ORIGINS`.
+    /// Unset or empty = reject all cross-origin requests.
+    pub fn from_env() -> Self {
+        let raw = std::env::var(ENV_CORS_ALLOWED_ORIGINS).unwrap_or_default();
+        let allowed_origins: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        Self { allowed_origins }
+    }
+
+    /// Construct directly from an explicit list of origins. The empty list
+    /// yields the safe default (no cross-origin requests admitted).
+    pub fn from_origins<I, S>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            allowed_origins: iter.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Build the CORS layer for the gateway router.
+///
+/// * Empty allowlist (`cfg.allowed_origins.is_empty()`) → returns
+///   `CorsLayer::new()`, which sets no `Access-Control-Allow-Origin` header
+///   and therefore rejects every cross-origin request. This is the safe
+///   default for fresh installs — operators opt in by setting
+///   `TENSOR_WASM_API_CORS_ALLOWED_ORIGINS`.
+/// * Non-empty allowlist → returns a layer that admits exactly those
+///   origins (parsed back into `HeaderValue`s; unparseable entries are
+///   silently dropped — they were already rejected at startup by the
+///   bearer-auth allowlist parser's stricter sibling and would never match
+///   a real browser `Origin` header anyway).
+///
+/// The allowed methods (`GET`, `POST`, `DELETE`) and headers
+/// (`Authorization`, `Content-Type`, `X-TensorWasm-Tenant`, `Traceparent`)
+/// match the API's wire surface — see `API.md`.
+pub fn cors_layer(cfg: &CorsConfig) -> CorsLayer {
+    use axum::http::Method;
+    // Cover every method the gateway routes use: `GET` (healthz, metrics,
+    // job poll), `POST` (deploy, invoke, invoke-async), and `DELETE`
+    // (function tear-down).
+    let allowed_methods = vec![Method::GET, Method::POST, Method::DELETE];
+    let base = CorsLayer::new()
+        .allow_methods(allowed_methods)
+        .allow_headers(
+            CORS_ALLOWED_HEADERS
+                .iter()
+                .filter_map(|h| h.parse::<axum::http::HeaderName>().ok())
+                .collect::<Vec<_>>(),
+        );
+
+    if cfg.allowed_origins.is_empty() {
+        // No origins configured — `CorsLayer::new()` admits no origins, so
+        // no cross-origin browser caller will see an
+        // `Access-Control-Allow-Origin` header and the request is rejected
+        // by the browser's preflight check.
+        base
+    } else {
+        let parsed: Vec<axum::http::HeaderValue> = cfg
+            .allowed_origins
+            .iter()
+            .filter_map(|origin| origin.parse::<axum::http::HeaderValue>().ok())
+            .collect();
+        base.allow_origin(AllowOrigin::list(parsed))
+    }
 }
 
 /// Snapshot of authentication configuration loaded from the process
@@ -174,13 +286,44 @@ impl AuthConfig {
     }
 
     /// `true` if the supplied bearer token is allowlisted.
+    ///
+    /// Uses a constant-time byte comparison against every allowlisted entry
+    /// so the time taken to reject a bad token does not leak which prefix
+    /// (if any) matched an allowlist entry. Delegates to [`scope_for`].
     pub fn accepts(&self, token: &str) -> bool {
-        self.scopes.contains_key(token)
+        self.scope_for(token).is_some()
     }
 
     /// Resolve `token` to its [`TokenScope`] if allowlisted.
+    ///
+    /// Iterates the full allowlist and uses [`subtle::ConstantTimeEq`] for
+    /// each entry rather than a `HashMap::get`. The hash-table lookup
+    /// short-circuits on hash mismatch and then bytes-eq matching entries,
+    /// which is timing-leakable for token discovery — an attacker can
+    /// measure how long the gateway took to reject a candidate token and
+    /// infer how close it got to a real entry. The loop runs over every
+    /// allowlist entry on every call, and we deliberately do NOT `break`
+    /// after a hit so the wall-clock cost is constant w.r.t. the matched
+    /// entry's position. Hashing still happens internally (`scopes` is an
+    /// `Arc<HashMap>` for cheap clones) but the lookup path is no longer
+    /// hash-keyed; the map is used purely as a `(token, scope)` store here.
     pub fn scope_for(&self, token: &str) -> Option<&TokenScope> {
-        self.scopes.get(token)
+        let mut found_scope: Option<&TokenScope> = None;
+        let token_bytes = token.as_bytes();
+        for (allow_token, scope) in self.scopes.iter() {
+            // ct_eq requires equal-length inputs; mismatched lengths cannot
+            // be equal so we skip them. The length itself is not secret —
+            // the operator's `TENSOR_WASM_API_TOKENS` allowlist is fixed at
+            // startup and its lengths are observable through other means.
+            if allow_token.len() == token_bytes.len()
+                && allow_token.as_bytes().ct_eq(token_bytes).into()
+            {
+                found_scope = Some(scope);
+                // Intentionally NOT `break` — keep iterating so the loop
+                // time is constant w.r.t. the matched entry's position.
+            }
+        }
+        found_scope
     }
 
     /// `true` if no allowlist was configured (dev mode).
@@ -399,6 +542,35 @@ mod tests {
     #[test]
     fn body_limit_layer_constructs() {
         let _ = body_limit_layer(MAX_REQUEST_BODY_BYTES);
+    }
+
+    #[test]
+    fn cors_config_default_is_empty_allowlist() {
+        let cfg = CorsConfig::default();
+        assert!(cfg.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn cors_config_from_origins_round_trips() {
+        let cfg = CorsConfig::from_origins(["https://app.example.com"]);
+        assert_eq!(cfg.allowed_origins, vec!["https://app.example.com"]);
+    }
+
+    #[test]
+    fn cors_layer_constructs_empty_allowlist() {
+        // The empty-allowlist branch is the safe default: it must produce
+        // a layer that does not set Access-Control-Allow-Origin. We only
+        // exercise construction here; the wire-level rejection check sits
+        // in the integration test suite where a full router is in scope.
+        let _ = cors_layer(&CorsConfig::default());
+    }
+
+    #[test]
+    fn cors_layer_constructs_with_origins() {
+        let _ = cors_layer(&CorsConfig::from_origins([
+            "https://app.example.com",
+            "https://admin.example.com",
+        ]));
     }
 
     #[test]

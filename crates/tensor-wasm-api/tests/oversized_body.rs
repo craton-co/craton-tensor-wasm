@@ -2,8 +2,8 @@
 // Copyright 2026 Craton Software Company
 
 //! Verifies the 64 MiB inbound body cap installed via
-//! `tower_http::limit::RequestBodyLimitLayer`. Posting 100 MB of dummy
-//! data must be rejected before any handler reads the body.
+//! `axum::extract::DefaultBodyLimit::max`. Posting 100 MB of dummy data
+//! must be rejected before any handler reads the body.
 
 use std::sync::Arc;
 
@@ -29,8 +29,8 @@ async fn limit_constant_is_64_mib() {
 
 #[tokio::test]
 async fn oversized_body_is_rejected() {
-    // 100 MiB > 64 MiB cap. The tower_http layer short-circuits with 413
-    // before the deploy handler runs.
+    // 100 MiB > 64 MiB cap. `DefaultBodyLimit::max` short-circuits with
+    // `413 Payload Too Large` before the deploy handler reads the body.
     let huge: Vec<u8> = vec![b'a'; 100 * 1024 * 1024];
     let req = Request::builder()
         .method(Method::POST)
@@ -40,13 +40,15 @@ async fn oversized_body_is_rejected() {
         .unwrap();
 
     let resp = router().oneshot(req).await.expect("oneshot");
-    // tower_http::limit returns 413 Payload Too Large. Some intermediaries
-    // surface it as 400 with our envelope; either is acceptable per the
-    // public contract.
+    // The `DefaultBodyLimit::max` guard returns `413 Payload Too Large` for
+    // any body that exceeds the cap. The public contract in `API.md`
+    // (`body_too_large` → `413`) pins the response to exactly that code;
+    // the earlier "either 413 or 400 is acceptable" allowance has been
+    // tightened — the gateway must not silently downgrade the rejection.
     let status = resp.status();
     assert!(
-        status == StatusCode::PAYLOAD_TOO_LARGE || status == StatusCode::BAD_REQUEST,
-        "expected 413 or 400 for oversized body, got {status}"
+        status == StatusCode::PAYLOAD_TOO_LARGE,
+        "expected 413 for oversized body, got {status}"
     );
 }
 

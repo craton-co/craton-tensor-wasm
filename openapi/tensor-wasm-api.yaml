@@ -372,8 +372,8 @@ components:
             $ref: "#/components/schemas/ApiErrorEnvelope"
     PayloadTooLarge:
       description: |
-        Request body exceeded the 64 MiB cap enforced by
-        `RequestBodyLimitLayer`. Often rendered as a bare 413 with no
+        Request body exceeded the 64 MiB cap enforced by axum's
+        `DefaultBodyLimit::max`. Often rendered as a bare 413 with no
         body when the limit is hit during streaming.
       headers:
         X-Request-Id:
