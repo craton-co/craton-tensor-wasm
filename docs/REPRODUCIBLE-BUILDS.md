@@ -150,36 +150,54 @@ no TZ-database lookup happens at build time.
 
 ### Git-pinned sources
 
-Two crates enter the workspace via `git = ...` pins rather than from
-crates.io, both as of v0.3.1 (per [RFC 0001](../rfcs/0001-cuda-oxide-integration.md)).
-Both pins are explicit revs (NOT branches), so a `cargo update` cannot
-silently flip them and `cargo deny check sources` audits the URL +
-rev pair on every CI run:
+The cuda-oxide HOST crates enter the workspace via a `git = ...` pin
+rather than from crates.io, as of v0.3.1 (per
+[RFC 0001](../rfcs/0001-cuda-oxide-integration.md)). The pin is an
+explicit rev (NOT a branch), so a `cargo update` cannot silently flip
+it and `cargo deny check sources` audits the URL + rev pair on every
+CI run:
 
 | Crate(s) | Repository | Pinned rev | Why git, not crates.io |
 |---|---|---|---|
-| `cuda-host`, `cuda-core`, `cuda-async` | `https://github.com/NVlabs/cuda-oxide` | `4a56e4220aab8ce5d085a411e7f806cebb647d14` (v0.1.0 tag) | NVlabs has not yet published these workspace members to crates.io; the crates.io `cuda-oxide` name is a different, unrelated 2018-era project. Re-evaluated at v0.4 per the RFC. |
-| `pliron`, `pliron-derive` (transitive via cuda-oxide) | `https://github.com/vaivaswatha/pliron` | `b51e73b11648508188184451adebdcf63957b7fe` | Pliron is cuda-oxide's MLIR-like Rust-native IR framework; not yet on crates.io as a stable release. Mirrored from cuda-oxide's own `Cargo.toml` pin. |
+| `cuda-host`, `cuda-core`, `cuda-device`, `cuda-macros`, `cuda-async` | `https://github.com/NVlabs/cuda-oxide` | `4a56e4220aab8ce5d085a411e7f806cebb647d14` (v0.1.0 tag) | NVlabs has not yet published these workspace members to crates.io; the crates.io `cuda-oxide` name is a different, unrelated 2018-era project. Re-evaluated at v0.4 per the RFC. |
+
+**Pliron is no longer git-pinned (W3.1 discovery, 2026-05-27).** When
+this document was first written, Pliron was a transitive git pin via
+cuda-oxide's own `Cargo.toml`. W3.1 discovered that Pliron published
+v0.15.0 to crates.io in 2026-05, and W3.3 cut TensorWasm's
+`tensor-wasm-jit` over to `pliron = "0.15"` directly from crates.io
+(see [`crates/tensor-wasm-jit/Cargo.toml`](../crates/tensor-wasm-jit/Cargo.toml)).
+`pliron-llvm` 0.15.0 is also published but pulls in
+`llvm-sys = "221"`, which requires LLVM 221 installed system-wide;
+that dep is therefore gated behind a separate `pliron-llvm-backend`
+feature per W3.3 rather than being bundled into `cuda-oxide-backend`.
+The cuda-oxide upstream `Cargo.toml` still git-pins its own internal
+Pliron rev, but that pin is no longer load-bearing for TensorWasm
+builds — we resolve Pliron from crates.io directly.
 
 `deny.toml` carries one `allow-git` entry per repository URL above with
-a comment matching the table. When cuda-oxide bumps its Pliron pin in
-a future release, the workspace `Cargo.toml` cuda-oxide rev AND the
-`deny.toml` allowlist comment for `vaivaswatha/pliron` must be updated
-in the same commit so the SBOM (`tensor-wasm-cdx-v<version>.json`) and
-this doc stay in sync.
+a comment matching the table. The historical `vaivaswatha/pliron`
+allowlist entry is retained as a no-op compatibility marker (in case a
+future cuda-oxide rev pulls Pliron back in transitively) but is
+expected to drop out of the resolved graph entirely once NVlabs
+upgrades cuda-oxide to pliron 0.15+.
 
 #### Policy: how a git-pinned dep gets in (and out)
 
 The `cuda-oxide-backend` feature on `tensor-wasm-mem` is the first
 TensorWasm feature whose enablement pulls a git-pinned dependency into
-the resolved graph. Pliron — cuda-oxide's MLIR-like Rust-native IR
-framework — is currently a `git`-pinned transitive dependency of
-cuda-oxide because it has not yet published a stable release to
-crates.io. The cuda-oxide-backend feature in v0.3.1 is dep-less (an
+the resolved graph. The cuda-oxide HOST crates (`cuda-host`,
+`cuda-core`, `cuda-device`, `cuda-macros`, `cuda-async`) are currently
+git-pinned because NVlabs has not yet published them to crates.io.
+(Note: Pliron itself **was** a git pin until W3.1 / 2026-05-27, when
+we discovered pliron 0.15.0 had been published to crates.io and the
+W3.3 work cut over to the published crate — see the
+[Git-pinned sources](#git-pinned-sources) table above for the current
+state.) The cuda-oxide-backend feature in v0.3.1 is dep-light (the
 empty scaffold module per [RFC 0001](../rfcs/0001-cuda-oxide-integration.md)
-"Rollout"); the actual git pin lands in the v0.4 parity work. This
-section documents the policy so reviewers of that v0.4 PR know what
-to look for.
+"Rollout" plus a crates.io `pliron` dep landed in W3.3); the host
+crate git pin lands in the v0.4 parity work. This section documents
+the policy so reviewers of that v0.4 PR know what to look for.
 
 A git pin is acceptable in this workspace **only if all four of these
 hold**:
@@ -194,10 +212,15 @@ hold**:
 2. **There is a comment in `Cargo.toml` directly above the dependency
    line linking to [RFC 0001](../rfcs/0001-cuda-oxide-integration.md)
    (or the successor RFC that justifies the pin) and naming the
-   condition under which the pin is removed.** For Pliron, the removal
-   condition is "Pliron publishes a stable release to crates.io". The
-   comment is the contract; without it, a future cargo-update PR can
-   re-pin to a newer SHA without an RFC discussion.
+   condition under which the pin is removed.** For the cuda-oxide host
+   crates, the removal condition is "NVlabs publishes `cuda-host`,
+   `cuda-core`, `cuda-device`, `cuda-macros` (and optionally
+   `cuda-async`) to crates.io". (Historical example, now resolved: the
+   same policy was originally applied to Pliron with removal condition
+   "Pliron publishes a stable release to crates.io" — that condition
+   was met in 2026-05 / W3.1; see the table above.) The comment is the
+   contract; without it, a future cargo-update PR can re-pin to a
+   newer SHA without an RFC discussion.
 3. **There is a matching `allow-git` entry in `deny.toml` (under
    `[sources]`) for the repository URL.** `cargo deny check sources`
    audits this on every CI run via the `deny` job in
@@ -233,16 +256,20 @@ Reviewer checklist when a PR adds (or bumps) a git pin:
       was regenerated and committed.
 - [ ] The release notes / CHANGELOG entry calls out the bump.
 
-When Pliron publishes to crates.io, the git pin in cuda-oxide's
-`Cargo.toml` will be replaced with a normal version requirement; the
-transitive git source for `vaivaswatha/pliron` will drop out of the
-workspace's resolved graph; the `allow-git` row in `deny.toml` and the
-table row above can be deleted; and this subsection (kept until then
-as a forward-looking policy statement) can be reduced back to the
-table-only treatment that the NVlabs/cuda-oxide pin gets today. The
-open RFC question that tracks this is
+**Status update (W3.1, 2026-05-27):** the Pliron half of this
+forward-looking statement has been fulfilled — pliron 0.15.0 is on
+crates.io and TensorWasm depends on it directly. The corresponding
 [RFC 0001 "Unresolved questions"](../rfcs/0001-cuda-oxide-integration.md#unresolved-questions)
-— "How does Pliron pin to a stable release vs git?".
+entry ("How does Pliron pin to a stable release vs git?") has been
+**resolved**. The `vaivaswatha/pliron` row in `deny.toml`
+`allow-git` is being kept as a historical no-op (in case cuda-oxide's
+own internal Pliron pin pulls it back into the resolved graph
+transitively before NVlabs upgrades); it can be deleted once the v0.4
+cuda-oxide bump confirms the transitive pin is gone. When the
+cuda-oxide host crates publish to crates.io (the remaining git pin),
+the NVlabs/cuda-oxide row above can also be deleted and this whole
+subsection can be reduced back to a short forward-looking policy
+note.
 
 ### ELF `NT_GNU_BUILD_ID`
 

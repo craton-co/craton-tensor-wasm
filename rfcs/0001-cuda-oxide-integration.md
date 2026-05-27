@@ -90,7 +90,7 @@ needs maintainer alignment in writing — that is this RFC.
 | Host runtime (alloc, stream, event, launch) | `cust` 0.3.x, EOL | `cudarc` 0.13.x, maintained, clean-room | `cuda-host` 0.1.x, NVIDIA-shipped, alpha |
 | Kernel authoring | Hand-written PTX or out-of-tree `nvcc` | Same as today | Rust source via `#[cuda_module]` (cuda-oxide compiles to PTX) |
 | Upstream owner | None | Single maintainer, active | NVIDIA Labs |
-| Crates.io presence | Yes (frozen) | Yes (regular releases) | Partial — Pliron pinned via `git` rev, not on crates.io |
+| Crates.io presence | Yes (frozen) | Yes (regular releases) | Partial — host crates (`cuda-host`, `cuda-core`, `cuda-device`, `cuda-macros`) still git-only; Pliron published to crates.io as of 0.15 (2026-05, per W3.1 discovery) |
 | Compatible with the W1.2 spike | N/A (status quo) | Spike landed | cuda-oxide ecosystem doc lists cudarc as a compatible host alternative; the two coexist |
 | Toolchain pin | `nightly-2026-03-15` (workspace default) | Same | `nightly-2026-04-03` (cuda-oxide's own pin) |
 | Workspace edition | Edition 2021 | Same | Edition 2024 (consumable from 2021 callers, but worth flagging) |
@@ -234,12 +234,26 @@ flip on a downstream that has reasons to stay.
   rework at v0.2. The contingent-default approach in the Summary is
   the mitigation, but it does not erase the maintenance cost of
   chasing alpha churn through v0.3.x and v0.4.x.
-- **Pliron is not on crates.io.** cuda-oxide's `Cargo.toml` pins
-  Pliron to a `git` revision. Dependabot is blind to git pins
+- **cuda-oxide HOST crates are still git-only.** The `cuda-host`,
+  `cuda-core`, `cuda-device`, and `cuda-macros` workspace members
+  remain unpublished on crates.io and arrive via a `git` pin on
+  NVlabs/cuda-oxide. Dependabot is blind to git pins
   (see `.github/dependabot.yml`), `cargo-deny` flags them, and
-  reproducible-builds work (W3.6) needs an explicit allowlist entry.
-  Until Pliron publishes, the supply-chain story is weaker than for
-  cudarc.
+  reproducible-builds work (W3.6) needs an explicit allowlist entry
+  for the NVlabs/cuda-oxide repository URL. Until NVlabs publishes
+  those crates, the supply-chain story for the host runtime is weaker
+  than for cudarc.
+
+  _W3.1 discovery (2026-05-27):_ **Pliron itself is now on crates.io
+  at v0.15.0** — same applies to `pliron-llvm` 0.15.0 — so the
+  Pliron-specific portion of this drawback is **no longer stale**.
+  TensorWasm depends on `pliron = "0.15"` directly from crates.io
+  (see [`crates/tensor-wasm-jit/Cargo.toml`](../crates/tensor-wasm-jit/Cargo.toml)).
+  `pliron-llvm` carries a hard `llvm-sys = "221"` system dependency
+  and is therefore gated behind a separate `pliron-llvm-backend`
+  feature per W3.3, not bundled into `cuda-oxide-backend`. The
+  remaining git-pin supply-chain hazard is scoped to the cuda-oxide
+  host crates listed above.
 - **Toolchain split.** Two pinned nightlies in the workspace — one
   for the default build, one for `cuda-oxide-backend` — is a
   contributor-onboarding tax. New contributors hit it the first time
@@ -279,9 +293,12 @@ and the Pliron-based auto-offload future would have to be re-added
 later under a third backend anyway.
 
 **What would change the calculus.** cuda-oxide stalling at v0.1.x
-through 2026, NVIDIA discontinuing the project, or Pliron failing to
-publish to crates.io. If any of those happen, the contingent fallback
-in this RFC's Summary lands us here.
+through 2026, NVIDIA discontinuing the project, or the cuda-oxide
+host crates (`cuda-host`/`-core`/`-device`/`-macros`) failing to
+reach crates.io. If any of those happen, the contingent fallback
+in this RFC's Summary lands us here. (As of W3.1 / 2026-05-27,
+Pliron itself is on crates.io at 0.15.0, so its publication risk
+is no longer in this list.)
 
 ### Option B: cuda-oxide-only (skip cudarc)
 
@@ -348,12 +365,18 @@ indefinitely or vendor cust ourselves (Option D).
   `cudarc-backend` for if no. Open until cuda-oxide publishes a v0.2
   release schedule, or until the v0.4 release cycle, whichever comes
   first.
-- **How does Pliron pin to a stable release vs git?** Proposed
-  answer: track Pliron upstream and re-evaluate once it publishes
-  to crates.io; if it has not by v0.5, document the git pin in
+- **~~How does Pliron pin to a stable release vs git?~~** **Resolved
+  by W3.1 (2026-05-27):** Pliron published 0.15.0 to crates.io in
+  2026-05 and TensorWasm now depends on `pliron = "0.15"` directly
+  via crates.io (see [`crates/tensor-wasm-jit/Cargo.toml`](../crates/tensor-wasm-jit/Cargo.toml)).
+  `pliron-llvm` 0.15.0 is also on crates.io but carries a hard
+  `llvm-sys = "221"` system dependency, so it is gated behind a
+  separate `pliron-llvm-backend` feature (W3.3) rather than riding on
+  `cuda-oxide-backend`. The remaining git-pin work in
   [`docs/REPRODUCIBLE-BUILDS.md`](../docs/REPRODUCIBLE-BUILDS.md) and
-  add an explicit `cargo-deny` allowlist entry. Open until Pliron
-  publishes.
+  the `cargo-deny` allowlist is scoped to the cuda-oxide HOST crates
+  (`cuda-host`, `cuda-core`, `cuda-device`, `cuda-macros`), which
+  remain git-only and unpublished.
 - **Does cuda-async's Tokio integration outperform our hand-rolled
   `DispatchFuture` busy-poll?** Proposed answer: unknown; benchmark
   during the v0.4 parity work. The W4.6 P99.9 bench extension is the

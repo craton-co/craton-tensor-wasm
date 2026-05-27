@@ -30,12 +30,17 @@ wasm-encoder = { version = "0.218", features = ["wasmparser"] }
 # pliron — MLIR-style IR framework underpinning cuda-oxide's dialect-mir →
 # dialect-llvm → PTX pipeline (RFC 0001 "Pliron lever and the auto-offload
 # pipeline"). Optional + feature-gated so the default build is unaffected;
-# only `--features cuda-oxide-backend` pulls it in. Published to crates.io
-# as of 0.15.0 (the RFC's "Pliron is not on crates.io" drawback is stale —
-# pin via crates.io directly rather than a git rev). The cuda-oxide
-# upstream itself still uses a git pin at v0.14.0; we choose the published
+# only `--features cuda-oxide-backend` pulls it in.
+#
+# Supply-chain status: W3.1 (2026-05-27) discovered that pliron is now on
+# crates.io at 0.15.0 — the old RFC 0001 "Pliron is not on crates.io"
+# drawback is no longer accurate (RFC has been amended). We depend on the
+# published crate directly rather than a git rev. The cuda-oxide upstream
+# itself still uses a git pin at v0.14.0 of pliron; we choose the published
 # 0.15.0 for the dependabot/cargo-deny story documented in
-# `docs/REPRODUCIBLE-BUILDS.md`.
+# `docs/REPRODUCIBLE-BUILDS.md`. The cuda-oxide HOST crates
+# (cuda-host/cuda-core/cuda-device/cuda-macros) remain git-only and are the
+# only remaining supply-chain git pin once wave 4 lands.
 pliron = { version = "0.15", optional = true }
 # pliron-llvm — LLVM-dialect ops + textual IR emission for pliron 0.15.
 # Wave 3.3 uses this to lower `twasm.*` ops emitted by `pliron_lowering`
@@ -66,22 +71,21 @@ auto-offload = []
 # cuda-oxide-backend gates the `pliron_dialect` scaffold module — the v0.5
 # cust-successor lever tracked in `rfcs/0001-cuda-oxide-integration.md`
 # (step 4, "Pliron lever and the auto-offload pipeline"). The feature is
-# deliberately dep-less today: the v0.3.1 landing is pure-Rust scaffolding
-# that fixes the trait surface + Cranelift→dialect-mir mapping table the
-# v0.4 author needs as a target. The real Pliron crate dependency (git pin,
-# per RFC 0001 "Drawbacks") gets added in the v0.4 implementation PR once
-# the workspace toolchain bumps to a nightly that satisfies cuda-oxide's
-# `nightly-2026-04-03` pin. Mirrors the `cuda-oxide-backend` feature on
+# deliberately dep-light today: it pulls in `pliron` 0.15 from crates.io
+# (published 2026-05, per W3.1 discovery on 2026-05-27) to land the
+# scaffold trait surface + Cranelift→dialect-mir mapping table the v0.4
+# author needs as a target. Mirrors the `cuda-oxide-backend` feature on
 # `tensor-wasm-mem` so a single `--features cuda-oxide-backend` invocation
 # at the workspace root selects the full opt-in stack.
 #
 # Supply-chain note: W3.1 (2026-05-27) discovered that pliron is now on
-# crates.io at v0.15 — the RFC 0001 "Drawbacks" claim is stale. The wave-3
-# dep here is therefore a regular crates.io version requirement, NOT a git
-# pin. The cuda-oxide host crates (cuda-host/core/device/macros) remain
-# git-only and arrive in wave 4 with the corresponding `deny.toml`
-# allowlist entries (already pre-declared under [sources] allow-git for
-# forward compatibility).
+# crates.io at v0.15 — the historical RFC 0001 "Drawbacks" claim that
+# Pliron is git-only is therefore stale (RFC has been amended). The
+# `pliron` dep here is a regular crates.io version requirement, NOT a git
+# pin. The cuda-oxide HOST crates (cuda-host/cuda-core/cuda-device/
+# cuda-macros) remain git-only and arrive in wave 4 with the corresponding
+# `deny.toml` allowlist entries (already pre-declared under [sources]
+# allow-git for forward compatibility).
 cuda-oxide-backend = ["dep:pliron"]
 # pliron-llvm-backend pulls in `pliron-llvm` 0.15 to wire the stage-2
 # `twasm.*` → `llvm.*` rewrite in `pliron_ptx`. Strict superset of
