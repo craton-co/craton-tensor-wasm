@@ -24,6 +24,21 @@ use wasmtime::{Module, ResourceLimiter, Store};
 use crate::engine::TensorWasmEngine;
 use crate::instance::{TensorWasmInstance, InstanceState};
 
+/// Convert a wall-clock [`Duration`] into a number of epoch ticks suitable
+/// for [`wasmtime::Store::set_epoch_deadline`].
+///
+/// Rounds up so a sub-tick remainder still terminates, with a floor of 1 so
+/// `Duration::from_nanos(1)` does not silently become "never trip". Clamps
+/// at [`u64::MAX`] if a caller supplies a pathologically long deadline. The
+/// `tick` parameter is the engine's `epoch_tick` cadence; a zero-or-less tick
+/// is treated as 1 ms to avoid division-by-zero on a malformed config.
+fn duration_to_epoch_ticks(d: Duration, tick: Duration) -> u64 {
+    let d_ms = d.as_millis();
+    let t_ms = tick.as_millis().max(1);
+    let ticks_u128 = d_ms.div_ceil(t_ms).max(1);
+    u64::try_from(ticks_u128).unwrap_or(u64::MAX)
+}
+
 /// Errors raised by the executor.
 #[derive(Debug, Error)]
 pub enum ExecError {
@@ -336,7 +351,16 @@ impl TensorWasmExecutor {
         let mut state =
             InstanceState::new(cfg.tenant_id, id).with_memory_limit(max_memory_bytes);
         if let Some(d) = cfg.deadline {
-            state = state.with_deadline(Instant::now() + d);
+            // Seed the absolute deadline at spawn time so the first call has
+            // a meaningful window even if it fires before `call_export` gets
+            // a chance to re-arm (which it always does in practice, but the
+            // invariant is "deadline is set whenever deadline_duration is").
+            // The per-call re-arm in `call_export` keeps subsequent calls
+            // honest — without it a second call inherits the elapsed window
+            // from the first and the timeout report degenerates to 0/0.
+            state = state
+                .with_deadline(Instant::now() + d)
+                .with_deadline_duration(d);
         }
         // Translate the SpawnConfig deadline (a wall-clock Duration) into the
         // number of epoch ticks after which Wasmtime should interrupt execution.
@@ -348,16 +372,7 @@ impl TensorWasmExecutor {
         // fresh, and the ticker drives the only progression of the counter.
         let tick = self.engine.config().epoch_tick;
         let epoch_deadline_ticks = match cfg.deadline {
-            Some(d) => {
-                // Convert duration → number of epoch ticks, rounding up,
-                // with a floor of 1 so a sub-tick deadline still terminates.
-                // Use `u64::try_from` to clamp at `u64::MAX` if a caller
-                // supplies a pathologically long deadline.
-                let d_ms = d.as_millis();
-                let t_ms = tick.as_millis().max(1);
-                let ticks_u128 = d_ms.div_ceil(t_ms).max(1);
-                u64::try_from(ticks_u128).unwrap_or(u64::MAX)
-            }
+            Some(d) => duration_to_epoch_ticks(d, tick),
             // No deadline → effectively unbounded. u64::MAX is fine: the
             // engine's epoch counter would need ~5.8 billion years at 10 ms/
             // tick to reach it, so the deadline will never trip in practice.
@@ -431,11 +446,34 @@ impl TensorWasmExecutor {
             .value()
             .clone();
         let mut guard = handle.lock().await;
-        // Snapshot the deadline (if any) before taking the call path so
-        // we can synthesise a `Timeout` variant with real elapsed/deadline
-        // figures when the epoch interrupt fires.
+        // Re-arm the deadline at the start of each call.
+        //
+        // The fields on `InstanceState` work in concert: `deadline_duration`
+        // is the configured per-call budget (immutable for the life of the
+        // instance), and `deadline` is the absolute `Instant` we expect to
+        // not cross. At spawn time we seeded `deadline = now + d`, but if a
+        // caller invokes `call_export` twice with delay in between, the
+        // second call would inherit an already-elapsed deadline — and the
+        // wasmtime epoch counter set at spawn would already be consumed.
+        // That used to surface as `Timeout { elapsed_ms: 0, deadline_ms: 0 }`
+        // because the wasmtime trap fired before any real work happened and
+        // the legacy `deadline_at.saturating_duration_since(started_at)`
+        // returned zero. Re-arming here gives every call its own honest
+        // window (and honest numbers if it does time out).
+        let call_start = Instant::now();
+        let configured_deadline = guard.store.data().deadline_duration;
+        if let Some(d) = configured_deadline {
+            let new_deadline = call_start + d;
+            guard.store.data_mut().deadline = Some(new_deadline);
+            let tick = self.engine.config().epoch_tick;
+            guard
+                .store
+                .set_epoch_deadline(duration_to_epoch_ticks(d, tick));
+        }
         let deadline_at = guard.store.data().deadline;
-        let started_at = Instant::now();
+        let configured_deadline_ms = configured_deadline
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
         let wasmtime_instance = *guard.wasmtime_instance();
         let func = wasmtime_instance
             .get_func(&mut guard.store, export)
@@ -449,18 +487,15 @@ impl TensorWasmExecutor {
                 // If we had a deadline AND the wall clock has tripped past
                 // it, classify the failure as Timeout with real numbers.
                 // Otherwise propagate the raw wasmtime error.
-                let elapsed = started_at.elapsed();
+                let elapsed = call_start.elapsed();
                 let past_deadline = deadline_at
                     .map(|d| Instant::now() >= d)
                     .unwrap_or(false);
                 if past_deadline {
-                    let deadline_ms = deadline_at
-                        .map(|d| d.saturating_duration_since(started_at).as_millis())
-                        .unwrap_or(0);
                     Err(ExecError::Timeout(TimeoutContext {
                         id,
                         elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                        deadline_ms: u64::try_from(deadline_ms).unwrap_or(u64::MAX),
+                        deadline_ms: configured_deadline_ms,
                     }))
                 } else {
                     Err(ExecError::Wasmtime(err))
