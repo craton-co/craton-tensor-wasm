@@ -82,9 +82,10 @@ a high-level summary.
 |---|---|---|
 | `image.repository` | `ghcr.io/craton-co/tensor-wasm` | OCI repository. |
 | `image.tag` | `""` (uses `.Chart.AppVersion`) | |
-| `image.backend` | `""` | One of `cust` \| `cudarc` \| `cuda-oxide` \| `""`. Appends `-<backend>` to the tag. See "Backend selection". |
+| `image.backend` | `""` | **Legacy.** One of `cust` \| `cudarc` \| `cuda-oxide` \| `""`. Appends `-<backend>` to the tag. New installs should prefer `backend.type` (below); `image.backend` stays the actual tag-composition input until the v0.4 image pipeline lands. See "Backend selection". |
 | `image.pullPolicy` | `IfNotPresent` | |
 | `imagePullSecrets` | `[]` | |
+| `backend.type` | `"unified-memory"` | **W4.3, RFC-0001-aligned.** One of `unified-memory` \| `cudarc` \| `cuda-oxide`. The canonical operator-facing toggle; validated at install time. Currently a "documentation handle" surfaced via `helm get values` and a pod annotation; wave-4 lands the image pipeline that consumes it for tag composition. See "Backend selection". |
 | `replicaCount` | `1` | Runtime keeps no shared state across pods. |
 | `strategy.type` | `Recreate` | Use `RollingUpdate` only with `replicaCount > 1`. |
 | `service.type` | `ClusterIP` | `NodePort` / `LoadBalancer` also valid. |
@@ -182,6 +183,44 @@ Different builds ship as different image tags; the chart picks between them
 by suffixing `image.tag` with `-<image.backend>`. The runtime env-var
 surface (`rateLimit.qps`, `auth.tokens`, `cuda.arch`, …) is identical
 across backends — only the binary inside the image differs.
+
+### `backend.type` (canonical, W4.3)
+
+`backend.type` is the **canonical operator-facing toggle**, added in W4.3
+per RFC 0001 "Rollout — v0.4 (parity)":
+
+> Promote the W2.7 Helm chart to expose a `values.yaml` toggle for the
+> backend choice.
+
+It accepts exactly the three RFC-0001-aligned names:
+
+| `backend.type` value | Maps to feature flag | Status |
+|---|---|---|
+| `unified-memory` (default) | `--features unified-memory` (cust path) | Production default through v0.4.x. |
+| `cudarc` | `--features cudarc-backend` | Recommended-stable for v0.3.x; v0.5 default fallback. |
+| `cuda-oxide` | `--features cuda-oxide-backend` | v0.5 default contingent on cuda-oxide v0.2; alpha today. |
+
+Invalid values fail the install with a clear error rather than producing an
+`ImagePullBackOff` on a tag that does not exist (see
+`templates/_helpers.tpl` `tensor-wasm.validateBackend`).
+
+**Today (v0.3.5) this toggle is a "documentation handle".** The
+release-engineering pipeline that publishes per-backend container tags
+(`<tag>-unified-memory`, `<tag>-cudarc`, `<tag>-cuda-oxide`) is wave-4
+work; until those images exist on `ghcr.io/craton-co/*` the chart does
+not consume `backend.type` for tag composition. The value is still
+surfaced two ways:
+
+- `helm get values <release>` includes the operator's choice for audit.
+- The Deployment carries a `craton.io/backend-type: <value>` pod
+  annotation (visible via `kubectl describe pod`), and a checksum so a
+  bare `backend.type` flip still re-rolls the pod.
+
+When the wave-4 pipeline lands, `backend.type` will become the
+authoritative input to the image-tag suffix and `image.backend` will be
+deprecated.
+
+### `image.backend` (legacy)
 
 Three values are accepted for `image.backend`:
 

@@ -34,6 +34,32 @@ image:
   # -- One of Always, IfNotPresent, Never.
   pullPolicy: IfNotPresent
 
+# GPU backend selection. Affects which compile-time --features the
+# tensor-wasm container image was built with. The container image tags
+# encode the backend selection; this value picks the matching tag.
+# See rfcs/0001-cuda-oxide-integration.md and docs/PLIRON-PIPELINE.md.
+#
+# This is the canonical, RFC-0001-aligned knob and supersedes the legacy
+# `image.backend` field (which is still honored when this value is left
+# at its default "unified-memory" AND `image.backend` is set explicitly,
+# preserving v0.3.x install behavior). Greenfield installs should set
+# `backend.type` and leave `image.backend` empty.
+#
+# NOTE: this toggle is currently a "documentation handle" insofar as the
+# release-engineering pipeline that produces per-backend container tags
+# (`<tag>-unified-memory`, `<tag>-cudarc`, `<tag>-cuda-oxide`) is wave-4
+# work; the W4.3 chart change here lands the operator-facing surface so
+# that v0.4 + v0.5 only need to publish the matching images. Until the
+# images exist on `ghcr.io/craton-co/*`, set `image.repository` to your
+# own registry per the README "Image registry is not yet provisioned"
+# callout. `helm get values` will still surface the choice for audit.
+backend:
+  # -- One of: "unified-memory" (default cust path), "cudarc",
+  # "cuda-oxide". At v0.5 (when cuda-oxide is promoted to default
+  # contingent on its v0.2), the default flips. Until then
+  # "unified-memory" is the supported production default.
+  type: "unified-memory"
+
 # -- imagePullSecrets passed through to the Deployment's PodSpec.
 imagePullSecrets: []
 # - name: ghcr-pull-secret

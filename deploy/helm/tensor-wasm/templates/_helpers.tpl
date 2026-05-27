@@ -80,15 +80,48 @@ chart-managed Secret is suppressed in that case.
 {{- end -}}
 
 {{/*
+Validate .Values.backend.type. Must be exactly one of the three names
+RFC 0001 enumerates ("Feature-flag layout"):
+  - "unified-memory" (default; today's cust path)
+  - "cudarc"
+  - "cuda-oxide"
+
+Failing here surfaces a clean Helm install error rather than a confusing
+ImagePullBackOff once the pod tries to pull a nonexistent tag.
+*/}}
+{{- define "tensor-wasm.validateBackend" -}}
+{{- $valid := list "unified-memory" "cudarc" "cuda-oxide" -}}
+{{- if not (has .Values.backend.type $valid) -}}
+{{- fail (printf "tensor-wasm: backend.type=%q is invalid. Must be one of: unified-memory, cudarc, cuda-oxide. See rfcs/0001-cuda-oxide-integration.md \"Feature-flag layout\"." .Values.backend.type) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Resolve the container image reference, defaulting tag to .Chart.AppVersion.
 
-When .Values.image.backend is set (cust | cudarc | cuda-oxide) the helper
-appends "-<backend>" to the tag, matching the build-time feature-flag
-convention from RFC 0001 (rfcs/0001-cuda-oxide-integration.md "Feature-flag
-layout"). The empty default leaves the tag untouched, so existing installs
-that pin a registry without backend-suffixed tags keep working.
+Tag-suffix selection — two knobs coexist for a transition window:
+
+  - `backend.type` (W4.3, RFC-0001-aligned: unified-memory|cudarc|cuda-oxide)
+    is the canonical operator-facing toggle. The wave-4 release-engineering
+    pipeline will publish container tags suffixed with these names so that
+    `backend.type=cudarc` lands on the matching build. Until the pipeline
+    is in place this toggle is a "documentation handle" — visible in
+    `helm get values` and validated for typos, but not consumed for tag
+    composition (we do not want to point pods at a tag that does not
+    exist on `ghcr.io/craton-co/*` yet).
+
+  - `image.backend` (legacy, v0.3.x: cust|cudarc|cuda-oxide) is the
+    actual tag-composition input today. When non-empty the chart appends
+    `-<image.backend>` to the tag; when empty the tag is used verbatim,
+    preserving existing-install behavior for registries that do not
+    publish backend-suffixed variants.
+
+At v0.5 (per RFC 0001 "Rollout") the wave-4 image pipeline lands and
+`backend.type` becomes the authoritative input; `image.backend` will be
+deprecated then.
 */}}
 {{- define "tensor-wasm.image" -}}
+{{- include "tensor-wasm.validateBackend" . -}}
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
 {{- if .Values.image.backend -}}
 {{- printf "%s:%s-%s" .Values.image.repository $tag .Values.image.backend -}}

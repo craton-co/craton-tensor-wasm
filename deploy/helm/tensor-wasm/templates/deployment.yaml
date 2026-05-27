@@ -36,6 +36,13 @@ spec:
         # as a build-time decision; the rollout trigger is what makes the
         # build-time pick observable to the cluster.
         checksum/image: {{ include "tensor-wasm.image" . | sha256sum }}
+        # Surface the W4.3 backend.type pick on the pod metadata so a
+        # `kubectl describe pod` shows the operator's choice without
+        # needing `helm get values`. Also forces a rollout when only
+        # backend.type flips (e.g. unified-memory -> cudarc), which is
+        # what makes the documentation-handle toggle observably
+        # connected to the running workload pre-v0.5.
+        craton.io/backend-type: {{ .Values.backend.type | quote }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
