@@ -506,7 +506,7 @@ use today):
 - `wasi_cuda_launch(kernel_id: i64, grid_x..block_z, shared_mem, args_ptr, args_len: i32) -> i32`
 - `wasi_cuda_sync() -> i32`
 
-All names live under the import module `wasi:cuda/host@0.1.0`. See
+All names live under the import module `wasi:cuda/host@0.2.0`. See
 [`crates/tensor-wasm-wasi-gpu/src/abi.rs`](../crates/tensor-wasm-wasi-gpu/src/abi.rs)
 for the full constant set, including the `wasi_cuda_last_error_len` /
 `wasi_cuda_last_error_copy` pair used to retrieve the host's last
@@ -539,7 +539,7 @@ const N: u32 = 1024;
 const TAG_U32: u8 = 0x05;
 const TAG_PTR: u8 = 0x07;
 
-#[link(wasm_import_module = "wasi:cuda/host@0.1.0")]
+#[link(wasm_import_module = "wasi:cuda/host@0.2.0")]
 extern "C" {
     fn wasi_cuda_load_ptx(
         ptx_ptr: i32, ptx_len: i32,
@@ -622,7 +622,7 @@ time until `args_len` bytes are consumed.
 #include <string.h>
 #include <assert.h>
 
-#define IMPORT __attribute__((import_module("wasi:cuda/host@0.1.0")))
+#define IMPORT __attribute__((import_module("wasi:cuda/host@0.2.0")))
 IMPORT int64_t wasi_cuda_load_ptx(int32_t pp, int32_t pl, int32_t ep, int32_t el);
 IMPORT int32_t wasi_cuda_launch(int64_t kid,
     int32_t gx, int32_t gy, int32_t gz, int32_t bx, int32_t by, int32_t bz,

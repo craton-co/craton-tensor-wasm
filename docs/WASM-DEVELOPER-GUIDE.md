@@ -10,7 +10,7 @@ Craton TensorWasm targets **`wasm32-wasip1`** — the WebAssembly System Interfa
 rustup target add wasm32-wasip1
 ```
 
-`wasm32-wasip1` gives your guest access to a curated set of host imports: clocks, random, filesystem (sandboxed), and TensorWasm's own `wasi:cuda/host@0.1.0` for GPU work.
+`wasm32-wasip1` gives your guest access to a curated set of host imports: clocks, random, filesystem (sandboxed), and TensorWasm's own `wasi:cuda/host@0.2.0` for GPU work.
 
 If you're writing a **pure compute kernel** with no I/O, you can also use `wasm32-unknown-unknown`. The output is smaller and the link is faster, but you lose all WASI imports — no clocks, no random, no GPU. Use it only when you genuinely need nothing from the host.
 
@@ -79,12 +79,12 @@ Pointers (`*const f32`, `*mut f32`) are **guest-relative offsets** into the Wasm
 
 ## 4. Using wasi-cuda for explicit GPU kernels
 
-When you've written a CUDA kernel by hand and compiled it to PTX, you can launch it from your Wasm guest using the `wasi:cuda/host@0.1.0` import surface.
+When you've written a CUDA kernel by hand and compiled it to PTX, you can launch it from your Wasm guest using the `wasi:cuda/host@0.2.0` import surface.
 
 Declare the host imports your guest will call:
 
 ```rust
-#[link(wasm_import_module = "wasi:cuda/host@0.1.0")]
+#[link(wasm_import_module = "wasi:cuda/host@0.2.0")]
 extern "C" {
     fn wasi_cuda_load_ptx(
         ptx_ptr: i32, ptx_len: i32,

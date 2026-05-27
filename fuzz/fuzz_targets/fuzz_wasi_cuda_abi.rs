@@ -2,7 +2,7 @@
 // Copyright 2026 Craton Software Company
 
 //! Fuzz target for the wasi-cuda ABI: drives a wasmtime instance importing
-//! the `wasi:cuda/host@0.1.0` functions and feeds the host fuzzer-derived
+//! the `wasi:cuda/host@0.2.0` functions and feeds the host fuzzer-derived
 //! `(ptr, len)` pairs for `load_ptx`, `launch`, and `last_error_copy`.
 //!
 //! The goal is to crash the host on memory-safety bugs in the ABI
@@ -61,15 +61,15 @@ impl HasWasiCuda for Store {
 
 const HARNESS_WAT: &str = r#"
 (module
-  (import "wasi:cuda/host@0.1.0" "wasi_cuda_load_ptx"
+  (import "wasi:cuda/host@0.2.0" "wasi_cuda_load_ptx"
       (func $load_ptx (param i32 i32 i32 i32) (result i64)))
-  (import "wasi:cuda/host@0.1.0" "wasi_cuda_launch"
+  (import "wasi:cuda/host@0.2.0" "wasi_cuda_launch"
       (func $launch (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
-  (import "wasi:cuda/host@0.1.0" "wasi_cuda_sync"
+  (import "wasi:cuda/host@0.2.0" "wasi_cuda_sync"
       (func $sync (result i32)))
-  (import "wasi:cuda/host@0.1.0" "wasi_cuda_last_error_len"
+  (import "wasi:cuda/host@0.2.0" "wasi_cuda_last_error_len"
       (func $last_err_len (result i32)))
-  (import "wasi:cuda/host@0.1.0" "wasi_cuda_last_error_copy"
+  (import "wasi:cuda/host@0.2.0" "wasi_cuda_last_error_copy"
       (func $last_err_copy (param i32 i32) (result i32)))
 
   ;; 1 page = 64 KiB so fuzzer-derived ptr/len can sweep around the boundary.
