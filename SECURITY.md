@@ -75,6 +75,24 @@ that miss Wasmtime's bounds checks raise a hardware fault before they can
 corrupt adjacent allocations. This applies only to the host-backed buffer;
 managed memory remains unguarded for the reason above.
 
+### Snapshot authenticity
+
+Snapshots may be HMAC-SHA256 authenticated. See
+[`docs/SNAPSHOT-COMPATIBILITY.md`](docs/SNAPSHOT-COMPATIBILITY.md#v2--v3-migration-signed-snapshots)
+for migration. Without a key, snapshots carry only CRC32 (integrity,
+not authenticity); operators handling untrusted snapshot bytes SHOULD
+configure a key.
+
+Signing is opt-in (default-off writer, `signed-snapshots` feature
+default-on) so existing v2 archives stay readable while a deployment
+rolls forward. The end-state recommendation for any operator who
+exposes the snapshot restore path to a network they do not fully
+control is the four-step rollout that ends with
+`SnapshotReader::require_signature()` (CLI: `--require-signature`;
+API: `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE=true`) — at which
+point the reader refuses any v2 archive and any v3 archive whose HMAC
+does not verify under the configured key.
+
 ### Kernel launch hardening
 
 `wasi_cuda_load_ptx` validates PTX with `ptxas --gpu-name <arch>` before
