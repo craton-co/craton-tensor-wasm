@@ -19,7 +19,7 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
-use wasmtime::{Module, ResourceLimiter, Store};
+use wasmtime::{ExternType, Module, ResourceLimiter, Store};
 
 use crate::engine::TensorWasmEngine;
 use crate::instance::{TensorWasmInstance, InstanceState};
@@ -67,6 +67,24 @@ pub enum ExecError {
     /// like `ExecError::Timeout(_)` keep compiling.
     #[error("{0}")]
     Timeout(TimeoutContext),
+    /// The module declares — via an exported or imported
+    /// [`wasmtime::ExternType::Memory`] — an initial or maximum linear
+    /// memory size that exceeds `EngineConfig::max_memory_bytes`.
+    ///
+    /// Surfaced *before* `Instance::new_async` because Wasmtime's
+    /// [`wasmtime::ResourceLimiter::memory_growing`] only fires on
+    /// `memory.grow`, not on the initial allocation. A guest declaring
+    /// `(memory 1 65536)` would otherwise force a 4 GiB allocation at
+    /// instantiation. Maps to
+    /// [`tensor_wasm_core::error::TensorWasmError::MemoryExhausted`].
+    #[error("module-declared linear memory {requested_bytes} bytes exceeds engine cap {limit_bytes} bytes")]
+    ModuleMemoryTooLarge {
+        /// Bytes the module asked for (initial or declared maximum,
+        /// whichever tripped the check first).
+        requested_bytes: u64,
+        /// Configured engine-wide per-instance cap in bytes.
+        limit_bytes: u64,
+    },
 }
 
 /// Payload for [`ExecError::Timeout`]. Carries the real elapsed and deadline
@@ -119,6 +137,13 @@ impl From<ExecError> for tensor_wasm_core::error::TensorWasmError {
             ExecError::Timeout(ctx) => TensorWasmError::KernelTimeout {
                 elapsed_ms: ctx.elapsed_ms,
                 deadline_ms: ctx.deadline_ms,
+            },
+            ExecError::ModuleMemoryTooLarge {
+                requested_bytes,
+                limit_bytes,
+            } => TensorWasmError::MemoryExhausted {
+                requested: requested_bytes,
+                limit: limit_bytes,
             },
         }
     }
@@ -244,6 +269,53 @@ pub struct TensorWasmExecutor {
     /// Optional metrics handle. When `Some`, spawn/terminate operations
     /// increment the corresponding Prometheus counters / gauges.
     metrics: Option<TensorWasmMetrics>,
+}
+
+/// Walk every exported and imported [`ExternType::Memory`] in `module` and
+/// reject the spawn if either the initial (`minimum`) or the declared
+/// `maximum` size, expressed in bytes via the memory type's own
+/// `page_size()`, exceeds `cap_bytes`.
+///
+/// Returns [`ExecError::ModuleMemoryTooLarge`] on the first offending
+/// memory found. The check runs against the compiled [`Module`] before
+/// `Instance::new_async`, so a rejected module is never instantiated and
+/// no host allocation is attempted on its behalf.
+fn check_module_memory_within_cap(module: &Module, cap_bytes: usize) -> Result<(), ExecError> {
+    let cap_u64 = cap_bytes as u64;
+    let mut check = |mt: &wasmtime::MemoryType| -> Result<(), ExecError> {
+        let page_size = mt.page_size();
+        // `minimum()` is in pages; multiply with overflow-safe saturating
+        // arithmetic so a pathological declaration cannot wrap on cast.
+        let min_pages = mt.minimum();
+        let min_bytes = min_pages.saturating_mul(page_size);
+        if min_bytes > cap_u64 {
+            return Err(ExecError::ModuleMemoryTooLarge {
+                requested_bytes: min_bytes,
+                limit_bytes: cap_u64,
+            });
+        }
+        if let Some(max_pages) = mt.maximum() {
+            let max_bytes = max_pages.saturating_mul(page_size);
+            if max_bytes > cap_u64 {
+                return Err(ExecError::ModuleMemoryTooLarge {
+                    requested_bytes: max_bytes,
+                    limit_bytes: cap_u64,
+                });
+            }
+        }
+        Ok(())
+    };
+    for ex in module.exports() {
+        if let ExternType::Memory(mt) = ex.ty() {
+            check(&mt)?;
+        }
+    }
+    for im in module.imports() {
+        if let ExternType::Memory(mt) = im.ty() {
+            check(&mt)?;
+        }
+    }
+    Ok(())
 }
 
 impl TensorWasmExecutor {
@@ -379,6 +451,21 @@ impl TensorWasmExecutor {
             None => u64::MAX,
         };
         let module = self.compile_module_cached(wasm)?;
+
+        // Pre-instantiation memory cap (closes mem-H5 / exec-S-2 / exec-S-10).
+        // Wasmtime's `ResourceLimiter::memory_growing` fires only on
+        // `memory.grow`, not on the initial allocation a module declares
+        // with `(memory N M)`. A guest could therefore force a multi-GiB
+        // allocation at instantiation time without ever calling
+        // `memory.grow` — and the per-store `TensorWasmResourceLimiter`
+        // would never see it. Walk every exported AND imported memory
+        // type and reject the spawn if its initial OR maximum size
+        // exceeds the engine's configured cap. We use the memory type's
+        // own `page_size()` so this stays correct for both the wasm32
+        // default 64 KiB pages and any future custom-page-size proposal
+        // memory types Wasmtime accepts.
+        check_module_memory_within_cap(&module, max_memory_bytes)?;
+
         let mut store = Store::new(self.engine.inner(), state);
         // Cap linear-memory growth at the engine-configured maximum. The
         // limiter lives inside the store payload (`InstanceState::limiter`)

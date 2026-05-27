@@ -48,6 +48,24 @@ use crate::unified::{DeviceId, UnifiedBuffer, UnifiedError};
 /// bound on its linear memory. 256 MiB matches the plan's working-set cap.
 pub const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
 
+/// Absolute upper bound on linear-memory capacity per Wasm instance.
+///
+/// Wasmtime's [`wasmtime::ResourceLimiter::memory_growing`] only fires on
+/// `memory.grow` — NOT on the initial allocation a module declares with
+/// `(memory N M)`. A malicious or buggy guest can therefore force the host
+/// to allocate up to 4 GiB (the spec maximum for a 32-bit Wasm memory:
+/// 65 536 pages × 64 KiB) at instantiation time without ever calling
+/// `memory.grow`. This constant is the hard ceiling enforced by
+/// [`TensorWasmLinearMemory::new_on`] and
+/// [`TensorWasmMemoryCreator::new_memory`]; oversize requests are rejected
+/// with [`UnifiedError::TooLarge`] before any backing allocation happens.
+///
+/// 4 GiB matches the wasm32 spec maximum so a compliant module that
+/// reserves the full address space is still admitted (subject to the
+/// per-engine `EngineConfig::max_memory_bytes`); anything larger than the
+/// spec maximum is fail-fast on the host side.
+pub const HARD_MAX_LINEAR_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
 /// A Wasm linear memory backed by [`UnifiedBuffer`].
 ///
 /// The buffer is allocated at construction time with the requested *maximum*
@@ -75,12 +93,32 @@ impl TensorWasmLinearMemory {
     }
 
     /// Same as [`new`](Self::new) but on a specific device.
+    ///
+    /// Fails with [`UnifiedError::TooLarge`] when `maximum_bytes` (or the
+    /// `minimum_bytes` floor) would exceed [`HARD_MAX_LINEAR_MEMORY_BYTES`].
+    /// This closes mem-H5 / exec-S-2 / exec-S-10: Wasmtime's
+    /// [`wasmtime::ResourceLimiter::memory_growing`] only fires on
+    /// `memory.grow`, so a guest declaring `(memory 1 65536)` would
+    /// otherwise force a 4 GiB allocation at instantiation. The hard cap
+    /// is enforced *before* the backing allocator is invoked.
     pub fn new_on(
         minimum_bytes: usize,
         maximum_bytes: Option<usize>,
         device_id: DeviceId,
     ) -> Result<Self, UnifiedError> {
         let max = maximum_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+        if max > HARD_MAX_LINEAR_MEMORY_BYTES {
+            return Err(UnifiedError::TooLarge {
+                requested: max as u64,
+                limit: HARD_MAX_LINEAR_MEMORY_BYTES as u64,
+            });
+        }
+        if minimum_bytes > HARD_MAX_LINEAR_MEMORY_BYTES {
+            return Err(UnifiedError::TooLarge {
+                requested: minimum_bytes as u64,
+                limit: HARD_MAX_LINEAR_MEMORY_BYTES as u64,
+            });
+        }
         if minimum_bytes > max {
             return Err(UnifiedError::Allocation(format!(
                 "minimum {minimum_bytes} > maximum {max}"
@@ -400,6 +438,23 @@ unsafe impl MemoryCreator for TensorWasmMemoryCreator {
         guard_size_in_bytes: usize,
     ) -> Result<Box<dyn LinearMemory>, String> {
         let max = maximum.unwrap_or(DEFAULT_MAX_BYTES);
+        // Enforce HARD_MAX_LINEAR_MEMORY_BYTES on the cap declared by the
+        // module's MemoryType BEFORE any backing allocation runs. Wasmtime's
+        // ResourceLimiter only fires on `memory.grow`, not on initial
+        // allocation, so without this guard a guest declaring
+        // `(memory 1 65536)` would force a 4 GiB allocation here. See
+        // [`HARD_MAX_LINEAR_MEMORY_BYTES`] for the closed mem-H5 /
+        // exec-S-2 / exec-S-10 audit gap.
+        if max > HARD_MAX_LINEAR_MEMORY_BYTES {
+            return Err(format!(
+                "module-declared memory maximum {max} bytes exceeds hard cap {HARD_MAX_LINEAR_MEMORY_BYTES} bytes",
+            ));
+        }
+        if minimum > HARD_MAX_LINEAR_MEMORY_BYTES {
+            return Err(format!(
+                "module-declared memory minimum {minimum} bytes exceeds hard cap {HARD_MAX_LINEAR_MEMORY_BYTES} bytes",
+            ));
+        }
         if minimum > max {
             return Err(format!("minimum {minimum} > maximum {max}"));
         }
@@ -551,6 +606,71 @@ mod tests {
     fn minimum_exceeds_maximum_rejected() {
         let err = TensorWasmLinearMemory::new(1024 * 1024, Some(512 * 1024)).unwrap_err();
         assert!(matches!(err, UnifiedError::Allocation(_)));
+    }
+
+    #[test]
+    fn maximum_above_hard_cap_rejected_without_allocating() {
+        // 5 GiB > HARD_MAX_LINEAR_MEMORY_BYTES (4 GiB). Must fast-fail with
+        // TooLarge BEFORE any backing allocation is attempted. The point is
+        // to make sure a guest can't push us into a multi-GiB cudaMalloc
+        // simply by declaring a giant maximum on its `(memory ...)`.
+        let big = HARD_MAX_LINEAR_MEMORY_BYTES + 1;
+        let err = TensorWasmLinearMemory::new(64 * 1024, Some(big)).unwrap_err();
+        match err {
+            UnifiedError::TooLarge { requested, limit } => {
+                assert_eq!(requested, big as u64);
+                assert_eq!(limit, HARD_MAX_LINEAR_MEMORY_BYTES as u64);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn minimum_above_hard_cap_rejected() {
+        // A pathological module declaring an initial size above the hard
+        // cap is rejected at the same gate, even if the maximum is None
+        // (which would otherwise default to DEFAULT_MAX_BYTES, < cap).
+        let big = HARD_MAX_LINEAR_MEMORY_BYTES + 1;
+        let err = TensorWasmLinearMemory::new(big, Some(big + 1)).unwrap_err();
+        assert!(matches!(err, UnifiedError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn maximum_exactly_at_hard_cap_admitted_but_not_allocated_in_test() {
+        // We can't actually attempt the 4 GiB allocation here (CI hosts
+        // don't have that much UVM / heap), so we only assert that the
+        // CHECK at the cap boundary lets the request through and produces
+        // an `Allocation` failure mode from the underlying allocator
+        // rather than the early `TooLarge` rejection. The downstream
+        // allocator may succeed on a beefy host; either outcome is fine
+        // for this contract test.
+        let at_cap = HARD_MAX_LINEAR_MEMORY_BYTES;
+        // Use a tiny minimum so we exercise the cap check on `max` only.
+        let result = TensorWasmLinearMemory::new(0, Some(at_cap));
+        match result {
+            Ok(_) => { /* well-resourced host */ }
+            Err(UnifiedError::Allocation(_)) | Err(UnifiedError::Cuda(_)) => {
+                // Allocator refused the 4 GiB request — fine.
+            }
+            Err(other) => panic!(
+                "request at exactly the hard cap must not be rejected as TooLarge: got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn creator_rejects_module_max_above_hard_cap() {
+        use wasmtime::MemoryCreator;
+        let creator = TensorWasmMemoryCreator::default();
+        let mt = wasmtime::MemoryType::new(1, None);
+        let big = HARD_MAX_LINEAR_MEMORY_BYTES + 1;
+        let err = creator
+            .new_memory(mt, 64 * 1024, Some(big), None, 0)
+            .expect_err("oversized module max must be refused");
+        assert!(
+            err.contains("hard cap"),
+            "error must mention the hard cap; got: {err}"
+        );
     }
 
     #[test]

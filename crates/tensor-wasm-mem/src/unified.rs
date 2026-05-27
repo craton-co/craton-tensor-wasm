@@ -55,6 +55,19 @@ pub enum UnifiedError {
     /// Zero-byte allocation requested (not supported).
     #[error("cannot allocate a zero-byte buffer")]
     ZeroSize,
+    /// Requested allocation exceeds the configured / hard-coded cap.
+    ///
+    /// Distinct from [`UnifiedError::Allocation`] so callers can plumb
+    /// structured `requested` / `limit` figures all the way through to
+    /// `tensor_wasm_core::error::TensorWasmError::MemoryExhausted` without
+    /// resorting to substring-matching on a message.
+    #[error("requested {requested} bytes exceeds hard cap {limit}")]
+    TooLarge {
+        /// Bytes the caller asked for.
+        requested: u64,
+        /// Hard cap enforced by the host (bytes).
+        limit: u64,
+    },
 }
 
 /// Identifies a CUDA device. On non-CUDA hosts this is a free-form tag.
@@ -538,6 +551,9 @@ impl From<UnifiedError> for tensor_wasm_core::error::TensorWasmError {
                 }
             }
             UnifiedError::Cuda(msg) => tensor_wasm_core::error::TensorWasmError::CudaError(msg.into()),
+            UnifiedError::TooLarge { requested, limit } => {
+                tensor_wasm_core::error::TensorWasmError::MemoryExhausted { requested, limit }
+            }
         }
     }
 }
