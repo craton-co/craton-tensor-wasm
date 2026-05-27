@@ -47,6 +47,14 @@ auto-offload = []
 # `nightly-2026-04-03` pin. Mirrors the `cuda-oxide-backend` feature on
 # `tensor-wasm-mem` so a single `--features cuda-oxide-backend` invocation
 # at the workspace root selects the full opt-in stack.
+#
+# Supply-chain note: when wave 3 wires the real cuda-oxide + Pliron deps
+# behind this feature, both arrive as git-pinned sources (RFC 0001
+# "Drawbacks": Pliron is not on crates.io). The corresponding policy
+# entries already live in the workspace `deny.toml` under `[sources]
+# allow-git` — see the comments there for the v0.4 cutover checklist
+# (both allowlist rows are removed in the same PR that flips Pliron to
+# its crates.io release).
 cuda-oxide-backend = []
 
 [package.metadata.docs.rs]
