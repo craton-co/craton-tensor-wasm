@@ -78,6 +78,11 @@ struct ArenaState {
     /// `alloc` call lazily sizes the arena based on the current memory
     /// length.
     bump_cursor: Option<u32>,
+    /// Lower bound of the arena. Allocations that would push the cursor
+    /// below this are refused so they can never overwrite guest static
+    /// data (which lives below `arena_floor`). Set on the same first-call
+    /// seed that initialises `bump_cursor`.
+    arena_floor: u32,
     /// Stack of (ptr, size) for LIFO free validation. Out-of-order frees
     /// degrade to "leak the slot until reset" rather than corrupt the
     /// arena.
@@ -160,18 +165,33 @@ where
                 }
                 let new_len = memory.data(&caller).len() as u64;
                 let top = u32::try_from(new_len).unwrap_or(u32::MAX);
+                // The arena occupies the upper SCRATCH_ARENA_BYTES of
+                // memory only. Anything below `arena_floor` belongs to the
+                // guest (static data, stack, heap, …) and must never be
+                // overwritten.
+                let floor = top.saturating_sub(SCRATCH_ARENA_BYTES);
+                st.arena_floor = floor;
                 st.bump_cursor = Some(top);
                 top
             }
         };
         // Drop down by `size` bytes (8-byte align) for the new allocation.
         let aligned_size = (size_u + 7) & !7;
-        let ptr = cursor.checked_sub(aligned_size).unwrap_or(0);
-        if ptr == 0 || ptr + aligned_size > cursor {
+        let Some(ptr) = cursor.checked_sub(aligned_size) else {
             tracing::warn!(
                 target: "tensor_wasm_exec::jit_dispatch",
                 requested = size,
-                "alloc: scratch arena exhausted"
+                "alloc: scratch arena exhausted (cursor underflow)"
+            );
+            return -1;
+        };
+        if ptr < st.arena_floor {
+            tracing::warn!(
+                target: "tensor_wasm_exec::jit_dispatch",
+                requested = size,
+                arena_floor = st.arena_floor,
+                cursor = cursor,
+                "alloc: scratch arena exhausted (would collide with guest data)"
             );
             return -1;
         }
@@ -657,6 +677,75 @@ mod tests {
             r, 5,
             "end-to-end add(2,3) must marshall args, dispatch, and load result"
         );
+    }
+
+    /// Regression test for the scratch arena vs. guest static-data
+    /// collision: a guest with a non-trivial data section must still see
+    /// its data byte intact after a JIT scratch alloc. The arena lives in
+    /// the upper `SCRATCH_ARENA_BYTES` of memory; allocations must land
+    /// above the static data region, never on top of it.
+    #[test]
+    fn alloc_does_not_overwrite_guest_static_data() {
+        let engine = make_engine();
+        let cache = Arc::new(KernelCache::new());
+        let mut linker: Linker<()> = Linker::new(&engine);
+        add_jit_dispatch_to_linker(&mut linker, cache).expect("register");
+        // Memory: 2 pages (128 KiB) > SCRATCH_ARENA_BYTES (64 KiB), so the
+        // arena_floor sits at 65536 and the lower 64 KiB is "guest data".
+        // We place a sentinel byte at offset 1024 and assert it survives.
+        let wat = r#"
+            (module
+              (import "tensor-wasm:jit/host" "alloc"
+                (func $a (param i32) (result i32)))
+              (memory (export "memory") 2)
+              (data (i32.const 1024) "\AB")
+              (func (export "alloc_one") (param i32) (result i32)
+                (call $a (local.get 0)))
+              (func (export "sentinel") (result i32)
+                (i32.load8_u (i32.const 1024))))
+        "#;
+        let mut store = Store::new(&engine, ());
+        let wasm = wat::parse_str(wat).expect("wat");
+        let module = Module::new(&engine, &wasm).expect("module");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
+        let alloc_one = instance
+            .get_typed_func::<i32, i32>(&mut store, "alloc_one")
+            .expect("typed func alloc_one");
+        let sentinel = instance
+            .get_typed_func::<(), i32>(&mut store, "sentinel")
+            .expect("typed func sentinel");
+
+        // A small allocation must succeed and live in the upper 64 KiB,
+        // i.e. strictly above the 64 KiB static-data region. With a 2-page
+        // (128 KiB) memory and SCRATCH_ARENA_BYTES = 64 KiB, the arena
+        // floor is at offset 65536, so any valid ptr must be >= 65536.
+        let p = alloc_one.call(&mut store, 64).expect("alloc 64");
+        assert!(p > 0, "alloc must succeed, got {p}");
+        assert!(
+            (p as u32) >= 65536,
+            "ptr {p} must land in the upper page (>= 64 KiB), above guest static data",
+        );
+        // Sentinel byte at offset 1024 must be untouched.
+        let s = sentinel.call(&mut store, ()).expect("sentinel load");
+        assert_eq!(
+            s, 0xAB,
+            "guest static-data byte must survive JIT scratch alloc"
+        );
+
+        // A second allocation larger than the arena's remaining room must
+        // fail with -1 rather than encroach on guest data.
+        let too_big = alloc_one
+            .call(&mut store, SCRATCH_ARENA_BYTES as i32)
+            .expect("alloc oversize");
+        assert_eq!(
+            too_big, -1,
+            "alloc that would overflow into guest data must return -1"
+        );
+        // Sentinel still intact after the failed alloc.
+        let s2 = sentinel.call(&mut store, ()).expect("sentinel load 2");
+        assert_eq!(s2, 0xAB, "guest static data must survive a refused alloc");
     }
 
     /// Alloc/free should round-trip — every successful alloc must produce
