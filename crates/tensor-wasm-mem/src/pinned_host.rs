@@ -102,9 +102,21 @@ impl GuardedHostBuffer {
             return Err(UnifiedError::ZeroSize);
         }
         let page = region::page::size();
-        // Round usable up to a page multiple.
-        let usable = size.div_ceil(page) * page;
-        let total = usable + 2 * page;
+        // Round usable up to a page multiple. Both the round-up and the
+        // guard-page addition can overflow when `size` is close to
+        // `usize::MAX`; without these checks `total` would wrap to a tiny
+        // value, `region::alloc` would succeed, and the slices we hand out
+        // would point outside the mapping.
+        let usable = size.checked_next_multiple_of(page).ok_or_else(|| {
+            UnifiedError::Allocation(format!(
+                "size {size} overflows usable bytes when rounded to page size {page}"
+            ))
+        })?;
+        let total = usable.checked_add(2 * page).ok_or_else(|| {
+            UnifiedError::Allocation(format!(
+                "usable {usable} overflows total bytes when adding 2 guard pages of {page}"
+            ))
+        })?;
         // Allocate the whole region as PROT_NONE first, then mark the middle
         // as ReadWrite. `region::alloc` returns page-aligned anonymous memory.
         let alloc = region::alloc(total, Protection::NONE)
@@ -243,6 +255,17 @@ mod tests {
             GuardedHostBuffer::new(0).unwrap_err(),
             UnifiedError::ZeroSize
         ));
+    }
+
+    /// `size == usize::MAX` must error rather than overflow the page-rounding
+    /// arithmetic and hand back a buffer pointing outside its mapping.
+    #[test]
+    fn usize_max_size_rejected() {
+        let err = GuardedHostBuffer::new(usize::MAX).unwrap_err();
+        assert!(
+            matches!(err, UnifiedError::Allocation(_)),
+            "expected Allocation error, got {err:?}",
+        );
     }
 
     #[test]
