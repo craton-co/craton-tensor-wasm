@@ -168,6 +168,82 @@ a future release, the workspace `Cargo.toml` cuda-oxide rev AND the
 in the same commit so the SBOM (`tensor-wasm-cdx-v<version>.json`) and
 this doc stay in sync.
 
+#### Policy: how a git-pinned dep gets in (and out)
+
+The `cuda-oxide-backend` feature on `tensor-wasm-mem` is the first
+TensorWasm feature whose enablement pulls a git-pinned dependency into
+the resolved graph. Pliron — cuda-oxide's MLIR-like Rust-native IR
+framework — is currently a `git`-pinned transitive dependency of
+cuda-oxide because it has not yet published a stable release to
+crates.io. The cuda-oxide-backend feature in v0.3.1 is dep-less (an
+empty scaffold module per [RFC 0001](../rfcs/0001-cuda-oxide-integration.md)
+"Rollout"); the actual git pin lands in the v0.4 parity work. This
+section documents the policy so reviewers of that v0.4 PR know what
+to look for.
+
+A git pin is acceptable in this workspace **only if all four of these
+hold**:
+
+1. **The pin is an explicit revision (a 40-char commit SHA), not a
+   branch or tag-name.** Branch pins can silently move; tag pins are
+   safer but can still be force-pushed by an upstream that does not
+   treat tags as immutable. A SHA cannot move. `cargo update` may not
+   change a git revision pinned by SHA — that is what makes the pin
+   reproducible. The resolved revision is captured in `Cargo.lock` for
+   `--locked` builds.
+2. **There is a comment in `Cargo.toml` directly above the dependency
+   line linking to [RFC 0001](../rfcs/0001-cuda-oxide-integration.md)
+   (or the successor RFC that justifies the pin) and naming the
+   condition under which the pin is removed.** For Pliron, the removal
+   condition is "Pliron publishes a stable release to crates.io". The
+   comment is the contract; without it, a future cargo-update PR can
+   re-pin to a newer SHA without an RFC discussion.
+3. **There is a matching `allow-git` entry in `deny.toml` (under
+   `[sources]`) for the repository URL.** `cargo deny check sources`
+   audits this on every CI run via the `deny` job in
+   [`.github/workflows/ci.yml`](../.github/workflows/ci.yml); if the
+   workspace ever picks up an un-allowlisted git source the build
+   fails. The `deny.toml` comment must match the `Cargo.toml` comment
+   (same RFC link, same removal condition).
+4. **The SBOM (`tensor-wasm-cdx-v<version>.json`, see
+   [`SBOM.md`](SBOM.md)) records the resolved git URL + rev as the
+   `purl` for the pinned crate.** `cargo-cyclonedx` does this by
+   default for `git` sources; the check is that the SBOM contains a
+   `pkg:cargo/...?vcs_url=git+https://...@<sha>` purl line for the
+   pinned crate, not a bare `pkg:cargo/<name>@<version>` line that
+   would imply a crates.io source.
+
+When all four hold, the build is as reproducible as a crates.io
+pin: two builders cloning the same SHA, running the same
+`cargo build --locked` recipe (see
+[Section 4](#the-reproducibility-recipe)), get bit-identical output.
+The git protocol itself does not add non-determinism — cargo's
+on-disk layout for git sources is content-addressed by SHA.
+
+Reviewer checklist when a PR adds (or bumps) a git pin:
+
+- [ ] `Cargo.toml` has a comment above the dep linking to the
+      justifying RFC and naming the removal condition.
+- [ ] `deny.toml` has a matching `allow-git` row with the same RFC
+      link and removal condition in its comment.
+- [ ] The pin is a 40-char SHA, not a branch or tag-name.
+- [ ] `Cargo.lock` was regenerated in the same commit; the resolved
+      revision matches.
+- [ ] If this is a bump (not an add), the SBOM purl for the crate
+      was regenerated and committed.
+- [ ] The release notes / CHANGELOG entry calls out the bump.
+
+When Pliron publishes to crates.io, the git pin in cuda-oxide's
+`Cargo.toml` will be replaced with a normal version requirement; the
+transitive git source for `vaivaswatha/pliron` will drop out of the
+workspace's resolved graph; the `allow-git` row in `deny.toml` and the
+table row above can be deleted; and this subsection (kept until then
+as a forward-looking policy statement) can be reduced back to the
+table-only treatment that the NVlabs/cuda-oxide pin gets today. The
+open RFC question that tracks this is
+[RFC 0001 "Unresolved questions"](../rfcs/0001-cuda-oxide-integration.md#unresolved-questions)
+— "How does Pliron pin to a stable release vs git?".
+
 ### ELF `NT_GNU_BUILD_ID`
 
 The linker can be configured to compute the build-ID from a hash of
