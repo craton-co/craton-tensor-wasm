@@ -4,7 +4,7 @@
 
 Serverless GPU workloads live and die by their cold-start latency. A function that ships its weights through a 200 MB container image, JIT-compiles a few PTX modules, and warms the CUDA driver on every invocation cannot meet the millisecond-scale tail-latency targets that interactive inference, RAG retrieval, and online feature stores demand. Craton TensorWasm's `tensor-wasm-snapshot` crate exists to short-circuit that path: instead of re-executing the cold initialisation sequence, the host restores a pre-captured `Snapshot` containing the Wasm linear memory, GPU device memory, and the JIT register file, then resumes execution from where the previous instance left off.
 
-Honest framing matters here. A handful of academic papers and vendor blog posts have claimed "sub-millisecond" GPU cold starts; the marketing has outrun the physics. Real hosts pay for the bincode decode, the zstd decompression, the page-fault-driven UVM migration into device memory, and the first kernel launch before the function can do useful work. This document explains what each of those costs is, gives a calibrated estimate of what we expect to measure once S19's benchmarks land, and lists the levers operators have today to keep cold starts inside their SLO.
+Honest framing matters here. A handful of academic papers and vendor blog posts have claimed "sub-millisecond" GPU cold starts; the marketing has outrun the physics. Real hosts pay for the bincode decode, the zstd decompression, the page-fault-driven UVM migration into device memory, and the first kernel launch before the function can do useful work. This document explains what each of those costs is, gives a calibrated estimate to set expectations against the measured numbers in [`PERFORMANCE.md`](PERFORMANCE.md) and [`bench-results/baseline.json`](../bench-results/baseline.json), and lists the levers operators have today to keep cold starts inside their SLO.
 
 ## Latency model
 
@@ -26,7 +26,7 @@ with the UVM term dominating for any snapshot larger than a few MiB.
 
 ## Estimated latency table
 
-The table below is a **modelling estimate, not a measurement**. The S19 benchmark suite (see `docs/PERFORMANCE.md` — pending) will replace these numbers with empirical P50/P95/P99s captured on the reference rig (Ryzen 9 7950X3D, RTX 4090, Gen 4 NVMe). Treat the figures as order-of-magnitude guidance only.
+The table below is a **modelling estimate, not a measurement**. See [`PERFORMANCE.md`](PERFORMANCE.md) and [`bench-results/baseline.json`](../bench-results/baseline.json) for the empirical P50/P95/P99s captured on the reference rig (Ryzen 9 7950X3D, RTX 4090, Gen 4 NVMe). Treat the figures below as order-of-magnitude guidance only.
 
 | Snapshot size | P50      | P95      | P99      | Dominant term |
 | ------------- | -------- | -------- | -------- | ------------- |

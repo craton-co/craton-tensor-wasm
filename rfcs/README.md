@@ -131,9 +131,10 @@ recorded as the final comment on the PR before merge.
 Authors are not maintainers for the purpose of their own RFC.
 Maintainers who wrote the RFC abstain from the vote.
 
-This will tighten when [`GOVERNANCE.md`](../GOVERNANCE.md) lands at
-v0.5; until then, the maintainer roster in
-[`MAINTAINERS.md`](../MAINTAINERS.md) is the authoritative list.
+See [`GOVERNANCE.md`](../GOVERNANCE.md) at the repo root for the
+project's lightweight governance model. The maintainer roster in
+[`MAINTAINERS.md`](../MAINTAINERS.md) is the authoritative list of
+current decision-makers.
 
 ## Directory layout
 

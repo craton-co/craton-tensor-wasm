@@ -1,6 +1,8 @@
 # `cust` → `cudarc` migration spike
 
-**Status:** spike landed for v0.2; full cutover deferred to v0.2 release cycle pending S22 runner validation. See [`RISKS.md`](RISKS.md) ("CUDA `cust` 0.3.x EOL" row) and the [Path to v1](PATH-TO-V1.md) ("Open decision #1") for the surrounding context.
+**Status (2026-05-27): superseded by RFC 0001. F4 toolchain bump (2026-04-03) closed the originally-blocking cust + bindgen path.**
+
+**Original status:** spike landed for v0.2; full cutover deferred to v0.2 release cycle pending S22 runner validation. See [`RISKS.md`](RISKS.md) ("CUDA `cust` 0.3.x EOL" row) and the [Path to v1](PATH-TO-V1.md) ("Open decision #1") for the surrounding context.
 
 **Concrete frictions surfaced (W5.9 build attempt):** building `--features cudarc-backend` against `cudarc 0.13.9` on `nightly-2026-03-15` fails because the spike code references several FFI symbols at `cudarc::driver::sys` paths that the released crate does not actually export:
 

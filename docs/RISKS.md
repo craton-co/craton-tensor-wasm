@@ -2,7 +2,7 @@
 
 Living document tracking architectural risks, upstream pinning decisions, and known limitations for maintainers. Updated alongside `CHANGELOG.md` releases.
 
-Last updated: 2026-05-24 (v0.1.0)
+Last updated: 2026-05-27 (v0.3.5)
 
 ---
 

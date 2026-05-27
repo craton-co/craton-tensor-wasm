@@ -34,8 +34,8 @@ make ci
 ```
 
 `make ci` runs `cargo fmt --check`, `cargo clippy -- -D warnings`,
-`cargo test --workspace`, and `cargo doc --no-deps`. It is the exact set
-of checks the GitHub Actions workflow runs on every PR; running it
+`cargo check --workspace`, and `cargo test --workspace`. It is the exact
+set of checks the GitHub Actions workflow runs on every PR; running it
 locally before pushing keeps the feedback loop short.
 
 If you only want a fast smoke test, `make build` and `make test` are
