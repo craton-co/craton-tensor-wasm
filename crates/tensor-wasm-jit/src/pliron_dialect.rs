@@ -27,10 +27,22 @@
 //!   diff is a body swap, not a refactor.
 //! - A [`StubLowerer`] that implements the trait, always returning
 //!   [`PlironLoweringError::NotYetImplemented`] with an actionable message
-//!   pointing to RFC 0001.
-//! - A convenience entry point [`cranelift_to_dialect_mir`] that wraps the
-//!   stub, mirroring the shape of the eventual public free function so the
-//!   detector → lowering call site is stable across the port.
+//!   pointing to RFC 0001. Retained as a sentinel implementor for tests
+//!   that want a known-failing impl of the trait.
+//! - A real [`CraneliftLowerer`] (wave 2.5) that implements the trait by
+//!   delegating to the wave-2 module-level lowering driver
+//!   ([`crate::lowering_driver::lower_function`]). This is the
+//!   production-path implementor: it returns an actual
+//!   [`crate::lowered_ir::LoweredFunction`] for any Cranelift IR function
+//!   the wave-1 per-family lowerings cover, and maps driver errors through
+//!   the existing [`From<crate::lowering_errors::LoweringError>`] impl
+//!   into [`PlironLoweringError::UnsupportedOp`]. Wave 3 will extend the
+//!   impl to also produce a `pliron::Operation` once the Pliron dependency
+//!   is added.
+//! - A convenience entry point [`cranelift_to_dialect_mir`] that wraps
+//!   [`CraneliftLowerer`], mirroring the shape of the eventual public free
+//!   function so the detector → lowering call site is stable across the
+//!   port.
 //! - The [Cranelift IR ⇄ dialect-mir mapping table](#mapping-table) below.
 //!   This is the most load-bearing artifact in the file: the v0.4 author
 //!   should be able to walk this table top-to-bottom and produce the real
@@ -257,41 +269,72 @@ impl WasmToPliron for StubLowerer {
     }
 }
 
-/// Convenience entry point: lower a Cranelift IR function to a
-/// [`LoweredFunction`] via the default [`StubLowerer`].
+/// Real [`WasmToPliron`] impl that delegates to the wave-2 lowering driver.
 ///
-/// **Scaffold only.** Always returns
-/// `Err(PlironLoweringError::NotYetImplemented("cranelift_to_dialect_mir"))`.
-/// The v0.4 port will rewrite the body to construct the real lowering
-/// pipeline; the signature is intentionally already final so the
-/// detector → lowering call site is stable across the port.
+/// Replaces the [`StubLowerer`] sentinel for callers that want actual
+/// [`LoweredFunction`] output. The trait surface returns
+/// `Result<LoweredFunction, PlironLoweringError>`, so this impl maps the
+/// driver's [`crate::lowering_errors::LoweringError`] through the existing
+/// `From` impl into [`PlironLoweringError::UnsupportedOp`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CraneliftLowerer;
+
+impl WasmToPliron for CraneliftLowerer {
+    fn lower(
+        &self,
+        func: &cranelift_codegen::ir::Function,
+    ) -> Result<crate::lowered_ir::LoweredFunction, PlironLoweringError> {
+        crate::lowering_driver::lower_function(func).map_err(Into::into)
+    }
+}
+
+/// Convenience entry point: lower a Cranelift IR function to a
+/// [`LoweredFunction`] via the default [`CraneliftLowerer`].
+///
+/// Wave 2.5: this function now delegates to the real driver; wave 3 will
+/// extend it to also produce a `pliron::Operation` once the Pliron dep
+/// is added.
 pub fn cranelift_to_dialect_mir(
-    _func: &Function,
-) -> Result<LoweredFunction, PlironLoweringError> {
-    // The dedicated `cranelift_to_dialect_mir` sentinel (rather than
-    // delegating to StubLowerer) keeps the error tag grep-able to the
-    // entry point — useful when triaging which surface the caller hit.
-    Err(PlironLoweringError::NotYetImplemented(
-        "cranelift_to_dialect_mir",
-    ))
+    func: &cranelift_codegen::ir::Function,
+) -> Result<crate::lowered_ir::LoweredFunction, PlironLoweringError> {
+    CraneliftLowerer.lower(func)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cranelift_codegen::ir::{Function, Signature, UserFuncName};
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::{Function, InstBuilder, Signature, UserFuncName};
     use cranelift_codegen::isa::CallConv;
 
     /// Build a minimal empty Cranelift `Function` fixture for the
-    /// scaffold-error tests. Wave-1 follow-up agents that flesh out the
-    /// per-family lowerings will replace these fixtures with richer
-    /// programs; the shape here only needs to satisfy the type-level
-    /// signature of [`WasmToPliron::lower`].
+    /// scaffold-error tests. The shape here only needs to satisfy the
+    /// type-level signature of [`WasmToPliron::lower`] — it has no entry
+    /// block, so the wave-2 driver rejects it with `MalformedTerminator`
+    /// (folded through the `From` impl into
+    /// [`PlironLoweringError::UnsupportedOp`]). Suitable for the
+    /// [`StubLowerer`] tests that never reach the driver.
     fn trivial_function() -> Function {
         Function::with_name_signature(
             UserFuncName::user(0, 0),
             Signature::new(CallConv::SystemV),
         )
+    }
+
+    /// Build a minimal well-formed `fn() -> ()` Cranelift `Function`: a
+    /// single entry block containing a unit `return_`. Suitable for the
+    /// [`CraneliftLowerer`] success tests that exercise the wave-2 driver
+    /// end-to-end.
+    fn minimal_unit_function() -> Function {
+        let mut func = Function::with_name_signature(
+            UserFuncName::testcase("minimal".as_bytes()),
+            Signature::new(CallConv::SystemV),
+        );
+        let block = func.dfg.make_block();
+        func.layout.append_block(block);
+        let mut cursor = FuncCursor::new(&mut func).at_bottom(block);
+        cursor.ins().return_(&[]);
+        func
     }
 
     /// The stub `lower` always returns the documented sentinel variant.
@@ -312,20 +355,41 @@ mod tests {
         }
     }
 
-    /// The convenience entry point produces its own grep-able sentinel
-    /// distinct from the trait stub.
+    /// The convenience entry point now delegates to [`CraneliftLowerer`]
+    /// and the wave-2 driver: a well-formed minimal `fn() -> ()` must
+    /// successfully lower to a [`LoweredFunction`] with one block and an
+    /// empty signature.
     #[test]
-    fn cranelift_to_dialect_mir_returns_not_yet_implemented() {
-        let func = trivial_function();
-        let err = cranelift_to_dialect_mir(&func).expect_err("scaffold must error");
-        match err {
-            PlironLoweringError::NotYetImplemented(tag) => {
-                assert_eq!(tag, "cranelift_to_dialect_mir");
-            }
-            other => panic!(
-                "expected PlironLoweringError::NotYetImplemented, got {other:?}"
-            ),
-        }
+    fn cranelift_to_dialect_mir_lowers_minimal_function_via_driver() {
+        let func = minimal_unit_function();
+        let lowered =
+            cranelift_to_dialect_mir(&func).expect("minimal fn() -> () must lower");
+        assert_eq!(lowered.blocks.len(), 1, "one block expected");
+        assert!(
+            lowered.signature.params.is_empty(),
+            "fn() -> () must have no params, got {:?}",
+            lowered.signature.params,
+        );
+        assert!(
+            lowered.signature.returns.is_empty(),
+            "fn() -> () must have no returns, got {:?}",
+            lowered.signature.returns,
+        );
+    }
+
+    /// `CraneliftLowerer::lower` returns `Ok(LoweredFunction)` for a
+    /// well-formed `fn() -> ()` Cranelift function — the real driver path
+    /// (not the [`StubLowerer`] sentinel) must succeed.
+    #[test]
+    fn cranelift_lowerer_lowers_unit_function() {
+        let lowerer = CraneliftLowerer;
+        let func = minimal_unit_function();
+        let lowered = lowerer
+            .lower(&func)
+            .expect("CraneliftLowerer must lower a well-formed fn() -> ()");
+        assert_eq!(lowered.blocks.len(), 1);
+        assert!(lowered.signature.params.is_empty());
+        assert!(lowered.signature.returns.is_empty());
     }
 
     /// `is_scaffold_stub` is true for the stub variant and false for the
@@ -389,6 +453,7 @@ mod tests {
     fn trait_and_types_are_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<StubLowerer>();
+        assert_send_sync::<CraneliftLowerer>();
         assert_send_sync::<PlironLoweringError>();
         // `dyn WasmToPliron + Send + Sync` is the shape the dispatch path
         // will hold; assert the unsized version is constructible.
