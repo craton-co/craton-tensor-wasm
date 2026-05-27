@@ -20,7 +20,11 @@
 //! * `TENSOR_WASM_TOKEN` — if set, sent as `Authorization: Bearer <token>` on every
 //!   outbound request. See `docs/CLI.md` for the operator guide.
 //! * `TENSOR_WASM_LOG` — `tracing-subscriber` `EnvFilter` directive. Defaults to
-//!   `warn`.
+//!   `warn`. **Security note:** setting this to `trace` (or enabling
+//!   `reqwest=trace` specifically) causes `reqwest` to log outbound request
+//!   headers, including the `Authorization: Bearer <token>` header. Do not
+//!   enable trace-level logging in production; restrict it to local debugging
+//!   against a non-production token.
 #![deny(missing_docs)]
 
 use std::path::PathBuf;

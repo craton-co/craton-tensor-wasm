@@ -42,6 +42,13 @@ Use `tensor-wasm <subcommand> --help` for the authoritative flag list — that t
 | `TENSOR_WASM_LOG`    | `tracing-subscriber` env-filter directive (e.g. `TENSOR_WASM_LOG=info,reqwest=warn`). Defaults to `warn`. |
 | `RUST_LOG`    | Fallback consulted if `TENSOR_WASM_LOG` is unset.                                                   |
 
+> **Security warning.** Setting `TENSOR_WASM_LOG` (or `RUST_LOG`) to `trace`
+> — especially with `reqwest=trace` enabled — causes `reqwest` to log
+> outbound request headers, **including the `Authorization: Bearer <token>`
+> header**. Do not enable `trace`-level logging in production; restrict it to
+> local debugging against a non-production token. The CLI does not currently
+> install a tracing field-redaction layer.
+
 ## Global flags
 
 * `--tenant <u64>` — when non-zero, the CLI attaches `X-TensorWasm-Tenant: <N>` to every outbound API request. Zero (the default) suppresses the header for backwards compatibility with older servers.

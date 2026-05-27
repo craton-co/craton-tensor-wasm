@@ -298,8 +298,10 @@ back" steps that runbook calls into.
 
 Use the existing CLI subcommand
 ([`crates/tensor-wasm-cli/src/cmd/snapshot.rs`](../crates/tensor-wasm-cli/src/cmd/snapshot.rs)).
-The CLI does local-side size validation (`--max-decompressed`)
-before any upload.
+The CLI does local-side size validation (`--max-archive-bytes`,
+which bounds the *on-disk* archive — the decompressed footprint
+is enforced server-side) before any upload. The deprecated alias
+`--max-decompressed` is accepted for one release.
 
 ```sh
 tensor-wasm snapshot restore \

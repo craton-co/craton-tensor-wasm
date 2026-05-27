@@ -16,7 +16,7 @@ Options:
           Identifier to assign to the restored instance
       --server <SERVER>
           Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
-      --max-decompressed <MAX_DECOMPRESSED>
-          Maximum decompressed snapshot size we'll accept, in bytes. Mirrors the server-side cap so the CLI rejects oversized archives without a pointless upload [default: 268435456]
+      --max-archive-bytes <MAX_ARCHIVE_BYTES>
+          Maximum *on-disk archive* size the CLI will upload, in bytes (default 256 MiB). This bounds the compressed payload only — the decompressed footprint is enforced server-side and may be much larger. The deprecated alias `--max-decompressed` is accepted for one release; prefer `--max-archive-bytes` in new scripts [default: 268435456]
   -h, --help
           Print help

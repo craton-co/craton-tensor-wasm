@@ -12,7 +12,7 @@ prints the top-level synopsis. Every subcommand also supports `--help` for its o
 
 ## Global behaviour
 
-- Logging is configured via `TENSOR_WASM_LOG` (which uses `tracing-subscriber`'s `EnvFilter` directive syntax). The default level is `info`; set `TENSOR_WASM_LOG=tensor_wasm_exec=debug` to drill into the executor or `TENSOR_WASM_LOG=warn` to quiet routine progress.
+- Logging is configured via `TENSOR_WASM_LOG` (which uses `tracing-subscriber`'s `EnvFilter` directive syntax). The default level is `info`; set `TENSOR_WASM_LOG=tensor_wasm_exec=debug` to drill into the executor or `TENSOR_WASM_LOG=warn` to quiet routine progress. **Security warning:** setting the level to `trace` (notably `reqwest=trace`) causes `reqwest` to log outbound request headers, including the `Authorization: Bearer <token>` header set by `TENSOR_WASM_TOKEN`. Do not enable trace-level logging in production; the CLI does not currently install a tracing field-redaction layer.
 - Exit codes follow the Unix convention: `0` on success, non-zero on any user or runtime error. Errors print to stderr with a chained-cause summary courtesy of `anyhow`.
 - Arguments and outputs that involve guest data use JSON. Use `--args '[1.0, 2.0]'`-style values; non-array JSON is rejected with a clear message.
 
