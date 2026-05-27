@@ -37,6 +37,22 @@ wasm-encoder = { version = "0.218", features = ["wasmparser"] }
 # 0.15.0 for the dependabot/cargo-deny story documented in
 # `docs/REPRODUCIBLE-BUILDS.md`.
 pliron = { version = "0.15", optional = true }
+# pliron-llvm — LLVM-dialect ops + textual IR emission for pliron 0.15.
+# Wave 3.3 uses this to lower `twasm.*` ops emitted by `pliron_lowering`
+# into the standard `llvm.*` dialect, which is the last pliron stage
+# before textual LLVM IR + the NVPTX backend (W4.x).
+#
+# IMPORTANT: pliron-llvm 0.15 has a hard transitive dependency on
+# `llvm-sys = "221"`, which requires LLVM 221 to be installed system-wide
+# (via `LLVM_SYS_221_PREFIX`). On a typical dev machine that's not the
+# case, so we gate this dep behind its OWN feature
+# (`pliron-llvm-backend`) instead of riding on `cuda-oxide-backend`. The
+# stage-2 rewrite (twasm.* → llvm.*) is therefore behind that feature;
+# the base `cuda-oxide-backend` build returns
+# `PtxError::NotYetWired("twasm_to_llvm_dialect")` from the stage. W4.x
+# is the layer that pulls in pliron-llvm on a CI image with the LLVM
+# toolchain pre-installed.
+pliron-llvm = { version = "0.15", optional = true }
 
 [dev-dependencies]
 tokio.workspace = true
@@ -67,6 +83,13 @@ auto-offload = []
 # allowlist entries (already pre-declared under [sources] allow-git for
 # forward compatibility).
 cuda-oxide-backend = ["dep:pliron"]
+# pliron-llvm-backend pulls in `pliron-llvm` 0.15 to wire the stage-2
+# `twasm.*` → `llvm.*` rewrite in `pliron_ptx`. Strict superset of
+# `cuda-oxide-backend`. Gated separately because pliron-llvm carries a
+# hard `llvm-sys = "221"` dep that requires a system LLVM 221 install
+# (W4.x's CI image will satisfy this; the default workstation build will
+# not).
+pliron-llvm-backend = ["cuda-oxide-backend", "dep:pliron-llvm"]
 
 [package.metadata.docs.rs]
 all-features = true
