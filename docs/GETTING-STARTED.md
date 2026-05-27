@@ -148,7 +148,7 @@ For the full metrics catalog and dashboard layout, see [OBSERVABILITY.md](./OBSE
 
 Now that you have an end-to-end loop working, here are the docs to read next:
 
-- **[WASM-DEVELOPER-GUIDE.md](./WASM-DEVELOPER-GUIDE.md)** — write real compute functions, including hand-tuned GPU kernels via `wasi:cuda/host@0.1.0`.
+- **[WASM-DEVELOPER-GUIDE.md](./WASM-DEVELOPER-GUIDE.md)** — write real compute functions, including hand-tuned GPU kernels via `wasi:cuda/host@0.2.0`.
 - **[AUTO-OFFLOAD.md](./AUTO-OFFLOAD.md)** — learn when and how TensorWasm automatically promotes hot SIMD loops to GPU kernels, no PTX required.
 - **[API.md](../crates/tensor-wasm-api/API.md)** — the full HTTP API: deploy, invoke, list, delete, snapshots.
 - **[CUDA-SETUP.md](./CUDA-SETUP.md)** — installing CUDA, picking an `sm_*` arch, and validating your GPU.

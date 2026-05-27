@@ -100,7 +100,7 @@ Wasmtime instead of *building on* it.
 (pinned at `25.x` per
 [`WASMTIME-UPGRADE.md`](WASMTIME-UPGRADE.md)), wrapping it with
 HTTP gateway, snapshots, tenant registry, audit, metrics; a
-GPU-aware Wasm runtime via `wasi:cuda/host@0.1.0`
+GPU-aware Wasm runtime via `wasi:cuda/host@0.2.0`
 ([`wit/wasi-cuda.wit`](../wit/wasi-cuda.wit)) — the only such
 surface we know of that ships with a runtime rather than as a
 research patch; Apache-2.0, self-hosted; compatible with the same
@@ -153,7 +153,7 @@ matches usually have a better answer elsewhere
   `cuLaunchKernel`-style explicit dispatch from inside the sandbox);
   `wasmtime-cuda`-style patches exist in research repos but do not
   ship as tested runtimes. TensorWasm's
-  [`wasi:cuda/host@0.1.0`](../wit/wasi-cuda.wit) gives the guest
+  [`wasi:cuda/host@0.2.0`](../wit/wasi-cuda.wit) gives the guest
   `load_ptx`, `launch`, `sync`, and `last_error`, with bounds
   checks before any driver call and a back-pressure semaphore.
   **Caveat:** v0.1.0 reaches the driver only for zero-argument
@@ -239,7 +239,7 @@ table.
 ### 6.2 The equivalent TensorWasm shape
 
 The executor flattens that into a single call. You give up `Linker`
-customization (TensorWasm pre-wires WASI P2 + `wasi:cuda/host@0.1.0`)
+customization (TensorWasm pre-wires WASI P2 + `wasi:cuda/host@0.2.0`)
 and gain tenant binding, back-pressure semaphore, and snapshot
 hooks for free:
 
@@ -437,7 +437,7 @@ CUDA C++ over `cuLaunchKernel`, Triton's Python dispatcher,
 Every existing case you might be coming from is *trusted code
 talking to a trusted driver* — no sandbox. Moving to TensorWasm
 means accepting one: your code is now a Wasm guest, and every CUDA
-call goes through `wasi:cuda/host@0.1.0`, which bounds-checks
+call goes through `wasi:cuda/host@0.2.0`, which bounds-checks
 pointers against the guest's linear memory *before* any driver call
 ([`wit/wasi-cuda.wit`](../wit/wasi-cuda.wit)). The benefit is
 isolation between mutually-distrusting workloads on one host; the
