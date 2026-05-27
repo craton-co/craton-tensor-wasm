@@ -16,6 +16,22 @@
 //! `String` carries (and shrink each variant's footprint by one pointer-sized
 //! word). Callers that have a `String` should pass it via `.into()`; callers
 //! with a `&str` should use `.into()` likewise.
+//!
+//! # Display sanitisation
+//!
+//! The `CudaError`, `WasmTrap`, `WasmCompile`, and `Serialization` variants
+//! carry inner strings produced by third-party crates (wasmtime, cust, serde,
+//! ...). Those messages can leak host filesystem paths, raw pointer
+//! addresses, or fragments of tenant-supplied source bytes — none of which is
+//! safe to render into a response body or end-user log line. The
+//! `Display` impls for those four variants therefore emit a stable, opaque
+//! label only (e.g. `"cuda driver call failed"`). The inner string is still
+//! reachable through `Debug` formatting for operator-side diagnostic logs and
+//! through the `inner()` accessor for callers that need the raw text in a
+//! trusted context. Variants whose fields are structured (`MemoryExhausted`,
+//! `KernelTimeout`, `TenantIsolationViolation`) format normally — those
+//! fields are integers and tenant-controlled identifiers, not opaque strings
+//! from a vendor crate.
 
 use std::io;
 
@@ -31,15 +47,27 @@ use crate::types::TenantId;
 #[derive(Debug, Error)]
 pub enum TensorWasmError {
     /// A call into the CUDA driver or runtime failed.
-    #[error("CUDA error: {0}")]
+    ///
+    /// The inner string is the underlying vendor message (cust / cuda-oxide /
+    /// cudarc); it can contain raw pointer addresses and host paths, so it is
+    /// deliberately omitted from `Display` and only surfaced via `Debug`.
+    #[error("cuda driver call failed")]
     CudaError(Box<str>),
 
     /// A Wasm trap was triggered during execution (divide-by-zero, OOB access, ...).
-    #[error("Wasm trap: {0}")]
+    ///
+    /// The inner string is wasmtime's trap message, which may include host
+    /// instruction-pointer addresses; it is omitted from `Display` and only
+    /// surfaced via `Debug`.
+    #[error("wasm trap")]
     WasmTrap(Box<str>),
 
     /// Compiling Wasm bytes to native code failed.
-    #[error("Wasm compile error: {0}")]
+    ///
+    /// The inner string is wasmtime's compiler diagnostic, which can echo
+    /// fragments of the tenant-supplied module bytes; it is omitted from
+    /// `Display` and only surfaced via `Debug`.
+    #[error("wasm compile failed")]
     WasmCompile(Box<str>),
 
     /// The instance exceeded its memory quota.
@@ -83,7 +111,11 @@ pub enum TensorWasmError {
     Io(#[from] io::Error),
 
     /// A (de)serialisation error.
-    #[error("serialization error: {0}")]
+    ///
+    /// The inner string is the serde / format-crate message and may quote
+    /// untrusted input bytes verbatim; it is omitted from `Display` and only
+    /// surfaced via `Debug`.
+    #[error("serialization error")]
     Serialization(Box<str>),
 }
 
@@ -100,6 +132,26 @@ impl TensorWasmError {
             self,
             TensorWasmError::KernelTimeout { .. } | TensorWasmError::Io(_) | TensorWasmError::MemoryExhausted { .. }
         )
+    }
+
+    /// Returns the inner diagnostic string for the four variants that wrap a
+    /// vendor message (`CudaError`, `WasmTrap`, `WasmCompile`,
+    /// `Serialization`). For every other variant — and for `Io`, whose
+    /// `std::io::Error` source is already reachable via [`std::error::Error::source`]
+    /// — this returns `None`.
+    ///
+    /// This accessor exists so server-side operator logs can record the full
+    /// vendor message even though `Display` deliberately omits it. **Never
+    /// expose the returned string to end-users / response bodies**: that is
+    /// precisely the leak surface the sanitised `Display` impls protect against.
+    pub fn inner(&self) -> Option<&str> {
+        match self {
+            TensorWasmError::CudaError(s)
+            | TensorWasmError::WasmTrap(s)
+            | TensorWasmError::WasmCompile(s)
+            | TensorWasmError::Serialization(s) => Some(s),
+            _ => None,
+        }
     }
 
     /// Returns a stable, machine-readable variant name (used in metrics labels).
@@ -125,9 +177,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_cuda() {
-        let e = TensorWasmError::CudaError("ctx not current".into());
-        assert_eq!(format!("{e}"), "CUDA error: ctx not current");
+    fn display_cuda_is_opaque() {
+        // Display must NOT echo the inner vendor string — it can carry pointer
+        // addresses and host paths. The inner string is reachable via inner()
+        // and Debug for operator-side logging.
+        let e = TensorWasmError::CudaError("ctx not current at 0x7ffe0000".into());
+        assert_eq!(format!("{e}"), "cuda driver call failed");
+        assert_eq!(e.inner(), Some("ctx not current at 0x7ffe0000"));
     }
 
     #[test]
@@ -184,15 +240,17 @@ mod tests {
     }
 
     #[test]
-    fn display_wasm_trap() {
-        let e = TensorWasmError::WasmTrap("unreachable".into());
-        assert_eq!(format!("{e}"), "Wasm trap: unreachable");
+    fn display_wasm_trap_is_opaque() {
+        let e = TensorWasmError::WasmTrap("unreachable at ip 0x401234".into());
+        assert_eq!(format!("{e}"), "wasm trap");
+        assert_eq!(e.inner(), Some("unreachable at ip 0x401234"));
     }
 
     #[test]
-    fn display_wasm_compile() {
-        let e = TensorWasmError::WasmCompile("bad opcode".into());
-        assert_eq!(format!("{e}"), "Wasm compile error: bad opcode");
+    fn display_wasm_compile_is_opaque() {
+        let e = TensorWasmError::WasmCompile("bad opcode 0xfe in /tmp/mod.wasm".into());
+        assert_eq!(format!("{e}"), "wasm compile failed");
+        assert_eq!(e.inner(), Some("bad opcode 0xfe in /tmp/mod.wasm"));
     }
 
     #[test]
@@ -204,9 +262,36 @@ mod tests {
     }
 
     #[test]
-    fn display_serialization() {
-        let e = TensorWasmError::Serialization("bad json".into());
-        assert_eq!(format!("{e}"), "serialization error: bad json");
+    fn display_serialization_is_opaque() {
+        let e = TensorWasmError::Serialization("bad json at byte 42: 'secret-tenant-key'".into());
+        assert_eq!(format!("{e}"), "serialization error");
+        assert_eq!(
+            e.inner(),
+            Some("bad json at byte 42: 'secret-tenant-key'"),
+        );
+    }
+
+    #[test]
+    fn inner_returns_none_for_structured_variants() {
+        // Variants without an inner vendor string return None — there's
+        // nothing to hand to the operator log beyond the Display output.
+        let mem = TensorWasmError::MemoryExhausted {
+            requested: 1,
+            limit: 1,
+        };
+        let kt = TensorWasmError::KernelTimeout {
+            elapsed_ms: 1,
+            deadline_ms: 1,
+        };
+        let iso = TensorWasmError::TenantIsolationViolation {
+            tenant_id: crate::types::TenantId(1),
+            resource: "x".into(),
+        };
+        let io = TensorWasmError::Io(io::Error::new(io::ErrorKind::Other, "x"));
+        assert!(mem.inner().is_none());
+        assert!(kt.inner().is_none());
+        assert!(iso.inner().is_none());
+        assert!(io.inner().is_none());
     }
 
     #[test]
@@ -269,15 +354,17 @@ mod tests {
     fn string_construction_via_into() {
         // String, &str, and Box<str> should all convert into the inner Box<str>
         // via the standard library `From` impls — exercise each path so future
-        // refactors that break ergonomics are caught here.
+        // refactors that break ergonomics are caught here. Display is opaque
+        // (see `display_cuda_is_opaque`), so we verify the inner string was
+        // captured via `inner()` rather than re-asserting the format string.
         let from_string: Box<str> = String::from("hello").into();
         let from_str: Box<str> = "hello".into();
         let from_box: Box<str> = Box::<str>::from("hello");
         let e1 = TensorWasmError::CudaError(from_string);
         let e2 = TensorWasmError::CudaError(from_str);
         let e3 = TensorWasmError::CudaError(from_box);
-        assert_eq!(format!("{e1}"), "CUDA error: hello");
-        assert_eq!(format!("{e2}"), "CUDA error: hello");
-        assert_eq!(format!("{e3}"), "CUDA error: hello");
+        assert_eq!(e1.inner(), Some("hello"));
+        assert_eq!(e2.inner(), Some("hello"));
+        assert_eq!(e3.inner(), Some("hello"));
     }
 }
