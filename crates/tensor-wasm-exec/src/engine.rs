@@ -103,6 +103,37 @@ impl TensorWasmEngine {
         wt_cfg.wasm_component_model(cfg.component_model);
         wt_cfg.strategy(cfg.strategy);
 
+        // ─── Wasm proposal deny-list (security pin) ─────────────────────────
+        //
+        // These flags are pinned because:
+        //   (a) the hardened multi-tenant trust model of this crate depends
+        //       on them — enabling a proposal we have not audited (threads,
+        //       memory64, multi-memory, relaxed-simd, tail-call, GC, typed
+        //       function references) would widen the sandbox attack surface
+        //       and may invalidate isolation assumptions (e.g. `wasm_threads`
+        //       interacts with our pooling/MPK backend in non-obvious ways);
+        //   (b) a future `wasmtime` minor/patch bump must not silently change
+        //       behaviour. If wasmtime flips a default upstream, we want the
+        //       guest contract to remain identical until we explicitly opt in.
+        //
+        // The positive flags below are the proposals this codebase *does*
+        // consume; pinning them to `true` defends against the symmetric
+        // failure mode (a future bump silently disabling something we rely
+        // on).
+        wt_cfg.wasm_threads(false);
+        wt_cfg.wasm_memory64(false);
+        wt_cfg.wasm_multi_memory(false);
+        wt_cfg.wasm_relaxed_simd(false);
+        wt_cfg.wasm_tail_call(false);
+        wt_cfg.wasm_gc(false);
+        wt_cfg.wasm_function_references(false);
+        // Explicitly KEEP the proposals we depend on, so a wasmtime bump
+        // cannot silently flip them:
+        wt_cfg.wasm_simd(true);
+        wt_cfg.wasm_bulk_memory(true);
+        wt_cfg.wasm_reference_types(true);
+        wt_cfg.wasm_multi_value(true);
+
         match cfg.backend {
             MemoryBackend::UnifiedBuffer => {
                 let memory_creator = Arc::new(TensorWasmMemoryCreator::default());
