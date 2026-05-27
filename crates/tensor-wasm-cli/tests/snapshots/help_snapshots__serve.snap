@@ -38,5 +38,12 @@ Options:
           
           [default: 67108864]
 
+      --allow-plaintext-public
+          Acknowledge that you are knowingly exposing a dev-mode (no auth) deployment to a non-loopback address. Required when `--addr` resolves to `0.0.0.0`, `::`, or any non-loopback IP AND no bearer-token allowlist is configured (no `--token` flags AND empty/unset `TENSOR_WASM_API_TOKENS`). Without this opt-in, the CLI refuses to bind such a configuration: a no-auth gateway reachable on a routable address is a critical misconfiguration that has historically leaked internal endpoints to the public internet (cli S-35 + api S-35).
+          
+          Setting this flag does NOT enable auth — it merely silences the safety gate. The 60-second recurring "no auth + public bind" warning continues to fire so the misconfiguration remains visible in long-running container logs.
+          
+          [env: TENSOR_WASM_ALLOW_PLAINTEXT_PUBLIC=]
+
   -h, --help
           Print help (see a summary with '-h')
