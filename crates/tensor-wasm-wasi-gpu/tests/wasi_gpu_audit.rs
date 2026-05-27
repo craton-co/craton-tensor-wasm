@@ -181,7 +181,11 @@ async fn last_error_copy_returns_invalid_pointer_past_memory_end() {
     let mut store = wasmtime::Store::new(
         &engine,
         TestStore {
-            cuda: WasiCudaContext::new(InstanceId(31)),
+            cuda: {
+                let mut c = WasiCudaContext::new(InstanceId(31));
+                c.enable_wasi_cuda();
+                c
+            },
         },
     );
     let instance = linker
@@ -208,7 +212,11 @@ async fn load_ptx_with_non_utf8_entry_returns_invalid_args() {
     let mut store = wasmtime::Store::new(
         &engine,
         TestStore {
-            cuda: WasiCudaContext::new(InstanceId(32)),
+            cuda: {
+                let mut c = WasiCudaContext::new(InstanceId(32));
+                c.enable_wasi_cuda();
+                c
+            },
         },
     );
     let instance = linker
@@ -235,7 +243,11 @@ async fn launch_with_block_dim_over_cap_returns_invalid_dimensions() {
     let mut store = wasmtime::Store::new(
         &engine,
         TestStore {
-            cuda: WasiCudaContext::new(InstanceId(33)),
+            cuda: {
+                let mut c = WasiCudaContext::new(InstanceId(33));
+                c.enable_wasi_cuda();
+                c
+            },
         },
     );
     let instance = linker
@@ -262,7 +274,11 @@ async fn launch_with_block_product_over_cap_returns_invalid_dimensions() {
     let mut store = wasmtime::Store::new(
         &engine,
         TestStore {
-            cuda: WasiCudaContext::new(InstanceId(34)),
+            cuda: {
+                let mut c = WasiCudaContext::new(InstanceId(34));
+                c.enable_wasi_cuda();
+                c
+            },
         },
     );
     let instance = linker
@@ -289,7 +305,11 @@ async fn launch_with_negative_shared_mem_returns_invalid_dimensions() {
     let mut store = wasmtime::Store::new(
         &engine,
         TestStore {
-            cuda: WasiCudaContext::new(InstanceId(35)),
+            cuda: {
+                let mut c = WasiCudaContext::new(InstanceId(35));
+                c.enable_wasi_cuda();
+                c
+            },
         },
     );
     let instance = linker
@@ -339,7 +359,11 @@ async fn load_ptx_over_max_ptx_bytes_returns_quota_exceeded() {
     let mut store = wasmtime::Store::new(
         &engine,
         TestStore {
-            cuda: WasiCudaContext::new(InstanceId(37)),
+            cuda: {
+                let mut c = WasiCudaContext::new(InstanceId(37));
+                c.enable_wasi_cuda();
+                c
+            },
         },
     );
     let instance = linker
@@ -388,7 +412,11 @@ async fn launch_args_region_past_end_returns_invalid_pointer() {
     let mut store = wasmtime::Store::new(
         &engine,
         TestStore {
-            cuda: WasiCudaContext::new(InstanceId(36)),
+            cuda: {
+                let mut c = WasiCudaContext::new(InstanceId(36));
+                c.enable_wasi_cuda();
+                c
+            },
         },
     );
     let instance = linker

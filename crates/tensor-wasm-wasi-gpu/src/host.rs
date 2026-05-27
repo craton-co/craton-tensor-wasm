@@ -68,7 +68,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use tensor_wasm_core::types::{InstanceId, KernelId};
-use tracing::{info, info_span, warn};
+use tracing::{info, info_span, warn, Instrument};
 use wasmtime::{Caller, Linker};
 
 use crate::abi::{
@@ -112,11 +112,34 @@ pub struct WasiCudaContext {
     /// immediately after the launch returns; do NOT cache the
     /// pointers across guest-callable boundaries.
     pub last_lowered_args: Mutex<Vec<LoweredArg>>,
+    /// Capability flag controlling whether the wasi-cuda host functions
+    /// linked via [`add_to_linker`] are allowed to perform real work on
+    /// this instance.
+    ///
+    /// Defaults to `false`. The embedder must call
+    /// [`WasiCudaContext::enable_wasi_cuda`] (or pre-set the field
+    /// directly) before the guest invokes any wasi-cuda host function.
+    /// Every host function bodies wired by `add_to_linker` short-circuits
+    /// with [`AbiError::NotAvailable`] when this is `false` — including
+    /// `last_error_len` / `last_error_copy`, so a guest cannot fingerprint
+    /// the host's wasi-cuda capability indirectly through the error
+    /// surface.
+    ///
+    /// Rationale: linking the wasi-cuda host module historically gave
+    /// every guest that imported it full driver access. Capability gating
+    /// follows the broader WASI design ("imports without capability are
+    /// inert") and lets the executor link wasi-cuda once at engine setup
+    /// while still admitting per-instance policy decisions.
+    pub wasi_cuda_enabled: bool,
 }
 
 impl WasiCudaContext {
     /// Construct a fresh context for the given instance with a dedicated
     /// (un-shared) back-pressure cap.
+    ///
+    /// The wasi-cuda capability defaults to **disabled**; the embedder
+    /// must call [`WasiCudaContext::enable_wasi_cuda`] before the guest
+    /// can use any wasi-cuda host function.
     pub fn new(instance_id: InstanceId) -> Self {
         Self {
             instance_id,
@@ -124,12 +147,16 @@ impl WasiCudaContext {
             last_error: Mutex::new(None),
             back_pressure: Arc::new(BackPressure::new()),
             last_lowered_args: Mutex::new(Vec::new()),
+            wasi_cuda_enabled: false,
         }
     }
 
     /// Construct a context that shares the given [`BackPressure`] cap with
     /// other contexts. Used by the executor to enforce one process-wide
     /// concurrency limit across all Wasm instances.
+    ///
+    /// The wasi-cuda capability defaults to **disabled**, mirroring
+    /// [`WasiCudaContext::new`].
     pub fn with_back_pressure(instance_id: InstanceId, bp: Arc<BackPressure>) -> Self {
         Self {
             instance_id,
@@ -137,6 +164,7 @@ impl WasiCudaContext {
             last_error: Mutex::new(None),
             back_pressure: bp,
             last_lowered_args: Mutex::new(Vec::new()),
+            wasi_cuda_enabled: false,
         }
     }
 
@@ -145,15 +173,41 @@ impl WasiCudaContext {
         &self.back_pressure
     }
 
+    /// Grant this context the wasi-cuda capability. Without this call the
+    /// linked host functions return [`AbiError::NotAvailable`] regardless
+    /// of host CUDA support — see [`WasiCudaContext::wasi_cuda_enabled`].
+    pub fn enable_wasi_cuda(&mut self) {
+        self.wasi_cuda_enabled = true;
+    }
+
+    /// `true` when [`WasiCudaContext::enable_wasi_cuda`] has been called
+    /// (or the field was pre-set on construction).
+    pub fn wasi_cuda_enabled(&self) -> bool {
+        self.wasi_cuda_enabled
+    }
+
     fn record_error(&self, msg: impl Into<String>) {
         let msg = msg.into();
         warn!(target: "tensor_wasm_wasi_gpu::host", instance = %self.instance_id, %msg, "wasi-cuda error");
-        *self.last_error.lock().expect("last_error poisoned") = Some(msg);
+        // A panicked `record_error` call earlier in the launch path would
+        // have poisoned this mutex. The error payload is still valid and
+        // we'd rather overwrite it with the current call's message than
+        // brick the rest of the instance — recover the inner String slot.
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(msg);
     }
 
     /// Borrow the most recent error message.
     pub fn last_error(&self) -> Option<String> {
-        self.last_error.lock().expect("last_error poisoned").clone()
+        // Mirror `record_error`: recover from poisoning so a single
+        // panicked call doesn't make subsequent observability queries
+        // panic too.
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Snapshot of the args parsed by the most recent successful `launch`
@@ -162,7 +216,7 @@ impl WasiCudaContext {
     pub fn last_lowered_args(&self) -> Vec<LoweredArg> {
         self.last_lowered_args
             .lock()
-            .expect("last_lowered_args poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 }
@@ -188,6 +242,14 @@ pub trait HasWasiCuda {
 pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
     linker: &mut Linker<T>,
 ) -> wasmtime::Result<()> {
+    // Capability gating: every host fn below first checks
+    // `wasi_cuda_enabled` on the per-instance context. Guests whose
+    // executor has not granted the capability see [`AbiError::NotAvailable`]
+    // — indistinguishable from "this host lacks a GPU", which is the
+    // desired posture (the guest cannot fingerprint whether the host is
+    // capability-gating or genuinely CUDA-less). The check happens before
+    // any other validation so even malformed inputs cannot be used to
+    // probe state through error-discrimination side channels.
     linker.func_wrap(
         MODULE,
         FN_LOAD_PTX,
@@ -197,6 +259,13 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
          entry_ptr: i32,
          entry_len: i32|
          -> i64 {
+            if !caller.data().wasi_cuda().wasi_cuda_enabled {
+                caller
+                    .data()
+                    .wasi_cuda()
+                    .record_error("wasi-cuda capability not granted");
+                return AbiError::NotAvailable.code() as i64;
+            }
             match load_ptx_impl(&mut caller, ptx_ptr, ptx_len, entry_ptr, entry_len) {
                 Ok(k) => k.0 as i64,
                 Err(e) => e.code() as i64,
@@ -222,6 +291,13 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
         ): (i64, i32, i32, i32, i32, i32, i32, i32, i32, i32)|
          -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
             Box::new(async move {
+                if !caller.data().wasi_cuda().wasi_cuda_enabled {
+                    caller
+                        .data()
+                        .wasi_cuda()
+                        .record_error("wasi-cuda capability not granted");
+                    return AbiError::NotAvailable.code();
+                }
                 launch_impl_async(
                     &mut caller,
                     kernel_id,
@@ -242,6 +318,13 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
     )?;
 
     linker.func_wrap(MODULE, FN_SYNC, |caller: Caller<'_, T>| -> i32 {
+        if !caller.data().wasi_cuda().wasi_cuda_enabled {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error("wasi-cuda capability not granted");
+            return AbiError::NotAvailable.code();
+        }
         sync_impl(&caller).map_or_else(|e| e.code(), |_| 0)
     })?;
 
@@ -255,6 +338,16 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
     // backwards-compat but is now an unimported name from the guest's POV.
 
     linker.func_wrap(MODULE, FN_LAST_ERROR_LEN, |caller: Caller<'_, T>| -> i32 {
+        if !caller.data().wasi_cuda().wasi_cuda_enabled {
+            // Note: we do NOT call `record_error` here — the guest could
+            // read that recorded message back via this same surface,
+            // turning the gate into a leak channel. Returning the
+            // negative `NotAvailable` code is unambiguous: a positive
+            // `n > 0` is a real length, `0` means "no error" on a
+            // gate-passing context, and a negative value means "the
+            // surface is unavailable on this instance."
+            return AbiError::NotAvailable.code();
+        }
         caller
             .data()
             .wasi_cuda()
@@ -267,6 +360,12 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
         MODULE,
         FN_LAST_ERROR_COPY,
         |mut caller: Caller<'_, T>, dst_ptr: i32, dst_len: i32| -> i32 {
+            if !caller.data().wasi_cuda().wasi_cuda_enabled {
+                // See the matching note on FN_LAST_ERROR_LEN: keep the
+                // failure shape distinct from "no error" without recording
+                // anything the guest could subsequently observe.
+                return AbiError::NotAvailable.code();
+            }
             // Sentinel return values:
             //   `0`              — no error currently recorded.
             //   `-2` (`AbiError::InvalidPointer.code()`) — the guest's
@@ -593,6 +692,30 @@ fn validate_launch_args<T: HasWasiCuda>(
 /// `stream.synchronize()` so the wasmtime fiber may be suspended while
 /// the GPU runs.
 ///
+/// ## Pointer-aliasing safety across the back-pressure await
+///
+/// Wasmtime's `Memory::data` borrow may be invalidated by *any* await on
+/// the same store — including `memory.grow` triggered by an embedder
+/// host hook. To keep raw pointers resolved by [`parse_argv`] from
+/// becoming dangling at the `cuLaunchKernel` call, we structure the
+/// body as:
+///
+///  1. Synchronously validate dims + the outer args region.
+///  2. `await bp.acquire_borrowed()` — back-pressure permit, the only
+///     await on the path.
+///  3. After the await resolves, synchronously snapshot the args buffer,
+///     run `parse_argv` (which resolves guest offsets to host pointers),
+///     stash the lowered args for observability, look up the kernel
+///     handle, and call `cuLaunchKernel`.
+///
+/// Step 3 cannot cross another await (the host function holds the
+/// wasmtime store for its full duration after the permit resolves), so
+/// the resolved host pointers remain valid through the
+/// `cuLaunchKernel` call. The subsequent `spawn_blocking`
+/// `stream.synchronize()` is also safe: `cuLaunchKernel` has already
+/// captured the pointers, and the guest cannot run (let alone grow
+/// memory) until this async fn returns.
+///
 /// See the module-level docs for the kernel-args marshalling contract.
 #[allow(clippy::too_many_arguments)]
 async fn launch_impl_async<T: HasWasiCuda>(
@@ -608,12 +731,14 @@ async fn launch_impl_async<T: HasWasiCuda>(
     args_ptr: i32,
     args_len: i32,
 ) -> Result<(), AbiError> {
-    // NOTE: we deliberately do *not* hold an `EnteredSpan` here. That guard
-    // is `!Send`, which would poison the `Send` future required by
-    // `func_wrap_async`. Span context for this call is recorded through
-    // the synchronous helpers (validation, lookup) which capture it via
-    // the surrounding `info!`/`warn!` events.
-    let _ = info_span!(
+    // Build the launch span up front and instrument the inner future with
+    // it. `info_span!` returns a `Span` whose `.enter()` guard is `!Send`
+    // — entering it directly here would poison the `Send` bound the
+    // `func_wrap_async` boxed future carries. Wrapping the inner future
+    // via `tracing::Instrument` attaches the span across `await` points
+    // instead, so each poll re-enters the span and our log lines stay
+    // attributed to this launch.
+    let launch_span = info_span!(
         "wasi_cuda.launch",
         instance = %caller.data().wasi_cuda().instance_id,
         kernel = kernel_id,
@@ -621,7 +746,28 @@ async fn launch_impl_async<T: HasWasiCuda>(
         block_x = block_x, block_y = block_y, block_z = block_z,
         shared_mem = shared_mem,
     );
+    launch_impl_async_inner(
+        caller, kernel_id, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_mem, args_ptr,
+        args_len,
+    )
+    .instrument(launch_span)
+    .await
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn launch_impl_async_inner<T: HasWasiCuda>(
+    caller: &mut Caller<'_, T>,
+    kernel_id: i64,
+    grid_x: i32,
+    grid_y: i32,
+    grid_z: i32,
+    block_x: i32,
+    block_y: i32,
+    block_z: i32,
+    shared_mem: i32,
+    args_ptr: i32,
+    args_len: i32,
+) -> Result<(), AbiError> {
     let kid = validate_launch_args(
         caller, kernel_id, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_mem, args_ptr,
         args_len,
@@ -629,19 +775,42 @@ async fn launch_impl_async<T: HasWasiCuda>(
     let owner = caller.data().wasi_cuda().instance_id;
     let registry = caller.data().wasi_cuda().registry.clone();
 
-    // Read the args region into a host-side buffer before the back-pressure
-    // permit is acquired so a slow launch can't pin a memory borrow across
-    // an await. The buffer is parsed into a typed `Vec<LoweredArg>`
-    // immediately so any malformed-byte / OOB-pointer error surfaces
-    // before we touch the CUDA driver. Pointer args are resolved against
-    // the caller's current linear memory snapshot — `read_bytes` returns
-    // an owned `Vec<u8>` so the borrow does not pin the memory across the
-    // upcoming `await`, but the resolved host pointers still alias the
-    // live linear memory and are only safe to use until the next
-    // `memory.grow`. We therefore push parsing here (synchronous, no
-    // await crossed) and consume the resolved pointers in the immediate
-    // `cuLaunchKernel` call inside `spawn_blocking`, before the wasmtime
-    // fiber resumes and the guest can grow memory.
+    // Back-pressure: on the async path we await rather than reject so the
+    // Wasm fiber suspends when the cap is reached. The permit is held for
+    // the lifetime of this future — on return (success OR error) it drops
+    // and the live-counter decrements, enforcing the cap regardless of
+    // outcome.
+    //
+    // CRITICAL ORDERING: the permit is acquired *before* we resolve any
+    // pointers into guest linear memory. `parse_argv` calls
+    // `mem.as_ptr().add(start)` on a `Memory::data(&caller)` borrow whose
+    // pointers wasmtime is allowed to invalidate across any await on this
+    // store. By awaiting the permit first and only then snapshotting +
+    // parsing + dispatching to `cuLaunchKernel`, we never let a resolved
+    // host pointer outlive the synchronous critical section that consumes
+    // it. The remaining `spawn_blocking(stream.synchronize())` is safe
+    // because `cuLaunchKernel` has already captured the pointers and the
+    // guest cannot run until this fn returns.
+    //
+    // We use `acquire_borrowed` (not `acquire`) because this host function
+    // never moves the permit across a `tokio::spawn` boundary: the
+    // `spawn_blocking` call below moves only the CUDA stream/event/module
+    // handle, not the permit. Borrowing skips the `Arc<Semaphore>` clone
+    // the owned variant pays on every dispatch — a measurable saving on
+    // the hot path. `&BackPressure` outlives the borrow because the
+    // `WasiCudaContext` (which owns the Arc<BackPressure>) is held by the
+    // wasmtime `Caller` for the duration of this async fn.
+    let bp = caller.data().wasi_cuda().back_pressure.clone();
+    let _permit = bp.acquire_borrowed().await;
+
+    // Resolve argv now, after the permit has been acquired. Pointer args
+    // are resolved against the caller's current linear-memory snapshot;
+    // the resolution and the consuming `cuLaunchKernel` call live in this
+    // same synchronous critical section, so the wasmtime guest cannot
+    // run between them and the resolved pointers are guaranteed valid at
+    // launch time. Once `cuLaunchKernel` returns, CUDA has its own copy
+    // of the parameter slot bytes and we never re-read the resolved
+    // pointers from this side.
     //
     // `KernelArgsUnsupported` is preserved as a fallback for buffers that
     // exceed the kernel-args sanity caps — see
@@ -686,31 +855,14 @@ async fn launch_impl_async<T: HasWasiCuda>(
         .wasi_cuda()
         .last_lowered_args
         .lock()
-        .expect("last_lowered_args poisoned") = lowered_args.clone();
+        .unwrap_or_else(|e| e.into_inner()) = lowered_args.clone();
 
     // Eagerly take a strong, owned handle to the kernel (Arc-wrapped on
     // CUDA builds). This both validates `kid` and frees the registry's
-    // dashmap entry before we cross any await boundary, eliminating the
-    // UAF window that existed when we kept a raw pointer derived from a
-    // transient `dashmap::Ref` alive across the launch.
+    // dashmap entry before any further work, eliminating the UAF window
+    // that existed when we kept a raw pointer derived from a transient
+    // `dashmap::Ref` alive across the launch.
     let handle = registry.lookup(kid, owner)?;
-
-    // Back-pressure: on the async path we await rather than reject so the
-    // Wasm fiber suspends when the cap is reached. The permit is held for
-    // the lifetime of this future — on return (success OR error) it drops
-    // and the live-counter decrements, enforcing the cap regardless of
-    // outcome.
-    //
-    // We use `acquire_borrowed` (not `acquire`) because this host function
-    // never moves the permit across a `tokio::spawn` boundary: the
-    // `spawn_blocking` call below moves only the CUDA stream/event/module
-    // handle, not the permit. Borrowing skips the `Arc<Semaphore>` clone
-    // the owned variant pays on every dispatch — a measurable saving on
-    // the hot path. `&BackPressure` outlives the borrow because the
-    // `WasiCudaContext` (which owns the Arc<BackPressure>) is held by the
-    // wasmtime `Caller` for the duration of this async fn.
-    let bp = caller.data().wasi_cuda().back_pressure.clone();
-    let _permit = bp.acquire_borrowed().await;
 
     #[cfg(feature = "cuda")]
     {
@@ -863,7 +1015,7 @@ async fn launch_impl_async<T: HasWasiCuda>(
             .wasi_cuda()
             .last_lowered_args
             .lock()
-            .expect("last_lowered_args poisoned") = lowered_args;
+            .unwrap_or_else(|e| e.into_inner()) = lowered_args;
         // `handle` is still in scope here; it (and the Arc<Module>) is
         // released by Drop now that synchronize has returned. The clone
         // moved into the blocking task may still hold the Arc briefly,
@@ -885,7 +1037,7 @@ async fn launch_impl_async<T: HasWasiCuda>(
             .wasi_cuda()
             .last_lowered_args
             .lock()
-            .expect("last_lowered_args poisoned") = lowered_args;
+            .unwrap_or_else(|e| e.into_inner()) = lowered_args;
         caller.data().wasi_cuda().record_error(format!(
             "launch: CUDA not available on this host (argv parsed: {parsed_count} args)"
         ));
@@ -1042,10 +1194,9 @@ mod tests {
         );
         let bytes = wat::parse_str(&wat).unwrap();
         let module = wasmtime::Module::new(&engine, &bytes).expect("compile");
-        let mut store = wasmtime::Store::new(
-            &engine,
-            Dummy(WasiCudaContext::new(InstanceId(202))),
-        );
+        let mut ctx = WasiCudaContext::new(InstanceId(202));
+        ctx.enable_wasi_cuda();
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
         let instance = linker
             .instantiate_async(&mut store, &module)
             .await
@@ -1107,10 +1258,9 @@ mod tests {
         );
         let bytes = wat::parse_str(&wat).unwrap();
         let module = wasmtime::Module::new(&engine, &bytes).expect("compile");
-        let mut store = wasmtime::Store::new(
-            &engine,
-            Dummy(WasiCudaContext::new(InstanceId(203))),
-        );
+        let mut ctx = WasiCudaContext::new(InstanceId(203));
+        ctx.enable_wasi_cuda();
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
         let instance = linker
             .instantiate_async(&mut store, &module)
             .await
@@ -1170,10 +1320,9 @@ mod tests {
         );
         let bytes = wat::parse_str(&wat).unwrap();
         let module = wasmtime::Module::new(&engine, &bytes).expect("compile");
-        let mut store = wasmtime::Store::new(
-            &engine,
-            Dummy(WasiCudaContext::new(InstanceId(220))),
-        );
+        let mut ctx = WasiCudaContext::new(InstanceId(220));
+        ctx.enable_wasi_cuda();
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
         let instance = linker
             .instantiate_async(&mut store, &module)
             .await
@@ -1186,6 +1335,132 @@ mod tests {
             rc,
             AbiError::KernelArgsUnsupported.code(),
             "argv buffer past sanity cap must return KernelArgsUnsupported"
+        );
+    }
+
+    /// Capability gating: when `wasi_cuda_enabled` is `false` (the default
+    /// for a brand-new context), every host function linked by
+    /// [`add_to_linker`] must short-circuit with `AbiError::NotAvailable`
+    /// — even otherwise-valid calls. This prevents a guest from gaining
+    /// CUDA access just by importing the module.
+    #[tokio::test]
+    async fn launch_without_capability_returns_not_available() {
+        let mut config = wasmtime::Config::new();
+        config.async_support(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut linker: Linker<Dummy> = Linker::new(&engine);
+        add_to_linker(&mut linker).expect("add_to_linker");
+
+        // A trivially-valid launch: 1x1x1 grid + block, zero args. With the
+        // capability enabled this would either succeed (CUDA) or return
+        // `NotAvailable` from the no-CUDA branch *after* full validation;
+        // with the capability disabled we expect `NotAvailable` directly
+        // from the linker wrapper, *before* any validation work.
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "{fn_name}"
+                (func $launch (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "try_launch") (result i32)
+                (call $launch
+                  (i64.const 1)
+                  (i32.const 1) (i32.const 1) (i32.const 1)
+                  (i32.const 1) (i32.const 1) (i32.const 1)
+                  (i32.const 0) (i32.const 0) (i32.const 0)))
+            )
+            "#,
+            m = MODULE,
+            fn_name = FN_LAUNCH,
+        );
+        let bytes = wat::parse_str(&wat).unwrap();
+        let module = wasmtime::Module::new(&engine, &bytes).expect("compile");
+        // Note: we deliberately do NOT call `enable_wasi_cuda()`.
+        let ctx = WasiCudaContext::new(InstanceId(901));
+        assert!(
+            !ctx.wasi_cuda_enabled(),
+            "freshly-constructed context must default to disabled"
+        );
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+        let try_launch = instance
+            .get_typed_func::<(), i32>(&mut store, "try_launch")
+            .expect("typed func");
+        let rc = try_launch.call_async(&mut store, ()).await.expect("call");
+        assert_eq!(
+            rc,
+            AbiError::NotAvailable.code(),
+            "ungranted wasi-cuda capability must surface as NotAvailable, \
+             got {rc}"
+        );
+        // The wrapper should have recorded an error explaining why the
+        // call was rejected — the guest can read it via last_error_*.
+        let last = store.data().wasi_cuda().last_error().unwrap_or_default();
+        assert!(
+            last.contains("wasi-cuda capability not granted"),
+            "expected capability error message, got: {last}"
+        );
+    }
+
+    /// Once the capability is granted on the same context the launch
+    /// proceeds through validation and reaches the launch dispatch path
+    /// (which on no-CUDA hosts ultimately also returns `NotAvailable`,
+    /// but only *after* validation runs — confirming the gate flipped).
+    #[tokio::test]
+    async fn launch_with_capability_passes_gate() {
+        let mut config = wasmtime::Config::new();
+        config.async_support(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut linker: Linker<Dummy> = Linker::new(&engine);
+        add_to_linker(&mut linker).expect("add_to_linker");
+
+        // Use a bogus kernel id (999): with the capability enabled
+        // validation passes the dimension caps and reaches the kernel
+        // lookup, which returns `InvalidKernel`. Without the capability
+        // we'd see `NotAvailable` instead — the cross-check that
+        // confirms `enable_wasi_cuda` actually flips behaviour.
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "{fn_name}"
+                (func $launch (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "try_launch") (result i32)
+                (call $launch
+                  (i64.const 999)
+                  (i32.const 1) (i32.const 1) (i32.const 1)
+                  (i32.const 1) (i32.const 1) (i32.const 1)
+                  (i32.const 0) (i32.const 0) (i32.const 0)))
+            )
+            "#,
+            m = MODULE,
+            fn_name = FN_LAUNCH,
+        );
+        let bytes = wat::parse_str(&wat).unwrap();
+        let module = wasmtime::Module::new(&engine, &bytes).expect("compile");
+        let mut ctx = WasiCudaContext::new(InstanceId(902));
+        ctx.enable_wasi_cuda();
+        assert!(
+            ctx.wasi_cuda_enabled(),
+            "enable_wasi_cuda() must flip the flag"
+        );
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+        let try_launch = instance
+            .get_typed_func::<(), i32>(&mut store, "try_launch")
+            .expect("typed func");
+        let rc = try_launch.call_async(&mut store, ()).await.expect("call");
+        assert_eq!(
+            rc,
+            AbiError::InvalidKernel.code(),
+            "with capability granted, an unknown kernel id must reach the \
+             registry lookup and return InvalidKernel; got {rc}"
         );
     }
 

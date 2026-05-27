@@ -142,7 +142,15 @@ fuzz_target!(|data: &[u8]| {
         let mut store = wasmtime::Store::new(
             &engine,
             Store {
-                cuda: WasiCudaContext::new(InstanceId(0xf_u128)),
+                cuda: {
+                    // Grant the wasi-cuda capability so the fuzz harness
+                    // actually exercises the host fn bodies; without this
+                    // every call short-circuits with NotAvailable and the
+                    // fuzz reduces to a no-op.
+                    let mut c = WasiCudaContext::new(InstanceId(0xf_u128));
+                    c.enable_wasi_cuda();
+                    c
+                },
             },
         );
         let instance = match linker.instantiate_async(&mut store, &module).await {
