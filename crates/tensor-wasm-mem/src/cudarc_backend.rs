@@ -40,6 +40,7 @@
 
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -48,6 +49,24 @@ use cudarc::driver::CudaDevice;
 
 use crate::advise::Advice;
 use crate::unified::{DeviceId, UnifiedError};
+
+/// Process-wide counter of `cuMemFree_v2` failures observed in
+/// [`CudarcUnifiedBuffer::drop`]. A non-zero value indicates leaked managed
+/// allocations — the driver refused to release them. Operators can poll this
+/// via [`cudarc_free_failures`] to alert on leak rate.
+static CUDARC_FREE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Number of `cuMemFree_v2` failures observed since process start.
+///
+/// Each increment corresponds to one leaked managed-memory allocation: the
+/// driver returned non-`CUDA_SUCCESS` from [`Drop`] so the bytes are still
+/// resident in the process's address space. The counter is a `u64` so it
+/// will not realistically wrap; operators can subtract two snapshots to get
+/// a leak rate over any window. The monotonically-increasing failure log is
+/// also emitted at `tracing::warn!` for forensic correlation.
+pub fn cudarc_free_failures() -> u64 {
+    CUDARC_FREE_FAILURES.load(Ordering::Relaxed)
+}
 
 /// Process-wide cached `CudaDevice` for device 0.
 ///
@@ -140,6 +159,18 @@ impl CudarcUnifiedBuffer {
         // default ("attached globally — every stream on every device") and
         // sidesteps the enum-path drift entirely.
         const CU_MEM_ATTACH_GLOBAL: u32 = 1;
+        // Drift guard: if cudarc renumbers the enum in a future minor bump
+        // (the path itself drifts between `CUmemAttach_flags_enum` and
+        // `CUmemAttach_flags`, see the comment above), the build fails here
+        // rather than at runtime with a confusing `CUDA_ERROR_INVALID_VALUE`.
+        // We dodge `static_assertions` to keep the dep tree tight — a plain
+        // `const _: () = assert!(...)` works on stable since 1.57.
+        const _: () = assert!(
+            CU_MEM_ATTACH_GLOBAL
+                == cuda_sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL as u32,
+            "cudarc renumbered CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL; \
+             update the inlined constant in cudarc_backend.rs",
+        );
         // SAFETY: `raw` is a valid out-parameter; `size > 0`; the device above
         // ensures the primary context is current on this thread.
         // cudarc 0.13.x exposes CUDA driver functions as methods on a Lib
@@ -285,12 +316,17 @@ impl Drop for CudarcUnifiedBuffer {
         let res = unsafe { cuda_sys::lib().cuMemFree_v2(self.ptr.as_ptr() as cuda_sys::CUdeviceptr) };
         if res != cuda_sys::cudaError_enum::CUDA_SUCCESS {
             // Drop cannot fail; surface via a trace event so post-mortem
-            // tooling can spot leaks without unwinding.
+            // tooling can spot leaks without unwinding, and bump a
+            // process-wide counter so the operator can monitor leak rate
+            // without scraping logs. The counter is exposed via the
+            // module-level `cudarc_free_failures()` helper.
+            let failures = CUDARC_FREE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::warn!(
                 target: "tensor_wasm_mem::cudarc_backend",
                 ?res,
                 ptr = ?self.ptr.as_ptr(),
                 size = self.size,
+                total_failures = failures,
                 "cuMemFree_v2 failed in CudarcUnifiedBuffer::drop",
             );
         }

@@ -131,15 +131,33 @@ mod backing_impl {
     }
 
     impl Backing {
-        pub(crate) fn allocate(size: usize) -> Result<(NonNull<u8>, Self), UnifiedError> {
+        pub(crate) fn allocate(
+            size: usize,
+            init_zero_bytes: usize,
+        ) -> Result<(NonNull<u8>, Self), UnifiedError> {
             // Ensure cuInit(0) + a primary context have run before the first
             // cuMemAllocManaged. Idempotent and cheap on subsequent calls.
             ensure_cuda_init()?;
-            // `as_raw_mut` is a `&mut self` method on cust's UnifiedPointer,
-            // so the buffer must be bound mutably even though we only read it
-            // once to derive the raw pointer.
-            let mut buf = cust::memory::UnifiedBuffer::new(&0u8, size)
+            // Allocate the managed region WITHOUT touching every byte. cust's
+            // `UnifiedBuffer::new(&0u8, size)` runs a per-element write loop
+            // over the whole allocation, which under `TensorWasmLinearMemory`'s
+            // option-(a) preallocate-at-max strategy costs a full
+            // `DEFAULT_MAX_BYTES` (256 MiB by default) memset on every Wasm
+            // spawn. Wasm semantics only require the *visible* window to be
+            // zero at instantiation; `memory.grow` bytes are zeroed by
+            // Wasmtime itself. So we ask cust for an uninitialised allocation
+            // and zero only `init_zero_bytes` ourselves.
+            //
+            // SAFETY: `uninitialized` only requires that the caller treats the
+            // returned bytes as uninitialised memory until written. We do
+            // exactly that — the slice below is the first write into the
+            // region, and we cap it at `init_zero_bytes <= size`.
+            let mut buf = unsafe { cust::memory::UnifiedBuffer::<u8>::uninitialized(size) }
                 .map_err(|e| UnifiedError::Cuda(format!("{e:?}")))?;
+            let init = init_zero_bytes.min(size);
+            if init > 0 {
+                buf.as_mut_slice()[..init].fill(0);
+            }
             // SAFETY: cust returns a non-null aligned pointer to the allocation.
             let ptr = NonNull::new(buf.as_unified_ptr().as_raw_mut() as *mut u8)
                 .ok_or_else(|| UnifiedError::Allocation("cust returned null".into()))?;
@@ -170,12 +188,24 @@ mod backing_impl {
     }
 
     impl Backing {
-        pub(crate) fn allocate(size: usize) -> Result<(NonNull<u8>, Self), UnifiedError> {
+        pub(crate) fn allocate(
+            size: usize,
+            init_zero_bytes: usize,
+        ) -> Result<(NonNull<u8>, Self), UnifiedError> {
             // Route through the W1.2 cudarc spike. `CudarcUnifiedBuffer::new`
             // already handles `cuInit` + primary-context retention via the
             // cached `Arc<CudaDevice>` in `cudarc_backend.rs`, so there is no
             // analogue of the cust path's `ensure_cuda_init()` helper here.
-            let buf = CudarcUnifiedBuffer::new(size)?;
+            let mut buf = CudarcUnifiedBuffer::new(size)?;
+            // cuMemAllocManaged does NOT zero-initialise the returned region,
+            // so we zero the Wasm visible window ourselves to match the
+            // initial-zero contract of `memory 1` instantiation. Bytes beyond
+            // `init_zero_bytes` stay uninitialised; Wasmtime separately zeros
+            // any bytes exposed by `memory.grow`.
+            let init = init_zero_bytes.min(size);
+            if init > 0 {
+                buf.as_mut_slice()[..init].fill(0);
+            }
             // SAFETY: cudarc returns a non-null aligned pointer on success;
             // `CudarcUnifiedBuffer::new` already verified this and would have
             // returned `UnifiedError::Allocation` otherwise.
@@ -206,8 +236,17 @@ mod backing_impl {
     }
 
     impl Backing {
-        pub(crate) fn allocate(size: usize) -> Result<(NonNull<u8>, Self), UnifiedError> {
+        pub(crate) fn allocate(
+            size: usize,
+            _init_zero_bytes: usize,
+        ) -> Result<(NonNull<u8>, Self), UnifiedError> {
             // Allocate a zeroed boxed slice; this serves the no-CUDA path.
+            // `vec![0u8; size]` already zeroes the entire allocation in one
+            // `memset`-equivalent call (and on this branch there is no GPU
+            // page-fault round trip to amortise against), so the
+            // `_init_zero_bytes` distinction is irrelevant: we keep the
+            // whole-slab zero-init regardless. The parameter is accepted to
+            // match the cust/cudarc signatures.
             let mut boxed: Box<[u8]> = vec![0u8; size].into_boxed_slice();
             let ptr = NonNull::new(boxed.as_mut_ptr())
                 .ok_or_else(|| UnifiedError::Allocation("Box returned null".into()))?;
@@ -220,16 +259,54 @@ use backing_impl::{Backing, IS_UVM_BACKED};
 
 impl UnifiedBuffer {
     /// Allocate a new unified buffer of `size` bytes on the default device.
+    ///
+    /// The full allocation is zero-initialised. For large allocations where
+    /// only a subset of bytes is observed before being written by the caller,
+    /// prefer [`Self::new_with_visible_window_on`], which limits the
+    /// zero-fill to a caller-supplied prefix and leaves the rest uninitialised
+    /// (skipping a per-element memset on the cust path).
     pub fn new(size: usize) -> Result<Self, UnifiedError> {
         Self::new_on(size, DeviceId::default())
     }
 
     /// Allocate a new unified buffer of `size` bytes on the named device.
+    ///
+    /// The full allocation is zero-initialised — see [`Self::new`] for the
+    /// rationale and the partial-zero alternative.
     pub fn new_on(size: usize, device_id: DeviceId) -> Result<Self, UnifiedError> {
+        // Zero the whole allocation to preserve historical semantics. Callers
+        // that can scope the zero-fill to a smaller prefix should use
+        // `new_with_visible_window_on` directly.
+        Self::new_with_visible_window_on(size, size, device_id)
+    }
+
+    /// Allocate `size` bytes on the named device, zeroing only the first
+    /// `visible_bytes` (clamped to `size`).
+    ///
+    /// This is the per-Wasm-spawn optimisation path: under
+    /// `TensorWasmLinearMemory`'s option-(a) preallocate-at-max strategy the
+    /// total allocation can reach hundreds of megabytes
+    /// ([`crate::wasm_memory::DEFAULT_MAX_BYTES`] is 256 MiB), but the Wasm
+    /// spec only requires the initial *minimum* window to read as zero —
+    /// Wasmtime separately zero-fills any bytes later exposed by
+    /// `memory.grow`. Restricting the up-front memset to `visible_bytes`
+    /// drops the per-spawn cost from O(cap) to O(minimum).
+    ///
+    /// The cust path (`unified-memory`) routes through
+    /// `cust::memory::UnifiedBuffer::uninitialized` + a bounded `fill(0)`;
+    /// the cudarc path zeros the same window after `cuMemAllocManaged` (which
+    /// does not zero-init); the host `Box<[u8]>` fallback ignores
+    /// `visible_bytes` and zero-fills via `vec![0u8; size]` because the
+    /// no-CUDA build has no large-allocation cost concern.
+    pub fn new_with_visible_window_on(
+        size: usize,
+        visible_bytes: usize,
+        device_id: DeviceId,
+    ) -> Result<Self, UnifiedError> {
         if size == 0 {
             return Err(UnifiedError::ZeroSize);
         }
-        let (ptr, backing) = Backing::allocate(size)?;
+        let (ptr, backing) = Backing::allocate(size, visible_bytes)?;
         Ok(Self {
             ptr,
             size,

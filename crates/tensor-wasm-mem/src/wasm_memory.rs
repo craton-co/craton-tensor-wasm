@@ -88,7 +88,12 @@ impl TensorWasmLinearMemory {
         }
         // Allocate at least 1 byte so the underlying allocator never sees zero.
         let cap = max.max(1);
-        let buffer = UnifiedBuffer::new_on(cap, device_id)?;
+        // Only zero the visible window. Wasm semantics require the initial
+        // `minimum_bytes` to read as zero; any bytes later exposed by
+        // `memory.grow` are zero-filled by Wasmtime itself. On the cust path
+        // this avoids paying a `cap`-sized memset on every Wasm spawn — a
+        // 256 MiB cost under the default `DEFAULT_MAX_BYTES` cap.
+        let buffer = UnifiedBuffer::new_with_visible_window_on(cap, minimum_bytes, device_id)?;
         Ok(Self {
             buffer,
             current_size: minimum_bytes,
