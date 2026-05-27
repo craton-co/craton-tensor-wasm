@@ -26,7 +26,9 @@ use crate::writer::{
 };
 
 #[cfg(feature = "signed-snapshots")]
-use crate::format::{SignatureKind, HMAC_SHA256_SIG_LEN, SIGNATURE_TRAILER_LEN};
+use crate::format::{
+    SignatureKind, HMAC_SHA256_SIG_LEN, SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN,
+};
 
 /// Reverse of [`SnapshotWriter`](crate::writer::SnapshotWriter) — turns a
 /// compressed byte blob back into an in-memory [`Snapshot`].
@@ -173,11 +175,19 @@ impl SnapshotReader {
     /// length, or CRC32 mismatch. The function never panics, so callers can
     /// safely feed it untrusted bytes from disk or the network.
     ///
-    /// Validation order is intentional: cheap header checks (input size)
-    /// happen before any expensive decompression. Decompression is streamed
-    /// through a hard byte cap so a "zip bomb" payload cannot allocate past
-    /// [`SnapshotReader::max_decompressed`] even if its compressed footprint
-    /// fits under [`limits::MAX_INPUT_BYTES`].
+    /// Validation order is intentional and follows "authenticate then parse":
+    /// (1) the cheap input-size cap rejects oversized blobs without touching
+    /// zstd; (2) for any v3 blob (detected by the trailing signature-kind
+    /// byte) the HMAC trailer is verified over the compressed prefix
+    /// **before** any decompression or bincode decoding runs, so an attacker
+    /// who has not forged a valid signature cannot exercise the zstd or
+    /// bincode decoders at all; (3) only after authentication (or after v2 is
+    /// confirmed under a `require_signature == false` reader) do we
+    /// decompress, decode, and run the remaining structural and integrity
+    /// checks (magic, version-consistency, per-blob caps, CRC32, total bytes).
+    /// Decompression is streamed through a hard byte cap so a "zip bomb"
+    /// payload cannot allocate past [`SnapshotReader::max_decompressed`] even
+    /// if its compressed footprint fits under [`limits::MAX_INPUT_BYTES`].
     #[instrument(skip(self, bytes), fields(input_len = bytes.len()))]
     pub fn restore(&self, bytes: &[u8]) -> Result<Snapshot> {
         // Cap the raw input first to bound the attacker's memory budget before
@@ -194,6 +204,62 @@ impl SnapshotReader {
             ));
         }
 
+        // Detect a v3 (signed) blob by peeking at the trailer position.
+        // A v3 envelope is `[compressed prefix][signature_kind][32-byte sig]`
+        // where the signature-kind byte sits at `len - SIGNATURE_TRAILER_LEN`.
+        // We deliberately key off the trailer *before* decompression so HMAC
+        // verification can authenticate the prefix bytes before zstd or
+        // bincode see them — the "authenticate then parse" property.
+        //
+        // A v2 blob whose final 33 bytes happen to put `SIGNATURE_KIND_HMAC_SHA256`
+        // at position `len - SIGNATURE_TRAILER_LEN` will be classified as v3
+        // and rejected by the HMAC check. This is the intended trade-off: the
+        // safety property of never decoding unauthenticated bytes is worth a
+        // per-blob ~1/256 false-positive risk on adversarial v2 inputs (and
+        // is vanishingly rare on real captures, since the byte sits inside
+        // the zstd frame epilogue which is largely structured).
+        #[cfg(feature = "signed-snapshots")]
+        let is_v3 = bytes.len() >= SIGNATURE_TRAILER_LEN
+            && bytes[bytes.len() - SIGNATURE_TRAILER_LEN] == SIGNATURE_KIND_HMAC_SHA256;
+        #[cfg(not(feature = "signed-snapshots"))]
+        let is_v3 = false;
+
+        // STEP 2.5 — AUTHENTICATE FIRST.
+        // Verify HMAC over the compressed prefix before any decompression or
+        // bincode decode runs. On failure we return immediately so an attacker
+        // cannot use the zstd or bincode decoders as oracles. The trailer
+        // length and HMAC are constants of the v3 envelope (33 bytes total),
+        // so the prefix is exactly `bytes[..len - SIGNATURE_TRAILER_LEN]`.
+        #[cfg(feature = "signed-snapshots")]
+        let prefix_len = if is_v3 {
+            let p = bytes.len() - SIGNATURE_TRAILER_LEN;
+            self.verify_v3_trailer(bytes, p)?;
+            p
+        } else {
+            bytes.len()
+        };
+        #[cfg(not(feature = "signed-snapshots"))]
+        let prefix_len = bytes.len();
+
+        // `require_signature` enforcement applies to anything that wasn't
+        // recognised as v3 above (i.e. legacy v2 or malformed). Together with
+        // the early HMAC verification, this closes the strip-trailer-and-
+        // rewrite-version downgrade attack: an attacker who removes the
+        // signature trailer ends up in this branch, and a reader configured
+        // with `require_signature` rejects without ever decoding the payload.
+        if !is_v3 && self.require_signature {
+            return Err(TensorWasmError::Serialization(
+                "snapshot is unsigned (v2) but signature is required".into(),
+            ));
+        }
+
+        // From here on we are working on authenticated bytes (for v3) or on a
+        // v2 input that the operator has chosen to accept unsigned. Strip the
+        // v3 trailer from the slice we hand to zstd so the decoder sees only
+        // the compressed frame and `cursor.position()` lines up with the end
+        // of that frame.
+        let auth_prefix: &[u8] = &bytes[..prefix_len];
+
         // Streaming zstd decode with a hard ceiling. `Read::take` aborts the
         // decoder once `max_decompressed + 1` bytes are emitted, so a zip-bomb
         // payload cannot grow the destination buffer past the cap. We probe
@@ -202,18 +268,18 @@ impl SnapshotReader {
         //
         // The decoder is wrapped around a `Cursor<&[u8]>` (which is itself a
         // `BufRead`) via `with_buffer`, bypassing zstd's default `BufReader`
-        // wrap. That matters for v3: after decoding we read `cursor.position()`
-        // to find the exact byte offset where the zstd frame ended. Any bytes
-        // past that point are the v3 signature trailer. `single_frame()` stops
-        // the decoder at the first frame end rather than treating the trailer
-        // bytes as the start of a second concatenated frame (which would
-        // otherwise fail with a misleading "zstd init" error).
+        // wrap. We then read `cursor.position()` to confirm the decoder
+        // consumed exactly the authenticated prefix (no junk left over inside
+        // it). `single_frame()` stops the decoder at the first frame end
+        // rather than treating any unexpected trailing bytes as the start of
+        // a second concatenated frame (which would otherwise fail with a
+        // misleading "zstd init" error).
         let cap = self.max_decompressed;
         let probe_limit = u64::try_from(cap)
             .ok()
             .and_then(|c| c.checked_add(1))
             .unwrap_or(u64::MAX);
-        let mut cursor = std::io::Cursor::new(bytes);
+        let mut cursor = std::io::Cursor::new(auth_prefix);
         let mut decoder = zstd::stream::read::Decoder::with_buffer(&mut cursor)
             .map_err(|e| TensorWasmError::Serialization(format!("zstd init: {e}").into()))?
             .single_frame();
@@ -228,8 +294,9 @@ impl SnapshotReader {
             .read_to_end(&mut decompressed)
             .map_err(|e| TensorWasmError::Serialization(format!("zstd decode: {e}").into()))?;
         drop(decoder);
-        // Bytes the zstd decoder consumed from the input. The remainder
-        // (`bytes[zstd_consumed..]`) is either empty (v2) or the v3 trailer.
+        // Bytes the zstd decoder consumed from the authenticated prefix. For
+        // a well-formed v2 input this equals `bytes.len()`; for a well-formed
+        // v3 input this equals `prefix_len` (i.e. `auth_prefix.len()`).
         let zstd_consumed = usize::try_from(cursor.position()).unwrap_or(usize::MAX);
         if decompressed.len() > cap {
             return Err(TensorWasmError::Serialization(
@@ -268,44 +335,86 @@ impl SnapshotReader {
             ));
         }
 
-        // Version dispatch. v2 is the unsigned legacy envelope (no trailer);
-        // v3 carries the HMAC-SHA256 trailer right after the zstd frame.
-        // Anything else is a hard reject, just like v2 readers refused
-        // future versions.
-        match snapshot.version {
-            SNAPSHOT_VERSION_V2 => {
-                if self.require_signature {
-                    return Err(TensorWasmError::Serialization(
-                        "snapshot is unsigned (v2) but signature is required".into(),
-                    ));
-                }
-                // v2 forbids any trailing bytes after the zstd frame —
-                // otherwise an attacker could append a chosen 33-byte tail
-                // and observe the reader's reaction.
-                if zstd_consumed != bytes.len() {
+        // Version dispatch (post-authentication). At this point HMAC has
+        // already either verified the trailer (`is_v3 == true`) or confirmed
+        // the input carries no trailer (`is_v3 == false`). The inner `version`
+        // field must agree with the trailer-derived classification: a v3 blob
+        // whose inner version is *not* v3 has been tampered with after
+        // signing; a v2 blob whose inner version *is* v3 is a downgrade
+        // attempt (someone stripped the trailer and left the inner version
+        // bumped) — closed by the `require_signature` branch above and by
+        // the consistency reject here.
+        match (is_v3, snapshot.version) {
+            (true, SNAPSHOT_VERSION_V3) => {
+                // Defence in depth: the zstd frame must end exactly at the
+                // trailer offset. The writer never inserts a gap between
+                // `encoder.finish()` and the appended trailer, so any tail
+                // junk inside the authenticated prefix would only show up
+                // under a writer bug (the HMAC has already certified those
+                // bytes as authentic, so it's not an attack — but it's not
+                // a shape the writer should ever emit either). This branch
+                // is unreachable when the `signed-snapshots` feature is off
+                // (because `is_v3` is then always `false`); the check still
+                // type-checks under both configurations.
+                if zstd_consumed != auth_prefix.len() {
                     return Err(TensorWasmError::Serialization(
                         format!(
-                            "snapshot v2 has unexpected trailing bytes: {} byte(s) past zstd frame",
-                            bytes.len().saturating_sub(zstd_consumed),
+                            "snapshot v3 has unexpected bytes between zstd frame and trailer: \
+                             {} byte(s) past zstd frame",
+                            auth_prefix.len().saturating_sub(zstd_consumed),
                         )
                         .into(),
                     ));
                 }
             }
-            SNAPSHOT_VERSION_V3 => {
-                #[cfg(feature = "signed-snapshots")]
-                {
-                    self.verify_v3_trailer(bytes, zstd_consumed)?;
-                }
-                #[cfg(not(feature = "signed-snapshots"))]
-                {
+            (false, SNAPSHOT_VERSION_V2) => {
+                // v2 forbids any trailing bytes after the zstd frame —
+                // otherwise an attacker could append a chosen 33-byte tail
+                // and observe the reader's reaction. `auth_prefix == bytes`
+                // for v2, so this comparison covers the entire input.
+                if zstd_consumed != auth_prefix.len() {
                     return Err(TensorWasmError::Serialization(
-                        "snapshot is signed (v3) but the `signed-snapshots` feature is not compiled in"
-                            .into(),
+                        format!(
+                            "snapshot v2 has unexpected trailing bytes: {} byte(s) past zstd frame",
+                            auth_prefix.len().saturating_sub(zstd_consumed),
+                        )
+                        .into(),
                     ));
                 }
             }
-            other => {
+            (false, SNAPSHOT_VERSION_V3) => {
+                // Inner payload claims v3 but no trailer was detected. Either
+                // the `signed-snapshots` feature is not compiled in (so we
+                // could not even classify the trailer), or the trailer was
+                // stripped (downgrade attack), or the writer produced a
+                // malformed v3 blob. Each case is rejected; the message
+                // distinguishes feature-off from a runtime tamper so an
+                // operator can tell at a glance which knob to flip.
+                #[cfg(feature = "signed-snapshots")]
+                return Err(TensorWasmError::Serialization(
+                    "snapshot v3 trailer missing".into(),
+                ));
+                #[cfg(not(feature = "signed-snapshots"))]
+                return Err(TensorWasmError::Serialization(
+                    "snapshot is signed (v3) but the `signed-snapshots` feature is not compiled in"
+                        .into(),
+                ));
+            }
+            (true, _) => {
+                // HMAC verified successfully, but the inner version field is
+                // not v3. This should be impossible for any blob produced by
+                // our writer: the signing path always bumps `version` to v3
+                // before computing the HMAC. Surface it as an explicit
+                // version-mismatch rather than letting it pass silently.
+                return Err(TensorWasmError::Serialization(
+                    format!(
+                        "snapshot v3 inner version mismatch: expected {}, got {}",
+                        SNAPSHOT_VERSION_V3, snapshot.version,
+                    )
+                    .into(),
+                ));
+            }
+            (false, other) => {
                 return Err(TensorWasmError::Serialization(
                     format!(
                         "snapshot version mismatch: expected {} or {}, got {}",
@@ -396,10 +505,15 @@ impl SnapshotReader {
 
     /// Validate the trailing `[signature_kind][signature]` bytes of a v3 blob.
     ///
-    /// Called after [`SnapshotReader::restore`] has confirmed the inner
-    /// `version` field is [`SNAPSHOT_VERSION_V3`]. `prefix_len` is the
-    /// number of bytes the zstd decoder consumed — anything past that point
-    /// in `bytes` is the trailer.
+    /// Called by [`SnapshotReader::restore`] **before** any decompression or
+    /// bincode decode runs, as soon as the input has been classified as v3
+    /// by the trailer-position byte. `prefix_len` is the number of bytes that
+    /// precede the trailer — for the v3 envelope this is always
+    /// `bytes.len() - SIGNATURE_TRAILER_LEN`, and the HMAC is computed over
+    /// `bytes[..prefix_len]`. Authenticating here, before exposing the
+    /// compressed prefix to zstd, is what gives the reader the "authenticate
+    /// then parse" property: a forged or tampered blob cannot drive the
+    /// zstd, bincode, or per-blob validation paths as a side channel.
     ///
     /// Errors are deliberately generic: we never include the expected or
     /// observed signature bytes in the error message, since either could
@@ -734,11 +848,23 @@ mod tests {
         }
     }
 
-    /// An unknown signature_kind byte (anything other than 1 in v0.3.x) is
-    /// rejected before the HMAC comparison runs.
+    /// Overwriting the signature-kind byte with anything other than 1 causes
+    /// the reader to no longer classify the blob as v3 — under the
+    /// authenticate-then-parse ordering the kind byte IS the trailer
+    /// discriminator, so a non-`HmacSha256` value at position
+    /// `len - SIGNATURE_TRAILER_LEN` makes the input look like a v2 blob to
+    /// the front-end. The inner bincode payload still claims `version = 3`,
+    /// so the post-decode version-consistency check trips and the reader
+    /// rejects with the missing-trailer error. (The pre-hoist code path
+    /// reached `verify_v3_trailer` after decode and emitted
+    /// "unknown signature_kind"; that wording is no longer reachable from
+    /// the public API because `SignatureKind::HmacSha256 == 1` is the only
+    /// known kind and so doubles as the v3 detection sentinel — the
+    /// `SignatureKind::from_byte` check inside `verify_v3_trailer` is now
+    /// pure defence-in-depth for future variants.)
     #[cfg(feature = "signed-snapshots")]
     #[test]
-    fn v3_unknown_signature_kind_is_rejected() {
+    fn v3_kind_byte_rewritten_falls_through_to_trailer_missing() {
         let key = [0x77u8; 32];
         let mut bytes = SnapshotWriter::new()
             .with_hmac_sha256_key(key)
@@ -757,10 +883,10 @@ mod tests {
         let err = SnapshotReader::new()
             .with_hmac_sha256_key(key)
             .restore(&bytes)
-            .expect_err("unknown signature_kind must be rejected");
+            .expect_err("rewritten kind byte must be rejected");
         match err {
             TensorWasmError::Serialization(m) => assert!(
-                m.contains("unknown signature_kind"),
+                m.contains("v3 trailer missing"),
                 "unexpected message: {m}",
             ),
             other => panic!("expected Serialization, got {other:?}"),

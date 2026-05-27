@@ -105,9 +105,13 @@ that:
 1. Generic zstd tooling that runs the decoder in single-frame mode (which
    the reader does) sees only the authenticated prefix and ignores the
    trailer cleanly — there is no "garbage at end of frame" error path.
-2. The reader can detect the trailer's location purely by asking the
-   zstd decoder how many input bytes it consumed: anything past that
-   offset is the trailer. No length prefix is needed.
+2. The reader can detect the trailer's location with a single cheap
+   constant-offset read: a v3 blob is classified by checking that
+   `input[input.len() - SIGNATURE_TRAILER_LEN] == SIGNATURE_KIND_HMAC_SHA256`.
+   This lets the reader **authenticate before decoding** — HMAC verifies
+   the compressed prefix before any zstd or bincode work runs on it. No
+   length prefix is needed; the trailer is fixed-length (33 bytes today)
+   and the `SignatureKind` discriminant is forward-compatible.
 
 ### HMAC inputs
 
@@ -115,12 +119,33 @@ that:
 HMAC-SHA256(key, prefix_bytes)
 ```
 
-where `prefix_bytes` is `input[..zstd_consumed]` — i.e. the complete v2-
-shaped envelope, magic and version and CRC32 included. Because every
+where `prefix_bytes` is `input[..input.len() - SIGNATURE_TRAILER_LEN]` —
+i.e. the complete v2-shaped envelope, magic and version and CRC32
+included, every byte the zstd decoder would later see. Because every
 byte of the v2 envelope is authenticated, an attacker cannot strip the
 trailer and re-encode the payload as v2 without the reader noticing
 (provided the operator has called `SnapshotReader::require_signature` to
 refuse the unsigned envelope).
+
+### Validation order
+
+The reader runs "authenticate then parse" — HMAC verification is the
+**second** step, before any expensive or attacker-shaped work:
+
+1. Reject inputs larger than `MAX_INPUT_BYTES` (cheap length check).
+2. **Classify by trailer and verify HMAC** over the compressed prefix.
+   On HMAC failure the reader returns `Serialization("snapshot HMAC
+   mismatch")` immediately — zstd and bincode never see the bytes.
+3. Stream-decompress the authenticated prefix (capped by
+   `max_decompressed`), then bincode-decode into a `Snapshot`.
+4. Check magic, version-consistency (the inner `version` must agree with
+   the trailer-derived classification), per-blob caps, CRC32, and the
+   `total_uncompressed_bytes` cross-check.
+
+This order means that a forged or tampered v3 blob cannot drive the
+zstd or bincode decoders as a side channel — the entire downstream
+pipeline only ever runs on bytes whose HMAC matches the configured
+key.
 
 ### Key length
 
