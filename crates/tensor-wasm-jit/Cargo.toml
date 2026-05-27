@@ -27,6 +27,17 @@ tracing.workspace = true
 wasmparser.workspace = true
 wasm-encoder = { version = "0.218", features = ["wasmparser"] }
 
+# pliron — MLIR-style IR framework underpinning cuda-oxide's dialect-mir →
+# dialect-llvm → PTX pipeline (RFC 0001 "Pliron lever and the auto-offload
+# pipeline"). Optional + feature-gated so the default build is unaffected;
+# only `--features cuda-oxide-backend` pulls it in. Published to crates.io
+# as of 0.15.0 (the RFC's "Pliron is not on crates.io" drawback is stale —
+# pin via crates.io directly rather than a git rev). The cuda-oxide
+# upstream itself still uses a git pin at v0.14.0; we choose the published
+# 0.15.0 for the dependabot/cargo-deny story documented in
+# `docs/REPRODUCIBLE-BUILDS.md`.
+pliron = { version = "0.15", optional = true }
+
 [dev-dependencies]
 tokio.workspace = true
 wat.workspace = true
@@ -48,14 +59,14 @@ auto-offload = []
 # `tensor-wasm-mem` so a single `--features cuda-oxide-backend` invocation
 # at the workspace root selects the full opt-in stack.
 #
-# Supply-chain note: when wave 3 wires the real cuda-oxide + Pliron deps
-# behind this feature, both arrive as git-pinned sources (RFC 0001
-# "Drawbacks": Pliron is not on crates.io). The corresponding policy
-# entries already live in the workspace `deny.toml` under `[sources]
-# allow-git` — see the comments there for the v0.4 cutover checklist
-# (both allowlist rows are removed in the same PR that flips Pliron to
-# its crates.io release).
-cuda-oxide-backend = []
+# Supply-chain note: W3.1 (2026-05-27) discovered that pliron is now on
+# crates.io at v0.15 — the RFC 0001 "Drawbacks" claim is stale. The wave-3
+# dep here is therefore a regular crates.io version requirement, NOT a git
+# pin. The cuda-oxide host crates (cuda-host/core/device/macros) remain
+# git-only and arrive in wave 4 with the corresponding `deny.toml`
+# allowlist entries (already pre-declared under [sources] allow-git for
+# forward compatibility).
+cuda-oxide-backend = ["dep:pliron"]
 
 [package.metadata.docs.rs]
 all-features = true
