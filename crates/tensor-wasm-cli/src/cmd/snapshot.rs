@@ -21,11 +21,18 @@
 //!
 //! ## Streaming / size limits
 //!
-//! The on-disk archive is bounded by `--max-decompressed`, which defaults to
-//! 256 MiB (matching `tensor_wasm_snapshot::SnapshotReader`'s built-in limit). The
-//! flag is accepted on restore so an operator can opt into larger snapshots
-//! when they trust the source. Save is bounded by whatever the server emits;
-//! we cap at the same default to avoid surprising disk-fill conditions.
+//! The on-disk archive size is bounded by `--max-archive-bytes`, which defaults
+//! to 256 MiB. Naming this honestly matters: the flag caps the *on-disk
+//! (compressed) archive* the CLI is willing to upload — the decompressed
+//! footprint is bounded server-side by
+//! `tensor_wasm_snapshot::SnapshotReader::with_max_decompressed`. A previous
+//! release exposed this flag as `--max-decompressed`, which was misleading
+//! because a small gzipped archive can decompress to many gigabytes; the old
+//! name is kept as a hidden alias for one release.
+//!
+//! On the save side, the server-supplied body is bounded by
+//! `--max-restore-bytes` (default 256 MiB) so a malicious server can't fill
+//! the operator's disk by streaming an unbounded response.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -35,10 +42,12 @@ use clap::Subcommand;
 
 use super::HttpContext;
 
-/// Default cap on the decompressed snapshot size, in bytes. Mirrors
-/// `tensor_wasm_snapshot::limits::MAX_DECOMPRESSED_BYTES` (256 MiB). Override per
-/// invocation with `--max-decompressed`.
-pub(crate) const DEFAULT_MAX_DECOMPRESSED: u64 = 256 * 1024 * 1024;
+/// Default cap on the on-disk snapshot archive size accepted by the CLI, in
+/// bytes (256 MiB). Override per invocation with `--max-archive-bytes` on
+/// restore or `--max-restore-bytes` on save. This is an honest bound on the
+/// *compressed* archive size — the decompressed footprint is bounded
+/// server-side by `tensor_wasm_snapshot::limits::MAX_DECOMPRESSED_BYTES`.
+pub(crate) const DEFAULT_MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Process exit codes used by the snapshot subcommands. Made explicit so
 /// callers (CI, smoke tests) can distinguish "feature not implemented" from a
@@ -66,6 +75,12 @@ pub enum SnapshotAction {
         /// Base URL of the target TensorWasm server (e.g. `http://localhost:8080`).
         #[arg(long)]
         server: String,
+        /// Maximum number of bytes the CLI will accept from the server and
+        /// write to `--output`. Defaults to 256 MiB; values above the default
+        /// are clamped down so a malicious server cannot fill the operator's
+        /// disk by streaming an unbounded response body.
+        #[arg(long, default_value_t = DEFAULT_MAX_ARCHIVE_BYTES)]
+        max_restore_bytes: u64,
     },
     /// Restore an instance from a `.tensor-wasm` archive via the API.
     Restore {
@@ -78,11 +93,17 @@ pub enum SnapshotAction {
         /// Base URL of the target TensorWasm server (e.g. `http://localhost:8080`).
         #[arg(long)]
         server: String,
-        /// Maximum decompressed snapshot size we'll accept, in bytes. Mirrors
-        /// the server-side cap so the CLI rejects oversized archives without a
-        /// pointless upload.
-        #[arg(long, default_value_t = DEFAULT_MAX_DECOMPRESSED)]
-        max_decompressed: u64,
+        /// Maximum *on-disk archive* size the CLI will upload, in bytes
+        /// (default 256 MiB). This bounds the compressed payload only — the
+        /// decompressed footprint is enforced server-side and may be much
+        /// larger. The deprecated alias `--max-decompressed` is accepted for
+        /// one release; prefer `--max-archive-bytes` in new scripts.
+        #[arg(
+            long = "max-archive-bytes",
+            alias = "max-decompressed",
+            default_value_t = DEFAULT_MAX_ARCHIVE_BYTES
+        )]
+        max_archive_bytes: u64,
     },
 }
 
@@ -116,23 +137,38 @@ pub async fn run(action: SnapshotAction, ctx: &HttpContext) -> Result<()> {
             instance,
             output,
             server,
-        } => save(&server, &instance, &output, ctx).await,
+            max_restore_bytes,
+        } => save(&server, &instance, &output, max_restore_bytes, ctx).await,
         SnapshotAction::Restore {
             input,
             as_instance,
             server,
-            max_decompressed,
-        } => restore(&server, &input, &as_instance, max_decompressed, ctx).await,
+            max_archive_bytes,
+        } => restore(&server, &input, &as_instance, max_archive_bytes, ctx).await,
     }
 }
 
 /// Implementation of `tensor-wasm snapshot save`.
-async fn save(server: &str, instance_id: &str, output: &Path, ctx: &HttpContext) -> Result<()> {
+///
+/// `max_restore_bytes` bounds the response body the CLI is willing to write
+/// to disk. It is clamped down to [`DEFAULT_MAX_ARCHIVE_BYTES`] so a caller
+/// cannot opt into unbounded disk consumption by raising the flag.
+async fn save(
+    server: &str,
+    instance_id: &str,
+    output: &Path,
+    max_restore_bytes: u64,
+    ctx: &HttpContext,
+) -> Result<()> {
     super::validate_server_url(server)?;
     validate_parent_writable(output)?;
     if instance_id.trim().is_empty() {
         return Err(local_err("--instance must be non-empty"));
     }
+
+    // Clamp down to the hard ceiling: callers can lower the cap (good for
+    // hosts with little spare disk) but never raise it past 256 MiB.
+    let cap = max_restore_bytes.min(DEFAULT_MAX_ARCHIVE_BYTES);
 
     let url = format!(
         "{}/instances/{}/snapshot",
@@ -163,11 +199,13 @@ async fn save(server: &str, instance_id: &str, output: &Path, ctx: &HttpContext)
         .bytes()
         .await
         .with_context(|| format!("streaming snapshot body from {url}"))?;
-    if bytes.len() as u64 > DEFAULT_MAX_DECOMPRESSED {
+    if bytes.len() as u64 > cap {
         return Err(anyhow::anyhow!(
-            "server returned {} bytes; refusing to write more than {} bytes to disk",
+            "server returned {} bytes; refusing to write more than {} bytes to disk \
+             (lower with --max-restore-bytes; the hard ceiling is {} bytes)",
             bytes.len(),
-            DEFAULT_MAX_DECOMPRESSED
+            cap,
+            DEFAULT_MAX_ARCHIVE_BYTES
         ));
     }
 
@@ -187,7 +225,7 @@ async fn restore(
     server: &str,
     input: &Path,
     as_instance: &str,
-    max_decompressed: u64,
+    max_archive_bytes: u64,
     ctx: &HttpContext,
 ) -> Result<()> {
     super::validate_server_url(server)?;
@@ -203,13 +241,14 @@ async fn restore(
             input.display()
         )));
     }
-    if meta.len() > max_decompressed {
+    if meta.len() > max_archive_bytes {
         return Err(local_err(format!(
-            "snapshot file {} is {} bytes; the configured cap is {} bytes \
-             (raise with --max-decompressed)",
+            "snapshot archive {} is {} bytes on disk; the configured cap is \
+             {} bytes (raise with --max-archive-bytes; note this bounds the \
+             *compressed* upload — decompressed size is enforced server-side)",
             input.display(),
             meta.len(),
-            max_decompressed
+            max_archive_bytes
         )));
     }
 

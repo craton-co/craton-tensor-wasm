@@ -577,7 +577,7 @@ _tensor-wasm() {
             return 0
             ;;
         tensor__subcmd__wasm__subcmd__snapshot__subcmd__restore)
-            opts="-h --input --as-instance --server --max-decompressed --tenant --help"
+            opts="-h --input --as-instance --server --max-archive-bytes --tenant --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -595,7 +595,7 @@ _tensor-wasm() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
-                --max-decompressed)
+                --max-archive-bytes)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -611,7 +611,7 @@ _tensor-wasm() {
             return 0
             ;;
         tensor__subcmd__wasm__subcmd__snapshot__subcmd__save)
-            opts="-h --instance --output --server --tenant --help"
+            opts="-h --instance --output --server --max-restore-bytes --tenant --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -626,6 +626,10 @@ _tensor-wasm() {
                     return 0
                     ;;
                 --server)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --max-restore-bytes)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
