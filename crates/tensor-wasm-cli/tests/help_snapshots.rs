@@ -72,3 +72,8 @@ fn snapshot_restore_help() {
 fn completions_help() {
     insta::assert_snapshot!("completions", help(&["completions", "--help"]));
 }
+
+#[test]
+fn serve_help() {
+    insta::assert_snapshot!("serve", help(&["serve", "--help"]));
+}

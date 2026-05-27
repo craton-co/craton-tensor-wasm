@@ -1,4 +1,5 @@
 #compdef tensor-wasm
+# NOTE: regenerate via `tensor-wasm completions zsh` after building.
 
 autoload -U is-at-least
 
@@ -154,6 +155,18 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(serve)
+_arguments "${_arguments_options[@]}" : \
+'--addr=[Address to bind the HTTP server to (e.g. 127.0.0.1\:8080, 0.0.0.0\:8080)]:ADDR:_default' \
+'*--token=[Bearer token accepted by the gateway. Repeat to allowlist multiple tokens]:TOKEN:_default' \
+'--tenant-header-policy=[Policy for the X-TensorWasm-Tenant header]:POLICY:(optional required)' \
+'*--cors-origin=[Origin to allow via CORS. Repeat for multiple origins]:ORIGIN:_default' \
+'--max-body-bytes=[Maximum inbound request body size, in bytes]:MAX_BODY_BYTES:_default' \
+'--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (completions)
 _arguments "${_arguments_options[@]}" : \
 '--out-dir=[Optional output directory. When provided, the script is written to \`<dir>/<conventional-name>\` (e.g. \`tensor-wasm.bash\`, \`_tensor-wasm\` for zsh, \`tensor-wasm.fish\`)]:OUT_DIR:_files' \
@@ -231,6 +244,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(serve)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (completions)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -262,6 +279,7 @@ _tensor-wasm_commands() {
 'snapshot:Save or restore an instance snapshot' \
 'metrics:Fetch and pretty-print Prometheus metrics from a TensorWasm server' \
 'observe:Live operator dashboard over \`/healthz\` + \`/metrics\` (refreshes in place)' \
+'serve:Run the TensorWasm HTTP API gateway in-process (binds and serves)' \
 'completions:Emit shell completion scripts for the named shell' \
 'man:Generate roff(7) man pages from the clap command tree' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -293,6 +311,7 @@ _tensor-wasm__subcmd__help_commands() {
 'snapshot:Save or restore an instance snapshot' \
 'metrics:Fetch and pretty-print Prometheus metrics from a TensorWasm server' \
 'observe:Live operator dashboard over \`/healthz\` + \`/metrics\` (refreshes in place)' \
+'serve:Run the TensorWasm HTTP API gateway in-process (binds and serves)' \
 'completions:Emit shell completion scripts for the named shell' \
 'man:Generate roff(7) man pages from the clap command tree' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -381,6 +400,16 @@ _tensor-wasm__subcmd__metrics_commands() {
 _tensor-wasm__subcmd__observe_commands() {
     local commands; commands=()
     _describe -t commands 'tensor-wasm observe commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__serve_commands] )) ||
+_tensor-wasm__subcmd__serve_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm serve commands' commands "$@"
+}
+(( $+functions[_tensor-wasm__subcmd__help__subcmd__serve_commands] )) ||
+_tensor-wasm__subcmd__help__subcmd__serve_commands() {
+    local commands; commands=()
+    _describe -t commands 'tensor-wasm help serve commands' commands "$@"
 }
 (( $+functions[_tensor-wasm__subcmd__run_commands] )) ||
 _tensor-wasm__subcmd__run_commands() {

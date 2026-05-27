@@ -1,6 +1,7 @@
+.\" NOTE: regenerate via `tensor-wasm man --out-dir crates/tensor-wasm-cli/man` after building.
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tensor-wasm 1  "tensor-wasm 0.3.1" 
+.TH tensor-wasm 1  "tensor-wasm 0.3.1"
 .SH NAME
 tensor\-wasm \- Developer CLI for Craton TensorWasm
 .SH SYNOPSIS
@@ -39,6 +40,9 @@ Fetch and pretty\-print Prometheus metrics from a TensorWasm server
 .TP
 tensor\-wasm\-observe(1)
 Live operator dashboard over `/healthz` + `/metrics` (refreshes in place)
+.TP
+tensor\-wasm\-serve(1)
+Run the TensorWasm HTTP API gateway in\-process (binds and serves)
 .TP
 tensor\-wasm\-completions(1)
 Emit shell completion scripts for the named shell

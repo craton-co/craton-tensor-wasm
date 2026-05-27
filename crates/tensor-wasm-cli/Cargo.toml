@@ -32,6 +32,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 base64 = "0.22"
 tensor-wasm-core = { path = "../tensor-wasm-core" }
 tensor-wasm-exec = { path = "../tensor-wasm-exec" }
+# Pulled in for `tensor-wasm serve` — the CLI subcommand stands up the api
+# crate's router in-process so the README quickstart `tensor-wasm serve
+# --addr 0.0.0.0:8080` works without an external binary.
+tensor-wasm-api = { path = "../tensor-wasm-api" }
+# `serve` binds the router via `axum::serve`; the api crate already
+# depends on axum 0.7 (workspace), so this is a transitive baseline we
+# need to declare explicitly here too.
+axum.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
