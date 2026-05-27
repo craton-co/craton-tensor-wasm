@@ -45,6 +45,43 @@ pub enum EmitError {
     /// Callers should treat this as "keep this function on the CPU path".
     #[error("PTX emission not yet implemented: {0}")]
     NotYetImplemented(&'static str),
+    /// The blueprint's `entry` field is not a valid PTX identifier.
+    ///
+    /// Today every legitimate caller constructs `entry` via
+    /// `format!("func{idx}")` so this can never fire — but the Pliron
+    /// `UserFuncName::Testcase` path can carry tenant-controlled bytes that
+    /// would otherwise be interpolated unescaped into the PTX template
+    /// (closing the kernel scope, emitting a second adversary kernel, etc.).
+    /// Closes jit S-1.
+    #[error("invalid PTX entry-name: {entry}")]
+    InvalidEntryName {
+        /// The rejected identifier (echoed for diagnostic purposes only —
+        /// callers MUST NOT include the value in untrusted-facing errors).
+        entry: String,
+    },
+}
+
+/// Maximum length of a PTX identifier (NVIDIA PTX ISA §A.3).
+pub const MAX_PTX_IDENTIFIER_LEN: usize = 1024;
+
+/// Returns `true` iff `s` matches `[A-Za-z_][A-Za-z0-9_$]*` and is no
+/// longer than [`MAX_PTX_IDENTIFIER_LEN`] bytes.
+///
+/// This is the validator that closes jit S-1 (PTX injection via guest-
+/// controlled entry name). Every value that ends up interpolated into
+/// the `.visible .entry {entry}(` template MUST be screened through this
+/// function first.
+#[must_use]
+pub fn is_valid_ptx_identifier(s: &str) -> bool {
+    if s.is_empty() || s.len() > MAX_PTX_IDENTIFIER_LEN {
+        return false;
+    }
+    let mut bytes = s.bytes();
+    let first = bytes.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
 }
 
 /// Default PTX target architecture.
@@ -239,6 +276,18 @@ pub fn emit_with(
     blueprint: &TensorWasmKernelBlueprint,
     cfg: &EmitConfig,
 ) -> Result<EmittedPtx, EmitError> {
+    // SECURITY (jit S-1): every `blueprint.entry` value reaches the PTX
+    // template unescaped through several `writeln!` sites below
+    // (`.visible .entry {entry}(`, `{entry}_param_in_ptr`, etc.). A
+    // tenant-controlled entry like `myfunc) … \n.entry attacker(...)`
+    // would close the kernel scope and emit a second kernel. Reject
+    // anything that isn't a well-formed PTX identifier BEFORE writing
+    // a byte of output.
+    if !is_valid_ptx_identifier(&blueprint.entry) {
+        return Err(EmitError::InvalidEntryName {
+            entry: blueprint.entry.clone(),
+        });
+    }
     // Rough estimate: ~64 B/op covers the per-op body line plus a fair share
     // of the fixed prologue/epilogue. Avoids grow-by-doubling reallocs on
     // the hot emit path.
