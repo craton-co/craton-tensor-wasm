@@ -12,12 +12,13 @@ The S22 runner runs **CUDA Toolkit 12.4** on **driver 550.54.15** under **Ubuntu
 4. [Verification commands](#verification-commands)
 5. [Feature-flag combinations](#feature-flag-combinations)
 6. [Using the cuda-oxide-backend feature](#using-the-cuda-oxide-backend-feature)
-7. [SM-level compatibility matrix](#sm-level-compatibility-matrix)
-8. [MPS quick-start](#mps-quick-start)
-9. [Troubleshooting](#troubleshooting)
-10. [One-shot verification script](#one-shot-verification-script)
-11. [Stub libraries for CI](#stub-libraries-for-ci)
-12. [Cross-references](#cross-references)
+7. [Using the cuda-oxide-host-backend feature](#using-the-cuda-oxide-host-backend-feature)
+8. [SM-level compatibility matrix](#sm-level-compatibility-matrix)
+9. [MPS quick-start](#mps-quick-start)
+10. [Troubleshooting](#troubleshooting)
+11. [One-shot verification script](#one-shot-verification-script)
+12. [Stub libraries for CI](#stub-libraries-for-ci)
+13. [Cross-references](#cross-references)
 
 ---
 
@@ -379,6 +380,124 @@ runner once the v0.4 parity work lands.
 - [`CUDA-KERNELS.md`](CUDA-KERNELS.md) — "Path C: Rust kernels via
   cuda-oxide" — the author-side kernel surface that the
   `#[cuda_module]` macro enables once the backend is wired.
+
+---
+
+## Using the cuda-oxide-host-backend feature
+
+`cuda-oxide-host-backend` (added in W4.1, 2026-05-27) is the
+**strict-superset** sibling of `cuda-oxide-backend`. Enabling it pulls
+in the four cuda-oxide host-side crates as git-pinned dependencies (pin
+SHA `4a56e4220aab8ce5d085a411e7f806cebb647d14`, matching the v0.1.0 tag)
+and switches `tensor_wasm_mem::cuda_oxide_backend::CudaOxideUnifiedBuffer`
+from the `NOT_YET_WIRED` sentinel-error scaffold to a real
+`cuMemAllocManaged`-backed allocation. The transitive crate set:
+
+| Crate | Role |
+|---|---|
+| `cuda-host` | Kernel launch helpers (`cuda_launch!`, `LtoIR` loader). |
+| `cuda-core` | RAII `CudaContext` / `CudaStream` / `CudaModule`. Re-exports the raw `cuda_bindings` as `cuda_core::sys` — the path `cuda_oxide_backend.rs` uses for `cuMemAllocManaged`, `cuMemPrefetchAsync`, `cuMemAdvise`, `cuMemFree_v2`. |
+| `cuda-device` | Device-side primitives (`DisjointSlice`, kernel attribute). Linked here for v0.4+ kernel-authoring follow-ups; not directly imported from `cuda_oxide_backend.rs` today. |
+| `cuda-macros` | `#[kernel]` and `cuda_launch!` / `cuda_launch_async!` proc-macros. Linked for the same v0.4+ rationale as `cuda-device`. |
+
+The pattern mirrors W3.3's `pliron-llvm-backend` on `tensor-wasm-jit`:
+the *base* feature (`cuda-oxide-backend`) is intentionally dep-less so
+contributor boxes without a CUDA Toolkit or `libclang` can still build
+the scaffold, and the *superset* feature (`cuda-oxide-host-backend`)
+adds the heavyweight git deps that need a full toolchain.
+
+### Toolchain prerequisites
+
+The `cuda-bindings` build script invokes `bindgen` against `<cuda.h>`,
+which needs **both** of:
+
+| Prerequisite | Linux | Windows |
+|---|---|---|
+| CUDA Toolkit (provides `<cuda.h>`, `libcuda.so` / `nvcuda.dll`) | `cuda-toolkit-12-4` (see [Install commands](#install-commands)) | NVIDIA CUDA installer (Option A/B/C, see above) |
+| `libclang` (for `bindgen`) | `sudo apt-get install -y libclang-dev` | `winget install LLVM.LLVM` (installs `libclang.dll` at `C:\Program Files\LLVM\bin\`) |
+| `LIBCLANG_PATH` env var | usually unnecessary; `libclang-dev` puts the SO on `LD_LIBRARY_PATH` | required: `setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"` |
+| `CUDA_TOOLKIT_PATH` env var (`cuda-bindings` reads this; defaults to `/usr/local/cuda`) | usually unnecessary on the default Linux install | required: `setx CUDA_TOOLKIT_PATH "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"` |
+
+The workspace nightly pin (`nightly-2026-04-03`, see
+[`rust-toolchain.toml`](../rust-toolchain.toml)) is the same nightly
+cuda-oxide itself pins, so no `RUSTUP_TOOLCHAIN` override is required
+on the default workspace toolchain.
+
+### Linux / WSL2 install
+
+```bash
+# CUDA Toolkit + driver — see Install commands above
+sudo apt-get install -y cuda-toolkit-12-4 build-essential
+
+# libclang for bindgen
+sudo apt-get install -y libclang-dev
+
+# verify
+ls /usr/lib/llvm-*/lib/libclang.so* | head -1   # should print at least one path
+echo "$CUDA_ROOT"                                # should resolve to /usr/local/cuda
+```
+
+If `libclang.so` lives outside the default search path, export
+`LIBCLANG_PATH`:
+
+```bash
+export LIBCLANG_PATH=/usr/lib/llvm-14/lib
+```
+
+### Windows 11 install
+
+```powershell
+# CUDA Toolkit — see Install commands above for Option A/B/C
+winget install --id Nvidia.CUDA --version 12.4.1 --accept-package-agreements --accept-source-agreements
+
+# LLVM (provides libclang.dll)
+winget install LLVM.LLVM --accept-package-agreements --accept-source-agreements
+
+# Persistent env vars (close + reopen the shell after)
+setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"
+setx CUDA_TOOLKIT_PATH "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+```
+
+### Build invocation
+
+From the repository root:
+
+```bash
+# Compile-only check (what CI's cuda-host runner runs)
+cargo check -p tensor-wasm-mem --features cuda-oxide-host-backend
+
+# Full build
+cargo build -p tensor-wasm-mem --features cuda-oxide-host-backend
+
+# Hardware-gated tests (requires a CUDA-capable GPU)
+cargo test -p tensor-wasm-mem --features cuda-oxide-host-backend \
+    --test cuda_oxide_smoke -- --ignored
+```
+
+The `--features tensor-wasm-mem/cuda-oxide-host-backend` form works
+identically from the workspace root:
+
+```bash
+cargo build --workspace --features tensor-wasm-mem/cuda-oxide-host-backend
+```
+
+### Failure modes
+
+| Error | Root cause | Fix |
+|---|---|---|
+| `Unable to find libclang: "couldn't find any valid shared libraries matching: ['clang.dll', 'libclang.dll']"` | `LIBCLANG_PATH` unset or points at a directory missing `libclang.dll`/`libclang.so`. | Install LLVM (see above) and `setx LIBCLANG_PATH ...` on Windows / `export LIBCLANG_PATH=...` on Linux. |
+| `fatal error: 'cuda.h' file not found` from `bindgen` | `CUDA_TOOLKIT_PATH` not set (or `cuda.h` not under `$CUDA_TOOLKIT_PATH/include`). | `setx CUDA_TOOLKIT_PATH ...` on Windows; verify `ls $CUDA_TOOLKIT_PATH/include/cuda.h` on Linux. |
+| `error: linker 'link.exe' not found` (Windows) | Visual Studio Build Tools not installed / not on `PATH`. | Open an `x64 Native Tools Command Prompt for VS 2022` (or run `vcvars64.bat`) before invoking `cargo`. |
+| `error[E0432]: unresolved import cuda_core::sys` | Stale `Cargo.lock` from before W4.1; the pinned rev did not include `cuda-core`. | `cargo update -p cuda-core --precise <pin>` or delete `Cargo.lock` and let cargo resolve afresh. |
+
+### What CI runs
+
+The `cuda-oxide-host-backend-check` job in `.github/workflows/ci.yml`
+runs `cargo check -p tensor-wasm-mem --features cuda-oxide-host-backend`
+on a runner image that pre-installs CUDA Toolkit 12.4 + LLVM 18. The
+existing CUDA-stub runners are untouched. Hardware-gated tests (the
+`#[ignore = "requires CUDA hardware"]` set in
+`tests/cuda_oxide_smoke.rs`) run on the S22 self-hosted runner only.
 
 ---
 
