@@ -39,3 +39,5 @@ pub mod reject_list;
 pub mod lower_signature;
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod lowering_builder;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lowering_errors;
