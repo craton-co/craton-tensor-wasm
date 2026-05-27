@@ -211,6 +211,21 @@ mod backing_impl {
             // returned `UnifiedError::Allocation` otherwise.
             let ptr = NonNull::new(buf.as_ptr() as *mut u8)
                 .ok_or_else(|| UnifiedError::Allocation("cudarc returned null".into()))?;
+            // Cross-tenant data-leak mitigation (audit H2): the CUDA driver's
+            // `cuMemAllocManaged` does not zero-initialise the returned region,
+            // unlike `cust::memory::UnifiedBuffer::new(&0u8, size)` on the cust
+            // path or `vec![0u8; size]` on the heap path. Zero the entire
+            // allocation here so every backing presents the same "fresh memory
+            // is zero" contract to upstream callers (notably
+            // `TensorWasmLinearMemory` and `UnifiedMemoryPool`).
+            //
+            // SAFETY: `ptr` is non-null and points to exactly `size` valid
+            // bytes of managed memory we just allocated; no other thread can
+            // hold an alias because we have not yet returned the buffer to the
+            // caller.
+            unsafe {
+                std::ptr::write_bytes(ptr.as_ptr(), 0u8, size);
+            }
             Ok((ptr, Backing::Cudarc(buf)))
         }
     }
