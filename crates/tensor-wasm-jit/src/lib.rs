@@ -43,3 +43,5 @@ pub mod lowering_builder;
 pub mod lowering_errors;
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod blueprint_adapter;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lowering_driver;
