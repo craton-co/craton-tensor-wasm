@@ -97,7 +97,11 @@ async fn malformed_ptx_returns_negative_code() {
     let mut store = wasmtime::Store::new(
         &engine,
         TestStore {
-            cuda: WasiCudaContext::new(InstanceId(1)),
+            cuda: {
+                let mut c = WasiCudaContext::new(InstanceId(1));
+                c.enable_wasi_cuda();
+                c
+            },
         },
     );
     let instance = linker
@@ -132,7 +136,11 @@ async fn launch_unknown_kernel_returns_invalid_kernel_code() {
     let mut store = wasmtime::Store::new(
         &engine,
         TestStore {
-            cuda: WasiCudaContext::new(InstanceId(7)),
+            cuda: {
+                let mut c = WasiCudaContext::new(InstanceId(7));
+                c.enable_wasi_cuda();
+                c
+            },
         },
     );
     let instance = linker
@@ -159,7 +167,11 @@ async fn sync_returns_ok_without_cuda() {
     let mut store = wasmtime::Store::new(
         &engine,
         TestStore {
-            cuda: WasiCudaContext::new(InstanceId(2)),
+            cuda: {
+                let mut c = WasiCudaContext::new(InstanceId(2));
+                c.enable_wasi_cuda();
+                c
+            },
         },
     );
     let instance = linker
@@ -222,8 +234,9 @@ async fn launch_over_back_pressure_cap_returns_quota_exceeded() {
     let wasm = wat::parse_str(WASI_CUDA_WAT).unwrap();
     let module = wasmtime::Module::new(&engine, &wasm).expect("compile");
 
-    let ctx =
+    let mut ctx =
         WasiCudaContext::with_back_pressure(InstanceId(11), Arc::new(BackPressure::with_cap(0)));
+    ctx.enable_wasi_cuda();
     // Register a kernel directly in the context's registry so the launch
     // path gets past the kernel-lookup gate and actually hits the
     // back-pressure check. The first id handed out is 1, matching
@@ -323,7 +336,11 @@ async fn last_error_copy_writes_message_into_wasm_memory() {
     let mut store = wasmtime::Store::new(
         &engine,
         TestStore {
-            cuda: WasiCudaContext::new(InstanceId(99)),
+            cuda: {
+                let mut c = WasiCudaContext::new(InstanceId(99));
+                c.enable_wasi_cuda();
+                c
+            },
         },
     );
     let instance = linker

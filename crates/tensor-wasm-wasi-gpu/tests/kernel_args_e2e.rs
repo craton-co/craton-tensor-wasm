@@ -281,7 +281,8 @@ fn register_real_kernel(
 async fn scalar_argv_round_trips_through_launch_path() {
     let (engine, linker) = make_engine_and_linker();
     let owner = InstanceId(301);
-    let ctx = WasiCudaContext::new(owner);
+    let mut ctx = WasiCudaContext::new(owner);
+    ctx.enable_wasi_cuda();
     let kid = register_stub_kernel(&ctx, owner, "scalar_kernel");
 
     let expected = vec![
@@ -343,7 +344,8 @@ async fn scalar_argv_round_trips_through_launch_path() {
 async fn pointer_argv_round_trips_through_launch_path() {
     let (engine, linker) = make_engine_and_linker();
     let owner = InstanceId(302);
-    let ctx = WasiCudaContext::new(owner);
+    let mut ctx = WasiCudaContext::new(owner);
+    ctx.enable_wasi_cuda();
     let kid = register_stub_kernel(&ctx, owner, "pointer_kernel");
 
     // Two pointer args: one at offset 256 (length 64), one at offset
@@ -426,7 +428,8 @@ async fn pointer_argv_round_trips_through_launch_path() {
 async fn pointer_argv_out_of_bounds_returns_invalid_pointer() {
     let (engine, linker) = make_engine_and_linker();
     let owner = InstanceId(303);
-    let ctx = WasiCudaContext::new(owner);
+    let mut ctx = WasiCudaContext::new(owner);
+    ctx.enable_wasi_cuda();
     let kid = register_stub_kernel(&ctx, owner, "oob_ptr_kernel");
 
     // Guest pointer at offset (4 pages == 256 KiB) is past the memory
@@ -481,7 +484,8 @@ async fn scalar_argv_real_cuda_launch() {
     // the CUDA-only step is the kernel-runs-and-mutates-output check.
     let (engine, linker) = make_engine_and_linker();
     let owner = InstanceId(401);
-    let ctx = WasiCudaContext::new(owner);
+    let mut ctx = WasiCudaContext::new(owner);
+    ctx.enable_wasi_cuda();
     let kid = register_stub_kernel(&ctx, owner, "scalar_add");
     let argv = encode_argv(&[LoweredArg::I32(2), LoweredArg::I32(3)]);
     let wat = build_launch_wat(&argv, 1024, kid);
@@ -516,7 +520,8 @@ async fn scalar_argv_real_cuda_launch() {
 async fn pointer_argv_real_cuda_launch() {
     let (engine, linker) = make_engine_and_linker();
     let owner = InstanceId(402);
-    let ctx = WasiCudaContext::new(owner);
+    let mut ctx = WasiCudaContext::new(owner);
+    ctx.enable_wasi_cuda();
     let kid = register_stub_kernel(&ctx, owner, "pointer_copy");
     let argv = encode_argv(&[
         LoweredArg::Ptr {
@@ -634,7 +639,8 @@ async fn vector_add_end_to_end_real_ptx_real_kernel() {
 
         let (engine, linker) = make_engine_and_linker();
         let owner = InstanceId(403);
-        let ctx = WasiCudaContext::new(owner);
+        let mut ctx = WasiCudaContext::new(owner);
+        ctx.enable_wasi_cuda();
         let (kid, loaded) = register_real_kernel(&ctx, owner, "vector_add", VECTOR_ADD_PTX);
         if !loaded {
             eprintln!(
@@ -775,7 +781,8 @@ async fn dispatch_pipeline_compiles_against_real_module_bytes() {
 
     let (engine, linker) = make_engine_and_linker();
     let owner = InstanceId(404);
-    let ctx = WasiCudaContext::new(owner);
+    let mut ctx = WasiCudaContext::new(owner);
+    ctx.enable_wasi_cuda();
 
     #[cfg(feature = "cuda")]
     let kid = {
