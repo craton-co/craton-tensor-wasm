@@ -20,6 +20,5 @@ External crates (pinned at workspace root):
 - `tokio` — async runtime for context lifecycle tasks.
 - `thiserror` — derive macro for tenant-level errors.
 - `tracing` — structured spans/events for context create/destroy and the underflow / pop-failure warnings.
-- `parking_lot` — fast mutexes guarding registry state.
-- `dashmap` — concurrent map of `TenantId` to `Arc<TenantContext>`.
+- `dashmap` — concurrent map of `TenantId` to `Arc<TenantContext>`; combined with the `AtomicU64` counters on `TenantContext`, this is the entirety of the registry's concurrency story — there are no mutexes on the hot path.
 - `cust` (optional, behind the `cuda` feature) — CUDA driver-API bindings; provides the primary-context API used by `ContextIsolated` tenants.

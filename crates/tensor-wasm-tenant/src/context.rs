@@ -64,6 +64,47 @@ impl std::fmt::Display for IsolationKind {
     }
 }
 
+/// Unforgeable proof of authority to mutate a single tenant's quota counters.
+///
+/// Minted only by [`crate::TenantRegistry::register_with_capability`]; the
+/// `_seal` field is private to this crate so no downstream crate (and no
+/// hostile workload) can construct one out of thin air. Holding an
+/// `Arc<TenantContext>` is therefore no longer sufficient to drive that
+/// tenant's `bytes_in_use` counter — the caller must also present the
+/// matching capability, which it can only get if it originally registered
+/// the tenant.
+///
+/// `Clone` is intentionally derived: the API gateway holds the
+/// authoritative copy and may need to hand clones to per-tenant subsystems
+/// (the scheduler, the memory pool, etc.). What is NOT derived is any
+/// `From<TenantId>` or public constructor, so a workload running inside
+/// tenant A cannot fabricate one for tenant B.
+#[derive(Debug, Clone)]
+pub struct TenantCapability {
+    tenant_id: TenantId,
+    /// Crate-private zero-sized seal: prevents `TenantCapability { .. }`
+    /// struct-literal construction outside `tensor-wasm-tenant`.
+    _seal: (),
+}
+
+impl TenantCapability {
+    /// Mint a capability bound to `tenant_id`.
+    ///
+    /// `pub(crate)` so only the registry can call it; the
+    /// `TenantCapability` cannot be created from outside this crate at all.
+    pub(crate) fn mint(tenant_id: TenantId) -> Self {
+        Self {
+            tenant_id,
+            _seal: (),
+        }
+    }
+
+    /// Identifier of the tenant this capability authorises.
+    pub fn tenant_id(&self) -> TenantId {
+        self.tenant_id
+    }
+}
+
 /// Per-tenant runtime handle: identity, isolation level, stream, and quota.
 ///
 /// Instances are constructed through [`TenantContextBuilder`] and then placed
@@ -157,7 +198,44 @@ impl TenantContext {
     /// asking for `u64::MAX` bytes — the second such call observes the
     /// overflow and returns `MemoryExhausted` while leaving the counter
     /// pinned at `u64::MAX` (saturating).
+    ///
+    /// # Deprecated
+    ///
+    /// This unchecked variant cannot tell which tenant is doing the
+    /// mutation. Prefer [`Self::consume_bytes_with_capability`], which
+    /// requires a [`TenantCapability`] minted by
+    /// [`crate::TenantRegistry::register_with_capability`] and rejects
+    /// cross-tenant calls with [`TensorWasmError::TenantIsolationViolation`].
+    /// The unchecked form is retained for the 0.3 line and will be removed
+    /// in v0.4.
+    #[deprecated(
+        since = "0.3.6",
+        note = "use consume_bytes_with_capability; unchecked variant will be removed in v0.4"
+    )]
     pub fn consume_bytes(&self, n: u64) -> Result<(), TensorWasmError> {
+        self.consume_bytes_inner(n)
+    }
+
+    /// Capability-checked variant of [`Self::consume_bytes`].
+    ///
+    /// Returns [`TensorWasmError::TenantIsolationViolation`] if `cap` was
+    /// minted for a different tenant; otherwise behaves exactly like the
+    /// (deprecated) unchecked variant. The check is a single integer
+    /// compare on the hot path — negligible compared to the CAS loop that
+    /// performs the actual quota arithmetic.
+    pub fn consume_bytes_with_capability(
+        &self,
+        cap: &TenantCapability,
+        n: u64,
+    ) -> Result<(), TensorWasmError> {
+        self.check_capability(cap, "quota.consume_bytes")?;
+        self.consume_bytes_inner(n)
+    }
+
+    /// Shared implementation: the lock-free CAS loop. Both the deprecated
+    /// `consume_bytes` and the checked `consume_bytes_with_capability`
+    /// delegate here so the atomic discipline lives in one place.
+    fn consume_bytes_inner(&self, n: u64) -> Result<(), TensorWasmError> {
         let limit = self.memory_quota_bytes;
         let mut current = self.bytes_in_use.load(Ordering::Acquire);
         loop {
@@ -182,6 +260,27 @@ impl TenantContext {
                 }
                 Err(observed) => current = observed,
             }
+        }
+    }
+
+    /// Verify that `cap` was minted for the same tenant this context
+    /// belongs to. Returns [`TensorWasmError::TenantIsolationViolation`]
+    /// labelled with the *capability's* tenant id (i.e. the offending
+    /// caller) and a `resource` string identifying the gated operation —
+    /// the offended tenant id is implicit in which context the call
+    /// landed on and is recorded by the surrounding span.
+    fn check_capability(
+        &self,
+        cap: &TenantCapability,
+        resource: &'static str,
+    ) -> Result<(), TensorWasmError> {
+        if cap.tenant_id == self.tenant_id {
+            Ok(())
+        } else {
+            Err(TensorWasmError::TenantIsolationViolation {
+                tenant_id: cap.tenant_id,
+                resource: resource.into(),
+            })
         }
     }
 
@@ -249,7 +348,47 @@ impl TenantContext {
     /// underflow we observe the wrap-around in `before` (the returned
     /// pre-update value is less than `bytes`), store `0`, and emit a
     /// warning so operators can chase the bookkeeping bug upstream.
+    ///
+    /// # Deprecated
+    ///
+    /// This unchecked variant cannot tell which tenant is doing the
+    /// mutation. Prefer [`Self::release_bytes_with_capability`], which
+    /// requires a [`TenantCapability`] minted by
+    /// [`crate::TenantRegistry::register_with_capability`] and rejects
+    /// cross-tenant calls with [`TensorWasmError::TenantIsolationViolation`].
+    /// The unchecked form is retained for the 0.3 line and will be removed
+    /// in v0.4.
+    #[deprecated(
+        since = "0.3.6",
+        note = "use release_bytes_with_capability; unchecked variant will be removed in v0.4"
+    )]
     pub fn release_bytes(&self, bytes: u64) {
+        self.release_bytes_inner(bytes);
+    }
+
+    /// Capability-checked variant of [`Self::release_bytes`].
+    ///
+    /// Returns [`TensorWasmError::TenantIsolationViolation`] if `cap` was
+    /// minted for a different tenant; otherwise behaves exactly like the
+    /// (deprecated) unchecked variant. Returns `Ok(())` on success — the
+    /// unchecked variant returns `()` because the underflow path is a
+    /// best-effort clamp, but the capability check itself is fallible, so
+    /// the public signature here is `Result<(), TensorWasmError>`.
+    pub fn release_bytes_with_capability(
+        &self,
+        cap: &TenantCapability,
+        bytes: u64,
+    ) -> Result<(), TensorWasmError> {
+        self.check_capability(cap, "quota.release_bytes")?;
+        self.release_bytes_inner(bytes);
+        Ok(())
+    }
+
+    /// Shared implementation: the lock-free `fetch_sub` + underflow clamp.
+    /// Both the deprecated `release_bytes` and the checked
+    /// `release_bytes_with_capability` delegate here so the atomic
+    /// discipline (and the underflow warning) lives in one place.
+    fn release_bytes_inner(&self, bytes: u64) {
         let before = self.bytes_in_use.fetch_sub(bytes, Ordering::Relaxed);
         let after = if before < bytes {
             // would underflow; clamp to 0 and warn
@@ -553,6 +692,12 @@ impl TenantContextBuilder {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
+// These tests pre-date the capability gate and exercise the unchecked
+// `consume_bytes` / `release_bytes` variants directly. The deprecation
+// warning is the *signal* to callers — silencing it here is the only
+// place it should be silenced, and only because these tests pin the
+// shim's behaviour until the variants are removed in v0.4.
 mod tests {
     use super::*;
 

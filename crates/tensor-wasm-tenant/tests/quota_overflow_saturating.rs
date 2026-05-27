@@ -12,6 +12,13 @@
 //! Crucially, the counter must remain at `u64::MAX` after the failed
 //! second call. A buggy CAS loop could leave it lower than that.
 
+#![allow(deprecated)]
+// Exercises the unchecked `consume_bytes` shim deliberately — the
+// overflow-saturation contract must hold for the deprecated path until
+// v0.4 removes it. The capability-checked variant shares the same inner
+// implementation (`consume_bytes_inner`) so this test transitively
+// covers it too.
+
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_tenant::TenantContext;

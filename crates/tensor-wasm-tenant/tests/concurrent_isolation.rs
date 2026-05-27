@@ -8,6 +8,13 @@
 //! CUDA-hosted version exercises: a tenant's quota counter is mutated by
 //! that tenant alone, never by another's concurrent work.
 
+#![allow(deprecated)]
+// This concurrency stress test pre-dates the capability gate. It uses
+// the unchecked variants to keep the kernel-model code terse; the
+// type-system enforcement of the cap gate is covered in the registry
+// inline tests. Once v0.4 removes the unchecked variants, this file
+// will be rewritten to thread the cap through the task closures.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 

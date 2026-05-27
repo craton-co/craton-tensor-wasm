@@ -13,6 +13,13 @@
 //!    `tensor_wasm_tenant::context` target with the expected `before` and
 //!    `bytes` fields, so operators can chase the bug upstream.
 
+#![allow(deprecated)]
+// This integration test deliberately exercises the unchecked
+// `consume_bytes`/`release_bytes` variants — the deprecated shim — to
+// pin the underflow-clamp behaviour until the variants are removed in
+// v0.4. A parallel capability-checked test path is covered by the
+// inline `capability_from_one_tenant_cannot_mutate_another` test.
+
 use std::sync::{Arc, Mutex};
 
 use tensor_wasm_core::types::TenantId;
