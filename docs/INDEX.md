@@ -161,6 +161,7 @@ need more than ~8 co-located tenants on one GPU.
 | [MPS-SETUP.md](MPS-SETUP.md) | — | NVIDIA MPS daemon startup, capabilities, limits, and the runtime probe TensorWasm uses to decide between MPS-shared and per-tenant CUDA contexts. |
 | [AUTO-OFFLOAD.md](AUTO-OFFLOAD.md) | — | User-facing reference for which Wasm patterns the auto-offload JIT recognises and how to enable it (also listed under Architecture). |
 | [CUDA-KERNELS.md](CUDA-KERNELS.md) | W4.5 | Practical guide for developers writing CUDA kernels that load and dispatch under TensorWasm's `wasi:cuda` surface, covering both explicit and auto-offload paths. |
+| [PLIRON-PIPELINE.md](PLIRON-PIPELINE.md) | — | Four-wave implementation plan for the Pliron-based auto-offload pipeline (Wasm to PTX via the interim `LoweredOp` IR and cuda-oxide), companion to RFC 0001. |
 
 ## Operations
 
