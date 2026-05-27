@@ -657,9 +657,14 @@ async fn run_invoke(
 ///
 /// The tenant id is sourced from the `X-TensorWasm-Tenant` middleware
 /// extension; absent it defaults to `TenantId(0)`.
+///
+/// Body parsing intentionally omitted (api S-31): /invoke currently
+/// accepts no per-call arguments; the body will be re-added with a strict
+/// schema when argument passing lands. Until then, accepting any body
+/// would be a wasted-CPU DoS surface.
 #[tracing::instrument(
     name = "http.invoke_function",
-    skip(state, auth, _args),
+    skip(state, auth),
     fields(
         function_id = %id,
         tenant = tracing::field::Empty,
@@ -670,7 +675,6 @@ pub async fn invoke_function(
     Path(id): Path<Uuid>,
     tenant: Option<Extension<TenantId>>,
     auth: Option<Extension<crate::rate_limit::AuthContext>>,
-    _args: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
     tracing::Span::current().record("tenant", tracing::field::display(tenant));
@@ -757,9 +761,14 @@ impl Drop for JobsActiveGuard {
 /// task updates the registry to `Completed` (with the JSON result) or
 /// `Failed` (with `{kind, message}`) on conclusion. Callers poll via
 /// `GET /jobs/{id}`.
+///
+/// Body parsing intentionally omitted (api S-31): /invoke currently
+/// accepts no per-call arguments; the body will be re-added with a strict
+/// schema when argument passing lands. Until then, accepting any body
+/// would be a wasted-CPU DoS surface.
 #[tracing::instrument(
     name = "http.invoke_function_async",
-    skip(state, auth, _args),
+    skip(state, auth),
     fields(
         function_id = %id,
         tenant = tracing::field::Empty,
@@ -771,7 +780,6 @@ pub async fn invoke_function_async(
     Path(id): Path<Uuid>,
     tenant: Option<Extension<TenantId>>,
     auth: Option<Extension<crate::rate_limit::AuthContext>>,
-    _args: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
     tracing::Span::current().record("tenant", tracing::field::display(tenant));
