@@ -127,20 +127,29 @@ impl KernelCache {
         // Safety net for the rare burst case where two concurrent `put`s
         // both insert without either triggering LRU's internal eviction
         // (because they raced on the lock). Drive storage back under cap.
-        while self.storage.len() > self.capacity {
-            let popped = self.lru.lock().pop_lru();
-            match popped {
-                Some((evict_key, ())) => {
-                    self.storage.remove(&evict_key);
-                }
-                None => {
-                    tracing::error!(
-                        target: "tensor_wasm_jit::cache",
-                        storage_len = self.storage.len(),
-                        capacity = self.capacity,
-                        "cache storage exceeds capacity but eviction queue is empty"
-                    );
-                    break;
+        //
+        // Hold the `lru` lock across the entire eviction loop instead of
+        // taking and releasing it on every iteration: a tight burst of
+        // overflow eviction used to lock-unlock the mutex `N` times,
+        // letting unrelated readers/writers contend on each pass. One
+        // acquisition costs the same as one iteration's lock+unlock but
+        // dispatches the whole burst in a single critical section.
+        if self.storage.len() > self.capacity {
+            let mut lru = self.lru.lock();
+            while self.storage.len() > self.capacity {
+                match lru.pop_lru() {
+                    Some((evict_key, ())) => {
+                        self.storage.remove(&evict_key);
+                    }
+                    None => {
+                        tracing::error!(
+                            target: "tensor_wasm_jit::cache",
+                            storage_len = self.storage.len(),
+                            capacity = self.capacity,
+                            "cache storage exceeds capacity but eviction queue is empty"
+                        );
+                        break;
+                    }
                 }
             }
         }
