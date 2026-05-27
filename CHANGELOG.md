@@ -343,6 +343,194 @@ checkout` the day v0.2 ships.
 ## [Unreleased]
 _No entries yet — open the next PR adding one._
 
+## [0.3.6] - 2026-05-27
+
+Hardening + correctness wave. Forty-plus surgical landings across
+`mem`, `exec`, `jit`, `wasi-gpu`, `api`, `tenant`, `snapshot`, `cli`,
+and the build / docs surface. No new feature surface area; existing
+surfaces tightened. Headline items: a tenant-quota capability gate
+that closes the cross-tenant quota-mutation attack surface, several
+silent-corruption-class JIT and exec fixes, constant-time bearer
+comparison on the API path, and the first batch of fuzz targets for
+snapshot restore + argv parsing + wasm rewrite + pool allocation.
+
+### Added
+- `tensor-wasm-tenant` — `TenantCapability` newtype + `TenantRegistry::register_with_capability`.
+  Unforgeable proof-of-authority gate on quota mutation; closes the
+  cross-tenant attack surface where any holder of an
+  `Arc<TenantContext>` could mutate any tenant's `bytes_in_use`. The
+  unchecked `consume_bytes` / `release_bytes` are retained as
+  `#[deprecated]` shims; targeted for removal in v0.4.
+- `tensor-wasm-api` — `CorsLayer` with an explicit origin allowlist,
+  configured via the new `TENSOR_WASM_API_CORS_ALLOWED_ORIGINS`
+  environment variable. Empty / unset = no cross-origin requests
+  permitted (previous default behavior; now explicit).
+- `tensor-wasm-snapshot` — `SnapshotReader::restore` now validates
+  `metadata.total_uncompressed_bytes` against the actual sum of
+  decompressed blob sizes; mismatches fail the restore rather than
+  silently returning a truncated state.
+- `tensor-wasm-exec` — per-call epoch deadline re-arm. Second and
+  subsequent calls on the same `TensorWasmInstance` no longer inherit
+  the first call's residual epoch budget; each `call` re-arms the
+  deadline so timeout numbers correspond to wall-clock per-call work.
+- `fuzz/` — four new libfuzzer targets: `fuzz_snapshot_restore`
+  (already had a target; corpus extended), `fuzz_parse_argv`,
+  `fuzz_rewrite_wasm`, `fuzz_pool_allocate`. Each wired into the
+  nightly `fuzz.yml` matrix and the weekly long-form cron from C4.
+- `SUPPORT.md`, `CITATION.cff`, `docs/glossary.md` — community
+  scaffolding: where to file what, how to cite the project in
+  academic work, single-source glossary of project-specific terms.
+- `.github/CODEOWNERS` — team-based review routing
+  (`@craton-co/maintainers` default; `@craton-co/security` on
+  security-sensitive paths; `@craton-co/release` co-owning `Cargo.toml`
+  and `CHANGELOG.md`). Uses teams (not individuals) so the file does
+  not need editing every time the maintainer roster changes.
+- `tensor-wasm-tenant` — `isolation_downgrade_count()` process-wide
+  counter exposed for operators that requested `ContextIsolated` and
+  need to alert on any silent downgrade to `StreamIsolated`.
+
+### Changed
+- `wasi-cuda` — host import-module bumped from `wasi:cuda/host@0.1.0`
+  to `wasi:cuda/host@0.2.0` to match the `wit/wasi-cuda.wit` package
+  version bumped in v0.3.4 (C7). Guests built against the older
+  module name will fail to link and must be re-built; the new
+  module name is the W1.1 typed-argv contract.
+- `tensor-wasm-cli` — `--max-decompressed` renamed to
+  `--max-archive-bytes` on `snapshot restore`. The old flag name is
+  retained as a deprecated alias that emits a one-line warning and
+  forwards to the new flag; removal target v1.0. Documentation,
+  shell completions, and help-output snapshots all updated.
+- `tensor-wasm-exec` — module cache key widened from a truncated
+  `u64` (first 8 bytes of BLAKE3) to the full `[u8; 32]` digest.
+  Collision probability drops from ~birthday-bound at 2^32 cached
+  modules to cryptographically infeasible.
+- `tensor-wasm-mem` — `UnifiedBuffer` no longer `memset`s the entire
+  allocation on the cust path. Only the Wasm-visible window
+  (`0..len`) is zero-filled at construction; the post-`len` tail
+  (rounded up to page boundary) is left uninitialized, matching
+  what Wasmtime's `MemoryCreator` contract actually requires and
+  saving up to one page of zeroing per allocation. Cust-path leak
+  counter added so the test suite can pin no-leak invariants under
+  the new code path.
+- `tensor-wasm-api` — bearer-token comparison rewritten to use
+  `subtle::ConstantTimeEq` instead of `==`. Timing-leakable byte-wise
+  comparison is gone; tokens of different lengths now also
+  constant-time-compared to the same length (the length itself is
+  no longer a side channel).
+- `tensor-wasm-api` — body-limit middleware standardized on axum's
+  `DefaultBodyLimit::max(...)` (was a mix of axum's limit and a
+  separate `tower-http` request-body limit; the tower-http variant
+  had a 32 MiB default that silently undercut the documented 256 MiB
+  cap). Documentation in `API.md` and the openapi schema aligned to
+  the single value.
+- `tensor-wasm-tenant` — `release_bytes` reimplemented as a CAS loop
+  computing `saturating_sub`. The previous `fetch_sub` + post-hoc
+  `store(0)` shape was racy under concurrent `consume_bytes`.
+
+### Deprecated
+- `tensor-wasm-tenant::TenantContext::consume_bytes` and
+  `release_bytes` — use `consume_bytes_with_capability` and
+  `release_bytes_with_capability` with the `TenantCapability` minted
+  by `TenantRegistry::register_with_capability`. Removal target v0.4.
+
+### Fixed
+- `tensor-wasm-mem::pinned_host` — integer overflow guard on the
+  `usable + 2 * page` size computation. Previously a sufficiently
+  large `usable` could wrap around silently and allocate a buffer
+  smaller than the caller asked for.
+- `tensor-wasm-mem::cudarc_backend` — `OnceLock` race fix.
+  Concurrent first-time initialisation could lose the CUDA primary
+  context and silently release the device on the losing thread;
+  now `set_or_take`-shaped so the winner's context is the one that
+  sticks.
+- `tensor-wasm-exec` — JIT scratch arena no longer overlaps the
+  guest's static data sections. The arena was previously placed in
+  the same linear-memory page range as guest globals; tight loops
+  could observe scratch writes as data corruption.
+- `tensor-wasm-exec` — `ResourceLimiter::table_growing` now caps
+  growth at the configured `engine_max_table_bytes` value (was:
+  caps at the per-table element count, which let large element
+  sizes exceed the byte budget).
+- `tensor-wasm-wasi-gpu` — pointer aliasing across `.await` fixed
+  in the kernel-launch path. Argv lowering and dispatch now resolve
+  inside the same critical section so a concurrent `wasi_cuda_launch`
+  on the same instance cannot observe a half-lowered argv vector.
+- `tensor-wasm-wasi-gpu` — every host function (`wasi_cuda_load_ptx`,
+  `wasi_cuda_launch`, `wasi_cuda_sync`, `wasi_cuda_last_error_*`)
+  now gated behind an explicit `WasiCudaCapability` rather than
+  unconditionally linked into every instance. Workloads that did
+  not opt into `wasi-cuda` no longer see the imports.
+- `tensor-wasm-jit` — `MatMul` PTX emission returns
+  `JitError::NotYetImplemented` instead of producing a structurally
+  broken `wmma` kernel. The previous emitter generated PTX that
+  passed `ptxas` but produced wrong results at SM_80; the explicit
+  error surfaces the gap at compile time.
+- `tensor-wasm-jit` — rewrite trampoline now traps on a nonzero
+  dispatch result. Previously a nonzero return from the host
+  dispatch was silently dropped and the guest continued as if the
+  call had succeeded.
+- `tensor-wasm-jit` — rewrite arithmetic uses `checked_add` /
+  `checked_mul` throughout. Overflow in the trampoline math is
+  now a trap rather than a silent wrap.
+- `tensor-wasm-jit` — `KernelCache` eviction holds the LRU lock
+  across the eviction loop instead of dropping and re-acquiring on
+  every iteration. Closes a window where two threads could both
+  observe the same victim and double-free.
+- `tensor-wasm-snapshot` — `examples/generate_golden.rs` migrated
+  to the bincode 2.x `Encode` / `Decode` derive API (was still on
+  the 1.x `bincode::serialize` / `deserialize` shape, which silently
+  no-op'd after the workspace bincode bump).
+- `tensor-wasm-cli` — `Box::leak` in `cmd/man.rs` retained only
+  where clap 4.6's `Str` API requires it (`Command::name` accepts
+  `impl Into<Str>` and clap 4.6 only implements `From<&'static str>`).
+  The bounded leak (≤10 subcommands × <32 B per process call) is
+  documented in-line.
+- `docs/FORMAT.md` — `instance_id` width corrected from `u64` to
+  `u128` (16 bytes on the wire). The format-on-disk has always been
+  `u128`; the doc was wrong.
+- `Dockerfile` — runtime image now installs `curl` so the
+  `HEALTHCHECK` directive actually has the binary it invokes
+  (previously the `HEALTHCHECK` line referenced a `curl` that was
+  not present in the distroless runtime layer; container runtime
+  reported `unhealthy` immediately on start).
+- `crates/tensor-wasm-api/openapi.json` regenerated as a hand-ported
+  3.0.3 mirror of the canonical `openapi/tensor-wasm-api.yaml` (the
+  file is referenced by both the CI `swagger-cli validate` job and
+  the crate's `API.md` cross-link; the regenerated version carries
+  v0.3.5 schemas, the `tenant_scope_denied` + `rate_limited` error
+  kinds, and the 429 / 403 responses).
+
+### Security
+- **Cross-tenant quota mutation now requires `TenantCapability`** —
+  the headline security landing of this release. Holding an
+  `Arc<TenantContext>` is no longer sufficient to mutate that
+  tenant's `bytes_in_use` counter; the caller must also present a
+  `TenantCapability` minted at registration time. The unchecked
+  variants are kept as deprecated shims for one minor cycle.
+- **Timing-leakable bearer-token comparison removed** —
+  `subtle::ConstantTimeEq` replaces `==` on the
+  `TENSOR_WASM_API_TOKENS` matching path.
+- **wasi-gpu host functions gated behind explicit capability** —
+  workloads that did not opt into `wasi-cuda` no longer have the
+  host functions linked into the instance, removing them from the
+  guest's reachable surface area.
+- **OnceLock race in cudarc backend** — prevents silent CUDA
+  primary-context release on the losing thread of a first-time
+  initialisation race, which would have left the process running
+  with no device context and (until first kernel launch failed)
+  no audible failure mode.
+
+### Build
+- Workspace path dependencies now carry an explicit `version =
+  "0.3.5"` field alongside the `path = "..."` field, so
+  `cargo publish` from a fresh checkout no longer fails with
+  "missing version for path dep". Crates.io publish readiness.
+- `Dockerfile` distroless runtime now runs as `USER nonroot:nonroot`
+  (was: implicit `root`). Matches CIS Docker Benchmark §4.1.
+- `tower-http` `"limit"` feature dropped — body-limit standardisation
+  on axum's `DefaultBodyLimit` made the tower-http limiter dead code.
+- `tensor-wasm-tenant` — unused `parking_lot` dependency dropped.
+
 
 
 
@@ -493,4 +681,5 @@ bound paths are feature-gated and exercised by a self-hosted CUDA CI runner
 - Auto-offload pipeline works against a simplified `BlockIR`; full
   Cranelift integration is deferred (see `docs/WASMTIME-FORK.md`).
 
+[0.3.6]: https://github.com/craton-co/craton-tensor-wasm/releases/tag/v0.3.6
 [0.1.0]: https://github.com/craton-co/craton-tensor-wasm/releases/tag/v0.1.0
