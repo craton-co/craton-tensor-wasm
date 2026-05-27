@@ -54,6 +54,14 @@ wat.workspace = true
 wasmtime.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+# W4.2 — cross-backend snapshot conformance tests pull in the snapshot
+# crate to drive the capture/restore round-trip against bytes produced by
+# each CUDA backing (`unified-memory` / cust, `cudarc-backend`,
+# `cuda-oxide-host-backend`). The snapshot crate itself is intentionally
+# backend-agnostic (bytes-in, bytes-out); these tests are the regression
+# guard documented in RFC 0001 "Test plan" that the W1.3 cross-version
+# compat suite runs cleanly under each backend feature.
+tensor-wasm-snapshot = { workspace = true }
 
 [features]
 # Default is empty so `cargo build` works on hosts without a CUDA toolkit

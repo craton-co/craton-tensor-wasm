@@ -3596,6 +3596,7 @@ dependencies = [
  "region",
  "tempfile",
  "tensor-wasm-core",
+ "tensor-wasm-snapshot",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
