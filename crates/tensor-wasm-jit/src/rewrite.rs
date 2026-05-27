@@ -52,6 +52,8 @@ use tracing::{debug, info};
 use wasm_encoder::reencode::Reencode;
 use wasmparser::{Operator, Parser, Payload};
 
+use tensor_wasm_core::types::TenantId;
+
 use crate::cache::{CacheKey, CachedKernel, CompiledHandle, KernelCache};
 use crate::clif_lower::lower_block;
 use crate::detector::{classify, BlockIR, DetectorConfig, DetectorVerdict, Op};
@@ -358,10 +360,23 @@ fn analyse(
                             Ok(blueprint) => match emit(&blueprint) {
                                 Ok(ptx) => {
                                     let fp = blueprint.fingerprint();
-                                    let key = CacheKey {
-                                        blueprint: fp,
-                                        sm_version: opts.sm_version,
-                                    };
+                                    // Rewrite-time pre-population: the
+                                    // rewriter runs at module-load with no
+                                    // tenant context yet, so pre-populated
+                                    // entries land under the placeholder
+                                    // `TenantId(0)`. The runtime dispatch
+                                    // (which knows the real tenant) will
+                                    // miss this entry and re-emit on first
+                                    // call — that's the safe default until
+                                    // the rewriter is plumbed with the
+                                    // owning tenant. See `CacheKey` docs
+                                    // for the cross-tenant confused-deputy
+                                    // primitive this prevents.
+                                    let key = CacheKey::for_tenant(
+                                        TenantId(0),
+                                        fp,
+                                        opts.sm_version,
+                                    );
                                     cache.put(
                                         key,
                                         CachedKernel {
@@ -1060,10 +1075,13 @@ mod tests {
         );
         let swapped = &out.offloaded_functions[0];
         assert_eq!(swapped.function_index, 0);
-        let key = CacheKey {
-            blueprint: swapped.fingerprint,
-            sm_version: DEFAULT_SM_VERSION,
-        };
+        // Rewriter pre-populates under the placeholder `TenantId(0)`; see the
+        // `key = CacheKey::for_tenant(TenantId(0), ...)` site above.
+        let key = CacheKey::for_tenant(
+            TenantId(0),
+            swapped.fingerprint,
+            DEFAULT_SM_VERSION,
+        );
         assert!(cache.get(&key).is_some(), "kernel was pre-populated");
 
         // The rewritten module must validate.

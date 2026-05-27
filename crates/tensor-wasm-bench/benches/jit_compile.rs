@@ -106,6 +106,7 @@ fn bench_blueprint_fingerprint(c: &mut Criterion) {
 }
 
 fn bench_cache_hit_vs_miss(c: &mut Criterion) {
+    use tensor_wasm_core::types::TenantId;
     use tensor_wasm_jit::cache::{CacheKey, CachedKernel, CompiledHandle, KernelCache};
     use std::sync::Arc;
 
@@ -113,10 +114,10 @@ fn bench_cache_hit_vs_miss(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     let bp = matmul_blueprint();
-    let key = CacheKey {
-        blueprint: bp.fingerprint(),
-        sm_version: 80,
-    };
+    // Bench-only: no real tenant context here, so use the placeholder
+    // `TenantId(0)`. Real dispatch sites must pass the calling tenant —
+    // see `CacheKey::for_tenant` docs.
+    let key = CacheKey::for_tenant(TenantId(0), bp.fingerprint(), 80);
 
     // Cold: pretend the cache is empty — pay the emit cost AND insert.
     // Cache construction is hoisted via `iter_batched_ref` so each sample

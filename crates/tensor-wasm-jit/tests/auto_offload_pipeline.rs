@@ -5,6 +5,7 @@
 //!
 //! Pipeline: detector → clif_lower → ptx_emit → cache.
 
+use tensor_wasm_core::types::TenantId;
 use tensor_wasm_jit::cache::{CacheKey, CachedKernel, CompiledHandle, KernelCache};
 use tensor_wasm_jit::clif_lower::lower_block;
 use tensor_wasm_jit::deopt::{DeoptGuard, DeoptReason};
@@ -60,10 +61,8 @@ fn pipeline_offload_path() {
     assert!(ptx.text.contains(".visible .entry matmul_inner"));
 
     let cache = KernelCache::new();
-    let key = CacheKey {
-        blueprint: blueprint.fingerprint(),
-        sm_version: 80,
-    };
+    let tenant = TenantId(42);
+    let key = CacheKey::for_tenant(tenant, blueprint.fingerprint(), 80);
     cache.put(
         key,
         CachedKernel {
@@ -73,8 +72,10 @@ fn pipeline_offload_path() {
         },
     );
 
-    // Cache hit on a second lookup with the same blueprint.
-    let hit = cache.get_for(&blueprint, 80).expect("cache hit expected");
+    // Cache hit on a second lookup with the same blueprint and tenant.
+    let hit = cache
+        .get_for(tenant, &blueprint, 80)
+        .expect("cache hit expected");
     assert_eq!(hit.fingerprint, blueprint.fingerprint());
 }
 

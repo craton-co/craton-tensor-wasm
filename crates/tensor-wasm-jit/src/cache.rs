@@ -30,17 +30,44 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
+use tensor_wasm_core::types::TenantId;
 
 use crate::ir::TensorWasmKernelBlueprint;
 use crate::ptx_emit::EmittedPtx;
 
 /// Cache key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `tenant_id` is the first field so that it dominates the derived `Hash`
+/// (field-order) and lexicographic `Ord` orderings. Keeping the cache keyed
+/// by tenant is the only thing preventing tenant A from looking up — and on
+/// the CUDA path executing — a compiled kernel that tenant B installed
+/// (exec S-7, cross-tenant confused-deputy). Every host-side `get` / `put`
+/// MUST therefore include the calling tenant; constructing a key without
+/// one (e.g. directly from guest-supplied bytes) is the bug we are fixing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CacheKey {
+    /// Owning tenant. Cache lookups MUST be scoped to the caller's tenant —
+    /// see the type-level docs. Use [`CacheKey::for_tenant`] to construct.
+    pub tenant_id: u64,
     /// `TensorWasmKernelBlueprint::fingerprint()`.
     pub blueprint: u64,
     /// CUDA compute capability (e.g. 80 for sm_80, 89 for sm_89).
     pub sm_version: u32,
+}
+
+impl CacheKey {
+    /// Construct a tenant-scoped cache key. This is the only constructor
+    /// host-side dispatch should use — the `tenant_id` MUST come from
+    /// trusted store state (e.g. `InstanceState::tenant_id`), never from
+    /// guest-supplied fingerprint bytes. See the [`CacheKey`] docs for the
+    /// confused-deputy primitive this guards against.
+    pub fn for_tenant(tenant_id: TenantId, blueprint: u64, sm_version: u32) -> Self {
+        Self {
+            tenant_id: tenant_id.get(),
+            blueprint,
+            sm_version,
+        }
+    }
 }
 
 /// Default cache capacity (kernels).
@@ -170,16 +197,19 @@ impl KernelCache {
         self.storage.get(key).map(|entry| entry.value().clone())
     }
 
-    /// Look up by blueprint + sm_version; convenience wrapper around [`Self::get`].
+    /// Look up by blueprint + sm_version for a given tenant; convenience
+    /// wrapper around [`Self::get`].
     pub fn get_for(
         &self,
+        tenant_id: TenantId,
         blueprint: &TensorWasmKernelBlueprint,
         sm_version: u32,
     ) -> Option<CachedKernel> {
-        self.get(&CacheKey {
-            blueprint: blueprint.fingerprint(),
+        self.get(&CacheKey::for_tenant(
+            tenant_id,
+            blueprint.fingerprint(),
             sm_version,
-        })
+        ))
     }
 
     /// Number of entries currently held.
@@ -225,10 +255,7 @@ mod tests {
     #[test]
     fn put_then_get() {
         let cache = KernelCache::new();
-        let key = CacheKey {
-            blueprint: 1,
-            sm_version: 80,
-        };
+        let key = CacheKey::for_tenant(TenantId(7), 1, 80);
         cache.put(key, dummy_kernel(1));
         assert_eq!(cache.get(&key).unwrap().fingerprint, 1);
     }
@@ -236,18 +263,9 @@ mod tests {
     #[test]
     fn lru_evicts_oldest() {
         let cache = KernelCache::with_capacity(2);
-        let k1 = CacheKey {
-            blueprint: 1,
-            sm_version: 80,
-        };
-        let k2 = CacheKey {
-            blueprint: 2,
-            sm_version: 80,
-        };
-        let k3 = CacheKey {
-            blueprint: 3,
-            sm_version: 80,
-        };
+        let k1 = CacheKey::for_tenant(TenantId(0), 1, 80);
+        let k2 = CacheKey::for_tenant(TenantId(0), 2, 80);
+        let k3 = CacheKey::for_tenant(TenantId(0), 3, 80);
         cache.put(k1, dummy_kernel(1));
         cache.put(k2, dummy_kernel(2));
         cache.put(k3, dummy_kernel(3));
@@ -261,15 +279,17 @@ mod tests {
     fn lookup_by_blueprint() {
         let cache = KernelCache::new();
         let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { lanes: 4 });
-        let key = CacheKey {
-            blueprint: bp.fingerprint(),
-            sm_version: 80,
-        };
+        let tenant = TenantId(11);
+        let key = CacheKey::for_tenant(tenant, bp.fingerprint(), 80);
         cache.put(key, dummy_kernel(bp.fingerprint()));
-        assert!(cache.get_for(&bp, 80).is_some());
+        assert!(cache.get_for(tenant, &bp, 80).is_some());
         assert!(
-            cache.get_for(&bp, 89).is_none(),
+            cache.get_for(tenant, &bp, 89).is_none(),
             "different sm_version is a miss"
+        );
+        assert!(
+            cache.get_for(TenantId(12), &bp, 80).is_none(),
+            "different tenant is a miss — keys are tenant-scoped"
         );
     }
 
@@ -295,10 +315,7 @@ mod tests {
             n: 16,
             k: 16,
         });
-        let key = CacheKey {
-            blueprint: bp.fingerprint(),
-            sm_version: 80,
-        };
+        let key = CacheKey::for_tenant(TenantId(3), bp.fingerprint(), 80);
         let original = Arc::new(EmittedPtx {
             text: "// pre-emitted".into(),
             launch_geometry: (1, 128),
@@ -330,10 +347,11 @@ mod tests {
             let cache = cache.clone();
             handles.push(thread::spawn(move || {
                 for i in 0..KEYS_PER_THREAD {
-                    let key = CacheKey {
-                        blueprint: (t as u64) * KEYS_PER_THREAD + i,
-                        sm_version: 80,
-                    };
+                    let key = CacheKey::for_tenant(
+                        TenantId(0),
+                        (t as u64) * KEYS_PER_THREAD + i,
+                        80,
+                    );
                     cache.put(key, dummy_kernel(key.blueprint));
                     // Interleave reads of own and (possibly absent) others.
                     let _ = cache.get(&key);
@@ -346,10 +364,11 @@ mod tests {
         // Every key written must still be retrievable.
         for t in 0..N_THREADS {
             for i in 0..KEYS_PER_THREAD {
-                let key = CacheKey {
-                    blueprint: (t as u64) * KEYS_PER_THREAD + i,
-                    sm_version: 80,
-                };
+                let key = CacheKey::for_tenant(
+                    TenantId(0),
+                    (t as u64) * KEYS_PER_THREAD + i,
+                    80,
+                );
                 assert!(
                     cache.get(&key).is_some(),
                     "missing key after concurrent inserts: ({t}, {i})"

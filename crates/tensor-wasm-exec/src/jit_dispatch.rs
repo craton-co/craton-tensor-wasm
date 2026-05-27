@@ -42,8 +42,47 @@
 
 use std::sync::Arc;
 
+use tensor_wasm_core::types::TenantId;
 use tensor_wasm_jit::cache::{CacheKey, KernelCache};
 use wasmtime::{Caller, Linker};
+
+use crate::instance::InstanceState;
+
+/// Trait for extracting the calling tenant from a wasmtime `Store<T>` payload.
+///
+/// The JIT dispatch host fn MUST build its [`CacheKey`] from the calling
+/// tenant's identity (taken from trusted `Store` state) rather than from
+/// guest-supplied bytes. Wiring this through a trait keeps
+/// [`add_jit_dispatch_to_linker`] generic over `T` while still forcing every
+/// store type that wants to host the dispatch import to declare which
+/// tenant a given store belongs to.
+///
+/// This guards against the cross-tenant confused-deputy primitive
+/// documented on [`tensor_wasm_jit::cache::CacheKey`]: without the trait,
+/// the dispatch closure had no way to look up the calling tenant and was
+/// trusting the guest fingerprint alone.
+pub trait TenantContext {
+    /// The tenant this store belongs to. Returned to the dispatch closure
+    /// on every host call so the cache lookup is scoped to the caller.
+    fn tenant_id(&self) -> TenantId;
+}
+
+impl TenantContext for InstanceState {
+    fn tenant_id(&self) -> TenantId {
+        self.tenant_id
+    }
+}
+
+/// Test-only impl. Real production stores always carry an
+/// [`InstanceState`]; the unit type is used by the in-crate dispatcher
+/// unit tests (which spin up a `Linker<()>`). The synthetic tenant id
+/// keeps those tests on the same lookup key the test harness pre-populates
+/// the cache under.
+impl TenantContext for () {
+    fn tenant_id(&self) -> TenantId {
+        TenantId(0)
+    }
+}
 
 /// Default sm_version the dispatcher looks up. Matches
 /// [`tensor_wasm_jit::rewrite::DEFAULT_SM_VERSION`].
@@ -131,7 +170,7 @@ pub fn add_jit_dispatch_to_linker<T>(
     cache: Arc<KernelCache>,
 ) -> wasmtime::Result<()>
 where
-    T: JitArenaProvider + 'static,
+    T: JitArenaProvider + TenantContext + 'static,
 {
     add_jit_dispatch_to_linker_with(
         linker,
@@ -158,7 +197,7 @@ pub fn add_jit_dispatch_to_linker_with<T>(
     sm_version: u32,
 ) -> wasmtime::Result<()>
 where
-    T: JitArenaProvider + 'static,
+    T: JitArenaProvider + TenantContext + 'static,
 {
     // alloc(size: i32) -> i32
     linker.func_wrap(host_module, alloc_fn, move |mut caller: Caller<'_, T>, size: i32| -> i32 {
@@ -274,19 +313,28 @@ where
             // Reconstruct the u64 fingerprint from two i64 halves. Mask to
             // u32 before recombining so sign extension doesn't pollute the
             // upper bits.
+            //
+            // SECURITY: `fingerprint_lo` / `fingerprint_hi` come from the
+            // guest. They feed the `blueprint` field of the cache key but
+            // MUST NOT determine which tenant's cache shelf the lookup
+            // hits — that comes from `caller.data().tenant_id()`, which
+            // is trusted host state set when the instance was spawned.
+            // Without this, tenant A could pass tenant B's fingerprint
+            // and (on the CUDA path) execute B's compiled kernel against
+            // A's memory — see `tensor_wasm_jit::cache::CacheKey` docs and
+            // exec S-7 in the threat model.
             let lo = (fingerprint_lo as u64) & 0xFFFF_FFFF;
             let hi = (fingerprint_hi as u64) & 0xFFFF_FFFF;
             let fp = lo | (hi << 32);
-            let key = CacheKey {
-                blueprint: fp,
-                sm_version,
-            };
+            let tenant_id = caller.data().tenant_id();
+            let key = CacheKey::for_tenant(tenant_id, fp, sm_version);
             let cached = match cache_disp.get(&key) {
                 Some(k) => k,
                 None => {
                     tracing::warn!(
                         target: "tensor_wasm_exec::jit_dispatch",
                         fingerprint = fp,
+                        tenant = %tenant_id,
                         "JIT dispatch cache miss"
                     );
                     return DISPATCH_CACHE_MISS;
@@ -296,6 +344,7 @@ where
             tracing::trace!(
                 target: "tensor_wasm_exec::jit_dispatch",
                 fingerprint = fp,
+                tenant = %tenant_id,
                 args_len, results_len,
                 "JIT dispatch cache hit"
             );
@@ -421,11 +470,11 @@ mod tests {
 
     fn make_cache_with(fp: u64, sm_version: u32) -> Arc<KernelCache> {
         let cache = Arc::new(KernelCache::new());
+        // Test harness uses `Linker<()>`, whose `TenantContext` impl reports
+        // `TenantId(0)`; store under the same tenant so the dispatch lookup
+        // is a hit.
         cache.put(
-            CacheKey {
-                blueprint: fp,
-                sm_version,
-            },
+            CacheKey::for_tenant(TenantId(0), fp, sm_version),
             CachedKernel {
                 fingerprint: fp,
                 ptx: Arc::new(EmittedPtx {
@@ -596,11 +645,14 @@ mod tests {
         let fp = outcome.offloaded_functions[0].fingerprint;
 
         // Pre-populate the cache (the rewriter does this, but double-check).
+        // The test driver below uses `Linker<()>` whose `TenantContext` impl
+        // reports `TenantId(0)` — store under the same tenant so the runtime
+        // dispatch lookup is a hit. The custom `dispatch` closure further
+        // down ignores the cache anyway and computes the result inline; but
+        // the rewriter-installed trampoline still calls into the default
+        // alloc/free imports keyed off the same store payload.
         cache.put(
-            CacheKey {
-                blueprint: fp,
-                sm_version: DEFAULT_DISPATCH_SM_VERSION,
-            },
+            CacheKey::for_tenant(TenantId(0), fp, DEFAULT_DISPATCH_SM_VERSION),
             CachedKernel {
                 fingerprint: fp,
                 ptx: Arc::new(EmittedPtx {
