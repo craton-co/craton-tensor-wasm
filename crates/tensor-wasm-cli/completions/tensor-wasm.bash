@@ -124,7 +124,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__bench)
+        tensor__wasm__subcmd__bench)
             opts="-h --export --n --tenant --help <FILE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -150,7 +150,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__completions)
+        tensor__wasm__subcmd__completions)
             opts="-h --out-dir --tenant --help bash elvish fish powershell zsh"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -172,7 +172,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__deploy)
+        tensor__wasm__subcmd__deploy)
             opts="-h --server --name --tenant --help <FILE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -198,7 +198,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help)
+        tensor__wasm__subcmd__help)
             opts="run deploy invoke bench snapshot metrics observe completions man help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -212,7 +212,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help__subcmd__bench)
+        tensor__wasm__subcmd__help__subcmd__bench)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -226,7 +226,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help__subcmd__completions)
+        tensor__wasm__subcmd__help__subcmd__completions)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -240,7 +240,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help__subcmd__deploy)
+        tensor__wasm__subcmd__help__subcmd__deploy)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -254,7 +254,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help__subcmd__help)
+        tensor__wasm__subcmd__help__subcmd__help)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -268,7 +268,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help__subcmd__invoke)
+        tensor__wasm__subcmd__help__subcmd__invoke)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -282,7 +282,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help__subcmd__man)
+        tensor__wasm__subcmd__help__subcmd__man)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -296,7 +296,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help__subcmd__metrics)
+        tensor__wasm__subcmd__help__subcmd__metrics)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -310,7 +310,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help__subcmd__observe)
+        tensor__wasm__subcmd__help__subcmd__observe)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -324,7 +324,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help__subcmd__run)
+        tensor__wasm__subcmd__help__subcmd__run)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -338,7 +338,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help__subcmd__snapshot)
+        tensor__wasm__subcmd__help__subcmd__snapshot)
             opts="save restore"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -352,7 +352,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help__subcmd__snapshot__subcmd__restore)
+        tensor__wasm__subcmd__help__subcmd__snapshot__subcmd__restore)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -366,7 +366,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__help__subcmd__snapshot__subcmd__save)
+        tensor__wasm__subcmd__help__subcmd__snapshot__subcmd__save)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -380,7 +380,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__invoke)
+        tensor__wasm__subcmd__invoke)
             opts="-h --server --args --tenant --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -406,7 +406,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__man)
+        tensor__wasm__subcmd__man)
             opts="-h --out-dir --tenant --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -428,7 +428,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__metrics)
+        tensor__wasm__subcmd__metrics)
             opts="-h --server --tenant --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -450,7 +450,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__observe)
+        tensor__wasm__subcmd__observe)
             opts="-h --addr --interval --tenant --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -476,7 +476,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__run)
+        tensor__wasm__subcmd__run)
             opts="-h --export --args --tenant --help <FILE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -502,7 +502,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__snapshot)
+        tensor__wasm__subcmd__snapshot)
             opts="-h --tenant --help save restore help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -520,7 +520,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__snapshot__subcmd__help)
+        tensor__wasm__subcmd__snapshot__subcmd__help)
             opts="save restore help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -534,7 +534,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__snapshot__subcmd__help__subcmd__help)
+        tensor__wasm__subcmd__snapshot__subcmd__help__subcmd__help)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -548,7 +548,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__snapshot__subcmd__help__subcmd__restore)
+        tensor__wasm__subcmd__snapshot__subcmd__help__subcmd__restore)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -562,7 +562,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__snapshot__subcmd__help__subcmd__save)
+        tensor__wasm__subcmd__snapshot__subcmd__help__subcmd__save)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -576,7 +576,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__snapshot__subcmd__restore)
+        tensor__wasm__subcmd__snapshot__subcmd__restore)
             opts="-h --input --as-instance --server --max-archive-bytes --tenant --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -610,7 +610,7 @@ _tensor-wasm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tensor__subcmd__wasm__subcmd__snapshot__subcmd__save)
+        tensor__wasm__subcmd__snapshot__subcmd__save)
             opts="-h --instance --output --server --max-restore-bytes --tenant --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
