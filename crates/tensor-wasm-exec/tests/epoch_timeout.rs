@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
+
 //! S7 done-when #2: epoch timeout kills infinite-loop Wasm within 2× deadline.
 
 use std::sync::Arc;

@@ -3,9 +3,21 @@ Copyright 2026 Craton Software Company
 
 This product includes software developed by:
   The Bytecode Alliance (Wasmtime)         — Apache-2.0 WITH LLVM-exception
+  The Bytecode Alliance (wasmparser)        — Apache-2.0 WITH LLVM-exception
   The Tokio Project                         — MIT
   The OpenTelemetry Authors                 — Apache-2.0
   The Cranelift Authors                     — Apache-2.0 WITH LLVM-exception
   The CUDA Rust Working Group (cust)        — MIT OR Apache-2.0
+  Coreyt Joseph (cudarc)                    — MIT OR Apache-2.0
+  NVIDIA Labs (cuda-oxide: cuda-host,       — Apache-2.0
+    cuda-core, cuda-async)
+  Arvind Sankaranarayanan (Pliron,          — Apache-2.0 WITH LLVM-exception
+    transitive via cuda-oxide)
+  The Tokio Authors (axum)                  — MIT
+  The Tokio Authors (tower)                 — MIT
+  The Tokio Authors (tower-http)            — MIT
+  The Tokio Authors (tracing)               — MIT
+  The prometheus-client-rust Authors        — Apache-2.0 OR MIT
+  The clap Authors                          — MIT OR Apache-2.0
 
 See `docs/RISKS.md` for upstream pinning notes.

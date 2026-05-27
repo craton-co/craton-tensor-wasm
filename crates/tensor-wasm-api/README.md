@@ -10,6 +10,15 @@ HTTP serverless API gateway for Craton TensorWasm, built on axum. Exposes REST e
 
 See [`API.md`](API.md) for the full wire-format reference.
 
+## What ships in 0.3.x
+
+The W2.x hardening wave layers the following on top of the core deploy/invoke surface:
+
+- **W1.4 Rate limiting.** Per-token leaky bucket; over-limit callers receive `429 Too Many Requests` with `Retry-After`.
+- **W2.1 Scoped tokens.** Per-tenant authorization; cross-tenant access surfaces as a `403` envelope.
+- **W2.2 Audit log.** Structured JSON records every authenticated request through a sink-pluggable writer.
+- **W2.3 HTTP metrics.** Prometheus exposition at `/metrics` covering request counts, duration histograms, and per-route labels.
+
 ## Feature flags
 
 This crate exposes no Cargo features; it compiles identically in every workspace configuration.

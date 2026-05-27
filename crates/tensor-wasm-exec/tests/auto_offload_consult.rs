@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
+
 //! End-to-end check that `tensor_wasm_exec::auto_offload::analyse` runs against
 //! the shared `matrix_multiply.wat` fixture and emits at least one
 //! verdict. The exact verdict mix is *not* asserted — that's the detector's
