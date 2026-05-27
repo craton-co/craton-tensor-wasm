@@ -21,15 +21,31 @@
 //! This is a contract with `tensor_wasm_exec::jit_dispatch`: the scratch buffer's
 //! `args` half maps to `in_ptr`, the `results` half maps to `out_ptr`.
 //!
-//! The previous emitter cycled the same four hard-coded registers
-//! (`%f0..%f3`), which causes the GPU to read undefined values once more
-//! than four ops execute — a memory-safety hazard that ptxas couldn't catch
-//! because the code was syntactically valid. The new emitter assigns a
-//! fresh register per op, so values flow correctly.
+//! ## What is intentionally NOT lowered
+//!
+//! [`TensorWasmOp::MatMul`] is currently rejected at emit time with
+//! [`EmitError::NotYetImplemented`]. A real wmma lowering needs fragment-
+//! handle materialisation (loading the `a`/`b` operand tiles into the
+//! `%r0..%r7` row/col handles) and a paired `StoreUnified` that writes the
+//! accumulator fragments back to global memory — neither of which the
+//! current IR-to-PTX path encodes. Emitting a syntactically-valid-but-
+//! semantically-broken wmma block would silently corrupt GPU state on
+//! launch, so we refuse instead. See v0.4 roadmap.
 
 use std::fmt::Write;
 
+use thiserror::Error;
+
 use crate::ir::{TensorWasmKernelBlueprint, TensorWasmOp};
+
+/// Errors produced by the PTX emitter.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum EmitError {
+    /// The blueprint contains an op the emitter does not yet lower to PTX.
+    /// Callers should treat this as "keep this function on the CPU path".
+    #[error("PTX emission not yet implemented: {0}")]
+    NotYetImplemented(&'static str),
+}
 
 /// Default PTX target architecture.
 pub const DEFAULT_TARGET: &str = "sm_80";
@@ -80,7 +96,10 @@ impl EmittedPtx {
 }
 
 /// Emit PTX text for a blueprint with default config.
-pub fn emit(blueprint: &TensorWasmKernelBlueprint) -> EmittedPtx {
+///
+/// Returns [`EmitError::NotYetImplemented`] for blueprints containing ops
+/// the emitter cannot lower (currently: [`TensorWasmOp::MatMul`]).
+pub fn emit(blueprint: &TensorWasmKernelBlueprint) -> Result<EmittedPtx, EmitError> {
     emit_with(blueprint, &EmitConfig::default())
 }
 
@@ -90,17 +109,21 @@ pub fn emit(blueprint: &TensorWasmKernelBlueprint) -> EmittedPtx {
 /// where `max_*` is one greater than the highest register index used (i.e.
 /// the count to declare in `.reg .f32 %f<N>;`). Counts are floored at 1 so
 /// the declaration is always well-formed even for empty kernels.
-fn lower_body(blueprint: &TensorWasmKernelBlueprint) -> (String, u32, u32, u32, u32) {
+fn lower_body(
+    blueprint: &TensorWasmKernelBlueprint,
+) -> Result<(String, u32, u32, u32, u32), EmitError> {
     let mut body = String::new();
-    // Pre-size the value stack to `ops.len()` — each op pushes at most a
-    // handful of registers, and most pop more than they push, so this is a
+    // Pre-size the value stack to `ops.len()` — each lowered op pushes at
+    // most one register, and most pop more than they push, so this is a
     // safe upper bound that avoids grow-by-doubling reallocs on the hot
-    // emit path (matmul[16x16x16] visibly suffered from this).
+    // emit path.
     let mut value_stack: Vec<u32> = Vec::with_capacity(blueprint.ops.len());
     let mut next_f = 0u32;
     // Counters for the other reg classes — track high-water mark so the
-    // header `.reg` declarations are exactly sized.
-    let mut max_s32 = 8u32; // always need at least %r0..%r7 for the MatMul tile path
+    // header `.reg` declarations are exactly sized. `%r0` carries the
+    // element count `n` from the param load in the prologue; nothing else
+    // currently uses the s32 reg class.
+    let max_s32 = 1u32;
     let max_s64 = 2u32; // %rd0 (in_ptr), %rd1 (out_ptr)
     let max_pred = 2u32;
     // Running byte offset into the input / output buffers; advances 4 bytes
@@ -149,54 +172,20 @@ fn lower_body(blueprint: &TensorWasmKernelBlueprint) -> (String, u32, u32, u32, 
                     value_stack.push(dst);
                 }
             }
-            TensorWasmOp::MatMul { m, n, k } => {
-                let _ = writeln!(
-                    body,
-                    "    // matmul[{m}x{n}x{k}] via wmma m16n16k16 (sm_80 tensor cores)",
-                );
-                // For the matmul tile we use fresh registers so the wmma
-                // operands don't alias prior values. Tensor-core fragments
-                // use 8 f32 accumulators + 4 s32 row/col handles each.
-                let dst_base = next_f;
-                for _ in 0..8 {
-                    let _ = alloc_f(&mut next_f);
-                }
-                let _ = writeln!(
-                    body,
-                    "    wmma.mma.sync.aligned.row.col.m16n16k16.f32.f16.f16.f32"
-                );
-                let _ = writeln!(
-                    body,
-                    "        {{%f{r0}, %f{r1}, %f{r2}, %f{r3}, %f{r4}, %f{r5}, %f{r6}, %f{r7}}},",
-                    r0 = dst_base,
-                    r1 = dst_base + 1,
-                    r2 = dst_base + 2,
-                    r3 = dst_base + 3,
-                    r4 = dst_base + 4,
-                    r5 = dst_base + 5,
-                    r6 = dst_base + 6,
-                    r7 = dst_base + 7,
-                );
-                let _ = writeln!(body, "        {{%r0, %r1, %r2, %r3}},");
-                let _ = writeln!(body, "        {{%r4, %r5, %r6, %r7}},");
-                let _ = writeln!(
-                    body,
-                    "        {{%f{r0}, %f{r1}, %f{r2}, %f{r3}, %f{r4}, %f{r5}, %f{r6}, %f{r7}}};",
-                    r0 = dst_base,
-                    r1 = dst_base + 1,
-                    r2 = dst_base + 2,
-                    r3 = dst_base + 3,
-                    r4 = dst_base + 4,
-                    r5 = dst_base + 5,
-                    r6 = dst_base + 6,
-                    r7 = dst_base + 7,
-                );
-                // Push the eight accumulators onto the value stack — a
-                // subsequent StoreUnified will pop them in order.
-                for i in 0..8 {
-                    value_stack.push(dst_base + i);
-                }
-                max_s32 = max_s32.max(8);
+            TensorWasmOp::MatMul { .. } => {
+                // Lowering wmma m16n16k16 requires fragment-handle
+                // materialisation (a/b operand tiles into `%r0..%r7`) and a
+                // paired store that writes the accumulator fragments back
+                // to global memory. Neither is encoded by the current IR-
+                // to-PTX path. The previous emitter wrote a wmma.mma.sync
+                // line referencing undefined `%r1..%r7` and never emitted
+                // the matching store, so the kernel would have read
+                // garbage and discarded its results. Refuse instead — the
+                // caller (rewrite.rs) treats this as a deopt and keeps
+                // the function on the CPU path. Deferred to v0.4.
+                return Err(EmitError::NotYetImplemented(
+                    "MatMul lowering deferred to v0.4",
+                ));
             }
             TensorWasmOp::LoadUnified { lanes } => {
                 let _ = writeln!(
@@ -239,11 +228,17 @@ fn lower_body(blueprint: &TensorWasmKernelBlueprint) -> (String, u32, u32, u32, 
 
     // `.reg .* %x<N>;` requires N >= 1, even if no register is used.
     let max_f = next_f.max(1);
-    (body, max_f, max_s32, max_s64, max_pred)
+    Ok((body, max_f, max_s32, max_s64, max_pred))
 }
 
 /// Emit PTX text for a blueprint with caller-supplied config.
-pub fn emit_with(blueprint: &TensorWasmKernelBlueprint, cfg: &EmitConfig) -> EmittedPtx {
+///
+/// Returns [`EmitError::NotYetImplemented`] for blueprints containing ops
+/// the emitter cannot lower (currently: [`TensorWasmOp::MatMul`]).
+pub fn emit_with(
+    blueprint: &TensorWasmKernelBlueprint,
+    cfg: &EmitConfig,
+) -> Result<EmittedPtx, EmitError> {
     // Rough estimate: ~64 B/op covers the per-op body line plus a fair share
     // of the fixed prologue/epilogue. Avoids grow-by-doubling reallocs on
     // the hot emit path.
@@ -264,7 +259,7 @@ pub fn emit_with(blueprint: &TensorWasmKernelBlueprint, cfg: &EmitConfig) -> Emi
     // Lower the body first so we know how many registers to declare. This
     // is the critical fix for the prior sham allocator: declare exactly
     // what we use, not a fixed `8` that overflowed silently.
-    let (body, max_f, max_s32, max_s64, max_pred) = lower_body(blueprint);
+    let (body, max_f, max_s32, max_s64, max_pred) = lower_body(blueprint)?;
 
     let _ = writeln!(text, ".visible .entry {}(", blueprint.entry);
     let _ = writeln!(text, "    .param .u64 {}_param_in_ptr,", blueprint.entry);
@@ -312,10 +307,10 @@ pub fn emit_with(blueprint: &TensorWasmKernelBlueprint, cfg: &EmitConfig) -> Emi
     let _ = writeln!(text, "    ret;");
     let _ = writeln!(text, "}}");
 
-    EmittedPtx {
+    Ok(EmittedPtx {
         text,
         launch_geometry: (grid_size, block_size),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -330,7 +325,7 @@ mod tests {
             .push(TensorWasmOp::LoadUnified { lanes: 4 })
             .push(TensorWasmOp::VecAdd { lanes: 4 })
             .push(TensorWasmOp::StoreUnified { lanes: 4 });
-        let out = emit(&bp);
+        let out = emit(&bp).expect("emit");
         assert!(out.text.contains(".target sm_80"));
         assert!(out.text.contains(".visible .entry vector_add"));
         assert!(out.text.contains("add.f32"));
@@ -339,22 +334,45 @@ mod tests {
         assert!(out.text.contains("ret;"));
     }
 
+    /// MatMul lowering is deferred to v0.4. The emitter must refuse to
+    /// produce PTX for blueprints containing a `MatMul` op rather than
+    /// emit a syntactically-valid-but-semantically-broken wmma block
+    /// (the prior emitter referenced undefined `%r1..%r7` and never paired
+    /// the accumulators with a store, so launched kernels would silently
+    /// corrupt state). Callers should treat this as a deopt signal.
     #[test]
-    fn matmul_emits_wmma() {
+    fn matmul_emission_is_not_yet_implemented() {
         let bp = TensorWasmKernelBlueprint::new("matmul_16x16x16").push(TensorWasmOp::MatMul {
             m: 16,
             n: 16,
             k: 16,
         });
-        let out = emit(&bp);
-        assert!(out.text.contains("wmma.mma.sync"));
-        assert!(out.text.contains("m16n16k16"));
+        let err = emit(&bp).expect_err("MatMul emission must fail until v0.4");
+        assert!(matches!(err, EmitError::NotYetImplemented(_)));
+    }
+
+    /// MatMul anywhere in the op stream taints the whole blueprint —
+    /// not just blueprints whose only op is MatMul.
+    #[test]
+    fn matmul_in_mixed_stream_also_refused() {
+        let bp = TensorWasmKernelBlueprint::new("mixed")
+            .push(TensorWasmOp::LoadUnified { lanes: 4 })
+            .push(TensorWasmOp::MatMul {
+                m: 16,
+                n: 16,
+                k: 16,
+            })
+            .push(TensorWasmOp::StoreUnified { lanes: 4 });
+        assert!(matches!(
+            emit(&bp),
+            Err(EmitError::NotYetImplemented(_))
+        ));
     }
 
     #[test]
     fn ptx_header_includes_version_and_target() {
         let bp = TensorWasmKernelBlueprint::new("noop");
-        let out = emit(&bp);
+        let out = emit(&bp).expect("emit");
         assert!(out.text.contains(".version 8.0"));
         assert!(out.text.contains(".target sm_80"));
         assert!(out.text.contains(".address_size 64"));
@@ -366,7 +384,7 @@ mod tests {
             total_threads: 1024,
             preferred_block_size: 128,
         });
-        let out = emit(&bp);
+        let out = emit(&bp).expect("emit");
         assert_eq!(out.launch_geometry, (8, 128));
         assert!(out.text.contains(".maxntid 128, 1, 1"));
         // Negative assertion: the broken C++-annotation form must not appear.
@@ -376,14 +394,14 @@ mod tests {
     #[test]
     fn barrier_emits_bar_sync() {
         let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::Barrier);
-        let out = emit(&bp);
+        let out = emit(&bp).expect("emit");
         assert!(out.text.contains("bar.sync 0;"));
     }
 
     #[test]
     fn fma_emits_fma_rn() {
         let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecFma { lanes: 4 });
-        let out = emit(&bp);
+        let out = emit(&bp).expect("emit");
         assert!(out.text.contains("fma.rn.f32"));
     }
 
@@ -394,14 +412,14 @@ mod tests {
             target: "sm_89".into(),
             ..EmitConfig::default()
         };
-        let out = emit_with(&bp, &cfg);
+        let out = emit_with(&bp, &cfg).expect("emit");
         assert!(out.text.contains(".target sm_89"));
     }
 
     #[test]
     fn emitted_text_nonempty() {
         let bp = TensorWasmKernelBlueprint::new("k");
-        let out = emit(&bp);
+        let out = emit(&bp).expect("emit");
         assert!(!out.is_empty());
     }
 
@@ -412,7 +430,7 @@ mod tests {
     #[test]
     fn register_allocator_assigns_fresh_destination_per_op() {
         let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { lanes: 8 });
-        let out = emit(&bp);
+        let out = emit(&bp).expect("emit");
         // After lowering, we expect at least registers %f0 through %f7 to
         // appear as add destinations. The exact regex match would couple
         // the test to the syntax, so we just count distinct destinations.
@@ -440,7 +458,7 @@ mod tests {
         // operand registers materialised on stack-underflow). The header
         // `.reg .f32 %f<N>` must declare at least N regs.
         let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { lanes: 16 });
-        let out = emit(&bp);
+        let out = emit(&bp).expect("emit");
         // Find the .reg .f32 declaration and parse out the count.
         let count_line = out
             .text
@@ -462,7 +480,7 @@ mod tests {
     #[test]
     fn prologue_loads_params_into_registers() {
         let bp = TensorWasmKernelBlueprint::new("vec_op");
-        let out = emit(&bp);
+        let out = emit(&bp).expect("emit");
         assert!(out.text.contains("ld.param.u64 %rd0"));
         assert!(out.text.contains("ld.param.u64 %rd1"));
         assert!(out.text.contains("ld.param.u32 %r0"));
@@ -471,7 +489,7 @@ mod tests {
     #[test]
     fn loads_advance_input_offset() {
         let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::LoadUnified { lanes: 3 });
-        let out = emit(&bp);
+        let out = emit(&bp).expect("emit");
         // First lane at [%rd0], next at [%rd0+4], next at [%rd0+8].
         assert!(out.text.contains("[%rd0];"), "first load uses no offset");
         assert!(out.text.contains("[%rd0+4]"), "second lane at offset 4");
@@ -483,7 +501,7 @@ mod tests {
         let bp = TensorWasmKernelBlueprint::new("k")
             .push(TensorWasmOp::LoadUnified { lanes: 2 })
             .push(TensorWasmOp::StoreUnified { lanes: 2 });
-        let out = emit(&bp);
+        let out = emit(&bp).expect("emit");
         assert!(out.text.contains("[%rd1]"));
         assert!(out.text.contains("[%rd1+4]"));
     }

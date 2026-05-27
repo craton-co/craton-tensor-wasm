@@ -9,7 +9,7 @@
 use std::process::Command;
 
 use tensor_wasm_jit::ir::{TensorWasmKernelBlueprint, TensorWasmOp, GridHint};
-use tensor_wasm_jit::ptx_emit::emit;
+use tensor_wasm_jit::ptx_emit::{emit, EmitError};
 
 fn ptxas_path() -> Option<String> {
     std::env::var("TENSOR_WASM_PTXAS").ok()
@@ -52,12 +52,18 @@ fn emitted_vector_add_validates_with_ptxas() {
             total_threads: 1024,
             preferred_block_size: 128,
         });
-    let out = emit(&bp);
+    let out = emit(&bp).expect("emit vector_add");
     run_ptxas_or_skip(&out.text, "vector_add");
 }
 
+/// MatMul PTX lowering is deferred to v0.4 — the emitter must refuse rather
+/// than produce a broken wmma block. This test was previously a positive
+/// ptxas-validates assertion; that contract no longer holds. Asserting the
+/// explicit "not yet implemented" error guards against accidentally re-
+/// introducing the broken emitter, which would silently launch kernels
+/// that read undefined `%r1..%r7` and never store their accumulators.
 #[test]
-fn emitted_matmul_validates_with_ptxas() {
+fn matmul_emission_is_explicitly_refused() {
     let bp = TensorWasmKernelBlueprint::new("matmul_16x16x16")
         .push(TensorWasmOp::MatMul {
             m: 16,
@@ -68,6 +74,6 @@ fn emitted_matmul_validates_with_ptxas() {
             total_threads: 256,
             preferred_block_size: 128,
         });
-    let out = emit(&bp);
-    run_ptxas_or_skip(&out.text, "matmul");
+    let err = emit(&bp).expect_err("MatMul emission must fail");
+    assert!(matches!(err, EmitError::NotYetImplemented(_)));
 }
