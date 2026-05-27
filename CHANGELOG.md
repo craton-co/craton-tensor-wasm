@@ -341,7 +341,18 @@ executable 8-step runbook ready for the maintainer who runs `git
 checkout` the day v0.2 ships.
 
 ## [Unreleased]
-_No entries yet — open the next PR adding one._
+
+### Added
+- `tensor-wasm-snapshot`: optional HMAC-SHA256 signing (`signed-snapshots` feature, default on). New v3 wire format = v2 + 33 trailing bytes (kind + 32-byte signature). Writer/reader opt-in via `with_hmac_sha256_key`; reader can `require_signature()` to reject v2.
+- `tensor-wasm-cli`: `--hmac-key-file` on `snapshot save`/`restore`; `--require-signature` on `restore`.
+- `tensor-wasm-api`: `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` (hex) and `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE` (bool) env vars wired into `AppConfig`. Snapshot routes themselves still feature-not-exposed; the config will pick the key up automatically when they ship.
+- `docs/SNAPSHOT-COMPATIBILITY.md`: new "v2 → v3 migration" section documenting the four-step rollout (provision key → configure reader → configure writer → flip to strict mode) and the cross-tier ordering for key rotation.
+- `docs/RISKS.md`: new "Snapshot authenticity" row recording the v0.3.5 audit finding and its closure under the v0.3.6 work.
+- `SECURITY.md`: new "Snapshot authenticity" subsection under the defences block pointing at the migration guide.
+- `crates/tensor-wasm-snapshot/README.md`: new "Threat model: authenticity vs integrity" section explaining the v2/v3 distinction and the opt-in design.
+
+### Security
+- Closes the "MEDIUM: no signature on snapshot" finding from the v0.3.5 audit: snapshots now support authentication via HMAC-SHA256. Default writer behaviour unchanged (still emits v2) so existing archives remain readable; operators opt into signed snapshots by configuring a key.
 
 ## [0.3.6] - 2026-05-27
 

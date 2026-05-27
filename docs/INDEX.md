@@ -193,7 +193,7 @@ end to end before a real CVE arrives. Reports go to
 
 | Doc | Wave | One-sentence summary |
 |---|---|---|
-| [../SECURITY.md](../SECURITY.md) | W3.5 (backport policy) | TensorWasm's threat model, isolation strategy summary, and the backport policy that decides which security fixes land on which release branches. |
+| [../SECURITY.md](../SECURITY.md) | W3.5 (backport policy), M8.5 (snapshot HMAC) | TensorWasm's threat model, isolation strategy summary, the optional snapshot HMAC authentication (cross-linked to [the v2 → v3 migration](SNAPSHOT-COMPATIBILITY.md#v2--v3-migration-signed-snapshots)), and the backport policy that decides which security fixes land on which release branches. |
 | [SECURITY-AUDIT.md](SECURITY-AUDIT.md) | — | The v0.1 security-audit findings: methodology (manual walk + `cargo-fuzz`), per-asset verdict, and the follow-up tracking for partially-mitigated items. |
 | [runbooks/cve-disclosure-dry-run.md](runbooks/cve-disclosure-dry-run.md) | W5.5 | Manual procedure for rehearsing the CVE disclosure pipeline end-to-end on a test repository before a real CVE arrives. |
 
@@ -231,7 +231,7 @@ touches both files in the same PR.
 
 | Doc | Wave | One-sentence summary |
 |---|---|---|
-| [SNAPSHOT-COMPATIBILITY.md](SNAPSHOT-COMPATIBILITY.md) | W1.3 | The cross-version compatibility promise: which TensorWasm versions can restore which on-disk snapshot versions, plus the format-bump procedure. |
+| [SNAPSHOT-COMPATIBILITY.md](SNAPSHOT-COMPATIBILITY.md) | W1.3, M8.5 (v2 → v3) | The cross-version compatibility promise: which TensorWasm versions can restore which on-disk snapshot versions, the format-bump procedure, and the [v2 → v3 signed-snapshot migration](SNAPSHOT-COMPATIBILITY.md#v2--v3-migration-signed-snapshots) (provision key → configure reader → configure writer → flip to strict mode). |
 | [../crates/tensor-wasm-snapshot/FORMAT.md](../crates/tensor-wasm-snapshot/FORMAT.md) | — | The wire-format specification — the byte layout `SnapshotWriter::capture` produces and `SnapshotReader::restore` consumes, including the magic constant and current version. |
 
 ---

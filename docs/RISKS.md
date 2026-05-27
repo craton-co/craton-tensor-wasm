@@ -2,7 +2,7 @@
 
 Living document tracking architectural risks, upstream pinning decisions, and known limitations for maintainers. Updated alongside `CHANGELOG.md` releases.
 
-Last updated: 2026-05-27 (v0.3.5)
+Last updated: 2026-05-27 (v0.3.6 — snapshot HMAC signing landed)
 
 ---
 
@@ -88,6 +88,29 @@ A third option has appeared since W1.2 wrote the spike: NVlabs `cuda-oxide` v0.1
 **Why:** zstd ratios on adversarial input can reach 1000× — without a hard cap, a small malicious snapshot can OOM the host.
 
 **Tuning:** raise via builder if legitimate snapshots exceed the default; never disable.
+
+**Owner:** snapshot maintainers.
+
+---
+
+## Snapshot authenticity (no signature on snapshot bytes)
+
+**Status:** **Closed (v0.3.6):** HMAC-SHA256 signing landed behind the `signed-snapshots` feature; opt-in via `with_hmac_sha256_key`.
+
+**Why this was on the register:** the v0.3.5 audit flagged that the on-wire `crc32` field is integrity-only — it catches bit-flips but does not authenticate the byte source. A malicious snapshot crafted with a matching CRC could be restored by a v0.1.0–v0.3.5 reader without any way for the operator to tell. The audit graded this MEDIUM (mitigated in practice by storing snapshots behind authenticated transports + ACLs; not mitigated for an operator-side compromise of the snapshot store).
+
+**What landed in v0.3.6:**
+
+- New wire v3 = v2 + `[signature_kind: u8][signature: 32 bytes]` trailer (`signature_kind = 1` is `HMAC-SHA256(key, v2_payload)`).
+- `SnapshotWriter::with_hmac_sha256_key(key)` opts in to v3 emission; the default writer still emits v2 for backward compatibility (existing archives remain readable).
+- `SnapshotReader` accepts both v2 and v3 by default once a key is configured; `SnapshotReader::require_signature()` rejects v2 outright for deployments that have completed the rollout.
+- CLI: `--hmac-key-file PATH` on `snapshot save`/`restore`; `--require-signature` on `restore`.
+- API: `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` (hex) and `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE` (bool) env vars wired into `AppConfig`. The snapshot HTTP routes themselves are not yet exposed; the config picks the key up automatically when they ship.
+- Feature gate: `signed-snapshots`, default on. Operators who explicitly do not want the codepath compiled in can `--no-default-features` it off.
+
+**Migration path:** [`docs/SNAPSHOT-COMPATIBILITY.md` — v2 → v3 migration](./SNAPSHOT-COMPATIBILITY.md#v2--v3-migration-signed-snapshots) documents the four-step rollout (provision key → configure reader → configure writer → flip to strict mode) and the cross-tier ordering for key rotation.
+
+**Residual risk:** the default writer still emits unsigned v2 blobs; an operator who never opts in keeps the v0.3.5 posture. The deployment-side recommendation is to provision a key and reach Step 4 (`require_signature = true`) before exposing the snapshot HTTP routes to untrusted networks.
 
 **Owner:** snapshot maintainers.
 
