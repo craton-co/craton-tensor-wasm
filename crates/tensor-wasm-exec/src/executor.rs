@@ -9,8 +9,8 @@
 //! [`TensorWasmExecutor::terminate`] — all async, all driven from the calling
 //! Tokio runtime.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tensor_wasm_core::metrics::TensorWasmMetrics;
@@ -38,6 +38,20 @@ fn duration_to_epoch_ticks(d: Duration, tick: Duration) -> u64 {
     let ticks_u128 = d_ms.div_ceil(t_ms).max(1);
     u64::try_from(ticks_u128).unwrap_or(u64::MAX)
 }
+
+/// Hard upper bound on how long a Wasm module's `start` function (and any
+/// other code that runs inside [`wasmtime::Instance::new_async`]) is allowed
+/// to execute before the epoch interrupt trips.
+///
+/// Without this cap a `SpawnConfig { deadline: None, .. }` would set the
+/// per-store epoch deadline to `u64::MAX`, which means an infinite-loop
+/// start function would burn forever inside `Instance::new_async`. Because
+/// the instance is not registered with the executor until that call
+/// returns, [`TensorWasmExecutor::terminate`] cannot reach it — the only
+/// thing that can interrupt the loop is the epoch deadline. 30 seconds is
+/// generous for legitimate start functions (which typically just call out
+/// to a few initialisers) while still bounding the worst case.
+pub const MAX_START_FN_DURATION: Duration = Duration::from_secs(30);
 
 /// Errors raised by the executor.
 #[derive(Debug, Error)]
@@ -269,6 +283,15 @@ pub struct TensorWasmExecutor {
     /// Optional metrics handle. When `Some`, spawn/terminate operations
     /// increment the corresponding Prometheus counters / gauges.
     metrics: Option<TensorWasmMetrics>,
+    /// One-shot guard for the "epoch ticker not running" operator warning.
+    ///
+    /// Initialised lazily on first observation of a missing ticker; the
+    /// inner [`AtomicBool`] flips to `true` once the warning has fired so
+    /// subsequent spawns on the same executor stay quiet (the warning is
+    /// load-bearing for operators, but at 1 line per spawn it would flood
+    /// the log). Scoped to the executor (and therefore the engine) so
+    /// distinct engines in the same process each get their own warning.
+    ticker_warned: Arc<OnceLock<AtomicBool>>,
 }
 
 /// Walk every exported and imported [`ExternType::Memory`] in `module` and
@@ -327,6 +350,7 @@ impl TensorWasmExecutor {
             next_instance_id: Arc::new(AtomicU64::new(1)),
             module_cache: Arc::new(DashMap::new()),
             metrics: None,
+            ticker_warned: Arc::new(OnceLock::new()),
         }
     }
 
@@ -340,6 +364,7 @@ impl TensorWasmExecutor {
             next_instance_id: Arc::new(AtomicU64::new(1)),
             module_cache: Arc::new(DashMap::new()),
             metrics: Some(metrics),
+            ticker_warned: Arc::new(OnceLock::new()),
         }
     }
 
@@ -450,6 +475,37 @@ impl TensorWasmExecutor {
             // tick to reach it, so the deadline will never trip in practice.
             None => u64::MAX,
         };
+        // Separate epoch budget for the *start* function (and anything else
+        // that runs inside `Instance::new_async`). Without this cap, a
+        // `SpawnConfig { deadline: None, .. }` would set the epoch deadline
+        // to `u64::MAX`, so an infinite-loop start function would burn
+        // forever inside `new_async`. The instance is not registered with
+        // the executor until that call returns, so `terminate` cannot
+        // reach it — the only thing that can interrupt the loop is the
+        // epoch deadline. Cap at the MIN of the caller's per-call deadline
+        // (if any) and `MAX_START_FN_DURATION`.
+        let max_start_ticks = {
+            let d_ms = MAX_START_FN_DURATION.as_millis();
+            let t_ms = tick.as_millis().max(1);
+            let ticks_u128 = d_ms.div_ceil(t_ms).max(1);
+            u64::try_from(ticks_u128).unwrap_or(u64::MAX)
+        };
+        let start_deadline_ticks = epoch_deadline_ticks.min(max_start_ticks);
+        // Warn (once per engine/executor) if the ticker isn't running —
+        // without it, neither the start-function cap above nor any
+        // call-time deadline will actually fire, and a runaway guest
+        // will wedge the worker thread until it returns of its own accord.
+        if !self.engine.is_epoch_ticker_running() {
+            let flag = self
+                .ticker_warned
+                .get_or_init(|| AtomicBool::new(false));
+            if !flag.swap(true, Ordering::AcqRel) {
+                tracing::error!(
+                    target: "tensor_wasm_exec::executor",
+                    "epoch ticker not running — deadlines will not fire; call `engine.spawn_epoch_ticker(Handle::current())` before serving traffic",
+                );
+            }
+        }
         let module = self.compile_module_cached(wasm)?;
 
         // Pre-instantiation memory cap (closes mem-H5 / exec-S-2 / exec-S-10).
@@ -474,8 +530,13 @@ impl TensorWasmExecutor {
         // object coercion so type inference doesn't choose the concrete
         // `&mut TensorWasmResourceLimiter`.
         store.limiter(|state| &mut state.limiter as &mut dyn ResourceLimiter);
-        store.set_epoch_deadline(epoch_deadline_ticks);
+        // Use the *start*-function deadline for the instantiation phase.
+        store.set_epoch_deadline(start_deadline_ticks);
         let instance = wasmtime::Instance::new_async(&mut store, &module, &[]).await?;
+        // Restore the per-call deadline budget so subsequent
+        // `call_export` invocations get the full configured deadline
+        // (or unbounded `u64::MAX` when the caller did not supply one).
+        store.set_epoch_deadline(epoch_deadline_ticks);
         let bi = TensorWasmInstance::new(store, instance);
         // Final occupancy check via `Entry::Vacant` — `allocate_instance_id`
         // already guards against active collisions, but a concurrent

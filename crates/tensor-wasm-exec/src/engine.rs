@@ -209,6 +209,20 @@ impl TensorWasmEngine {
         }
     }
 
+    /// True if [`spawn_epoch_ticker`](Self::spawn_epoch_ticker) has been called
+    /// on this engine and the ticker has not been
+    /// [`stop_epoch_ticker`](Self::stop_epoch_ticker)'d.
+    ///
+    /// Used by [`TensorWasmExecutor`](crate::executor::TensorWasmExecutor) to
+    /// emit a one-shot operator warning the first time an instance is spawned
+    /// on an engine whose ticker is not running (deadlines are otherwise
+    /// silently inert).
+    pub fn is_epoch_ticker_running(&self) -> bool {
+        self.ticker_handle
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+    }
+
     /// Increment the epoch once manually. Useful for tests that do not want
     /// to wait for the background ticker.
     pub fn tick(&self) {
