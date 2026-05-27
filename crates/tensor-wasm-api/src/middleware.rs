@@ -359,6 +359,40 @@ fn envelope(status: StatusCode, kind: &str, message: &str) -> Response {
     (status, body).into_response()
 }
 
+/// Parse the credentials portion of an `Authorization` header value when the
+/// scheme matches `Bearer` case-insensitively (RFC 6750 §2.1 / RFC 7235 §2.1).
+///
+/// The header value is split on the first run of whitespace separating the
+/// scheme token from the credentials. The scheme is compared via
+/// `eq_ignore_ascii_case("bearer")` so `Bearer`, `bearer`, and `BEARER`
+/// (the latter two emerge from upstream load balancers that normalise
+/// header names/values) all match. Both space and horizontal tab are
+/// accepted as separators (RFC 7235 BWS = bad whitespace). The trailing
+/// credentials are trimmed of surrounding ASCII whitespace before being
+/// returned.
+///
+/// Returns `None` when the value has no whitespace (i.e. is a single token
+/// such as `Bearer`) or the scheme is not bearer. An empty-credential
+/// case (e.g. `"Bearer   "`) returns `Some("")` so the caller can still
+/// enforce its empty-token rejection rule.
+fn parse_bearer_credentials(value: &str) -> Option<&str> {
+    // Find the first whitespace byte (space or tab) — anything else
+    // separating scheme from credentials would itself be a protocol
+    // violation, so we don't bother with general Unicode whitespace.
+    let split = value
+        .as_bytes()
+        .iter()
+        .position(|&b| b == b' ' || b == b'\t')?;
+    let (scheme, rest) = value.split_at(split);
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    // Trim the leading whitespace run (BWS) plus any trailing whitespace
+    // around the credentials. `trim_matches` over the BWS set keeps the
+    // behaviour aligned with `str::trim`'s ASCII-whitespace semantics.
+    Some(rest.trim_matches(|c: char| c == ' ' || c == '\t'))
+}
+
 /// Bearer-token authentication middleware.
 ///
 /// If the allowlist is empty the request passes through (dev mode — already
@@ -387,7 +421,7 @@ pub async fn bearer_auth(mut req: Request, next: Next) -> Response {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok());
 
-    let token = match header.and_then(|h| h.strip_prefix("Bearer ").map(str::trim)) {
+    let token = match header.and_then(parse_bearer_credentials) {
         Some(t) if !t.is_empty() => t.to_owned(),
         _ => {
             return envelope(
@@ -650,6 +684,54 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(tid, TenantId(7));
+    }
+
+    #[test]
+    fn parse_bearer_credentials_accepts_canonical_scheme() {
+        assert_eq!(parse_bearer_credentials("Bearer abc"), Some("abc"));
+    }
+
+    #[test]
+    fn parse_bearer_credentials_is_case_insensitive() {
+        // Load balancers (e.g. Envoy / nginx lowercase plugins) may have
+        // normalised the scheme; RFC 6750 §2.1 says scheme matching is
+        // case-insensitive.
+        assert_eq!(parse_bearer_credentials("bearer abc"), Some("abc"));
+        assert_eq!(parse_bearer_credentials("BEARER abc"), Some("abc"));
+        assert_eq!(parse_bearer_credentials("BeArEr abc"), Some("abc"));
+    }
+
+    #[test]
+    fn parse_bearer_credentials_accepts_tab_separator() {
+        assert_eq!(parse_bearer_credentials("Bearer\tabc"), Some("abc"));
+    }
+
+    #[test]
+    fn parse_bearer_credentials_trims_surrounding_whitespace() {
+        assert_eq!(parse_bearer_credentials("Bearer   abc"), Some("abc"));
+        assert_eq!(parse_bearer_credentials("Bearer abc  "), Some("abc"));
+        assert_eq!(parse_bearer_credentials("Bearer \t abc \t "), Some("abc"));
+    }
+
+    #[test]
+    fn parse_bearer_credentials_rejects_other_schemes() {
+        assert_eq!(parse_bearer_credentials("Basic ZGVhZGJlZWY="), None);
+        assert_eq!(parse_bearer_credentials("Token abc"), None);
+    }
+
+    #[test]
+    fn parse_bearer_credentials_returns_none_for_no_whitespace() {
+        // No separator at all => not a parseable Authorization value.
+        assert_eq!(parse_bearer_credentials("Bearer"), None);
+        assert_eq!(parse_bearer_credentials(""), None);
+    }
+
+    #[test]
+    fn parse_bearer_credentials_empty_token_is_some_empty() {
+        // Caller (`bearer_auth`) is responsible for the empty-token check;
+        // we surface the empty string so it can reject with the same shape
+        // as a missing header.
+        assert_eq!(parse_bearer_credentials("Bearer   "), Some(""));
     }
 
     #[test]

@@ -17,6 +17,22 @@ use tensor_wasm_api::{
 };
 use tower::ServiceExt;
 
+/// A path on the PROTECTED router stack — `/healthz` no longer flows
+/// through `bearer_auth` / `rate_limit` (see
+/// `openapi/tensor-wasm-api.yaml`, `paths./healthz` `security: []`), so
+/// every rate-limit test in this file drives a protected route instead.
+/// `GET /jobs/{id}` is the cheapest such route: the handler does no I/O,
+/// it just looks the id up in an in-memory map and returns 404 when it
+/// is missing — which is exactly the "permitted by the limiter" outcome
+/// these tests are looking for. The job id is a fixed nil UUID so the
+/// status is deterministic across runs.
+const PROTECTED_PATH: &str = "/jobs/00000000-0000-0000-0000-000000000000";
+/// Status returned by `GET /jobs/{nil-uuid}` when the limiter permits the
+/// request — the handler finds no entry and returns the standard
+/// `not_found` envelope. Anything that is NOT this status (and not 429)
+/// is a wiring failure.
+const ALLOWED_STATUS: StatusCode = StatusCode::NOT_FOUND;
+
 fn router_with_limit(tokens: &[&str], qps: u32, burst: u32) -> axum::Router {
     let auth = AuthConfig::from_tokens(tokens.iter().copied());
     let limiter = RateLimiter::new(RateLimitConfig { qps, burst });
@@ -40,7 +56,7 @@ async fn burst_window_admits_then_429s_with_retry_after() {
     for _ in 0..4 {
         let req = Request::builder()
             .method(Method::GET)
-            .uri("/healthz")
+            .uri(PROTECTED_PATH)
             .header("Authorization", "Bearer A")
             .body(Body::empty())
             .unwrap();
@@ -56,9 +72,9 @@ async fn burst_window_admits_then_429s_with_retry_after() {
         statuses.push(status);
     }
 
-    assert_eq!(statuses[0], StatusCode::OK);
-    assert_eq!(statuses[1], StatusCode::OK);
-    assert_eq!(statuses[2], StatusCode::OK);
+    assert_eq!(statuses[0], ALLOWED_STATUS);
+    assert_eq!(statuses[1], ALLOWED_STATUS);
+    assert_eq!(statuses[2], ALLOWED_STATUS);
     assert_eq!(statuses[3], StatusCode::TOO_MANY_REQUESTS);
     assert!(
         retry_after.is_some(),
@@ -74,16 +90,16 @@ async fn separate_tokens_get_separate_buckets_through_router() {
     for _ in 0..2 {
         let req = Request::builder()
             .method(Method::GET)
-            .uri("/healthz")
+            .uri(PROTECTED_PATH)
             .header("Authorization", "Bearer A")
             .body(Body::empty())
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), ALLOWED_STATUS);
     }
     let drained = Request::builder()
         .method(Method::GET)
-        .uri("/healthz")
+        .uri(PROTECTED_PATH)
         .header("Authorization", "Bearer A")
         .body(Body::empty())
         .unwrap();
@@ -96,12 +112,12 @@ async fn separate_tokens_get_separate_buckets_through_router() {
     for _ in 0..2 {
         let req = Request::builder()
             .method(Method::GET)
-            .uri("/healthz")
+            .uri(PROTECTED_PATH)
             .header("Authorization", "Bearer B")
             .body(Body::empty())
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), ALLOWED_STATUS);
     }
 }
 
@@ -112,12 +128,12 @@ async fn disabled_limiter_does_not_throttle() {
     for _ in 0..50 {
         let req = Request::builder()
             .method(Method::GET)
-            .uri("/healthz")
+            .uri(PROTECTED_PATH)
             .header("Authorization", "Bearer A")
             .body(Body::empty())
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), ALLOWED_STATUS);
     }
 }
 
@@ -129,7 +145,7 @@ async fn rate_limit_runs_after_bearer_auth() {
     let router = router_with_limit(&["A"], 1, 1);
     let req = Request::builder()
         .method(Method::GET)
-        .uri("/healthz")
+        .uri(PROTECTED_PATH)
         .body(Body::empty())
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
@@ -140,11 +156,11 @@ async fn rate_limit_runs_after_bearer_auth() {
     // a permit from token A's bucket.
     let ok = Request::builder()
         .method(Method::GET)
-        .uri("/healthz")
+        .uri(PROTECTED_PATH)
         .header("Authorization", "Bearer A")
         .body(Body::empty())
         .unwrap();
-    assert_eq!(router.oneshot(ok).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(router.oneshot(ok).await.unwrap().status(), ALLOWED_STATUS);
 }
 
 #[tokio::test]
@@ -164,15 +180,15 @@ async fn dev_mode_shares_a_single_bucket() {
     for i in 0..2 {
         let req = Request::builder()
             .method(Method::GET)
-            .uri("/healthz")
+            .uri(PROTECTED_PATH)
             .body(Body::empty())
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "request {i}");
+        assert_eq!(resp.status(), ALLOWED_STATUS, "request {i}");
     }
     let req = Request::builder()
         .method(Method::GET)
-        .uri("/healthz")
+        .uri(PROTECTED_PATH)
         .body(Body::empty())
         .unwrap();
     assert_eq!(

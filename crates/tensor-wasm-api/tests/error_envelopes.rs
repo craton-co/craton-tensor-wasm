@@ -127,10 +127,13 @@ async fn kind_invalid_wasm_bad_magic() {
 
 #[tokio::test]
 async fn kind_unauthorized() {
+    // `/healthz` and `/metrics` are intentionally unauthenticated (see
+    // `openapi/tensor-wasm-api.yaml`, `security: []`), so we drive a
+    // protected route to exercise the bearer-auth layer.
     let router = auth_router(&["good"]);
     let req = Request::builder()
         .method(Method::GET)
-        .uri("/healthz")
+        .uri(format!("/jobs/{}", Uuid::nil()))
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -140,10 +143,12 @@ async fn kind_unauthorized() {
 
 #[tokio::test]
 async fn kind_missing_tenant() {
+    // Same rationale as `kind_unauthorized` above: the tenant-scope layer
+    // only runs on protected routes after Fix 2.
     let router = require_tenant_router();
     let req = Request::builder()
         .method(Method::GET)
-        .uri("/healthz")
+        .uri(format!("/jobs/{}", Uuid::nil()))
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -176,10 +181,12 @@ async fn kind_not_found() {
 #[tokio::test]
 async fn kind_tenant_header_invalid() {
     // Bad tenant value (non-u64) surfaces as missing_tenant 400 — the
-    // other branch of the same envelope.
+    // other branch of the same envelope. Driven against a protected route
+    // because `/healthz` no longer flows through `tenant_scope` (see
+    // `openapi/tensor-wasm-api.yaml`, `security: []`).
     let req = Request::builder()
         .method(Method::GET)
-        .uri("/healthz")
+        .uri(format!("/jobs/{}", Uuid::nil()))
         .header(HEADER_TENANT, "abc")
         .body(Body::empty())
         .unwrap();

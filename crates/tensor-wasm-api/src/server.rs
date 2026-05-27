@@ -134,7 +134,14 @@ pub fn build_router_with_audit(
         routes: RouteAllowList::new_default(),
     };
 
-    let global_layers = ServiceBuilder::new()
+    // Layers that apply to EVERY route (protected and probe alike): tracing,
+    // trace-id injection, the body cap, the timeout, the concurrency cap,
+    // and HTTP metrics counting. Auth / tenant / rate-limit / audit are
+    // intentionally NOT in this stack — `/healthz` and `/metrics` are
+    // documented in `openapi/tensor-wasm-api.yaml` as `security: []` (no
+    // auth) so that k8s liveness/readiness probes and Prometheus scrapers
+    // can hit them without holding bearer tokens.
+    let common_layers = ServiceBuilder::new()
         .layer(trace_layer_with_propagation())
         // `inject_trace_id_header` runs inside the trace layer so the
         // current span (the one the trace layer just created with its
@@ -158,9 +165,12 @@ pub fn build_router_with_audit(
         .layer(body_limit_layer(MAX_REQUEST_BODY_BYTES))
         .layer(timeout_layer(Duration::from_secs(30)))
         .layer(concurrency_limit_layer(64))
-        // Pass the config into the request extensions so the `from_fn`
-        // middleware below can pick it up without capturing through a
-        // type-erased closure.
+        // Pass the auth + tenant + limiter + audit config into the request
+        // extensions so the protected stack's `from_fn` middleware can pick
+        // them up without capturing through a type-erased closure. The
+        // probe stack does not consume these but inserting them is cheap
+        // and keeps the stacks symmetric — relevant if a future probe
+        // grows an auth-aware behaviour (e.g. degraded-mode signalling).
         .layer(axum::Extension(auth))
         .layer(axum::Extension(tenant))
         .layer(axum::Extension(limiter))
@@ -169,7 +179,31 @@ pub fn build_router_with_audit(
         // Metrics emission wraps every downstream layer (including
         // bearer_auth) so 401s, 429s, and handler responses all get
         // counted — see the comment block above.
-        .layer(axum::middleware::from_fn(http_metrics_middleware))
+        .layer(axum::middleware::from_fn(http_metrics_middleware));
+
+    // Probe stack: `/healthz` and `/metrics` deliberately bypass bearer
+    // auth, tenant scope, the per-token rate limiter, and the audit log.
+    // OpenAPI (`openapi/tensor-wasm-api.yaml` `paths./healthz` and
+    // `paths./metrics`) declares `security: []` for both, k8s probes do
+    // not carry an Authorization header, and Prometheus scrapers typically
+    // share a single credential across many endpoints — protecting these
+    // here would break the published contract and silently disable
+    // upstream health checks.
+    let probe_router = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics));
+
+    // Protected stack: everything that operates on tenant data. Auth /
+    // tenant resolution / rate limit / audit all run on top of
+    // `common_layers`, in the same order as before so the audit record
+    // still observes the final status and any handler-stamped outcome
+    // extension.
+    let protected_router = Router::new()
+        .route("/functions", post(create_function))
+        .route("/functions/:id", delete(delete_function))
+        .route("/functions/:id/invoke", post(invoke_function))
+        .route("/functions/:id/invoke-async", post(invoke_function_async))
+        .route("/jobs/:id", get(get_job))
         .layer(axum::middleware::from_fn(bearer_auth))
         .layer(axum::middleware::from_fn(tenant_scope))
         .layer(axum::middleware::from_fn(rate_limit))
@@ -177,15 +211,9 @@ pub fn build_router_with_audit(
         // status code and any AuditOutcomeExt the handler stamped.
         .layer(axum::middleware::from_fn(audit_log_middleware));
 
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/metrics", get(metrics))
-        .route("/functions", post(create_function))
-        .route("/functions/:id", delete(delete_function))
-        .route("/functions/:id/invoke", post(invoke_function))
-        .route("/functions/:id/invoke-async", post(invoke_function_async))
-        .route("/jobs/:id", get(get_job))
-        .layer(global_layers)
+    protected_router
+        .merge(probe_router)
+        .layer(common_layers)
         .with_state(state)
 }
 

@@ -187,31 +187,33 @@ async fn invoke_with_bogus_id_uses_route_template_label_not_uuid() {
 async fn unauthorized_401_is_still_counted() {
     let (router, _state) = router_with_tokens(&["secret-token"]);
 
-    // No Authorization header -> 401 from bearer_auth. The metrics layer
-    // sits OUTSIDE bearer_auth so the counter must still record the
-    // response with status="401".
+    // No Authorization header on a PROTECTED route -> 401 from bearer_auth.
+    // The metrics layer sits OUTSIDE bearer_auth in the common layer stack
+    // so the counter must still record the response with `status="401"`.
+    // We use `POST /functions` rather than `/healthz` here because the
+    // probe routes (`/healthz`, `/metrics`) intentionally bypass auth (see
+    // `openapi/tensor-wasm-api.yaml` — `security: []`).
     let req = Request::builder()
-        .method(Method::GET)
-        .uri("/healthz")
-        .body(Body::empty())
+        .method(Method::POST)
+        .uri("/functions")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    // The /metrics scrape itself needs to bypass auth — but our router
-    // applies bearer_auth to /metrics as well. Supply the bearer token
-    // for the scrape so we can read the counter.
+    // `/metrics` is unauthenticated by design, so no bearer header is
+    // required to scrape it.
     let req = Request::builder()
         .method(Method::GET)
         .uri("/metrics")
-        .header("authorization", "Bearer secret-token")
         .body(Body::empty())
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = String::from_utf8(body_bytes(resp.into_body()).await).expect("utf8");
     assert!(
-        body.contains("tensor_wasm_http_requests_total{route=\"/healthz\",method=\"GET\",status=\"401\"} 1"),
-        "401 on /healthz was not counted; got:\n{body}"
+        body.contains("tensor_wasm_http_requests_total{route=\"/functions\",method=\"POST\",status=\"401\"} 1"),
+        "401 on /functions was not counted; got:\n{body}"
     );
 }
