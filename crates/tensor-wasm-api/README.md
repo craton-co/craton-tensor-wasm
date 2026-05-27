@@ -7,6 +7,8 @@ HTTP serverless API gateway for Craton TensorWasm, built on axum. Exposes REST e
 - **Body limit (64 MiB).** Every inbound request is capped via `tower_http::limit::RequestBodyLimitLayer`. Larger bodies are rejected with `413 Payload Too Large` before any handler runs.
 - **Bearer-token auth via `TENSOR_WASM_API_TOKENS`.** A comma-separated allowlist of accepted tokens. Empty/unset puts the gateway in dev mode (warn-once on startup, requests pass through). When set, callers must send `Authorization: Bearer <token>`.
 - **Tenant scoping via `X-TensorWasm-Tenant` header.** The header is parsed as a `u64` and threaded through to the executor. Absent header defaults to tenant `0`; set `TENSOR_WASM_API_REQUIRE_TENANT=1` to make the header mandatory.
+- **Snapshot HMAC key via `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` (hex, 64 chars).** Optional. When set, the upcoming `/snapshot/save` and `/snapshot/restore` routes will HMAC-SHA256 sign on save and verify on restore. Malformed-but-set is a hard startup error so a typo never silently degrades to the no-signing path. The routes themselves are not yet wired (v0.4); the env knob is parsed today so manifests can be staged ahead of time.
+- **Snapshot strict-verify via `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE` (`true`/`false`, default `false`).** Optional. When `true`, snapshot restore refuses v2 (unsigned) blobs even when a signing key is configured.
 
 See [`API.md`](API.md) for the full wire-format reference.
 
