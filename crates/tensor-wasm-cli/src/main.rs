@@ -9,9 +9,13 @@
 //! save/restore (`snapshot`), Prometheus scraping (`metrics`), shell
 //! completion (`completions`), and man-page generation (`man`).
 //!
-//! Subcommand implementations live under [`cmd`]. Each command parses its
-//! arguments via `clap` derive, runs to completion, and returns an
-//! [`anyhow::Result`] back to `main` for unified error reporting.
+//! Subcommand implementations live under [`tensor_wasm_cli::cmd`]. Each
+//! command parses its arguments via `clap` derive, runs to completion, and
+//! returns an [`anyhow::Result`] back to `main` for unified error
+//! reporting. The clap top-level types ([`Cli`] / [`Command`]) live in
+//! the sibling library (`src/lib.rs`) so the `man` subcommand can walk
+//! the command tree from `Cli::command()` and integration tests under
+//! `tests/` can call parser-level helpers directly.
 //!
 //! # Global flags & environment
 //!
@@ -27,74 +31,10 @@
 //!   against a non-production token.
 #![deny(missing_docs)]
 
-use std::path::PathBuf;
-
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use clap_complete::Shell;
+use clap::Parser;
 
-mod cmd;
-
-/// Craton TensorWasm — GPU-accelerated serverless Wasm runtime CLI.
-#[derive(Debug, Parser)]
-#[command(
-    name = "tensor-wasm",
-    bin_name = "tensor-wasm",
-    version,
-    about = "Developer CLI for Craton TensorWasm",
-    long_about = "Run, deploy, invoke, bench, snapshot, and inspect TensorWasm Wasm workloads."
-)]
-pub struct Cli {
-    /// Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`.
-    /// Zero (the default) suppresses the header for backwards compatibility.
-    #[arg(long, global = true, default_value_t = 0)]
-    pub tenant: u64,
-
-    /// Subcommand to execute.
-    #[command(subcommand)]
-    pub command: Command,
-}
-
-/// Top-level `tensor-wasm` subcommands.
-#[derive(Debug, Subcommand)]
-pub enum Command {
-    /// Run a Wasm module locally against the in-process TensorWasm engine.
-    Run(cmd::run::RunArgs),
-    /// Upload a Wasm module to a TensorWasm server.
-    Deploy(cmd::deploy::DeployArgs),
-    /// Invoke a previously deployed function by id.
-    Invoke(cmd::invoke::InvokeArgs),
-    /// Benchmark local invocation latency (P50/P95/P99/max).
-    Bench(cmd::bench::BenchArgs),
-    /// Save or restore an instance snapshot.
-    Snapshot {
-        /// Snapshot sub-action.
-        #[command(subcommand)]
-        action: cmd::snapshot::SnapshotAction,
-    },
-    /// Fetch and pretty-print Prometheus metrics from a TensorWasm server.
-    Metrics(cmd::metrics::MetricsArgs),
-    /// Live operator dashboard over `/healthz` + `/metrics` (refreshes in place).
-    Observe(cmd::observe::ObserveArgs),
-    /// Run the TensorWasm HTTP API gateway in-process (binds and serves).
-    Serve(cmd::serve::ServeArgs),
-    /// Emit shell completion scripts for the named shell.
-    ///
-    /// By default the script is written to stdout. Pass `--out-dir <dir>` to
-    /// write it to a conventional filename inside `<dir>` instead — used by
-    /// `crates/tensor-wasm-cli/completions/` regeneration.
-    Completions {
-        /// Target shell (bash, zsh, fish, powershell, elvish).
-        shell: Shell,
-        /// Optional output directory. When provided, the script is written to
-        /// `<dir>/<conventional-name>` (e.g. `tensor-wasm.bash`,
-        /// `_tensor-wasm` for zsh, `tensor-wasm.fish`).
-        #[arg(long)]
-        out_dir: Option<PathBuf>,
-    },
-    /// Generate roff(7) man pages from the clap command tree.
-    Man(cmd::man::ManArgs),
-}
+use tensor_wasm_cli::{cmd, Cli, Command};
 
 #[tokio::main]
 async fn main() {

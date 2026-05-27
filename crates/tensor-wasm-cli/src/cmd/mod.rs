@@ -8,6 +8,7 @@
 //! into these modules; tests in `tests/cli_smoke.rs` exercise them through the
 //! built binary.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -39,11 +40,18 @@ pub(crate) const TENANT_HEADER: &str = "X-TensorWasm-Tenant";
 /// `X-TensorWasm-Tenant` header are applied uniformly across `deploy`, `invoke`,
 /// `metrics`, and `snapshot` — i.e. every command that issues an HTTP request.
 ///
-/// The `tenant` field follows the convention documented in
-/// [`crate::Cli::tenant`]: a value of `0` suppresses the header entirely so
-/// upgrading clients do not start sending headers servers may not yet handle.
+/// The `tenant` field follows the convention documented for the CLI's
+/// `--tenant` flag (`src/main.rs`): a value of `0` suppresses the header
+/// entirely so upgrading clients do not start sending headers servers may
+/// not yet handle.
+/// The struct is `pub` only so integration tests under `tests/` can
+/// observe credential-safety behaviour through the lib surface. The type
+/// is `#[doc(hidden)]` because it is NOT stable public API — the only
+/// supported consumer is the in-tree `tensor-wasm` binary plus the
+/// in-tree tests.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
-pub(crate) struct HttpContext {
+pub struct HttpContext {
     /// Bearer token loaded from [`TENSOR_WASM_TOKEN_ENV`], if set.
     token: Option<String>,
     /// Tenant id; `0` means "do not attach the header".
@@ -53,11 +61,34 @@ pub(crate) struct HttpContext {
 impl HttpContext {
     /// Build a context from the supplied `--tenant` value and the process
     /// environment. Missing / empty `TENSOR_WASM_TOKEN` is treated as "no auth".
-    pub(crate) fn from_env(tenant: u64) -> Self {
+    pub fn from_env(tenant: u64) -> Self {
         let token = std::env::var(TENSOR_WASM_TOKEN_ENV)
             .ok()
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
+        Self { token, tenant }
+    }
+
+    /// Test-only constructor that bypasses the process environment so
+    /// integration tests can build an `HttpContext` with a known token
+    /// without racing other tests that mutate `TENSOR_WASM_TOKEN`. Marked
+    /// `#[doc(hidden)]` so it doesn't leak into the public API surface.
+    #[doc(hidden)]
+    pub fn from_env_for_test_with_token(token: impl Into<String>, tenant: u64) -> Self {
+        Self {
+            token: Some(token.into()),
+            tenant,
+        }
+    }
+
+    /// Test-only constructor accepting an optional token. Mirrors
+    /// [`Self::from_env_for_test_with_token`] but lets a test exercise the
+    /// "no token configured" branch deterministically.
+    #[doc(hidden)]
+    pub fn from_env_for_test_with_token_optional(
+        token: Option<String>,
+        tenant: u64,
+    ) -> Self {
         Self { token, tenant }
     }
 
@@ -75,8 +106,28 @@ impl HttpContext {
     /// Attach `Authorization` and `X-TensorWasm-Tenant` headers to a request builder
     /// when configured. Returns the (possibly unchanged) builder so callers
     /// can chain.
-    pub(crate) fn apply(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    ///
+    /// When a bearer token is configured and the request URL is non-loopback
+    /// `http://`, a one-shot `tracing::warn!` fires so an operator who
+    /// accidentally points the CLI at a plaintext endpoint sees a clear
+    /// signal in their logs. We do NOT refuse — operators may legitimately
+    /// be on a trusted private network; the HMAC-key case in `snapshot.rs`
+    /// is stricter (refuse) because the snapshot signing key is far more
+    /// sensitive than a bearer token (which can be rotated cheaply).
+    pub fn apply(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(t) = &self.token {
+            // Try to inspect the URL on the in-flight builder so we can warn
+            // before the token leaves the process. `try_clone` + `build` is
+            // the only stable way to peek at the builder's URL today.
+            if let Some(cloned) = req.try_clone() {
+                if let Ok(built) = cloned.build() {
+                    let scheme = built.url().scheme();
+                    let host = built.url().host_str().unwrap_or("");
+                    if scheme == "http" && !is_loopback_host(host) {
+                        warn_plaintext_token_once();
+                    }
+                }
+            }
             req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
         }
         if self.tenant != 0 {
@@ -86,13 +137,76 @@ impl HttpContext {
     }
 }
 
+/// Latch so the plaintext-token warning fires at most once per process.
+/// `OnceLock<()>` rather than `OnceLock<bool>` because we only need
+/// "have we fired yet?" semantics — `get().is_some()` is the answer.
+static PLAINTEXT_TOKEN_WARNED: OnceLock<()> = OnceLock::new();
+
+/// Test-only accessor returning whether the plaintext-token warning has
+/// been emitted by the current process. Used by `tests/url_credential_safety.rs`
+/// to verify the warn-once gating without needing a tracing subscriber.
+///
+/// `OnceLock` has no public `reset`, so callers cannot observe the
+/// transition more than once per process. Tests that depend on the
+/// pre-warning state must therefore run before anything that triggers the
+/// gate; the integration test in `tests/url_credential_safety.rs` is the
+/// only consumer and it owns its own test binary, so isolation is
+/// guaranteed.
+///
+/// Marked `#[doc(hidden)]` rather than `#[cfg(test)]` because integration
+/// tests under `tests/` are compiled as *external* consumers of this lib
+/// crate, so a `cfg(test)` symbol would not be visible to them. The
+/// `doc(hidden)` attribute keeps the function out of rustdoc / IDE
+/// autocomplete so it cannot be mistaken for stable API.
+#[doc(hidden)]
+pub fn plaintext_token_warned_for_test() -> bool {
+    PLAINTEXT_TOKEN_WARNED.get().is_some()
+}
+
+/// Emit the one-shot plaintext-token warning. The `OnceLock::set` call is
+/// the gate: a second call returns `Err` and is silently dropped, which is
+/// the desired "warn once" semantics.
+fn warn_plaintext_token_once() {
+    if PLAINTEXT_TOKEN_WARNED.set(()).is_ok() {
+        tracing::warn!(
+            "sending TENSOR_WASM_TOKEN bearer auth over plaintext http:// to a \
+             non-loopback host; rotate the token if this URL was unexpected \
+             and prefer https:// for production endpoints"
+        );
+    }
+}
+
+/// Loopback / dev-only hosts where plaintext http:// is acceptable. We match
+/// `localhost`, `127.x.y.z` (any IPv4 loopback), and `::1` (IPv6 loopback).
+/// IPv6 hosts arrive bracketed in URLs but reqwest's `Url::host_str` returns
+/// them unbracketed, so we compare against `::1` directly.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        return true;
+    }
+    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+        return addr.is_loopback();
+    }
+    false
+}
+
 /// Lightweight URL validator used by the HTTP-shaped subcommands (`deploy`,
 /// `invoke`, `metrics`).
 ///
 /// Accepts any string that starts with `http://` or `https://` and contains a
 /// non-empty host component. Returns an `anyhow::Error` otherwise so the CLI
 /// fails fast with a clear message instead of dispatching a request to garbage.
-pub(crate) fn validate_server_url(url: &str) -> Result<()> {
+///
+/// URLs containing embedded credentials (`http://user:pass@host`) are also
+/// rejected — `reqwest` forwards the userinfo as a Basic-auth header, and
+/// every subcommand that formats `{url}` into an error message would
+/// otherwise echo the password verbatim into logs and CI output. Auth
+/// belongs in the `TENSOR_WASM_TOKEN` env var (see [`HttpContext::from_env`]).
+///
+/// `pub` rather than `pub(crate)` so the integration test in
+/// `tests/url_credential_safety.rs` can exercise the credential-safety
+/// branches directly without spawning the full binary.
+pub fn validate_server_url(url: &str) -> Result<()> {
     let rest = if let Some(r) = url.strip_prefix("http://") {
         r
     } else if let Some(r) = url.strip_prefix("https://") {
@@ -102,8 +216,19 @@ pub(crate) fn validate_server_url(url: &str) -> Result<()> {
     };
     // Host is everything up to the first `/` or `?`. It must be non-empty.
     let host_end = rest.find(['/', '?']).unwrap_or(rest.len());
-    if rest[..host_end].is_empty() {
+    let authority = &rest[..host_end];
+    if authority.is_empty() {
         anyhow::bail!("--server has no host component: `{url}`");
+    }
+    // Userinfo lives between the scheme and the first `/` or `?`, separated
+    // from the host by a literal `@`. We deliberately do NOT echo the URL
+    // back here because the offending password is part of the string — the
+    // error message must not leak the credential a careless operator just
+    // pasted into their shell history.
+    if authority.contains('@') {
+        anyhow::bail!(
+            "URLs with embedded credentials are not allowed; pass auth via TENSOR_WASM_TOKEN env var"
+        );
     }
     Ok(())
 }
@@ -152,6 +277,45 @@ pub(crate) fn render_error_response(status: reqwest::StatusCode, body: &str) -> 
 /// concatenate `"/path"` suffixes without producing `//path`.
 pub(crate) fn server_base(url: &str) -> &str {
     url.trim_end_matches('/')
+}
+
+/// Extract `(scheme, host)` from a server URL the CLI accepts (`http://...` or
+/// `https://...`). Strips a `:port` suffix from the host so `is_loopback_host`
+/// only sees the hostname. Returns `None` if the URL lacks a recognised
+/// scheme — callers should have already passed `validate_server_url` so this
+/// is purely defensive.
+///
+/// Note: this is a deliberately lightweight scheme/host extractor, not a
+/// full URL parser. The CLI already calls [`validate_server_url`] before
+/// any HTTP code path runs, so by the time we get here the input is known
+/// to be `http://…` or `https://…` with a non-empty authority and no
+/// embedded userinfo (`@`). That lets us shortcut the parse without
+/// pulling in the `url` crate.
+pub(crate) fn extract_scheme_host(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("http://") {
+        ("http", r)
+    } else if let Some(r) = url.strip_prefix("https://") {
+        ("https", r)
+    } else {
+        return None;
+    };
+    let host_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..host_end];
+    // Strip `:port`. IPv6 literals would be bracketed (`[::1]:8080`); the
+    // simple `rfind(':')` works for IPv4 / hostnames; for the bracketed
+    // IPv6 case the host portion runs from `[` to `]` and the port (if
+    // any) starts after `]`. We handle both shapes here so a future
+    // `https://[::1]:8443` URL is classified correctly.
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        // `[ipv6]` or `[ipv6]:port`. Find the closing bracket.
+        let close = stripped.find(']')?;
+        &stripped[..close]
+    } else if let Some(colon) = authority.rfind(':') {
+        &authority[..colon]
+    } else {
+        authority
+    };
+    Some((scheme, host))
 }
 
 #[cfg(test)]
@@ -250,8 +414,11 @@ mod tests {
             tenant: 0,
         };
         // Build an off-stack RequestBuilder so we can inspect headers.
+        // Use https:// so this test doesn't trip the plaintext-token warn-once
+        // latch and inadvertently flip the gate state observed by the
+        // sibling tests in `tests/url_credential_safety.rs`.
         let client = reqwest::Client::new();
-        let req = ctx.apply(client.get("http://x")).build().unwrap();
+        let req = ctx.apply(client.get("https://x")).build().unwrap();
         assert_eq!(req.headers().get("authorization").unwrap(), "Bearer abc");
         assert!(req.headers().get(TENANT_HEADER).is_none());
     }
@@ -263,7 +430,7 @@ mod tests {
             tenant: 7,
         };
         let client = reqwest::Client::new();
-        let req = ctx.apply(client.get("http://x")).build().unwrap();
+        let req = ctx.apply(client.get("https://x")).build().unwrap();
         assert_eq!(req.headers().get(TENANT_HEADER).unwrap(), "7");
         assert!(req.headers().get("authorization").is_none());
     }
@@ -275,7 +442,76 @@ mod tests {
             tenant: 0,
         };
         let client = reqwest::Client::new();
-        let req = ctx.apply(client.get("http://x")).build().unwrap();
+        let req = ctx.apply(client.get("https://x")).build().unwrap();
         assert!(req.headers().get(TENANT_HEADER).is_none());
+    }
+
+    #[test]
+    fn validate_server_url_rejects_userinfo() {
+        // Use distinctive credential values (`hunter2`, `alice42`) so the
+        // "must not leak" assertions below can grep for them without
+        // colliding with words that legitimately appear in the rejection
+        // message (the spec-mandated text says "pass auth via …", so
+        // looking for the literal substring "pass" would be ambiguous).
+        let err = validate_server_url("http://alice42:hunter2@host").unwrap_err();
+        let s = format!("{err}");
+        assert!(
+            s.contains("embedded credentials"),
+            "message should mention embedded credentials: {s}"
+        );
+        // The error must NOT echo the credential values back — that's the
+        // whole point of routing this through a generic message instead of
+        // `{url}`.
+        assert!(
+            !s.contains("hunter2"),
+            "must not leak the password value: {s}"
+        );
+        assert!(
+            !s.contains("alice42"),
+            "must not leak the username value: {s}"
+        );
+    }
+
+    #[test]
+    fn validate_server_url_rejects_userinfo_no_password() {
+        // `http://user@host` (no password) is still userinfo and must be
+        // rejected, otherwise an operator could smuggle a token-like
+        // username past the check.
+        assert!(validate_server_url("http://token@host").is_err());
+    }
+
+    #[test]
+    fn is_loopback_host_classifies_dev_addresses() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.10.20.30"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("example.com"));
+        assert!(!is_loopback_host("10.0.0.1"));
+        assert!(!is_loopback_host(""));
+    }
+
+    #[test]
+    fn extract_scheme_host_handles_common_shapes() {
+        assert_eq!(
+            extract_scheme_host("http://localhost:8080"),
+            Some(("http", "localhost"))
+        );
+        assert_eq!(
+            extract_scheme_host("https://example.com/api?x=1"),
+            Some(("https", "example.com"))
+        );
+        assert_eq!(
+            extract_scheme_host("http://127.0.0.1"),
+            Some(("http", "127.0.0.1"))
+        );
+        // IPv6 with port and without.
+        assert_eq!(
+            extract_scheme_host("http://[::1]:8443"),
+            Some(("http", "::1"))
+        );
+        assert_eq!(extract_scheme_host("http://[::1]"), Some(("http", "::1")));
+        assert_eq!(extract_scheme_host("ftp://x"), None);
     }
 }

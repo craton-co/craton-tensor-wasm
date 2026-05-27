@@ -251,6 +251,16 @@ async fn save(
         None => None,
     };
 
+    // Refuse to send the 32-byte HMAC signing key over plaintext http:// to a
+    // non-loopback host. The key is the *secret* used by the server to sign
+    // every snapshot it emits; leaking it lets an attacker forge archives
+    // that look authentic. Bearer tokens are also sensitive but cheaper to
+    // rotate (see `HttpContext::apply`, which only warns for the token
+    // case); the HMAC key warrants a hard refuse.
+    if hmac_key_hex.is_some() {
+        refuse_hmac_key_on_plaintext(server)?;
+    }
+
     let url = format!(
         "{}/instances/{}/snapshot",
         super::server_base(server),
@@ -346,6 +356,12 @@ async fn restore(
         Some(path) => Some(load_hmac_key(path).map(hex::encode)?),
         None => None,
     };
+
+    // See the matching check in `save`: refuse to expose the HMAC key over
+    // plaintext to anything other than a loopback / dev address.
+    if hmac_key_hex.is_some() {
+        refuse_hmac_key_on_plaintext(server)?;
+    }
 
     let bytes = std::fs::read(input)
         .with_context(|| format!("reading snapshot file {}", input.display()))?;
@@ -444,6 +460,32 @@ fn local_err(msg: impl Into<String>) -> anyhow::Error {
         code: codes::LOCAL_VALIDATION_FAILED,
         message: msg.into(),
     })
+}
+
+/// Refuse to forward the HMAC signing key when the server URL is a
+/// non-loopback `http://`. Returns `Ok(())` for `https://` and loopback
+/// (`localhost`, `127.0.0.0/8`, `::1`) targets so dev workflows aren't
+/// blocked. The error is tagged with `LOCAL_VALIDATION_FAILED` because
+/// the failure is caught entirely on the client side before any bytes hit
+/// the wire.
+///
+/// Exposed as `pub` (gated by `#[doc(hidden)]`) so the integration test in
+/// `tests/url_credential_safety.rs` can exercise the refuse branch
+/// directly via the lib surface, without spawning a real server.
+#[doc(hidden)]
+pub fn refuse_hmac_key_on_plaintext(server: &str) -> Result<()> {
+    let Some((scheme, host)) = super::extract_scheme_host(server) else {
+        // `validate_server_url` is supposed to run first; if it didn't, fall
+        // back to silently allowing the call so the existing scheme-shape
+        // error elsewhere takes precedence over this defence-in-depth check.
+        return Ok(());
+    };
+    if scheme == "http" && !super::is_loopback_host(host) {
+        return Err(local_err(
+            "refusing to send HMAC key over plaintext http://; use https:// or omit --hmac-key-file",
+        ));
+    }
+    Ok(())
 }
 
 /// Load a 32-byte HMAC-SHA256 key from disk.
@@ -601,6 +643,35 @@ mod tests {
         let tagged: &SnapshotExit = err.downcast_ref().expect("typed error");
         assert_eq!(tagged.code, codes::LOCAL_VALIDATION_FAILED);
         assert!(tagged.message.contains("64 hex characters or 32 raw bytes"));
+    }
+
+    #[test]
+    fn refuse_hmac_key_on_plaintext_blocks_remote_http() {
+        let err = refuse_hmac_key_on_plaintext("http://example.com:8080").unwrap_err();
+        let tagged: &SnapshotExit = err.downcast_ref().expect("typed error");
+        assert_eq!(tagged.code, codes::LOCAL_VALIDATION_FAILED);
+        assert!(
+            tagged.message.contains("plaintext http://"),
+            "message should mention plaintext: {}",
+            tagged.message
+        );
+        assert!(
+            tagged.message.contains("--hmac-key-file"),
+            "message should mention the offending flag: {}",
+            tagged.message
+        );
+    }
+
+    #[test]
+    fn refuse_hmac_key_on_plaintext_allows_https() {
+        refuse_hmac_key_on_plaintext("https://example.com").unwrap();
+    }
+
+    #[test]
+    fn refuse_hmac_key_on_plaintext_allows_loopback_http() {
+        refuse_hmac_key_on_plaintext("http://localhost:8080").unwrap();
+        refuse_hmac_key_on_plaintext("http://127.0.0.1:8080").unwrap();
+        refuse_hmac_key_on_plaintext("http://[::1]:8080").unwrap();
     }
 
     #[test]
