@@ -120,18 +120,22 @@ impl TensorWasmEngine {
         // consume; pinning them to `true` defends against the symmetric
         // failure mode (a future bump silently disabling something we rely
         // on).
-        wt_cfg.wasm_threads(false);
+        // Proposal flags exposed by the workspace's wasmtime feature set
+        // (`async`, `cranelift`, `component-model`, `runtime`). The list is
+        // intentionally narrow — additional flags (`wasm_threads`,
+        // `wasm_gc`, `wasm_function_references`, `wasm_reference_types`) are
+        // gated behind feature flags we do NOT enable in this workspace, so
+        // the corresponding proposals are already compiled out of the engine
+        // and cannot be activated by config alone. If those wasmtime
+        // features ever get pulled in, mirror them here with `_(false)`.
         wt_cfg.wasm_memory64(false);
         wt_cfg.wasm_multi_memory(false);
         wt_cfg.wasm_relaxed_simd(false);
         wt_cfg.wasm_tail_call(false);
-        wt_cfg.wasm_gc(false);
-        wt_cfg.wasm_function_references(false);
         // Explicitly KEEP the proposals we depend on, so a wasmtime bump
         // cannot silently flip them:
         wt_cfg.wasm_simd(true);
         wt_cfg.wasm_bulk_memory(true);
-        wt_cfg.wasm_reference_types(true);
         wt_cfg.wasm_multi_value(true);
 
         match cfg.backend {

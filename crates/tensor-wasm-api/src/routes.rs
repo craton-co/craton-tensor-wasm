@@ -375,6 +375,12 @@ impl From<ExecError> for ApiError {
             // failures; the executor distinguishes them only when converting to
             // TensorWasmError. For the API surface we keep a single 500.
             ExecError::Wasmtime(_) => (StatusCode::INTERNAL_SERVER_ERROR, "wasmtime"),
+            // Per mem H5 + exec S-2: module's declared linear memory exceeds
+            // the engine's per-tenant cap. Surface as 413 so clients can
+            // distinguish quota rejection from a generic compile failure.
+            ExecError::ModuleMemoryTooLarge { .. } => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "module_memory_too_large")
+            }
         };
         ApiError {
             status,
