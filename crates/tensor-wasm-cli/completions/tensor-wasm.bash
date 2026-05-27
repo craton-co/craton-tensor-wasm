@@ -636,7 +636,7 @@ _tensor-wasm() {
             return 0
             ;;
         tensor__wasm__subcmd__snapshot__subcmd__restore)
-            opts="-h --input --as-instance --server --max-archive-bytes --tenant --help"
+            opts="-h --input --as-instance --server --max-archive-bytes --hmac-key-file --require-signature --tenant --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -658,6 +658,10 @@ _tensor-wasm() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --hmac-key-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --tenant)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
@@ -670,7 +674,7 @@ _tensor-wasm() {
             return 0
             ;;
         tensor__wasm__subcmd__snapshot__subcmd__save)
-            opts="-h --instance --output --server --max-restore-bytes --tenant --help"
+            opts="-h --instance --output --server --max-restore-bytes --hmac-key-file --tenant --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -689,6 +693,10 @@ _tensor-wasm() {
                     return 0
                     ;;
                 --max-restore-bytes)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --hmac-key-file)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

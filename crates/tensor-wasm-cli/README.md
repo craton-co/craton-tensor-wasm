@@ -37,6 +37,10 @@ A binary distribution channel (Homebrew tap, signed release tarballs) is on the 
 
 Use `tensor-wasm <subcommand> --help` for the authoritative flag list — that text is snapshot-tested with `insta` and reviewed on every change.
 
+### Snapshot signing (`--hmac-key-file`, `--require-signature`)
+
+Both `tensor-wasm snapshot save` and `tensor-wasm snapshot restore` accept `--hmac-key-file <PATH>` pointing at a 32-byte HMAC-SHA256 key. The file is read as 64 hex characters when it's exactly that length (surrounding whitespace stripped), otherwise as 32 raw bytes; mismatched-length files are rejected locally with exit code `2` before any network I/O. The hex-encoded key is forwarded to the server in the `X-TensorWasm-Snapshot-HMAC-Key` request header — actual sign/verify happens server-side via `tensor-wasm-snapshot`'s `with_hmac_sha256_key` builders. `snapshot restore` additionally accepts `--require-signature`, which sends `X-TensorWasm-Snapshot-Require-Signature: true` so the server refuses to rehydrate any archive that lacks an HMAC trailer. See the `tensor-wasm-snapshot` crate's `FORMAT.md` for the on-disk layout.
+
 ## Environment variables
 
 | Variable      | Purpose                                                                                      |

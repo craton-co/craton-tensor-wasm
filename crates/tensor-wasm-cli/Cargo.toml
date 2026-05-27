@@ -30,6 +30,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 base64 = "0.22"
+hex.workspace = true
 tensor-wasm-core = { workspace = true }
 tensor-wasm-exec = { workspace = true }
 # Pulled in for `tensor-wasm serve` — the CLI subcommand stands up the api

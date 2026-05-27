@@ -11,6 +11,61 @@ Save or restore an instance snapshot
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
+.SH SUBCOMMAND OPTIONS
+.SS save
+.TP
+\fB\-\-instance\fR \fI<INSTANCE>\fR
+Identifier of the running instance to snapshot
+.TP
+\fB\-\-output\fR \fI<OUTPUT>\fR
+Output path for the resulting `.tensor\-wasm` archive
+.TP
+\fB\-\-server\fR \fI<SERVER>\fR
+Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
+.TP
+\fB\-\-max\-restore\-bytes\fR \fI<MAX_RESTORE_BYTES>\fR
+Maximum number of bytes the CLI will accept from the server and write to
+\fI\-\-output\fR. Defaults to 256 MiB; values above the default are clamped
+down so a malicious server cannot fill the operator's disk by streaming an
+unbounded response body.
+.TP
+\fB\-\-hmac\-key\-file\fR \fI<PATH>\fR
+Path to a 32\-byte HMAC\-SHA256 key. The file is interpreted as 64 hex characters
+if it's that length (whitespace trimmed), otherwise as 32 raw bytes.
+Mismatched length is rejected with a local validation error before any
+network I/O. When present, the hex\-encoded key is forwarded to the server
+in the \fIX\-TensorWasm\-Snapshot\-HMAC\-Key\fR HTTP header so the server can
+sign the emitted archive.
+.SS restore
+.TP
+\fB\-\-input\fR \fI<INPUT>\fR
+Path to the `.tensor\-wasm` archive to upload
+.TP
+\fB\-\-as\-instance\fR \fI<AS_INSTANCE>\fR
+Identifier to assign to the restored instance
+.TP
+\fB\-\-server\fR \fI<SERVER>\fR
+Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
+.TP
+\fB\-\-max\-archive\-bytes\fR \fI<MAX_ARCHIVE_BYTES>\fR
+Maximum *on\-disk archive* size the CLI will upload, in bytes (default
+256 MiB). This bounds the compressed payload only \- the decompressed
+footprint is enforced server\-side and may be much larger. The deprecated
+alias \fI\-\-max\-decompressed\fR is accepted for one release; prefer
+\fI\-\-max\-archive\-bytes\fR in new scripts.
+.TP
+\fB\-\-hmac\-key\-file\fR \fI<PATH>\fR
+Path to a 32\-byte HMAC\-SHA256 key. The file is interpreted as 64 hex characters
+if it's that length (whitespace trimmed), otherwise as 32 raw bytes.
+Mismatched length is rejected with a local validation error before any
+network I/O. When present, the hex\-encoded key is forwarded to the server
+in the \fIX\-TensorWasm\-Snapshot\-HMAC\-Key\fR HTTP header so the server can
+verify the archive signature.
+.TP
+\fB\-\-require\-signature\fR
+Refuse to restore an unsigned (v2) snapshot. Sends
+\fIX\-TensorWasm\-Snapshot\-Require\-Signature: true\fR so the server rejects
+any archive that lacks an HMAC trailer rather than silently accepting it.
 .SH SUBCOMMANDS
 .TP
 tensor\-wasm\-snapshot\-save(1)

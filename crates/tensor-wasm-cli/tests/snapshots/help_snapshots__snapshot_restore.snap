@@ -18,5 +18,9 @@ Options:
           Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
       --max-archive-bytes <MAX_ARCHIVE_BYTES>
           Maximum *on-disk archive* size the CLI will upload, in bytes (default 256 MiB). This bounds the compressed payload only — the decompressed footprint is enforced server-side and may be much larger. The deprecated alias `--max-decompressed` is accepted for one release; prefer `--max-archive-bytes` in new scripts [default: 268435456]
+      --hmac-key-file <PATH>
+          Path to a 32-byte HMAC-SHA256 key. The file is interpreted as 64 hex characters if it's that length (whitespace trimmed), otherwise as 32 raw bytes. Mismatched length → error. When set, the key is forwarded to the server (hex-encoded, in the `X-TensorWasm-Snapshot-HMAC-Key` header) and the server uses it to verify the archive's signature
+      --require-signature
+          Refuse to restore an unsigned (v2) snapshot. Sends the `X-TensorWasm-Snapshot-Require-Signature: true` header so the server fails closed on archives produced before signing was enabled
   -h, --help
           Print help

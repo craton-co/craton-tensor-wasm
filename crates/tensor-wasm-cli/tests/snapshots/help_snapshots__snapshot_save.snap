@@ -18,5 +18,7 @@ Options:
           Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
       --max-restore-bytes <MAX_RESTORE_BYTES>
           Maximum number of bytes the CLI will accept from the server and write to `--output`. Defaults to 256 MiB; values above the default are clamped down so a malicious server cannot fill the operator's disk by streaming an unbounded response body [default: 268435456]
+      --hmac-key-file <PATH>
+          Path to a 32-byte HMAC-SHA256 key. The file is interpreted as 64 hex characters if it's that length (whitespace trimmed), otherwise as 32 raw bytes. Mismatched length → error. When set, the key is forwarded to the server (hex-encoded, in the `X-TensorWasm-Snapshot-HMAC-Key` header) and the server uses it to sign the emitted archive
   -h, --help
           Print help
