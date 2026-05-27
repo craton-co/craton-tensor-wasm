@@ -79,6 +79,25 @@ use crate::async_dispatch::BackPressure;
 use crate::kernel_args::{parse_argv, LoweredArg};
 use crate::registry::{KernelEntry, KernelRegistry};
 
+/// Maximum byte length of a single recorded `last_error` message.
+///
+/// `record_error` truncates any message above this cap (preserving UTF-8
+/// boundaries and appending an ellipsis) before storing it. The cap defends
+/// against a guest looping `launch` with malformed input — each call would
+/// otherwise force a large `format!` allocation that is immediately
+/// discarded on the next call.
+pub const MAX_RECORDED_ERROR_BYTES: usize = 512;
+
+/// Maximum byte length of a kernel entry-name passed to `load_ptx`.
+///
+/// CUDA identifiers are far below this in practice (PTX entries are
+/// C-style identifiers, typically under 64 bytes). The cap prevents a
+/// guest from forcing a multi-MiB UTF-8 validation + `String::from`
+/// allocation per `load_ptx` call. The PTX-bytes side is already
+/// bounded by [`MAX_PTX_BYTES`]; this is the matching cap for the
+/// entry-name side.
+pub const MAX_ENTRY_NAME_BYTES: usize = 256;
+
 /// Per-instance host state passed to wasi-cuda calls.
 ///
 /// `WasiCudaContext` is stored in the wasmtime `Store`'s data type (or in a
@@ -187,7 +206,23 @@ impl WasiCudaContext {
     }
 
     fn record_error(&self, msg: impl Into<String>) {
-        let msg = msg.into();
+        let mut msg = msg.into();
+        // Cap the recorded message so a guest looping `launch` with
+        // malformed input cannot keep forcing large `format!` allocations
+        // that are immediately discarded on the next call. We must
+        // truncate on a UTF-8 boundary — `String::truncate` panics
+        // otherwise — so walk back from the cap to the largest valid
+        // boundary index. `is_char_boundary(0)` is always true, so the
+        // `unwrap_or(0)` branch is unreachable in practice but keeps the
+        // expression total.
+        if msg.len() > MAX_RECORDED_ERROR_BYTES {
+            let cutoff = (0..=MAX_RECORDED_ERROR_BYTES)
+                .rev()
+                .find(|i| msg.is_char_boundary(*i))
+                .unwrap_or(0);
+            msg.truncate(cutoff);
+            msg.push_str("\u{2026}");
+        }
         warn!(target: "tensor_wasm_wasi_gpu::host", instance = %self.instance_id, %msg, "wasi-cuda error");
         // A panicked `record_error` call earlier in the launch path would
         // have poisoned this mutex. The error payload is still valid and
@@ -197,6 +232,17 @@ impl WasiCudaContext {
             .last_error
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(msg);
+    }
+
+    /// Test-only accessor for the truncating `record_error` path.
+    ///
+    /// Exposed so integration tests in `tests/` (which cannot reach the
+    /// private `record_error`) can exercise the cap. Production code
+    /// outside this crate has no reason to inject error messages and
+    /// should not call this method.
+    #[doc(hidden)]
+    pub fn record_error_for_test(&self, msg: impl Into<String>) {
+        self.record_error(msg);
     }
 
     /// Borrow the most recent error message.
@@ -456,6 +502,20 @@ fn load_ptx_impl<T: HasWasiCuda>(
     if (ptx_len as usize) > MAX_PTX_BYTES {
         caller.data().wasi_cuda().record_error(format!(
             "load_ptx: ptx_len {ptx_len} exceeds MAX_PTX_BYTES {MAX_PTX_BYTES}"
+        ));
+        return Err(AbiError::QuotaExceeded);
+    }
+    // Bound the entry-name length BEFORE `read_bytes` so a guest cannot
+    // force a multi-MiB UTF-8 validation + `String::from` allocation per
+    // call. `entry_len` is i32 from the wire; the negative-check inside
+    // `read_bytes` would still catch a negative value later, but checking
+    // the positive overflow here lets us reject without ever copying out
+    // of linear memory. We surface `QuotaExceeded` to match the existing
+    // PTX-bytes cap above — both are "input too large" failures from the
+    // guest's POV.
+    if entry_len < 0 || (entry_len as usize) > MAX_ENTRY_NAME_BYTES {
+        caller.data().wasi_cuda().record_error(format!(
+            "load_ptx: entry_len {entry_len} exceeds MAX_ENTRY_NAME_BYTES {MAX_ENTRY_NAME_BYTES}"
         ));
         return Err(AbiError::QuotaExceeded);
     }
