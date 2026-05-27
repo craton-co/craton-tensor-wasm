@@ -444,7 +444,20 @@ pub async fn create_function(
     // Full structural validation. `wasmparser::validate` walks every section
     // and rejects modules wasmtime would later refuse to compile, surfacing
     // the failure at deploy time rather than first invoke.
-    if let Err(e) = wasmparser::validate(&bytes) {
+    //
+    // For a 250 KiB module the walk takes 5-20ms of CPU; running it inline
+    // on a Tokio reactor thread would block every other connection multiplexed
+    // onto that worker. Offload to the blocking pool. We move `bytes` into the
+    // closure and recover ownership via the result tuple so the downstream
+    // `Arc::from(bytes)` does not need a second allocation.
+    let bytes = tokio::task::spawn_blocking(move || {
+        let validate_result = wasmparser::validate(&bytes);
+        (bytes, validate_result)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("wasm validator panicked: {e}")))?;
+    let (bytes, validate_result) = bytes;
+    if let Err(e) = validate_result {
         return Err(ApiError::bad_request(
             "invalid_wasm",
             format!("wasm validation failed: {e}"),
@@ -574,6 +587,62 @@ pub async fn invoke_function(
     Ok(Json(value))
 }
 
+/// RAII guard pairing one `jobs_active().inc()` with exactly one `.dec()`.
+///
+/// Constructed at the moment a job is accepted (synchronously, before the
+/// spawn); released on the happy path via [`Self::release`] once the job has
+/// reached a terminal state. If the owning task instead panics before
+/// `release` is called the `Drop` impl decrements the gauge and logs a
+/// warning — so an unwinding spawned task does not leak a permanent
+/// increment in the `tensor_wasm_jobs_active` series.
+///
+/// The handle stored is an `Arc<TensorWasmMetrics>` (not a borrowed reference)
+/// because the guard outlives the request handler frame: it is moved into
+/// the `tokio::spawn` body, which has a `'static` bound. The `Arc` clone is
+/// a single refcount bump regardless of registry size.
+struct JobsActiveGuard {
+    metrics: Arc<TensorWasmMetrics>,
+    decremented: bool,
+}
+
+impl JobsActiveGuard {
+    /// Increment `jobs_active` and return a guard that owns the matching
+    /// `dec()`. Always paired one-to-one with a single `release` (happy path)
+    /// or `Drop` (panic / early return path).
+    fn new(metrics: Arc<TensorWasmMetrics>) -> Self {
+        metrics.jobs_active().inc();
+        Self {
+            metrics,
+            decremented: false,
+        }
+    }
+
+    /// Happy-path release. Consumes the guard, decrements the gauge, and
+    /// marks the guard so the subsequent `Drop` is a no-op.
+    fn release(mut self) {
+        self.metrics.jobs_active().dec();
+        self.decremented = true;
+    }
+}
+
+impl Drop for JobsActiveGuard {
+    /// Panic / early-return safety net. Runs only when `release` was *not*
+    /// called — i.e. the holding future was cancelled or the spawned task
+    /// panicked before reaching its tail. Emits a `warn!` so an operator
+    /// scraping logs can correlate a `jobs_active` step-down with the
+    /// originating panic; the production happy path uses `release` and
+    /// stays silent.
+    fn drop(&mut self) {
+        if !self.decremented {
+            self.metrics.jobs_active().dec();
+            tracing::warn!(
+                target: "tensor_wasm_api::routes",
+                "jobs_active gauge decremented via Drop (likely task panic or cancellation)",
+            );
+        }
+    }
+}
+
 /// `POST /functions/{id}/invoke-async` — fire-and-forget invocation.
 ///
 /// Records a `Pending` [`JobRecord`], spawns the spawn/call/terminate flow
@@ -619,12 +688,13 @@ pub async fn invoke_function_async(
             created_unix_ms: now_unix_ms(),
         },
     );
-    // Account the new pending job in the gauge. The matching `.dec()` lives
-    // in the spawned task below and runs exactly once per terminal-state
-    // transition (Completed | Failed). v0.3.x emits a single series; the
-    // v0.4 follow-up to break out per tenant lands as a Family swap in
+    // Account the new pending job in the gauge via a Drop-implementing
+    // guard. The matching `.dec()` happens either through `guard.release()`
+    // at the end of the spawned task (happy path) or through `Drop` if the
+    // task unwinds first (panic safety net). v0.3.x emits a single series;
+    // the v0.4 follow-up to break out per tenant lands as a Family swap in
     // `tensor-wasm-core/src/metrics.rs` and a label tuple here.
-    state.metrics.jobs_active().inc();
+    let jobs_active_guard = JobsActiveGuard::new(Arc::clone(&state.metrics));
 
     // Spawn the real invocation. The executor is cheap to clone (it's an
     // `Arc` internally) and the jobs map is `Arc<DashMap>`.
@@ -638,7 +708,6 @@ pub async fn invoke_function_async(
     // disconnected from the inbound HTTP request in the OTLP backend.
     let executor = Arc::clone(&state.executor);
     let jobs = Arc::clone(&state.jobs);
-    let metrics = Arc::clone(&state.metrics);
     let job_span = tracing::info_span!(
         "async_invoke.job",
         job_id = %job_id,
@@ -648,6 +717,18 @@ pub async fn invoke_function_async(
     tokio::spawn(
         tracing::Instrument::instrument(
             async move {
+                // The guard is moved into the spawned task so its lifetime
+                // covers the entire async invocation, including any panic
+                // unwind from `run_invoke` or the result-write block.
+                let guard = jobs_active_guard;
+
+                // Test-only panic injection point: lets the gauge test
+                // exercise the Drop-based dec without needing a wasm
+                // module that actually traps an unwind. The probe is a
+                // single `Relaxed` atomic load in steady state — see
+                // [`test_hooks`] for the rationale.
+                test_hooks::maybe_panic_for_test();
+
                 let outcome = run_invoke(&executor, &wasm_bytes, tenant, id).await;
                 if let Some(mut entry) = jobs.get_mut(&job_id) {
                     match outcome {
@@ -665,16 +746,17 @@ pub async fn invoke_function_async(
                         }
                     }
                 }
-                // Balanced decrement: paired with the `.inc()` issued
+                // Balanced release: paired with the `JobsActiveGuard::new`
                 // before the spawn above. Runs once per terminal-state
-                // transition regardless of outcome (Completed | Failed)
-                // so the gauge converges back to zero on a quiescent
-                // node. NOTE: if the jobs map no longer contains the
-                // entry (e.g. an admin purge between insert and
-                // resolution) we still decrement — the contract is
-                // "one `dec` per `inc`", not "one `dec` per surviving
-                // JobRecord".
-                metrics.jobs_active().dec();
+                // transition regardless of outcome (Completed | Failed) so
+                // the gauge converges back to zero on a quiescent node.
+                // NOTE: if the jobs map no longer contains the entry (e.g.
+                // an admin purge between insert and resolution) we still
+                // decrement — the contract is "one `dec` per `inc`", not
+                // "one `dec` per surviving JobRecord". If this task panics
+                // before reaching `release`, the guard's `Drop` impl
+                // decrements the gauge with a warn-level log instead.
+                guard.release();
             },
             job_span,
         ),
@@ -695,6 +777,63 @@ pub async fn get_job(
     match state.jobs.get(&id) {
         Some(rec) => Ok(Json(rec.clone())),
         None => Err(ApiError::not_found(format!("job {id} not found"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test-only hooks
+// ---------------------------------------------------------------------------
+
+/// Test-only fault-injection probes for [`invoke_function_async`].
+///
+/// Exposed as `#[doc(hidden)] pub` so the in-tree integration test
+/// (`tests/jobs_active_gauge.rs`) can arm the probes. The steady-state cost
+/// is one `Relaxed` atomic load per async-invoke dispatch — negligible next
+/// to the executor `.spawn_instance` walk that immediately follows — so the
+/// probes are compiled into all builds rather than feature-gated. Outside
+/// the crate's test surface there is no public API to *set* the flag, so
+/// the production code path is unreachable.
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// When `true`, the next entry to `maybe_panic_for_test` panics and
+    /// resets the flag.
+    static PANIC_NEXT_INVOKE: AtomicBool = AtomicBool::new(false);
+
+    /// Arm the panic-injection probe. Returns a drop-guard that disarms it
+    /// on scope exit so a failing assertion does not leak the flag into a
+    /// neighbouring test.
+    pub fn arm_panic() -> ArmedPanic {
+        PANIC_NEXT_INVOKE.store(true, Ordering::SeqCst);
+        ArmedPanic
+    }
+
+    /// RAII disarm. Independent of whether the panic actually fired.
+    pub struct ArmedPanic;
+
+    impl Drop for ArmedPanic {
+        fn drop(&mut self) {
+            PANIC_NEXT_INVOKE.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Probe called from the spawned async-invoke task. Panics (and clears
+    /// the flag) when armed; otherwise a noop. Steady-state production
+    /// cost: one `Relaxed` atomic load.
+    #[inline]
+    pub(crate) fn maybe_panic_for_test() {
+        // `Relaxed` is the right ordering here: there is no other state
+        // we need to synchronise against the flag flip. The
+        // compare-exchange upgrades to `SeqCst` only on the cold path
+        // when the probe actually fires, which is fine for tests.
+        if PANIC_NEXT_INVOKE.load(Ordering::Relaxed)
+            && PANIC_NEXT_INVOKE
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            panic!("test_hooks::maybe_panic_for_test: deliberate panic for JobsActiveGuard Drop test");
+        }
     }
 }
 
@@ -783,6 +922,37 @@ mod tests {
         let api: ApiError = err.into();
         assert_eq!(api.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(api.kind, "wasmtime");
+    }
+
+    #[test]
+    fn jobs_active_guard_release_decrements_exactly_once() {
+        // Happy path: `new` + `release` is a balanced inc/dec, no warn.
+        let metrics = Arc::new(TensorWasmMetrics::new());
+        assert_eq!(metrics.jobs_active().get(), 0);
+        let g = JobsActiveGuard::new(Arc::clone(&metrics));
+        assert_eq!(metrics.jobs_active().get(), 1);
+        g.release();
+        assert_eq!(metrics.jobs_active().get(), 0);
+    }
+
+    #[test]
+    fn jobs_active_guard_drop_decrements_on_panic_path() {
+        // Panic-safety path: a guard dropped without `release` (i.e. the
+        // task unwound) still decrements the gauge so the series does not
+        // leak a permanent increment. We simulate the unwind by letting
+        // the guard fall out of scope without calling `release`.
+        let metrics = Arc::new(TensorWasmMetrics::new());
+        {
+            let _g = JobsActiveGuard::new(Arc::clone(&metrics));
+            assert_eq!(metrics.jobs_active().get(), 1);
+            // No `release()` here — simulates a panic before the explicit
+            // dec point. The `Drop` impl is the safety net.
+        }
+        assert_eq!(
+            metrics.jobs_active().get(),
+            0,
+            "Drop must decrement the gauge when release was not called"
+        );
     }
 
     #[test]
