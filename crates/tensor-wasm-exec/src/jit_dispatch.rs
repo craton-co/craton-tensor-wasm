@@ -43,7 +43,6 @@
 use std::sync::Arc;
 
 use tensor_wasm_jit::cache::{CacheKey, KernelCache};
-use parking_lot::Mutex;
 use wasmtime::{Caller, Linker};
 
 /// Default sm_version the dispatcher looks up. Matches
@@ -67,39 +66,72 @@ pub const DISPATCH_BAD_SCRATCH: i32 = -2;
 /// [`add_jit_dispatch_to_linker_with`] in test harnesses.
 pub const SCRATCH_ARENA_BYTES: u32 = 64 * 1024;
 
-/// Per-instance shared state the dispatch and alloc/free imports use.
+/// Per-instance state backing the `alloc`/`free`/`dispatch` imports.
 ///
-/// Wrapped in `Arc<Mutex<>>` so the same arena state is consulted across
-/// the three import callbacks. The mutex is parking_lot (no poisoning).
-#[derive(Default)]
-struct ArenaState {
+/// One [`ArenaState`] lives in each wasmtime `Store`'s payload (see
+/// [`crate::instance::InstanceState`]). Because every host-import closure
+/// reaches it through `caller.data_mut()` — an `&mut` borrow that wasmtime
+/// guarantees is unique for the duration of the call — no synchronisation
+/// wrapper is required, and crucially the arena is NOT shared across
+/// instances that happen to share a `Linker`. Two tenants instantiated
+/// from the same linker each get their own bump cursor and live stack.
+#[derive(Debug, Default)]
+pub struct ArenaState {
     /// Last-allocated offset; the next allocation drops below this. A
     /// `None` value means no allocation has happened yet — the first
     /// `alloc` call lazily sizes the arena based on the current memory
     /// length.
-    bump_cursor: Option<u32>,
+    pub(crate) bump_cursor: Option<u32>,
     /// Lower bound of the arena. Allocations that would push the cursor
     /// below this are refused so they can never overwrite guest static
     /// data (which lives below `arena_floor`). Set on the same first-call
     /// seed that initialises `bump_cursor`.
-    arena_floor: u32,
+    pub(crate) arena_floor: u32,
     /// Stack of (ptr, size) for LIFO free validation. Out-of-order frees
     /// degrade to "leak the slot until reset" rather than corrupt the
     /// arena.
-    live: Vec<(u32, u32)>,
+    pub(crate) live: Vec<(u32, u32)>,
+}
+
+impl ArenaState {
+    /// Current bump cursor, if any allocation has happened.
+    ///
+    /// Exposed primarily for tests that need to assert per-store isolation.
+    pub fn bump_cursor(&self) -> Option<u32> {
+        self.bump_cursor
+    }
+
+    /// Number of live (currently-allocated) slots on the LIFO stack.
+    ///
+    /// Exposed primarily for tests.
+    pub fn live_count(&self) -> usize {
+        self.live.len()
+    }
+}
+
+/// Lets the JIT host imports reach the per-store [`ArenaState`] through
+/// `caller.data_mut()`. Implemented by [`crate::instance::InstanceState`]
+/// and by test-only payload types.
+pub trait JitArenaProvider {
+    /// Borrow the per-store JIT arena mutably.
+    fn jit_arena_mut(&mut self) -> &mut ArenaState;
 }
 
 /// Register the `tensor-wasm:jit/host::dispatch`, `alloc`, and `free` imports on
 /// `linker`.
 ///
 /// The `cache` handle is cloned into each closure so the same backing store
-/// is consulted by every guest instance the linker instantiates.
+/// is consulted by every guest instance the linker instantiates — kernel
+/// caching IS designed to be cross-tenant. The bump arena, in contrast,
+/// lives in the per-store payload `T` (via [`JitArenaProvider`]) so two
+/// instances sharing a [`Linker`] do NOT see each other's cursor or live
+/// stack.
 pub fn add_jit_dispatch_to_linker<T>(
     linker: &mut Linker<T>,
     cache: Arc<KernelCache>,
 ) -> wasmtime::Result<()>
 where
-    T: 'static,
+    T: JitArenaProvider + 'static,
 {
     add_jit_dispatch_to_linker_with(
         linker,
@@ -126,12 +158,9 @@ pub fn add_jit_dispatch_to_linker_with<T>(
     sm_version: u32,
 ) -> wasmtime::Result<()>
 where
-    T: 'static,
+    T: JitArenaProvider + 'static,
 {
-    let arena = Arc::new(Mutex::new(ArenaState::default()));
-
     // alloc(size: i32) -> i32
-    let arena_alloc = arena.clone();
     linker.func_wrap(host_module, alloc_fn, move |mut caller: Caller<'_, T>, size: i32| -> i32 {
         if size <= 0 {
             return -1;
@@ -147,9 +176,12 @@ where
                 return -1;
             }
         };
-        let mut st = arena_alloc.lock();
+        // Capture the bump cursor (Copy) from the per-store arena. We
+        // release the &mut borrow before touching `memory` so wasmtime's
+        // borrow rules around `caller` are satisfied.
+        let cursor_opt = caller.data_mut().jit_arena_mut().bump_cursor;
         let mem_len = memory.data(&caller).len() as u64;
-        let cursor = match st.bump_cursor {
+        let cursor = match cursor_opt {
             Some(c) => c,
             None => {
                 // Lazily seed the arena: park it at the top of memory. If
@@ -170,8 +202,9 @@ where
                 // guest (static data, stack, heap, …) and must never be
                 // overwritten.
                 let floor = top.saturating_sub(SCRATCH_ARENA_BYTES);
-                st.arena_floor = floor;
-                st.bump_cursor = Some(top);
+                let arena = caller.data_mut().jit_arena_mut();
+                arena.arena_floor = floor;
+                arena.bump_cursor = Some(top);
                 top
             }
         };
@@ -185,6 +218,7 @@ where
             );
             return -1;
         };
+        let st = caller.data_mut().jit_arena_mut();
         if ptr < st.arena_floor {
             tracing::warn!(
                 target: "tensor_wasm_exec::jit_dispatch",
@@ -201,12 +235,11 @@ where
     })?;
 
     // free(ptr: i32, size: i32)
-    let arena_free = arena.clone();
-    linker.func_wrap(host_module, free_fn, move |_caller: Caller<'_, T>, ptr: i32, size: i32| {
+    linker.func_wrap(host_module, free_fn, move |mut caller: Caller<'_, T>, ptr: i32, size: i32| {
         if ptr <= 0 || size <= 0 {
             return;
         }
-        let mut st = arena_free.lock();
+        let st = caller.data_mut().jit_arena_mut();
         // LIFO: pop iff the top matches; otherwise treat as a leak and
         // move on. Mismatched frees mean the guest violated the arena
         // contract — log once and proceed.
@@ -340,6 +373,20 @@ mod tests {
     use std::sync::Arc;
     use wasmtime::{Config, Engine, Module, Store};
 
+    /// Minimal store payload for the in-module tests: just wraps an
+    /// [`ArenaState`] so we satisfy [`JitArenaProvider`] without dragging
+    /// in the rest of `InstanceState`.
+    #[derive(Default)]
+    struct TestState {
+        arena: ArenaState,
+    }
+
+    impl JitArenaProvider for TestState {
+        fn jit_arena_mut(&mut self) -> &mut ArenaState {
+            &mut self.arena
+        }
+    }
+
     /// Build a Wasm module that imports `tensor-wasm:jit/host::dispatch` and
     /// re-exports it as `call_dispatch(fp_lo, fp_hi) -> i32`, hardcoding
     /// `scratch_ptr` / `args_len` / `results_len` to zero. The test then
@@ -396,9 +443,9 @@ mod tests {
         let engine = make_engine();
         let fp: u64 = 0xDEAD_BEEF_CAFE_BABE;
         let cache = make_cache_with(fp, DEFAULT_DISPATCH_SM_VERSION);
-        let mut linker: Linker<()> = Linker::new(&engine);
+        let mut linker: Linker<TestState> = Linker::new(&engine);
         add_jit_dispatch_to_linker(&mut linker, cache).expect("register dispatch");
-        let mut store = Store::new(&engine, ());
+        let mut store = Store::new(&engine, TestState::default());
         let wasm = wat::parse_str(driver_wat()).expect("wat");
         let module = Module::new(&engine, &wasm).expect("module");
         let instance = linker
@@ -418,9 +465,9 @@ mod tests {
         let engine = make_engine();
         // Don't put anything in the cache; the lookup must miss.
         let cache = Arc::new(KernelCache::new());
-        let mut linker: Linker<()> = Linker::new(&engine);
+        let mut linker: Linker<TestState> = Linker::new(&engine);
         add_jit_dispatch_to_linker(&mut linker, cache).expect("register dispatch");
-        let mut store = Store::new(&engine, ());
+        let mut store = Store::new(&engine, TestState::default());
         let wasm = wat::parse_str(driver_wat()).expect("wat");
         let module = Module::new(&engine, &wasm).expect("module");
         let instance = linker
@@ -438,7 +485,7 @@ mod tests {
         let engine = make_engine();
         let fp: u64 = 42;
         let cache = make_cache_with(fp, 89);
-        let mut linker: Linker<()> = Linker::new(&engine);
+        let mut linker: Linker<TestState> = Linker::new(&engine);
         add_jit_dispatch_to_linker_with(
             &mut linker,
             cache,
@@ -463,7 +510,7 @@ mod tests {
                   (i32.const 0) (i32.const 0) (i32.const 0)))
             )
         "#;
-        let mut store = Store::new(&engine, ());
+        let mut store = Store::new(&engine, TestState::default());
         let wasm = wat::parse_str(wat).expect("wat");
         let module = Module::new(&engine, &wasm).expect("module");
         let instance = linker
@@ -483,9 +530,9 @@ mod tests {
         let engine = make_engine();
         let fp: u64 = 0xFFFF_FFFF_FFFF_FFFF;
         let cache = make_cache_with(fp, DEFAULT_DISPATCH_SM_VERSION);
-        let mut linker: Linker<()> = Linker::new(&engine);
+        let mut linker: Linker<TestState> = Linker::new(&engine);
         add_jit_dispatch_to_linker(&mut linker, cache).expect("register");
-        let mut store = Store::new(&engine, ());
+        let mut store = Store::new(&engine, TestState::default());
         let wasm = wat::parse_str(driver_wat()).expect("wat");
         let module = Module::new(&engine, &wasm).expect("module");
         let instance = linker
@@ -566,18 +613,17 @@ mod tests {
 
         // Build a custom linker with a dispatch that actually adds.
         let engine = make_engine();
-        let mut linker: Linker<()> = Linker::new(&engine);
+        let mut linker: Linker<TestState> = Linker::new(&engine);
 
         // Re-use the standard alloc / free / cache helpers; override dispatch
         // with a real adder so the test exercises the marshalling round trip
-        // end-to-end.
-        let arena: Arc<Mutex<ArenaState>> = Arc::new(Mutex::new(ArenaState::default()));
-        let arena_alloc = arena.clone();
+        // end-to-end. The arena lives in the per-store `TestState`, mirroring
+        // the production path through `InstanceState`.
         linker
             .func_wrap(
                 "tensor-wasm:jit/host",
                 "alloc",
-                move |mut caller: Caller<'_, ()>, size: i32| -> i32 {
+                move |mut caller: Caller<'_, TestState>, size: i32| -> i32 {
                     if size <= 0 {
                         return -1;
                     }
@@ -585,9 +631,9 @@ mod tests {
                         .get_export("memory")
                         .and_then(|e| e.into_memory())
                         .expect("memory exported");
-                    let mut st = arena_alloc.lock();
+                    let cursor_opt = caller.data_mut().jit_arena_mut().bump_cursor;
                     let mem_len = memory.data(&caller).len() as u64;
-                    let cursor = match st.bump_cursor {
+                    let cursor = match cursor_opt {
                         Some(c) => c,
                         None => {
                             if mem_len < SCRATCH_ARENA_BYTES as u64 {
@@ -599,25 +645,25 @@ mod tests {
                             }
                             let new_len = memory.data(&caller).len() as u64;
                             let top = u32::try_from(new_len).unwrap_or(u32::MAX);
-                            st.bump_cursor = Some(top);
+                            caller.data_mut().jit_arena_mut().bump_cursor = Some(top);
                             top
                         }
                     };
                     let aligned = (size as u32 + 7) & !7;
                     let ptr = cursor.checked_sub(aligned).expect("arena room");
+                    let st = caller.data_mut().jit_arena_mut();
                     st.bump_cursor = Some(ptr);
                     st.live.push((ptr, aligned));
                     ptr as i32
                 },
             )
             .expect("alloc");
-        let arena_free = arena.clone();
         linker
             .func_wrap(
                 "tensor-wasm:jit/host",
                 "free",
-                move |_caller: Caller<'_, ()>, ptr: i32, _size: i32| {
-                    let mut st = arena_free.lock();
+                move |mut caller: Caller<'_, TestState>, ptr: i32, _size: i32| {
+                    let st = caller.data_mut().jit_arena_mut();
                     if let Some((top_ptr, top_size)) = st.live.last().copied() {
                         if top_ptr == ptr as u32 {
                             st.live.pop();
@@ -631,7 +677,7 @@ mod tests {
             .func_wrap(
                 "tensor-wasm:jit/host",
                 "dispatch",
-                |mut caller: Caller<'_, ()>,
+                |mut caller: Caller<'_, TestState>,
                  _fp_lo: i64,
                  _fp_hi: i64,
                  scratch_ptr: i32,
@@ -666,7 +712,7 @@ mod tests {
             )
             .expect("dispatch");
 
-        let mut store = Store::new(&engine, ());
+        let mut store = Store::new(&engine, TestState::default());
         let module = Module::new(&engine, &outcome.rewritten_wasm).expect("module");
         let instance = linker.instantiate(&mut store, &module).expect("instantiate");
         let add = instance
@@ -755,7 +801,7 @@ mod tests {
     fn alloc_free_round_trip() {
         let engine = make_engine();
         let cache = Arc::new(KernelCache::new());
-        let mut linker: Linker<()> = Linker::new(&engine);
+        let mut linker: Linker<TestState> = Linker::new(&engine);
         add_jit_dispatch_to_linker(&mut linker, cache).expect("register");
         let wat = r#"
             (module
@@ -770,7 +816,7 @@ mod tests {
                 (call $a (i32.const 32))
                 (call $a (i32.const 32))))
         "#;
-        let mut store = Store::new(&engine, ());
+        let mut store = Store::new(&engine, TestState::default());
         let wasm = wat::parse_str(wat).expect("wat");
         let module = Module::new(&engine, &wasm).expect("module");
         let instance = linker

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use tensor_wasm_core::types::{InstanceId, TenantId};
 
 use crate::executor::TensorWasmResourceLimiter;
+use crate::jit_dispatch::{ArenaState, JitArenaProvider};
 
 /// Side-channel data attached to each wasmtime `Store`.
 ///
@@ -55,6 +56,12 @@ pub struct InstanceState {
     /// Per-instance linear-memory limiter. Mirrors the engine's
     /// `max_memory_bytes`; wasmtime invokes it from `memory.grow`.
     pub limiter: TensorWasmResourceLimiter,
+    /// Per-instance bump arena backing the JIT `alloc`/`free`/`dispatch`
+    /// imports. Living in the per-store payload (rather than captured in
+    /// the linker closures) is what keeps two tenants instantiated from
+    /// the same [`wasmtime::Linker`] from polluting each other's bump
+    /// cursor and LIFO stack — see [`JitArenaProvider`].
+    pub(crate) jit_arena: ArenaState,
 }
 
 impl InstanceState {
@@ -73,6 +80,7 @@ impl InstanceState {
             kernel_dispatches: AtomicU64::new(0),
             gpu_bytes_allocated: AtomicU64::new(0),
             limiter: TensorWasmResourceLimiter::new(usize::MAX),
+            jit_arena: ArenaState::default(),
         }
     }
 
@@ -113,6 +121,30 @@ impl InstanceState {
             Some(d) => Instant::now() >= d,
             None => false,
         }
+    }
+
+    /// Borrow the per-instance JIT scratch arena mutably.
+    ///
+    /// Used by the host imports registered via
+    /// [`crate::jit_dispatch::add_jit_dispatch_to_linker`] to keep one
+    /// bump cursor and LIFO `live` stack per store, even when multiple
+    /// instances share a single [`wasmtime::Linker`].
+    pub fn jit_arena_mut(&mut self) -> &mut ArenaState {
+        &mut self.jit_arena
+    }
+
+    /// Borrow the per-instance JIT scratch arena.
+    ///
+    /// Read-only counterpart to [`InstanceState::jit_arena_mut`]; useful
+    /// for tests asserting per-store isolation of the bump cursor.
+    pub fn jit_arena(&self) -> &ArenaState {
+        &self.jit_arena
+    }
+}
+
+impl JitArenaProvider for InstanceState {
+    fn jit_arena_mut(&mut self) -> &mut ArenaState {
+        InstanceState::jit_arena_mut(self)
     }
 }
 
