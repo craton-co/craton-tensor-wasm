@@ -16,7 +16,7 @@ use tensor_wasm_core::types::TenantId;
 use dashmap::DashMap;
 use thiserror::Error;
 
-use crate::context::TenantContext;
+use crate::context::{TenantCapability, TenantContext};
 
 /// Errors specific to [`TenantRegistry`] bookkeeping.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -88,7 +88,34 @@ impl TenantRegistry {
     /// Returns the `Arc<TenantContext>` now stored, or
     /// [`RegistryError::AlreadyRegistered`] if a tenant with the same id is
     /// already present. The caller may clone the returned `Arc` freely.
+    ///
+    /// This signature is preserved for backwards compatibility. Prefer
+    /// [`Self::register_with_capability`], which returns the
+    /// [`TenantCapability`] required by the quota-mutation methods
+    /// (`*_with_capability`) — without it, only the unchecked
+    /// `#[deprecated]` variants of `consume_bytes`/`release_bytes` work.
     pub fn register(&self, ctx: TenantContext) -> Result<Arc<TenantContext>, RegistryError> {
+        self.register_with_capability(ctx).map(|(arc, _cap)| arc)
+    }
+
+    /// Insert `ctx` into the registry and return the `Arc<TenantContext>`
+    /// alongside a [`TenantCapability`] bound to the same tenant.
+    ///
+    /// The capability is the *only* way to call the checked
+    /// `consume_bytes_with_capability` / `release_bytes_with_capability`
+    /// quota-mutation methods on the returned context. Because the
+    /// `TenantCapability` type cannot be constructed outside this crate,
+    /// holding an `Arc<TenantContext>` for tenant A grants no power to
+    /// mutate tenant B's accounting — even if A guesses or fabricates B's
+    /// numeric `TenantId`.
+    ///
+    /// On [`RegistryError::AlreadyRegistered`] the in-flight `ctx` is
+    /// dropped and no capability is minted; the previously registered
+    /// tenant's accounting is untouched.
+    pub fn register_with_capability(
+        &self,
+        ctx: TenantContext,
+    ) -> Result<(Arc<TenantContext>, TenantCapability), RegistryError> {
         let id = ctx.id();
         let entry = self.inner.entry(id);
         match entry {
@@ -96,7 +123,8 @@ impl TenantRegistry {
             dashmap::mapref::entry::Entry::Vacant(slot) => {
                 let arc = Arc::new(ctx);
                 slot.insert(Arc::clone(&arc));
-                Ok(arc)
+                let cap = TenantCapability::mint(id);
+                Ok((arc, cap))
             }
         }
     }
@@ -219,6 +247,49 @@ mod tests {
         a.register(ctx(10)).unwrap();
         assert_eq!(b.len(), 1);
         assert!(b.get(TenantId(10)).is_some());
+    }
+
+    #[test]
+    fn capability_from_one_tenant_cannot_mutate_another() {
+        // Threat model: a workload holding `Arc<TenantContext>` for tenant A
+        // (perhaps by guessing B's numeric id and calling `registry.get`)
+        // must not be able to drive B's quota counter using A's capability.
+        let reg = TenantRegistry::new();
+        let (a_ctx, a_cap) = reg.register_with_capability(ctx(1001)).unwrap();
+        let (b_ctx, b_cap) = reg.register_with_capability(ctx(1002)).unwrap();
+
+        // Baseline: each context starts empty.
+        assert_eq!(a_ctx.bytes_in_use(), 0);
+        assert_eq!(b_ctx.bytes_in_use(), 0);
+
+        // Legitimate path: A's cap on A's ctx succeeds.
+        a_ctx.consume_bytes_with_capability(&a_cap, 128).unwrap();
+        assert_eq!(a_ctx.bytes_in_use(), 128);
+
+        // Cross-tenant attack: try to drive A's counter with B's cap.
+        let err = a_ctx
+            .consume_bytes_with_capability(&b_cap, 256)
+            .expect_err("cross-tenant consume must be rejected");
+        match err {
+            tensor_wasm_core::error::TensorWasmError::TenantIsolationViolation {
+                tenant_id,
+                ..
+            } => {
+                assert_eq!(tenant_id, TenantId(1002));
+            }
+            other => panic!("expected TenantIsolationViolation, got {other:?}"),
+        }
+        // Counter unchanged by the rejected attempt.
+        assert_eq!(a_ctx.bytes_in_use(), 128);
+
+        // Same for release: B's cap cannot tamper with A's counter.
+        a_ctx.release_bytes_with_capability(&b_cap, 128).expect_err(
+            "cross-tenant release must be rejected",
+        );
+        assert_eq!(a_ctx.bytes_in_use(), 128);
+
+        // And B's own counter is untouched throughout.
+        assert_eq!(b_ctx.bytes_in_use(), 0);
     }
 
     #[test]

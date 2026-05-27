@@ -10,6 +10,13 @@
 //! past ~1μs on commodity x86 hardware something has gone wrong with our
 //! DashMap usage.
 
+#![allow(deprecated)]
+// Bench uses the unchecked `consume_bytes`/`release_bytes` variants to
+// keep the per-iteration overhead at the floor; the capability-checked
+// variant adds a single integer compare on top of the same inner CAS
+// loop and is benched separately in the cap-gate microbench (added in
+// v0.4 alongside the unchecked-variant removal).
+
 use std::time::Duration;
 
 use tensor_wasm_core::types::TenantId;

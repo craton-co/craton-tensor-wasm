@@ -11,7 +11,11 @@
 //!
 //! # Quick start
 //!
-//! Register a tenant and account some bytes against its quota:
+//! Register a tenant and account some bytes against its quota. The
+//! capability returned by [`TenantRegistry::register_with_capability`] is
+//! required to drive the quota counters — it cannot be fabricated by code
+//! outside this crate, so holding an `Arc<TenantContext>` for tenant A
+//! grants no power to mutate tenant B's accounting.
 //!
 //! ```
 //! # #[cfg(not(feature = "cuda"))]
@@ -20,10 +24,10 @@
 //! use tensor_wasm_tenant::{TenantContext, TenantRegistry};
 //!
 //! let reg = TenantRegistry::new();
-//! let ctx = reg
-//!     .register(TenantContext::builder(TenantId(1)).build())
+//! let (ctx, cap) = reg
+//!     .register_with_capability(TenantContext::builder(TenantId(1)).build())
 //!     .unwrap();
-//! ctx.consume_bytes(4096).unwrap();
+//! ctx.consume_bytes_with_capability(&cap, 4096).unwrap();
 //! assert_eq!(ctx.bytes_in_use(), 4096);
 //! # }
 //! # #[cfg(feature = "cuda")]
@@ -34,7 +38,7 @@
 pub mod context;
 pub mod registry;
 
-pub use context::{IsolationKind, TenantContext, TenantContextBuilder};
+pub use context::{IsolationKind, TenantCapability, TenantContext, TenantContextBuilder};
 pub use registry::{
     MpsDecision, RegistryError, TenantRegistry, MPS_CONTROL_PATH, MPS_PIPE_DIRECTORY_ENV,
 };

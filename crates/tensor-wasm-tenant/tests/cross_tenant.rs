@@ -5,6 +5,13 @@
 //! `Option<Arc<TenantContext>>` so callers can recover the handle for an
 //! orderly shutdown.
 
+#![allow(deprecated)]
+// Exercises the unchecked quota-mutation shim. The capability-gate
+// upgrade is covered by the inline `registry` test
+// `capability_from_one_tenant_cannot_mutate_another`; this file keeps
+// pinning the per-tenant counter independence until the unchecked
+// methods come out in v0.4.
+
 use std::sync::Arc;
 
 use tensor_wasm_core::error::TensorWasmError;

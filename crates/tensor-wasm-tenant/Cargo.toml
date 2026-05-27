@@ -25,7 +25,6 @@ tensor-wasm-core = { workspace = true }
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-parking_lot.workspace = true
 dashmap.workspace = true
 cust = { workspace = true, optional = true }
 

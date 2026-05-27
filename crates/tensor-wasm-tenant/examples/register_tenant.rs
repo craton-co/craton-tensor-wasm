@@ -18,7 +18,9 @@ async fn main() {
         .with_memory_quota_bytes(64 * 1024 * 1024) // 64 MiB
         .build();
 
-    let tenant = registry.register(ctx).expect("registration");
+    let (tenant, cap) = registry
+        .register_with_capability(ctx)
+        .expect("registration");
     println!("registered: {}", tenant.id());
 
     let same = registry
@@ -26,10 +28,12 @@ async fn main() {
         .expect("just-registered tenant must be findable");
     println!("isolation: {}", same.isolation());
 
-    same.consume_bytes(4096).expect("within quota");
+    same.consume_bytes_with_capability(&cap, 4096)
+        .expect("within quota");
     println!("after consume: {} bytes in use", same.bytes_in_use());
 
-    same.release_bytes(4096);
+    same.release_bytes_with_capability(&cap, 4096)
+        .expect("release on own capability");
     println!("after release: {} bytes in use", same.bytes_in_use());
 
     println!("has_real_context: {}", same.has_real_context());
