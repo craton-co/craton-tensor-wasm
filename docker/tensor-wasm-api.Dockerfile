@@ -35,6 +35,11 @@ FROM gcr.io/distroless/cc-debian12 AS runtime
 
 COPY --from=builder /usr/local/bin/tensor-wasm /usr/local/bin/tensor-wasm
 
+# Drop root: the distroless `cc` image ships a `nonroot` user (UID 65532)
+# specifically for this. This matches the k8s securityContext in
+# deploy/k8s/20-deployment.yaml (runAsUser: 65532).
+USER nonroot:nonroot
+
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/tensor-wasm"]
 CMD ["serve", "--addr", "0.0.0.0:8080"]
