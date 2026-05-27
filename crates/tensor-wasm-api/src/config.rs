@@ -67,7 +67,11 @@ pub const SNAPSHOT_HMAC_KEY_LEN: usize = 32;
 /// route handlers land they can hand the bytes to
 /// `SnapshotWriter::with_hmac_sha256_key(key)` /
 /// `SnapshotReader::with_hmac_sha256_key(key)` directly.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Debug` is implemented manually so that `snapshot_hmac_key` renders as
+/// a redacted placeholder. A derived `Debug` would print all 32 key bytes
+/// any time a caller writes `tracing::debug!(?cfg)` or similar.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct AppConfig {
     /// Optional HMAC-SHA256 signing key for snapshot save/restore.
     ///
@@ -84,6 +88,21 @@ pub struct AppConfig {
     /// a key is configured. Defaults to `false` so existing v2 archives
     /// keep working through the migration window.
     pub snapshot_require_signature: bool,
+}
+
+impl std::fmt::Debug for AppConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppConfig")
+            .field(
+                "snapshot_hmac_key",
+                &self
+                    .snapshot_hmac_key
+                    .as_ref()
+                    .map(|_| "<REDACTED 32-byte HMAC key>"),
+            )
+            .field("snapshot_require_signature", &self.snapshot_require_signature)
+            .finish()
+    }
 }
 
 impl AppConfig {

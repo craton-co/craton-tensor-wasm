@@ -47,7 +47,11 @@ use crate::format::{SignatureKind, HMAC_SHA256_SIG_LEN, SIGNATURE_TRAILER_LEN};
 ///
 /// Call [`SnapshotReader::require_signature`] to also refuse unsigned v2
 /// blobs (defence-in-depth for production deployments).
-#[derive(Clone, Copy, Debug)]
+///
+/// `Debug` is implemented manually to redact `hmac_key` — a derived `Debug`
+/// would print all 32 key bytes via `{:?}` and expose the signing secret
+/// any time a caller writes `tracing::debug!(?reader)` or similar.
+#[derive(Clone, Copy)]
 pub struct SnapshotReader {
     /// Hard ceiling on bytes the streaming zstd decoder is allowed to emit
     /// before being aborted. Bounds the attacker's memory budget independent
@@ -66,6 +70,20 @@ pub struct SnapshotReader {
 impl Default for SnapshotReader {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Debug for SnapshotReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("SnapshotReader");
+        d.field("max_decompressed", &self.max_decompressed);
+        #[cfg(feature = "signed-snapshots")]
+        d.field(
+            "hmac_key",
+            &self.hmac_key.as_ref().map(|_| "<REDACTED 32-byte HMAC key>"),
+        );
+        d.field("require_signature", &self.require_signature);
+        d.finish()
     }
 }
 

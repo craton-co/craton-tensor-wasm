@@ -143,7 +143,11 @@ pub struct SnapshotMetadata {
 /// of one-byte elements). The on-disk encoding matches what
 /// [`SnapshotWriter::capture`] writes via the borrowing `SnapshotRef` helper —
 /// no host-side `.to_vec()` copy is needed on the write path.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is implemented manually to print byte-length placeholders rather
+/// than the full byte vectors — a derived `Debug` over multi-GiB blobs would
+/// spool gigabytes to logs on any `tracing::debug!(?snapshot)`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Magic identifying this blob as a TensorWasm snapshot. Must equal [`SNAPSHOT_MAGIC`].
     pub magic: u32,
@@ -164,6 +168,20 @@ pub struct Snapshot {
     /// order), computed with the IEEE polynomial via [`crc32fast`]. The reader
     /// recomputes this value and rejects the snapshot if it does not match.
     pub crc32: u32,
+}
+
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("magic", &format_args!("0x{:08x}", self.magic))
+            .field("version", &self.version)
+            .field("wasm_memory_len", &self.wasm_memory.len())
+            .field("gpu_memory_len", &self.gpu_memory.len())
+            .field("registers_len", &self.registers.len())
+            .field("metadata", &self.metadata)
+            .field("crc32", &format_args!("0x{:08x}", self.crc32))
+            .finish()
+    }
 }
 
 /// Borrowing mirror of [`Snapshot`] used only on the write path so capture does
@@ -227,7 +245,11 @@ pub struct InstanceState<'a> {
 /// By default a writer emits the unsigned v2 envelope. Call
 /// [`SnapshotWriter::with_hmac_sha256_key`] (requires the `signed-snapshots`
 /// feature) to switch to the HMAC-SHA256-signed v3 envelope.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// `Debug` is implemented manually to redact `hmac_key` — a derived `Debug`
+/// would print all 32 key bytes via `{:?}` and expose the signing secret
+/// any time a caller writes `tracing::debug!(?writer)` or similar.
+#[derive(Clone, Copy, Default)]
 pub struct SnapshotWriter {
     /// zstd compression level to use. Defaults to [`DEFAULT_ZSTD_LEVEL`].
     pub zstd_level: i32,
@@ -240,6 +262,19 @@ pub struct SnapshotWriter {
     /// once they have configured it.
     #[cfg(feature = "signed-snapshots")]
     pub(crate) hmac_key: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for SnapshotWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("SnapshotWriter");
+        d.field("zstd_level", &self.zstd_level);
+        #[cfg(feature = "signed-snapshots")]
+        d.field(
+            "hmac_key",
+            &self.hmac_key.as_ref().map(|_| "<REDACTED 32-byte HMAC key>"),
+        );
+        d.finish()
+    }
 }
 
 /// Validate `len` against `max` and return a descriptive error if it overflows.
