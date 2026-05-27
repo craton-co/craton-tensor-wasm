@@ -182,11 +182,31 @@ impl ResourceLimiter for TensorWasmResourceLimiter {
     fn table_growing(
         &mut self,
         _current: u32,
-        _desired: u32,
-        _maximum: Option<u32>,
+        desired: u32,
+        maximum: Option<u32>,
     ) -> wasmtime::Result<bool> {
-        // Tables are unbounded in this limiter — only linear memory is
-        // policed at the byte level for v0.1.0.
+        // Cap table growth proportionally to the per-instance memory budget.
+        // Each table entry costs ~16 bytes of host memory on wasmtime (a
+        // tagged pointer plus type-index slot). Without this cap a guest
+        // could `table.grow` up to u32::MAX entries (~64 GiB of host RAM at
+        // 16 B/entry), bypassing the `memory_growing` cap entirely.
+        //
+        // Using `engine_max` (the linear-memory byte cap) as the table-byte
+        // budget keeps the policy a single dial: a tenant gets at most
+        // `engine_max` bytes of *either* linear memory *or* table backing
+        // store. That's loose (allows ~engine_max bytes for each) but it
+        // bounds the worst case from u32::MAX entries down to engine_max/16
+        // entries — the qualitative DoS vector closes.
+        const TABLE_ENTRY_BYTES: u64 = 16;
+        let bytes_needed = u64::from(desired).saturating_mul(TABLE_ENTRY_BYTES);
+        if bytes_needed > self.engine_max as u64 {
+            return Ok(false);
+        }
+        if let Some(m) = maximum {
+            if desired > m {
+                return Ok(false);
+            }
+        }
         Ok(true)
     }
 }
@@ -197,13 +217,15 @@ pub struct TensorWasmExecutor {
     engine: Arc<TensorWasmEngine>,
     instances: Arc<DashMap<InstanceId, Arc<Mutex<TensorWasmInstance>>>>,
     next_instance_id: Arc<AtomicU64>,
-    /// Per-engine compiled-module cache keyed by a 64-bit digest of the wasm
-    /// bytes. Avoids re-running Cranelift on every `spawn_instance` for
-    /// repeat tenants. Hash is computed with `blake3` (SIMD-accelerated;
-    /// ~5x faster than SipHash on multi-MiB wasm modules) and the first 8
-    /// bytes of the digest are interpreted as a little-endian `u64` for the
-    /// cache key — stable across runs and platforms.
-    module_cache: Arc<DashMap<u64, Module>>,
+    /// Per-engine compiled-module cache keyed by the full 256-bit BLAKE3
+    /// digest of the wasm bytes. Avoids re-running Cranelift on every
+    /// `spawn_instance` for repeat tenants. Hash is computed with `blake3`
+    /// (SIMD-accelerated; ~5x faster than SipHash on multi-MiB wasm
+    /// modules). The full 32-byte digest is used as the key — truncating
+    /// to 8 bytes would expose a ~2⁻³² birthday-collision window across
+    /// tenants (cross-tenant module-cache poisoning) that an attacker
+    /// crafting modules with colliding prefixes could exploit at scale.
+    module_cache: Arc<DashMap<[u8; 32], Module>>,
     /// Optional metrics handle. When `Some`, spawn/terminate operations
     /// increment the corresponding Prometheus counters / gauges.
     metrics: Option<TensorWasmMetrics>,
@@ -275,13 +297,16 @@ impl TensorWasmExecutor {
 
     /// Compile `wasm` via wasmtime, caching the result so repeat calls with
     /// the same bytes return without re-running Cranelift. Cache key is the
-    /// first 8 bytes of a BLAKE3 digest of the wasm bytes interpreted as a
-    /// little-endian `u64` — stable across runs and platforms, and ~5x
-    /// faster than SipHash on the multi-MiB modules we actually compile.
+    /// full 32-byte BLAKE3 digest of the wasm bytes — stable across runs
+    /// and platforms, and ~5x faster than SipHash on the multi-MiB modules
+    /// we actually compile. Using the full digest (rather than truncating
+    /// to 8 bytes) closes a cross-tenant cache-poisoning vector: at 8
+    /// bytes, a 65k-module corpus has a ~2⁻³² collision chance per pair,
+    /// which an attacker crafting prefix-colliding modules can amplify.
     fn compile_module_cached(&self, wasm: &[u8]) -> Result<Module, ExecError> {
         let digest = blake3::hash(wasm);
-        let bytes = digest.as_bytes();
-        let key = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        // BLAKE3 outputs a fixed 32-byte digest; use it whole as the cache key.
+        let key: [u8; 32] = *digest.as_bytes();
         if let Some(m) = self.module_cache.get(&key) {
             return Ok(m.clone());
         }
@@ -590,5 +615,27 @@ mod tests {
         assert!(!lim
             .memory_growing(0, 4096, Some(2048))
             .unwrap());
+    }
+
+    #[test]
+    fn resource_limiter_rejects_huge_table_growth() {
+        // 1 MiB engine cap → at 16 B/entry that's ~65k table entries max.
+        // u32::MAX (~4.3 billion entries × 16 B = ~64 GiB) must be denied.
+        let mut lim = TensorWasmResourceLimiter::new(1024 * 1024);
+        assert!(!lim.table_growing(0, u32::MAX, None).unwrap());
+    }
+
+    #[test]
+    fn resource_limiter_allows_modest_table_growth() {
+        // 1 MiB engine cap → ~65k entries should still fit.
+        let mut lim = TensorWasmResourceLimiter::new(1024 * 1024);
+        assert!(lim.table_growing(0, 1024, None).unwrap());
+    }
+
+    #[test]
+    fn resource_limiter_table_respects_module_maximum() {
+        // Even with an unbounded engine cap, the module's declared table max wins.
+        let mut lim = TensorWasmResourceLimiter::new(usize::MAX);
+        assert!(!lim.table_growing(0, 4096, Some(2048)).unwrap());
     }
 }
