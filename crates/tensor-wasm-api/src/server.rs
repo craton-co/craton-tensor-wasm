@@ -14,8 +14,9 @@ use tower::ServiceBuilder;
 use crate::audit::{audit_log_middleware, AuditConfig};
 use crate::http_metrics::{http_metrics_middleware, HttpMetricsLayerConfig, RouteAllowList};
 use crate::middleware::{
-    bearer_auth, body_limit_layer, concurrency_limit_layer, tenant_scope, timeout_layer,
-    trace_layer_with_propagation, AuthConfig, TenantConfig, MAX_REQUEST_BODY_BYTES,
+    bearer_auth, body_limit_layer, concurrency_limit_layer, cors_layer, tenant_scope,
+    timeout_layer, trace_layer_with_propagation, AuthConfig, CorsConfig, TenantConfig,
+    MAX_REQUEST_BODY_BYTES,
 };
 use crate::rate_limit::{rate_limit, RateLimitConfig, RateLimiter};
 use crate::routes::{
@@ -27,11 +28,13 @@ use crate::trace_propagation::{inject_trace_id_header, install_w3c_propagator};
 /// Build the axum Router with all routes and middleware applied.
 ///
 /// Reads [`AuthConfig`] (`$TENSOR_WASM_API_TOKENS`), [`TenantConfig`]
-/// (`$TENSOR_WASM_API_REQUIRE_TENANT`), and [`RateLimitConfig`]
-/// (`$TENSOR_WASM_API_RATE_LIMIT_QPS` / `$TENSOR_WASM_API_RATE_LIMIT_BURST`)
-/// from the process environment. Empty / unset `TENSOR_WASM_API_TOKENS` puts
-/// the gateway in dev mode (auth disabled with a startup warning); unset
-/// or zero rate-limit knobs disable the limiter (pass-through).
+/// (`$TENSOR_WASM_API_REQUIRE_TENANT`), [`RateLimitConfig`]
+/// (`$TENSOR_WASM_API_RATE_LIMIT_QPS` / `$TENSOR_WASM_API_RATE_LIMIT_BURST`),
+/// and [`CorsConfig`] (`$TENSOR_WASM_API_CORS_ALLOWED_ORIGINS`) from the
+/// process environment. Empty / unset `TENSOR_WASM_API_TOKENS` puts the
+/// gateway in dev mode (auth disabled with a startup warning); unset or
+/// zero rate-limit knobs disable the limiter (pass-through); empty / unset
+/// CORS allowlist rejects every cross-origin request (safe default).
 ///
 /// If any bare (unscoped) entries are present in `TENSOR_WASM_API_TOKENS`,
 /// `AuthConfig::from_env` emits a one-shot deprecation warning naming the
@@ -42,7 +45,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let tenant = TenantConfig::from_env();
     let limiter = RateLimiter::new(RateLimitConfig::from_env());
     let audit = AuditConfig::from_env();
-    build_router_with_audit(state, auth, tenant, limiter, audit)
+    let cors = CorsConfig::from_env();
+    build_router_with_audit(state, auth, tenant, limiter, audit, cors)
 }
 
 /// Build the router with explicit auth / tenant config and the rate limiter
@@ -76,28 +80,39 @@ pub fn build_router_with_full_config(
     tenant: TenantConfig,
     limiter: RateLimiter,
 ) -> Router {
-    build_router_with_audit(state, auth, tenant, limiter, AuditConfig::disabled())
+    build_router_with_audit(
+        state,
+        auth,
+        tenant,
+        limiter,
+        AuditConfig::disabled(),
+        CorsConfig::default(),
+    )
 }
 
-/// Build the router with full configuration including the audit sink.
+/// Build the router with full configuration including the audit sink and
+/// the CORS allowlist.
 ///
 /// The outer ServiceBuilder is layered top-to-bottom: tracing is the
-/// outermost layer (so it covers timeouts and rejections), the body
-/// limit guards every downstream layer from oversized payloads,
-/// followed by the per-request timeout and the global concurrency cap.
-/// Auth and tenant resolution are `from_fn` middleware that run after
-/// the size cap (so a request that would be rejected with 413 does
-/// not consume an auth slot). The per-token rate limiter runs after
-/// bearer auth so it can read the AuthContext the auth layer inserts.
-/// The audit middleware sits innermost, after every other layer has
-/// resolved the actor / tenant / scope, so the synthesised record
-/// captures the same identity the handler saw.
+/// outermost layer (so it covers timeouts and rejections), followed by
+/// the CORS layer (so cross-origin preflight short-circuits before any
+/// expensive downstream work), the body limit (which guards every
+/// downstream layer from oversized payloads), the per-request timeout
+/// and the global concurrency cap. Auth and tenant resolution are
+/// `from_fn` middleware that run after the size cap (so a request that
+/// would be rejected with 413 does not consume an auth slot). The
+/// per-token rate limiter runs after bearer auth so it can read the
+/// AuthContext the auth layer inserts. The audit middleware sits
+/// innermost, after every other layer has resolved the actor / tenant /
+/// scope, so the synthesised record captures the same identity the
+/// handler saw.
 pub fn build_router_with_audit(
     state: Arc<AppState>,
     auth: AuthConfig,
     tenant: TenantConfig,
     limiter: RateLimiter,
     audit: AuditConfig,
+    cors: CorsConfig,
 ) -> Router {
     // Wire the W3C Trace Context propagator globally. Idempotent across
     // calls; safe to invoke on every router rebuild (tests do that
@@ -129,6 +144,17 @@ pub fn build_router_with_audit(
         // runbook points at; without it operators have to read journald
         // to recover the trace id of a failed request.
         .layer(axum::middleware::from_fn(inject_trace_id_header))
+        // CORS sits near the outer edge so the layer can short-circuit
+        // browser preflight (`OPTIONS`) without it needing to clear bearer
+        // auth, rate-limit, or audit. The default config has an empty
+        // origin allowlist — cross-origin browser callers get no
+        // `Access-Control-Allow-Origin` header and the browser blocks the
+        // request — operators widen the surface via
+        // `TENSOR_WASM_API_CORS_ALLOWED_ORIGINS`. The headers and methods
+        // admitted on a cross-origin request mirror the API contract in
+        // `API.md`: `Authorization`, `Content-Type`, `X-TensorWasm-Tenant`,
+        // and `Traceparent`; methods `GET`, `POST`, `DELETE`.
+        .layer(cors_layer(&cors))
         .layer(body_limit_layer(MAX_REQUEST_BODY_BYTES))
         .layer(timeout_layer(Duration::from_secs(30)))
         .layer(concurrency_limit_layer(64))
