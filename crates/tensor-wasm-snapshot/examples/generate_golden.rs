@@ -123,7 +123,7 @@ fn build_snapshot(
 /// writer uses, so the resulting bytes are wire-identical to what
 /// `SnapshotWriter::capture` would emit for the same logical inputs.
 fn encode(snapshot: &Snapshot) -> io::Result<Vec<u8>> {
-    let encoded = bincode::serialize(snapshot)
+    let encoded = bincode::serde::encode_to_vec(snapshot, bincode::config::legacy())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bincode encode: {e}")))?;
     zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL)
 }
