@@ -290,6 +290,28 @@ impl ApiError {
         }
     }
 
+    /// Construct a `413 Payload Too Large` with `kind = "body_too_large"`.
+    ///
+    /// Returned when an inbound request body exceeds the global
+    /// [`MAX_REQUEST_BODY_BYTES`](crate::MAX_REQUEST_BODY_BYTES) cap. The
+    /// rejection is surfaced through axum's
+    /// [`DefaultBodyLimit::max`](axum::extract::DefaultBodyLimit::max) at
+    /// extract time — see [`From<JsonRejection>`](#impl-From%3CJsonRejection%3E-for-ApiError)
+    /// for the routing that translates the underlying
+    /// `JsonRejection::BytesRejection(LengthLimitError)` into this variant
+    /// instead of the generic `invalid_json` 400.
+    ///
+    /// The `body_too_large` kind is pinned in [API.md] and
+    /// [openapi.json]; clients can rely on the (kind, status) pair without
+    /// inspecting `message`.
+    pub fn body_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            kind: "body_too_large".to_string(),
+            message: message.into(),
+        }
+    }
+
     /// Render this error into the canonical `(kind, message)` pair so the
     /// async job recorder can persist the same shape callers see from the
     /// synchronous path.
@@ -322,7 +344,21 @@ impl IntoResponse for ApiError {
 
 impl From<JsonRejection> for ApiError {
     fn from(rej: JsonRejection) -> Self {
-        ApiError::bad_request("invalid_json", rej.body_text())
+        // When the inbound body exceeded the
+        // [`DefaultBodyLimit::max`](axum::extract::DefaultBodyLimit::max)
+        // cap, axum's `Json` extractor wraps the underlying
+        // `LengthLimitError` as `JsonRejection::BytesRejection`, whose
+        // `status()` is `413 PAYLOAD_TOO_LARGE`. Route those through the
+        // dedicated `body_too_large` envelope rather than the generic
+        // `invalid_json` 400 — the public contract in `API.md` (and the
+        // `oversized_body_is_rejected` test) pins this kind/status pair.
+        // Other JsonRejection variants (syntax errors, missing
+        // content-type, schema validation) remain `invalid_json` / 400.
+        if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::body_too_large(rej.body_text())
+        } else {
+            ApiError::bad_request("invalid_json", rej.body_text())
+        }
     }
 }
 
