@@ -55,9 +55,44 @@
 
 #![cfg(feature = "cuda-oxide-backend")]
 
+use std::collections::HashSet;
 use std::fmt;
+use std::sync::OnceLock;
+
+use parking_lot::Mutex;
 
 use crate::unified::{DeviceId, UnifiedError};
+
+/// Process-global set of raw CUDA device-pointer values orphaned by a failed
+/// free on the cuda-oxide path. Mirrors
+/// [`crate::cudarc_backend::leaked_cuda_allocations`]'s contract so the v0.4
+/// port inherits an instrumentation harness when the real `cuda_host` free
+/// call lands here. Today no construction succeeds, so the set stays empty
+/// in practice — but the public accessor exists so operator tooling can wire
+/// against a stable surface now. See `cudarc_backend` for the threat-model
+/// write-up; this backend inherits the same mem H4 invariant once it grows
+/// a real free path.
+static LEAKED_CUDA_ALLOCATIONS: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+
+fn leaked_set() -> &'static Mutex<HashSet<u64>> {
+    LEAKED_CUDA_ALLOCATIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[allow(dead_code)] // Wired into the Drop impl; the scaffold path can't reach the
+                    // call site today because no construction succeeds. Kept for
+                    // the v0.4 port — see RFC 0001.
+fn record_leak(ptr: u64) {
+    leaked_set().lock().insert(ptr);
+}
+
+/// Snapshot of the process-global set of CUDA pointers orphaned by a failed
+/// free on the cuda-oxide path. See
+/// [`crate::cudarc_backend::leaked_cuda_allocations`] for the full audit
+/// contract; this accessor is the cuda-oxide-path mirror so operator
+/// tooling has a single shape across backends.
+pub fn leaked_cuda_allocations() -> Vec<u64> {
+    leaked_set().lock().iter().copied().collect()
+}
 
 /// Sentinel error message returned by every stub call in this module when
 /// the dep-less `cuda-oxide-backend` scaffold is active (i.e. when the
@@ -616,6 +651,18 @@ mod host_backend {
 // =============================================================================
 // Re-export the active variant under stable names so callers do not need
 // to feature-gate their imports.
+//
+// MEM H4 INVARIANT (v0.4 port contract for cuda-oxide host backend):
+// - The Drop impl on the real `CudaOxideUnifiedBuffer` MUST never panic.
+// - On any non-success return from the real free call, the raw pointer
+//   MUST be passed to `record_leak()` (in this module) and the failure
+//   logged at `error!` level — see `cudarc_backend::Drop` for the
+//   reference pattern. A failed free is a security-relevant event:
+//   the driver may recycle the same VA for another tenant carrying
+//   residual bytes.
+// - After a failed free, the inner allocation handle MUST be replaced
+//   with a sentinel so any hypothetical double-Drop short-circuits.
+// - `leaked_cuda_allocations()` above is the operator audit surface.
 // =============================================================================
 
 #[cfg(not(feature = "cuda-oxide-host-backend"))]

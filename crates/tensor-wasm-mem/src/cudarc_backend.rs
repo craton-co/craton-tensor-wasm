@@ -38,6 +38,7 @@
 //! cutover (v0.2 or v0.3, see the spike doc) will route this through the
 //! existing per-tenant context plumbing in `tensor-wasm-tenant`.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,26 +47,54 @@ use std::sync::OnceLock;
 
 use cudarc::driver::sys as cuda_sys;
 use cudarc::driver::CudaDevice;
+use parking_lot::Mutex;
 
 use crate::advise::Advice;
 use crate::unified::{DeviceId, UnifiedError};
 
 /// Process-wide counter of `cuMemFree_v2` failures observed in
-/// [`CudarcUnifiedBuffer::drop`]. A non-zero value indicates leaked managed
-/// allocations — the driver refused to release them. Operators can poll this
-/// via [`cudarc_free_failures`] to alert on leak rate.
+/// [`CudarcUnifiedBuffer::drop`]. Lock-free fast-path counter for alerting
+/// — pair with [`leaked_cuda_allocations`] for the per-VA forensic trail.
 static CUDARC_FREE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Process-global set of raw CUDA device-pointer values orphaned by a failed
+/// `cuMemFree_v2` in [`CudarcUnifiedBuffer::drop`]. See [`leaked_cuda_allocations`]
+/// for the audit contract that closes mem H4.
+static LEAKED_CUDA_ALLOCATIONS: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+
+fn leaked_set() -> &'static Mutex<HashSet<u64>> {
+    LEAKED_CUDA_ALLOCATIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Record that the CUDA driver pointer `ptr` was orphaned by a failed free.
+///
+/// Private helper so the only code path that can mutate the set is the
+/// [`Drop`] impl on [`CudarcUnifiedBuffer`].
+fn record_leak(ptr: u64) {
+    leaked_set().lock().insert(ptr);
+}
 
 /// Number of `cuMemFree_v2` failures observed since process start.
 ///
-/// Each increment corresponds to one leaked managed-memory allocation: the
-/// driver returned non-`CUDA_SUCCESS` from [`Drop`] so the bytes are still
-/// resident in the process's address space. The counter is a `u64` so it
-/// will not realistically wrap; operators can subtract two snapshots to get
-/// a leak rate over any window. The monotonically-increasing failure log is
-/// also emitted at `tracing::warn!` for forensic correlation.
+/// Lock-free monotonic counter; subtract two snapshots for a leak rate.
+/// For per-pointer audit data, use [`leaked_cuda_allocations`].
 pub fn cudarc_free_failures() -> u64 {
     CUDARC_FREE_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Snapshot the process-global set of CUDA pointers orphaned by a failed
+/// `cuMemFree_v2` in [`CudarcUnifiedBuffer::drop`].
+///
+/// Returns a freshly allocated `Vec<u64>` — the lock is released before
+/// return, so callers can iterate the snapshot without holding the leak
+/// mutex. The order of the returned values is unspecified.
+///
+/// This is the auditing surface for mem H4: a non-empty vec means at least
+/// one CUDA virtual address the driver still considers live but this crate
+/// has lost the handle to. Safe remediation is to recycle the process
+/// before scheduling work for a new tenant on the same device.
+pub fn leaked_cuda_allocations() -> Vec<u64> {
+    leaked_set().lock().iter().copied().collect()
 }
 
 /// Process-wide cached `CudaDevice` for device 0.
@@ -309,26 +338,55 @@ impl fmt::Debug for CudarcUnifiedBuffer {
 }
 
 impl Drop for CudarcUnifiedBuffer {
+    /// Free the underlying `cuMemAllocManaged` allocation via `cuMemFree_v2`.
+    ///
+    /// # Invariants
+    ///
+    /// - Never panics. A `Drop` panic during unwinding would abort the
+    ///   process; we degrade to a recorded leak instead.
+    /// - On any non-`CUDA_SUCCESS` from `cuMemFree_v2` the raw pointer is
+    ///   added to the process-global [`leaked_cuda_allocations`] set so
+    ///   operators can audit (mem H4). The failure is logged at `error!`
+    ///   level (upgraded from `warn!` in the original implementation —
+    ///   a failed free is a security-relevant event because the driver
+    ///   may recycle the same VA for another tenant).
+    /// - After a failed free, `self.ptr` is replaced with
+    ///   `NonNull::dangling()`. This is purely defence-in-depth: if some
+    ///   future refactor reaches this Drop a second time (it shouldn't —
+    ///   Rust guarantees Drop runs at most once per value), the sentinel
+    ///   ensures we don't re-submit the same orphaned pointer to the
+    ///   driver and don't double-record the leak against the original
+    ///   address.
     fn drop(&mut self) {
+        let raw_ptr = self.ptr.as_ptr();
+        let raw_ptr_u64 = raw_ptr as u64;
         // SAFETY: `ptr` was returned by `cuMemAllocManaged` and has not been
         // freed yet; the cached `Arc<CudaDevice>` we hold ensures the primary
         // context is still alive when we call `cuMemFree_v2`.
-        let res = unsafe { cuda_sys::lib().cuMemFree_v2(self.ptr.as_ptr() as cuda_sys::CUdeviceptr) };
+        let res = unsafe { cuda_sys::lib().cuMemFree_v2(raw_ptr as cuda_sys::CUdeviceptr) };
         if res != cuda_sys::cudaError_enum::CUDA_SUCCESS {
-            // Drop cannot fail; surface via a trace event so post-mortem
-            // tooling can spot leaks without unwinding, and bump a
-            // process-wide counter so the operator can monitor leak rate
-            // without scraping logs. The counter is exposed via the
-            // module-level `cudarc_free_failures()` helper.
+            // Failed free: the driver still considers the VA mapped, so the
+            // next allocator pass could hand it to another tenant carrying
+            // residual bytes. Both the lock-free counter (for alerting) AND
+            // the per-VA audit set (for forensics) are updated. Drop cannot
+            // fail, so we surface via tracing + the audit set rather than
+            // unwinding (mem H4).
             let failures = CUDARC_FREE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::warn!(
+            record_leak(raw_ptr_u64);
+            tracing::error!(
                 target: "tensor_wasm_mem::cudarc_backend",
                 ?res,
-                ptr = ?self.ptr.as_ptr(),
+                ptr = ?raw_ptr,
                 size = self.size,
                 total_failures = failures,
-                "cuMemFree_v2 failed in CudarcUnifiedBuffer::drop",
+                "cuMemFree_v2 failed in CudarcUnifiedBuffer::drop -- VA leaked, \
+                 recorded in leaked_cuda_allocations() for operator audit (mem H4)",
             );
+            // Defence-in-depth: replace with a dangling sentinel so any
+            // hypothetical double-drop short-circuits and does not re-submit
+            // the same orphaned pointer to the driver. Rust guarantees Drop
+            // runs at most once per value, so this is belt-and-braces.
+            self.ptr = NonNull::dangling();
         }
     }
 }
