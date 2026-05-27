@@ -109,6 +109,7 @@ everything else in this section is a deeper cut into one subsystem.
 | [AUTO-OFFLOAD.md](AUTO-OFFLOAD.md) | — | User-facing reference for the auto-offload pipeline: which Wasm patterns the detector recognises, which it rejects, and how to enable it. |
 | [CUDARC-SPIKE.md](CUDARC-SPIKE.md) | W1.2 | The `cust` → `cudarc` migration spike record: version chosen, API mapping table, known gaps, and the recommended cutover plan. |
 | [COLD-START.md](COLD-START.md) | — | The five-component additive model for cold-start latency on a TensorWasm node and the operator levers that affect each component. |
+| [glossary.md](glossary.md) | — | Short paragraph definitions of recurring CUDA, Wasm, and TensorWasm-internal terms (UVM, MPS, MIG, PTX, WMMA, BLAKE3 fingerprint, deopt guard, dispatch future, etc.). |
 
 ## API surface
 
