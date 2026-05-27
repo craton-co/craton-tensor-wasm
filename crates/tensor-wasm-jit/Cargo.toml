@@ -27,6 +27,17 @@ tracing.workspace = true
 wasmparser.workspace = true
 wasm-encoder = { version = "0.218", features = ["wasmparser"] }
 
+# pliron — MLIR-style IR framework underpinning cuda-oxide's dialect-mir →
+# dialect-llvm → PTX pipeline (RFC 0001 "Pliron lever and the auto-offload
+# pipeline"). Optional + feature-gated so the default build is unaffected;
+# only `--features cuda-oxide-backend` pulls it in. Published to crates.io
+# as of 0.15.0 (the RFC's "Pliron is not on crates.io" drawback is stale —
+# pin via crates.io directly rather than a git rev). The cuda-oxide
+# upstream itself still uses a git pin at v0.14.0; we choose the published
+# 0.15.0 for the dependabot/cargo-deny story documented in
+# `docs/REPRODUCIBLE-BUILDS.md`.
+pliron = { version = "0.15", optional = true }
+
 [dev-dependencies]
 tokio.workspace = true
 wat.workspace = true
@@ -47,7 +58,7 @@ auto-offload = []
 # `nightly-2026-04-03` pin. Mirrors the `cuda-oxide-backend` feature on
 # `tensor-wasm-mem` so a single `--features cuda-oxide-backend` invocation
 # at the workspace root selects the full opt-in stack.
-cuda-oxide-backend = []
+cuda-oxide-backend = ["dep:pliron"]
 
 [package.metadata.docs.rs]
 all-features = true
