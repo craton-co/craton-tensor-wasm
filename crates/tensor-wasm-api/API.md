@@ -206,6 +206,38 @@ The wire-format schema, sample records, log-rotation guidance, latency
 budget, and the mTLS / XFCC trust boundary are documented end-to-end in
 [`docs/AUDIT-LOG.md`](../../docs/AUDIT-LOG.md).
 
+### Snapshot HMAC key (config landed; routes pending)
+
+The gateway reads two snapshot-related knobs at startup so production
+deployments can bake the secret into their manifests now and pick the
+routes up automatically when they ship:
+
+| Env var                                       | Format         | Default | Meaning                                                                                                            |
+|-----------------------------------------------|----------------|---------|--------------------------------------------------------------------------------------------------------------------|
+| `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`           | hex (64 chars) | unset   | Optional. When set, snapshot endpoints will HMAC-SHA256 sign on save and verify on restore.                        |
+| `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE`  | `true`/`false` | `false` | Optional. When `true`, restore refuses v2 (unsigned) snapshots even when a key is configured.                      |
+
+`TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` must be exactly 64 hex characters
+(case-insensitive — `0-9`, `a-f`, `A-F`); any other length or non-hex
+character is a hard startup failure with a `ConfigError::InvalidHexKey`
+message. Unset is fine and produces an unsigned-only deployment;
+malformed-but-set is rejected so a typo in the secret never silently
+degrades the gateway into the no-signing path.
+
+`TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE` accepts `true` or `false`
+(case-insensitive); any other non-empty value is also a hard startup
+failure. Combining `require_signature=true` with an unset key is
+explicitly allowed but emits a startup warning, because every restore
+will fail once the routes land.
+
+> **Status:** the `/snapshot/save` and `/snapshot/restore` routes
+> themselves are not yet wired into [`build_router`](src/server.rs);
+> `tensor-wasm` CLI returns `FEATURE_NOT_EXPOSED` for these paths today
+> (see `crates/tensor-wasm-cli/src/cmd/snapshot.rs:13-20`). The config
+> landing in v0.3.x lets operators stage the secret ahead of the v0.4
+> route ship so no config-management churn is needed when the routes
+> become available.
+
 ### Error envelope
 
 Every non-2xx response carries the same JSON envelope:

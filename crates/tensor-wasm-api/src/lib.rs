@@ -41,6 +41,14 @@
 //!   emits a structured JSON record to the sink selected by
 //!   `TENSOR_WASM_API_AUDIT_LOG` (default: stdout). Read-only routes
 //!   emit nothing. See [`audit`] and `docs/AUDIT-LOG.md`.
+//! * **Snapshot HMAC key (forward-looking).** When
+//!   `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` is set (64-char hex, 32 bytes)
+//!   the future `/snapshot/save` and `/snapshot/restore` routes will
+//!   HMAC-SHA256 sign on save and verify on restore. Set
+//!   `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE=true` to additionally
+//!   reject unsigned v2 blobs. The routes themselves are not yet wired
+//!   (see [`config`] for the schema and `crates/tensor-wasm-cli/src/cmd/snapshot.rs`
+//!   for the matching CLI shim that returns `FEATURE_NOT_EXPOSED` today).
 //! * **HTTP request metrics.** A tower middleware emits
 //!   `tensor_wasm_http_requests_total`,
 //!   `tensor_wasm_http_request_duration_seconds`, and
@@ -54,6 +62,7 @@
 #![deny(missing_docs)]
 
 pub mod audit;
+pub mod config;
 pub mod http_metrics;
 pub mod middleware;
 pub mod rate_limit;
@@ -66,6 +75,10 @@ pub use audit::{
     audit_log_middleware, AuditAction, AuditActor, AuditActorKind, AuditConfig, AuditOutcome,
     AuditRecord, AuditResource, AuditSink, FileJsonSink, NoopSink, StdoutJsonSink,
     TokenScopeView, ENV_AUDIT_LOG,
+};
+pub use config::{
+    AppConfig, ConfigError, HexParseReason, ENV_SNAPSHOT_HMAC_KEY,
+    ENV_SNAPSHOT_REQUIRE_SIGNATURE, SNAPSHOT_HMAC_KEY_LEN,
 };
 pub use http_metrics::{
     http_metrics_middleware, HttpMetricsLayerConfig, RouteAllowList, DEFAULT_ROUTE_ALLOWLIST,
