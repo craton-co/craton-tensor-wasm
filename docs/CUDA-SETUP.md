@@ -11,12 +11,13 @@ The S22 runner runs **CUDA Toolkit 12.4** on **driver 550.54.15** under **Ubuntu
 3. [Required environment variables](#required-environment-variables)
 4. [Verification commands](#verification-commands)
 5. [Feature-flag combinations](#feature-flag-combinations)
-6. [SM-level compatibility matrix](#sm-level-compatibility-matrix)
-7. [MPS quick-start](#mps-quick-start)
-8. [Troubleshooting](#troubleshooting)
-9. [One-shot verification script](#one-shot-verification-script)
-10. [Stub libraries for CI](#stub-libraries-for-ci)
-11. [Cross-references](#cross-references)
+6. [Using the cuda-oxide-backend feature](#using-the-cuda-oxide-backend-feature)
+7. [SM-level compatibility matrix](#sm-level-compatibility-matrix)
+8. [MPS quick-start](#mps-quick-start)
+9. [Troubleshooting](#troubleshooting)
+10. [One-shot verification script](#one-shot-verification-script)
+11. [Stub libraries for CI](#stub-libraries-for-ci)
+12. [Cross-references](#cross-references)
 
 ---
 
@@ -285,6 +286,99 @@ cargo build --workspace --features tensor-wasm-mem/unified-memory,tensor-wasm-me
 ```
 
 The S22 runner builds with `unified-memory` only. The cudarc spike runner (when online) will build with `cudarc-backend` only. Do not enable both in CI until the cutover decision is made.
+
+---
+
+## Using the cuda-oxide-backend feature
+
+The `cuda-oxide-backend` feature on `tensor-wasm-mem` is the third
+host-side CUDA backend, sitting alongside `unified-memory` (cust,
+production default) and `cudarc-backend` (the W1.2 spike). It compiles
+against the [cuda-oxide](https://github.com/NVlabs/cuda-oxide) host
+crates and is the v0.5 default candidate per
+[RFC 0001](../rfcs/0001-cuda-oxide-integration.md) ("cuda-oxide as
+the v0.5 cust successor"). The full Wasm→PTX kernel-compilation
+pipeline that cuda-oxide enables is documented in
+[`PLIRON-PIPELINE.md`](PLIRON-PIPELINE.md).
+
+At v0.3.1, `cuda-oxide-backend` is a **dep-less scaffold**: enabling it
+does not pull `cuda-host`, `cuda-core`, `cuda-async`, or `pliron` into
+the resolved dependency graph yet. The scaffold exists to lock in the
+feature name and the `CudaBackend` trait shape so call-sites in
+`tensor-wasm-jit` / `tensor-wasm-wasi-gpu` / `tensor-wasm-tenant`
+written against it during v0.3.x do not need to be re-typed when the
+actual cuda-oxide deps land in v0.4 (per [RFC 0001 "Rollout"](../rfcs/0001-cuda-oxide-integration.md#rollout-pr-sequencing)).
+Until v0.4, `cargo build --features cuda-oxide-backend` is therefore a
+no-op on link behaviour but exercises the feature-flag plumbing.
+
+### Toolchain pin
+
+cuda-oxide pins `nightly-2026-04-03`. The TensorWasm workspace currently
+pins the same nightly (see [`rust-toolchain.toml`](../rust-toolchain.toml)),
+so on the **current workspace pin** no toolchain override is required;
+a plain `cargo build --features cuda-oxide-backend` works.
+
+The RFC nevertheless documents an explicit toolchain override as the
+invocation pattern, for two reasons:
+
+1. The workspace pin may bump at v0.4 (per [RFC 0001 "Toolchain plan"
+   step 3](../rfcs/0001-cuda-oxide-integration.md#toolchain-plan))
+   to a nightly that satisfies both cuda-oxide and the W2.9 Wasmtime
+   cadence policy. If that nightly diverges from cuda-oxide's pin
+   between v0.4 and a later refresh, the override becomes load-bearing
+   again.
+2. Local toolchain overrides (`rustup override set <nightly>` in the
+   workspace, or a contributor running `--features cuda-oxide-backend`
+   from a non-default checkout) want a documented, explicit form.
+
+The documented invocation (matches [RFC 0001 "Toolchain plan" step 2](../rfcs/0001-cuda-oxide-integration.md#toolchain-plan)):
+
+### Linux / WSL2 / macOS (bash / zsh)
+
+```bash
+# Override only for this invocation; does not touch rust-toolchain.toml.
+RUSTUP_TOOLCHAIN=nightly-2026-04-03 \
+  cargo build --workspace --features tensor-wasm-mem/cuda-oxide-backend
+
+# Workspace check (no link, faster) — what CI runs:
+RUSTUP_TOOLCHAIN=nightly-2026-04-03 \
+  cargo check --workspace --features tensor-wasm-mem/cuda-oxide-backend
+```
+
+### Windows 11 (PowerShell)
+
+```powershell
+$env:RUSTUP_TOOLCHAIN = "nightly-2026-04-03"
+cargo build --workspace --features tensor-wasm-mem/cuda-oxide-backend
+Remove-Item Env:RUSTUP_TOOLCHAIN
+```
+
+### What CI runs
+
+The `.github/workflows/ci.yml` workflow gains a single matrix entry
+(`cuda-oxide-backend-check`) that runs
+`cargo check --workspace --features tensor-wasm-mem/cuda-oxide-backend`
+on ubuntu-latest with the pinned toolchain. The existing CUDA-stub
+runners are untouched; the new entry is additive and only fails when
+the cuda-oxide-backend wiring itself regresses. Tests that require
+actual GPU hardware are not run on hosted runners — they live in
+ignored tests under the cuda-oxide-backend gate, on the S22 self-hosted
+runner once the v0.4 parity work lands.
+
+### Cross-references
+
+- [RFC 0001](../rfcs/0001-cuda-oxide-integration.md) — full design
+  rationale for cuda-oxide as the v0.5 cust successor, the
+  contingent-default approach, and the cudarc fallback.
+- [`PLIRON-PIPELINE.md`](PLIRON-PIPELINE.md) — the Pliron-based
+  Wasm→PTX pipeline that cuda-oxide unlocks (v0.6+ research goal in
+  RFC 0001 "Future possibilities").
+- [`REPRODUCIBLE-BUILDS.md`](REPRODUCIBLE-BUILDS.md#git-pinned-sources)
+  — the git-pin policy for the Pliron transitive dependency that
+  cuda-oxide pulls in.
+- [`CUDA-KERNELS.md`](CUDA-KERNELS.md) — "Path C: Rust kernels via
+  cuda-oxide" — the author-side kernel surface that the
+  `#[cuda_module]` macro enables once the backend is wired.
 
 ---
 
