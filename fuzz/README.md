@@ -14,6 +14,7 @@ through `libfuzzer-sys` against the corresponding subsystem.
 | `fuzz_parse_argv` | `tensor-wasm-wasi-gpu` `kernel_args::parse_argv` | host-trust-boundary argv parser never panics; errors only as documented `AbiError::{InvalidArgs, InvalidPointer, KernelArgsUnsupported}` |
 | `fuzz_rewrite_wasm` | `tensor-wasm-jit` `rewrite::rewrite_wasm` | for any input that `wasmparser::validate` accepts, the rewritten module also validates (rewriter preserves Wasm validity) |
 | `fuzz_pool_allocate` | `tensor-wasm-mem` `pool::UnifiedMemoryPool::allocate` | bump-pointer pool never panics on arbitrary `(size, align)` — every failure mode (zero size, bad align, exhaustion, overflow) surfaces as `Err(UnifiedError)` |
+| `lowering_driver` | `tensor-wasm-jit` `lowering_driver::lower_function` | Cranelift → `LoweredFunction` driver never panics; every failure surfaces as `Err(LoweringError::{UnsupportedOpcode,UnsupportedType,UndefinedValue,MalformedTerminator,Rejected,BadBlockReference})` |
 
 The wave landed alongside the existing `fuzz_snapshot_restore` target —
 together the four exercise the four largest host-trust-boundary parsers
@@ -37,6 +38,7 @@ cargo +nightly fuzz run audit_json_round_trip -- -max_total_time=300
 cargo +nightly fuzz run fuzz_parse_argv -- -max_total_time=300
 cargo +nightly fuzz run fuzz_rewrite_wasm -- -max_total_time=300
 cargo +nightly fuzz run fuzz_pool_allocate -- -max_total_time=300
+cargo +nightly fuzz run lowering_driver -- -max_total_time=60
 
 # 24-hour soak (per the v0.5 PATH-TO-V1 security workstream:
 # "keep `fuzz/` targets running 24x7 on dedicated hardware")

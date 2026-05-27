@@ -13,10 +13,17 @@ arbitrary = { version = "1", features = ["derive"] }
 
 tensor-wasm-core = { path = "../crates/tensor-wasm-core" }
 tensor-wasm-api = { path = "../crates/tensor-wasm-api" }
-tensor-wasm-jit = { path = "../crates/tensor-wasm-jit" }
+# `cuda-oxide-backend` is required so the `lowering_driver` module
+# (gated behind that feature, per `crates/tensor-wasm-jit/src/lib.rs`) is
+# compiled in. The `lowering_driver` fuzz target depends on it; the other
+# targets are feature-agnostic so the extra opt-in is harmless for them.
+tensor-wasm-jit = { path = "../crates/tensor-wasm-jit", features = ["cuda-oxide-backend"] }
 tensor-wasm-mem = { path = "../crates/tensor-wasm-mem" }
 tensor-wasm-snapshot = { path = "../crates/tensor-wasm-snapshot" }
 tensor-wasm-wasi-gpu = { path = "../crates/tensor-wasm-wasi-gpu" }
+# Used by `lowering_driver` to hand-build small Cranelift `Function`s.
+# Pinned to the same version as the workspace (see top-level Cargo.toml).
+cranelift-codegen = "0.111"
 wasmparser = "0.218"
 wasmtime = { version = "25", default-features = false, features = ["async", "cranelift", "runtime"] }
 tokio = { version = "1.40", features = ["rt", "macros"] }
@@ -86,6 +93,13 @@ bench = false
 [[bin]]
 name = "audit_json_round_trip"
 path = "fuzz_targets/audit_json_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lowering_driver"
+path = "fuzz_targets/lowering_driver.rs"
 test = false
 doc = false
 bench = false
