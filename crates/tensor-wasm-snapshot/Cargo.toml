@@ -24,19 +24,31 @@ serde_bytes = "0.11"
 tracing.workspace = true
 zstd.workspace = true
 cust = { workspace = true, optional = true }
+# HMAC-SHA256 snapshot signing (v3 wire format). Pulled in only when the
+# `signed-snapshots` feature is enabled; `subtle` provides the
+# constant-time equality check used to compare the trailing 32-byte
+# signature against the recomputed HMAC.
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+subtle = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
 
 [features]
-default = []
+default = ["signed-snapshots"]
 # Enables the GPU-side restore path that materialises the snapshot's
 # `gpu_memory` blob directly into a CUDA UnifiedBuffer and prefetches it to
 # the target device. Pulls in `cust`; off by default so the crate builds on
 # CUDA-less hosts.
 cuda = ["dep:cust"]
+# Enables HMAC-SHA256 signing/verification for snapshots (v3 wire format).
+# When enabled (the default), `SnapshotWriter::with_hmac_sha256_key` and
+# `SnapshotReader::with_hmac_sha256_key` become available; without it the
+# writer/reader continue to handle only the unsigned v2 wire format.
+signed-snapshots = ["dep:hmac", "dep:sha2", "dep:subtle"]
 
 [package.metadata.docs.rs]
 all-features = false
-features = []
+features = ["signed-snapshots"]
 rustdoc-args = ["--cfg", "docsrs"]
