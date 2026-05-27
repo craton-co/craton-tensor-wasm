@@ -13,3 +13,23 @@ pub mod rewrite;
 
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod pliron_dialect;
+
+// Wave 1 of the Pliron pipeline: pure-Rust interim IR + per-family
+// Cranelift-IR lowering passes. See [`lowered_ir`] for the IR contract
+// and [`pliron_dialect`] for the trait surface that ties them together.
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lowered_ir;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lower_arith;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lower_float;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lower_memory;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lower_cf;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lower_vector;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lower_conv;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lowering_test_support;

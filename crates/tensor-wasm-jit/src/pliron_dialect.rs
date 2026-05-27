@@ -165,6 +165,7 @@ pub enum PlironLoweringError {
     /// because Pliron is `git`-pinned (RFC 0001 "Drawbacks") and the v0.4
     /// port will need a version-check entry point as part of the dep
     /// landing. No scaffold path returns it.
+    #[error("pliron_dialect: dialect-mir version mismatch -- expected `{expected}`, found `{found}`")]
     DialectVersionMismatch {
         /// Pinned dialect-mir version that `tensor-wasm-jit` was built
         /// against (e.g. `"dialect-mir@0.1.0"`).
