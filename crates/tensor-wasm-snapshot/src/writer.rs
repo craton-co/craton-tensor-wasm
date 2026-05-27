@@ -17,6 +17,9 @@ use tensor_wasm_core::types::{InstanceId, TenantId};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
+#[cfg(feature = "signed-snapshots")]
+use crate::format::{SIGNATURE_KIND_HMAC_SHA256, SNAPSHOT_VERSION_V3};
+
 /// Magic bytes that identify a TensorWasm snapshot blob.
 ///
 /// Stored at the head of the bincode payload. Read by [`crate::reader::SnapshotReader`]
@@ -26,16 +29,22 @@ use tracing::{debug, instrument};
 /// or every existing snapshot becomes unreadable.
 pub const SNAPSHOT_MAGIC: u32 = 0xBA11_5407;
 
-/// On-disk schema version for [`Snapshot`].
+/// On-disk schema version emitted by default by [`SnapshotWriter::capture`].
 ///
 /// Bumped whenever the serialised layout of `Snapshot` changes in a way that is
-/// not bincode-compatible with previous releases. The reader will reject any
-/// blob whose `version` does not equal this constant.
+/// not bincode-compatible with previous releases. The reader accepts both this
+/// (`v2`, unsigned) and [`crate::format::SNAPSHOT_VERSION_V3`] (HMAC-signed,
+/// produced when the writer has had
+/// [`SnapshotWriter::with_hmac_sha256_key`] called on it) — see `FORMAT.md`.
 ///
 /// Version `2` adds the [`Snapshot::crc32`] payload checksum and enforces the
 /// size limits defined in [`limits`]. Snapshots produced by version `1` writers
-/// are not accepted by version `2` readers.
-pub const SNAPSHOT_VERSION: u32 = 2;
+/// are not accepted.
+///
+/// The default stays bound to v2 through v0.3.x for backward compatibility;
+/// the v0.4 release will flip the default to v3 (signed) and require operators
+/// to opt out for unsigned writes.
+pub const SNAPSHOT_VERSION: u32 = crate::format::SNAPSHOT_VERSION_V2;
 
 /// Default zstd compression level used by [`SnapshotWriter::capture`].
 ///
@@ -214,10 +223,23 @@ pub struct InstanceState<'a> {
 ///
 /// Stateless: no internal buffers are reused between calls, so the writer is
 /// `Send + Sync` and trivially shareable across worker threads.
+///
+/// By default a writer emits the unsigned v2 envelope. Call
+/// [`SnapshotWriter::with_hmac_sha256_key`] (requires the `signed-snapshots`
+/// feature) to switch to the HMAC-SHA256-signed v3 envelope.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SnapshotWriter {
     /// zstd compression level to use. Defaults to [`DEFAULT_ZSTD_LEVEL`].
     pub zstd_level: i32,
+    /// HMAC-SHA256 key used to sign v3 snapshots. `None` -> emit v2.
+    ///
+    /// Stored only when the `signed-snapshots` feature is enabled so the
+    /// no-feature build keeps the legacy two-field struct layout and does
+    /// not pay 33 bytes of state per writer instance. The field is `pub(crate)`
+    /// rather than `pub` so callers cannot read the key back out by name
+    /// once they have configured it.
+    #[cfg(feature = "signed-snapshots")]
+    pub(crate) hmac_key: Option<[u8; 32]>,
 }
 
 /// Validate `len` against `max` and return a descriptive error if it overflows.
@@ -236,19 +258,48 @@ pub(crate) fn check_blob_size(kind: &'static str, len: usize, max: usize) -> Res
 }
 
 impl SnapshotWriter {
-    /// Construct a writer using [`DEFAULT_ZSTD_LEVEL`].
+    /// Construct a writer using [`DEFAULT_ZSTD_LEVEL`] and no HMAC key.
     pub const fn new() -> Self {
         Self {
             zstd_level: DEFAULT_ZSTD_LEVEL,
+            #[cfg(feature = "signed-snapshots")]
+            hmac_key: None,
         }
     }
 
-    /// Construct a writer with an explicit zstd compression level.
+    /// Construct a writer with an explicit zstd compression level and no HMAC key.
     ///
     /// Valid range is `1..=22`; out-of-range values are clamped by the zstd
     /// library at compression time.
     pub const fn with_level(zstd_level: i32) -> Self {
-        Self { zstd_level }
+        Self {
+            zstd_level,
+            #[cfg(feature = "signed-snapshots")]
+            hmac_key: None,
+        }
+    }
+
+    /// Configure HMAC-SHA256 signing with a 32-byte key.
+    ///
+    /// Once configured, [`SnapshotWriter::capture`] emits the v3 envelope:
+    /// the usual zstd(bincode(...)) blob with the inner `version` field bumped
+    /// from `2` to `3`, followed by a one-byte signature-kind discriminant
+    /// (`1` = HMAC-SHA256) and the 32-byte HMAC computed over the entire
+    /// compressed prefix. See `FORMAT.md` for the exact byte layout.
+    ///
+    /// The key is held by value inside the writer and never logged or surfaced
+    /// in error messages. Treat the writer as secret once this method has been
+    /// called: it is `Clone + Copy`, so any copy carries the same key.
+    ///
+    /// Without this call (or without the `signed-snapshots` feature compiled
+    /// in) the writer continues to emit the unsigned v2 envelope, preserving
+    /// the v0.3.x default behaviour.
+    #[cfg(feature = "signed-snapshots")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "signed-snapshots")))]
+    #[must_use]
+    pub const fn with_hmac_sha256_key(mut self, key: [u8; 32]) -> Self {
+        self.hmac_key = Some(key);
+        self
     }
 
     /// Encode and compress `state` into a snapshot blob.
@@ -290,6 +341,19 @@ impl SnapshotWriter {
 
         let crc32 = payload_crc32(state.wasm_memory, state.gpu_memory, state.registers);
 
+        // Pick the on-wire version. Without an HMAC key configured we emit the
+        // legacy unsigned v2 envelope; with a key we bump to v3 so the reader
+        // (which keys signature handling off the version field) knows to look
+        // for the trailing signature kind + 32-byte HMAC.
+        #[cfg(feature = "signed-snapshots")]
+        let on_wire_version = if self.hmac_key.is_some() {
+            SNAPSHOT_VERSION_V3
+        } else {
+            SNAPSHOT_VERSION
+        };
+        #[cfg(not(feature = "signed-snapshots"))]
+        let on_wire_version = SNAPSHOT_VERSION;
+
         // Build the on-wire view by borrowing the caller's slices — no
         // host-side `.to_vec()` for the three memory blobs. bincode serialises
         // the borrowed `&[u8]` (via `serde_bytes`) identically to how it
@@ -297,7 +361,7 @@ impl SnapshotWriter {
         // format is unchanged.
         let snapshot_ref = SnapshotRef {
             magic: SNAPSHOT_MAGIC,
-            version: SNAPSHOT_VERSION,
+            version: on_wire_version,
             wasm_memory: state.wasm_memory,
             gpu_memory: state.gpu_memory,
             registers: state.registers,
@@ -325,9 +389,33 @@ impl SnapshotWriter {
             .finish()
             .map_err(|e| TensorWasmError::Serialization(format!("zstd finish: {e}").into()))?;
 
+        // v3: append [signature_kind = 1][HMAC-SHA256(key, compressed_prefix)].
+        // The HMAC covers the entire v2-shaped prefix (i.e. every byte written
+        // so far, which transitively covers magic, version, payload, and CRC32
+        // because they are all encoded inside the bincode/zstd frame). The
+        // key never leaves this scope and is never written to the trace span.
+        #[cfg(feature = "signed-snapshots")]
+        if let Some(ref key) = self.hmac_key {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).map_err(|_| {
+                // `new_from_slice` only errors on invalid key length; ours is a
+                // fixed [u8; 32], so this branch is unreachable in practice.
+                // We still translate the error rather than panic, and keep the
+                // message key-free.
+                TensorWasmError::Serialization("HMAC init failed".into())
+            })?;
+            mac.update(&compressed);
+            let sig = mac.finalize().into_bytes();
+            compressed.reserve(1 + sig.len());
+            compressed.push(SIGNATURE_KIND_HMAC_SHA256);
+            compressed.extend_from_slice(sig.as_slice());
+        }
+
         debug!(
             uncompressed = total_uncompressed_bytes,
             compressed = compressed.len(),
+            version = on_wire_version,
             "snapshot captured",
         );
         Ok(compressed)
@@ -373,9 +461,13 @@ mod tests {
 
     #[test]
     fn version_mismatch_is_rejected() {
+        // Use a version that is neither v2 (unsigned) nor v3 (signed) so the
+        // rejection is unambiguously about an unknown schema rather than
+        // about a missing HMAC key.
+        const UNKNOWN_VERSION: u32 = 99;
         let mut s = Snapshot {
             magic: SNAPSHOT_MAGIC,
-            version: SNAPSHOT_VERSION + 1,
+            version: UNKNOWN_VERSION,
             wasm_memory: vec![],
             gpu_memory: vec![],
             registers: vec![],
@@ -443,5 +535,79 @@ mod tests {
         assert!(r.gpu_memory.is_empty());
         assert!(r.registers.is_empty());
         assert_eq!(r.metadata.total_uncompressed_bytes, 0);
+    }
+
+    /// Without the HMAC key configured, the writer must keep emitting v2
+    /// regardless of the `signed-snapshots` feature being compiled in. This
+    /// is the v0.3.x backward-compat contract.
+    #[test]
+    fn default_writer_still_emits_v2() {
+        let (wasm, gpu, regs) = sample_state();
+        let bytes = SnapshotWriter::new()
+            .capture(InstanceState {
+                tenant_id: TenantId(1),
+                instance_id: InstanceId(1),
+                wasm_memory: &wasm,
+                gpu_memory: &gpu,
+                registers: &regs,
+            })
+            .expect("capture");
+        // Decompress and peek at the version field (LE u32 at offset 4..8 of
+        // the bincode payload). It must read as v2 for an unsigned writer.
+        let decompressed = zstd::decode_all(bytes.as_slice()).expect("decode");
+        let version = u32::from_le_bytes([
+            decompressed[4],
+            decompressed[5],
+            decompressed[6],
+            decompressed[7],
+        ]);
+        assert_eq!(version, crate::format::SNAPSHOT_VERSION_V2);
+    }
+
+    /// Configuring an HMAC key bumps the on-wire version to v3 and appends a
+    /// 33-byte trailer (`[kind=1][32-byte signature]`). A v3 blob round-trips
+    /// through a reader configured with the same key.
+    #[cfg(feature = "signed-snapshots")]
+    #[test]
+    fn signed_writer_emits_v3_and_round_trips() {
+        let key = [0x42u8; 32];
+        let (wasm, gpu, regs) = sample_state();
+        let bytes = SnapshotWriter::new()
+            .with_hmac_sha256_key(key)
+            .capture(InstanceState {
+                tenant_id: TenantId(9),
+                instance_id: InstanceId(99),
+                wasm_memory: &wasm,
+                gpu_memory: &gpu,
+                registers: &regs,
+            })
+            .expect("capture");
+
+        // Trailer is exactly 33 bytes: `[1][32-byte sig]`.
+        assert!(bytes.len() >= crate::format::SIGNATURE_TRAILER_LEN + 4);
+        assert_eq!(
+            bytes[bytes.len() - crate::format::SIGNATURE_TRAILER_LEN],
+            crate::format::SIGNATURE_KIND_HMAC_SHA256
+        );
+
+        // Decompress just the prefix to confirm the inner version reads as v3.
+        let compressed_prefix = &bytes[..bytes.len() - crate::format::SIGNATURE_TRAILER_LEN];
+        let decompressed = zstd::decode_all(compressed_prefix).expect("decode prefix");
+        let version = u32::from_le_bytes([
+            decompressed[4],
+            decompressed[5],
+            decompressed[6],
+            decompressed[7],
+        ]);
+        assert_eq!(version, crate::format::SNAPSHOT_VERSION_V3);
+
+        let restored = SnapshotReader::new()
+            .with_hmac_sha256_key(key)
+            .restore(&bytes)
+            .expect("restore v3");
+        assert_eq!(restored.wasm_memory, wasm);
+        assert_eq!(restored.gpu_memory, gpu);
+        assert_eq!(restored.registers, regs);
+        assert_eq!(restored.version, crate::format::SNAPSHOT_VERSION_V3);
     }
 }
