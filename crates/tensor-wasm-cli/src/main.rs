@@ -76,6 +76,8 @@ pub enum Command {
     Metrics(cmd::metrics::MetricsArgs),
     /// Live operator dashboard over `/healthz` + `/metrics` (refreshes in place).
     Observe(cmd::observe::ObserveArgs),
+    /// Run the TensorWasm HTTP API gateway in-process (binds and serves).
+    Serve(cmd::serve::ServeArgs),
     /// Emit shell completion scripts for the named shell.
     ///
     /// By default the script is written to stdout. Pass `--out-dir <dir>` to
@@ -117,6 +119,7 @@ async fn main() {
         Command::Snapshot { action } => cmd::snapshot::run(action, &ctx).await,
         Command::Metrics(args) => cmd::metrics::run(args, &ctx).await,
         Command::Observe(args) => cmd::observe::run(args, &ctx).await,
+        Command::Serve(args) => cmd::serve::run(args).await,
         Command::Completions { shell, out_dir } => cmd::completions::run(shell, out_dir),
         Command::Man(args) => cmd::man::run(args),
     };

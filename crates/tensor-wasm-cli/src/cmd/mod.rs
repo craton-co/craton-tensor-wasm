@@ -20,6 +20,7 @@ pub mod man;
 pub mod metrics;
 pub mod observe;
 pub mod run;
+pub mod serve;
 pub mod snapshot;
 
 /// Environment variable read by [`HttpContext::from_env`] to obtain a bearer

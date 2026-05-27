@@ -1,3 +1,4 @@
+# NOTE: regenerate via `tensor-wasm completions bash` after building.
 _tensor-wasm() {
     local i cur prev opts cmd
     COMPREPLY=()
@@ -43,6 +44,9 @@ _tensor-wasm() {
             tensor__wasm,run)
                 cmd="tensor__wasm__subcmd__run"
                 ;;
+            tensor__wasm,serve)
+                cmd="tensor__wasm__subcmd__serve"
+                ;;
             tensor__wasm,snapshot)
                 cmd="tensor__wasm__subcmd__snapshot"
                 ;;
@@ -72,6 +76,9 @@ _tensor-wasm() {
                 ;;
             tensor__wasm__subcmd__help,run)
                 cmd="tensor__wasm__subcmd__help__subcmd__run"
+                ;;
+            tensor__wasm__subcmd__help,serve)
+                cmd="tensor__wasm__subcmd__help__subcmd__serve"
                 ;;
             tensor__wasm__subcmd__help,snapshot)
                 cmd="tensor__wasm__subcmd__help__subcmd__snapshot"
@@ -107,7 +114,7 @@ _tensor-wasm() {
 
     case "${cmd}" in
         tensor__wasm)
-            opts="-h -V --tenant --help --version run deploy invoke bench snapshot metrics observe completions man help"
+            opts="-h -V --tenant --help --version run deploy invoke bench snapshot metrics observe serve completions man help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -199,7 +206,7 @@ _tensor-wasm() {
             return 0
             ;;
         tensor__wasm__subcmd__help)
-            opts="run deploy invoke bench snapshot metrics observe completions man help"
+            opts="run deploy invoke bench snapshot metrics observe serve completions man help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -469,6 +476,58 @@ _tensor-wasm() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tensor__wasm__subcmd__serve)
+            opts="-h --addr --token --tenant-header-policy --cors-origin --max-body-bytes --tenant --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --addr)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --token)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --tenant-header-policy)
+                    COMPREPLY=( $(compgen -W "optional required" -- "${cur}") )
+                    return 0
+                    ;;
+                --cors-origin)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --max-body-bytes)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --tenant)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tensor__wasm__subcmd__help__subcmd__serve)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
                 *)
                     COMPREPLY=()
                     ;;
