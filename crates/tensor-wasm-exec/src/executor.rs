@@ -133,13 +133,27 @@ impl From<ExecError> for tensor_wasm_core::error::TensorWasmError {
                 // wasmtime wraps runtime traps as `wasmtime::Trap` inside the
                 // anyhow error; compile/parse failures do NOT. We classify
                 // accordingly so the unified `TensorWasmError` carries the right
-                // variant (and `is_retryable` / `kind` reflect it). The full
-                // error chain is preserved via `format!("{err:#}")` which
-                // walks the `#[source]` chain wasmtime/anyhow expose.
-                if err.downcast_ref::<wasmtime::Trap>().is_some() {
-                    TensorWasmError::WasmTrap(format!("{err:#}").into())
+                // variant (and `is_retryable` / `kind` reflect it).
+                //
+                // SECURITY (exec S-9): the full wasmtime error chain
+                // (`format!("{err:#}")`) walks every `#[source]` link and
+                // routinely surfaces host pointer addresses, host file paths,
+                // and internal stack-frame names — none of which are safe to
+                // hand back to an untrusted caller. We therefore log the full
+                // chain server-side and return a stable opaque string in the
+                // payload so external observers cannot fingerprint the host.
+                let is_trap = err.downcast_ref::<wasmtime::Trap>().is_some();
+                tracing::error!(
+                    target: "tensor_wasm_exec::executor",
+                    error = ?err,
+                    error_chain = %format!("{err:#}"),
+                    is_trap,
+                    "wasmtime trap",
+                );
+                if is_trap {
+                    TensorWasmError::WasmTrap("wasm trap".into())
                 } else {
-                    TensorWasmError::WasmCompile(format!("{err:#}").into())
+                    TensorWasmError::WasmCompile("wasm compile failed".into())
                 }
             }
             ExecError::NotFound(id) => {

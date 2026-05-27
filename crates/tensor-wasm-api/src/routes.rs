@@ -364,28 +364,55 @@ impl From<JsonRejection> for ApiError {
 
 impl From<ExecError> for ApiError {
     fn from(err: ExecError) -> Self {
-        // Snapshot the error message before pattern-matching so each arm
-        // can claim it without re-borrowing `err`.
-        let message = err.to_string();
-        let (status, kind) = match err {
-            ExecError::NotFound(_) => (StatusCode::NOT_FOUND, "instance_not_found"),
-            ExecError::MissingExport(_) => (StatusCode::BAD_REQUEST, "missing_export"),
-            ExecError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, "invoke_timeout"),
+        // SECURITY (api S-22): pre-W4.x this impl used `err.to_string()`
+        // verbatim as the wire `message`. For `ExecError::Wasmtime(_)` that
+        // surfaces the full wasmtime error chain (including host pointer
+        // addresses, host file paths, and internal stack-frame names) to
+        // untrusted callers. We now branch per-variant so structured
+        // variants (NotFound, MissingExport, Timeout) keep their safe,
+        // already-stable messages while the wasmtime variant is replaced
+        // with an opaque string and the full error is logged server-side.
+        match &err {
+            ExecError::NotFound(_) => ApiError {
+                status: StatusCode::NOT_FOUND,
+                kind: "instance_not_found".to_string(),
+                message: err.to_string(),
+            },
+            ExecError::MissingExport(_) => ApiError {
+                status: StatusCode::BAD_REQUEST,
+                kind: "missing_export".to_string(),
+                message: err.to_string(),
+            },
+            ExecError::Timeout(_) => ApiError {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                kind: "invoke_timeout".to_string(),
+                message: err.to_string(),
+            },
             // ExecError::Wasmtime collapses both runtime traps and compile
-            // failures; the executor distinguishes them only when converting to
-            // TensorWasmError. For the API surface we keep a single 500.
-            ExecError::Wasmtime(_) => (StatusCode::INTERNAL_SERVER_ERROR, "wasmtime"),
+            // failures; the executor distinguishes them only when converting
+            // to TensorWasmError. For the API surface we keep a single 500
+            // with a stable opaque message — the real chain is logged.
+            ExecError::Wasmtime(inner) => {
+                tracing::error!(
+                    target: "tensor_wasm_api::routes",
+                    error = ?inner,
+                    error_chain = %format!("{inner:#}"),
+                    "execution error mapped to 500",
+                );
+                ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    kind: "wasmtime".to_string(),
+                    message: "internal execution error".to_string(),
+                }
+            }
             // Per mem H5 + exec S-2: module's declared linear memory exceeds
             // the engine's per-tenant cap. Surface as 413 so clients can
             // distinguish quota rejection from a generic compile failure.
-            ExecError::ModuleMemoryTooLarge { .. } => {
-                (StatusCode::PAYLOAD_TOO_LARGE, "module_memory_too_large")
-            }
-        };
-        ApiError {
-            status,
-            kind: kind.to_string(),
-            message,
+            ExecError::ModuleMemoryTooLarge { .. } => ApiError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                kind: "module_memory_too_large".to_string(),
+                message: err.to_string(),
+            },
         }
     }
 }
