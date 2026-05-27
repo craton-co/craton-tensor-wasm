@@ -89,6 +89,7 @@ _arguments "${_arguments_options[@]}" : \
 '--instance=[Identifier of the running instance to snapshot]:INSTANCE:_default' \
 '--output=[Output path for the resulting \`.tensor-wasm\` archive]:OUTPUT:_files' \
 '--server=[Base URL of the target TensorWasm server (e.g. \`http\://localhost\:8080\`)]:SERVER:_default' \
+'--hmac-key-file=[Path to a 32-byte HMAC-SHA256 key. The file is interpreted as 64 hex characters if it'\''s that length (whitespace trimmed), otherwise as 32 raw bytes. Mismatched length → error]:PATH:_files' \
 '--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
@@ -100,6 +101,8 @@ _arguments "${_arguments_options[@]}" : \
 '--as-instance=[Identifier to assign to the restored instance]:AS_INSTANCE:_default' \
 '--server=[Base URL of the target TensorWasm server (e.g. \`http\://localhost\:8080\`)]:SERVER:_default' \
 '--max-decompressed=[Maximum decompressed snapshot size we'\''ll accept, in bytes. Mirrors the server-side cap so the CLI rejects oversized archives without a pointless upload]:MAX_DECOMPRESSED:_default' \
+'--hmac-key-file=[Path to a 32-byte HMAC-SHA256 key. The file is interpreted as 64 hex characters if it'\''s that length (whitespace trimmed), otherwise as 32 raw bytes. Mismatched length → error]:PATH:_files' \
+'--require-signature[Refuse to restore an unsigned (v2) snapshot]' \
 '--tenant=[Tenant id to advertise on outbound API requests via \`X-TensorWasm-Tenant\`. Zero (the default) suppresses the header for backwards compatibility]:TENANT:_default' \
 '-h[Print help]' \
 '--help[Print help]' \

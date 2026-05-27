@@ -143,6 +143,11 @@ crossbeam-channel = "0.5"
 # Hashing — used for stable, cross-Rust-version fingerprints (TensorWasmKernelBlueprint).
 blake3 = "1"
 
+# Hex encoding/decoding — used by the CLI to read 32-byte HMAC-SHA256 keys
+# from disk (snapshot signing) and to render them as ASCII for the
+# `X-TensorWasm-Snapshot-HMAC-Key` HTTP header. Pinned at 0.4 (latest 0.4.x).
+hex = "0.4"
+
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"

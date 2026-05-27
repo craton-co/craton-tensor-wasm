@@ -18,5 +18,9 @@ Options:
           Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
       --max-decompressed <MAX_DECOMPRESSED>
           Maximum decompressed snapshot size we'll accept, in bytes. Mirrors the server-side cap so the CLI rejects oversized archives without a pointless upload [default: 268435456]
+      --hmac-key-file <PATH>
+          Path to a 32-byte HMAC-SHA256 key. The file is interpreted as 64 hex characters if it's that length (whitespace trimmed), otherwise as 32 raw bytes. Mismatched length → error
+      --require-signature
+          Refuse to restore an unsigned (v2) snapshot
   -h, --help
           Print help

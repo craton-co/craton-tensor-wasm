@@ -52,6 +52,16 @@ pub(crate) mod codes {
     pub const LOCAL_VALIDATION_FAILED: i32 = 2;
 }
 
+/// HTTP header on `snapshot save` carrying the hex-encoded 32-byte
+/// HMAC-SHA256 key the server should use to sign the emitted archive.
+/// Server-side wiring lives in `tensor-wasm-api` (task M8.4).
+pub(crate) const HMAC_KEY_HEADER: &str = "X-TensorWasm-Snapshot-HMAC-Key";
+
+/// HTTP header on `snapshot restore` instructing the server to refuse
+/// unsigned (v2) snapshots. The header value is always the literal `true`
+/// when present; absence is treated as `false` server-side.
+pub(crate) const REQUIRE_SIGNATURE_HEADER: &str = "X-TensorWasm-Snapshot-Require-Signature";
+
 /// `tensor-wasm snapshot` sub-actions.
 #[derive(Debug, Subcommand)]
 pub enum SnapshotAction {
@@ -66,6 +76,11 @@ pub enum SnapshotAction {
         /// Base URL of the target TensorWasm server (e.g. `http://localhost:8080`).
         #[arg(long)]
         server: String,
+        /// Path to a 32-byte HMAC-SHA256 key. The file is interpreted as
+        /// 64 hex characters if it's that length (whitespace trimmed),
+        /// otherwise as 32 raw bytes. Mismatched length → error.
+        #[arg(long, value_name = "PATH")]
+        hmac_key_file: Option<PathBuf>,
     },
     /// Restore an instance from a `.tensor-wasm` archive via the API.
     Restore {
@@ -83,6 +98,14 @@ pub enum SnapshotAction {
         /// pointless upload.
         #[arg(long, default_value_t = DEFAULT_MAX_DECOMPRESSED)]
         max_decompressed: u64,
+        /// Path to a 32-byte HMAC-SHA256 key. The file is interpreted as
+        /// 64 hex characters if it's that length (whitespace trimmed),
+        /// otherwise as 32 raw bytes. Mismatched length → error.
+        #[arg(long, value_name = "PATH")]
+        hmac_key_file: Option<PathBuf>,
+        /// Refuse to restore an unsigned (v2) snapshot.
+        #[arg(long)]
+        require_signature: bool,
     },
 }
 
@@ -116,23 +139,50 @@ pub async fn run(action: SnapshotAction, ctx: &HttpContext) -> Result<()> {
             instance,
             output,
             server,
-        } => save(&server, &instance, &output, ctx).await,
+            hmac_key_file,
+        } => save(&server, &instance, &output, hmac_key_file.as_deref(), ctx).await,
         SnapshotAction::Restore {
             input,
             as_instance,
             server,
             max_decompressed,
-        } => restore(&server, &input, &as_instance, max_decompressed, ctx).await,
+            hmac_key_file,
+            require_signature,
+        } => {
+            restore(
+                &server,
+                &input,
+                &as_instance,
+                max_decompressed,
+                hmac_key_file.as_deref(),
+                require_signature,
+                ctx,
+            )
+            .await
+        }
     }
 }
 
 /// Implementation of `tensor-wasm snapshot save`.
-async fn save(server: &str, instance_id: &str, output: &Path, ctx: &HttpContext) -> Result<()> {
+async fn save(
+    server: &str,
+    instance_id: &str,
+    output: &Path,
+    hmac_key_file: Option<&Path>,
+    ctx: &HttpContext,
+) -> Result<()> {
     super::validate_server_url(server)?;
     validate_parent_writable(output)?;
     if instance_id.trim().is_empty() {
         return Err(local_err("--instance must be non-empty"));
     }
+
+    // Load and validate the HMAC key before any network I/O so a malformed
+    // key file fails fast with a LOCAL_VALIDATION_FAILED exit code.
+    let hmac_key_hex = match hmac_key_file {
+        Some(path) => Some(load_hmac_key(path).map(hex::encode)?),
+        None => None,
+    };
 
     let url = format!(
         "{}/instances/{}/snapshot",
@@ -141,8 +191,12 @@ async fn save(server: &str, instance_id: &str, output: &Path, ctx: &HttpContext)
     );
     let client = ctx.build_client(Duration::from_secs(120))?;
 
+    let mut req = client.post(&url);
+    if let Some(hex_key) = &hmac_key_hex {
+        req = req.header(HMAC_KEY_HEADER, hex_key);
+    }
     let resp = ctx
-        .apply(client.post(&url))
+        .apply(req)
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
@@ -183,11 +237,14 @@ async fn save(server: &str, instance_id: &str, output: &Path, ctx: &HttpContext)
 }
 
 /// Implementation of `tensor-wasm snapshot restore`.
+#[allow(clippy::too_many_arguments)]
 async fn restore(
     server: &str,
     input: &Path,
     as_instance: &str,
     max_decompressed: u64,
+    hmac_key_file: Option<&Path>,
+    require_signature: bool,
     ctx: &HttpContext,
 ) -> Result<()> {
     super::validate_server_url(server)?;
@@ -213,20 +270,31 @@ async fn restore(
         )));
     }
 
+    // Load and validate the HMAC key before any network I/O so a malformed
+    // key file fails fast with a LOCAL_VALIDATION_FAILED exit code.
+    let hmac_key_hex = match hmac_key_file {
+        Some(path) => Some(load_hmac_key(path).map(hex::encode)?),
+        None => None,
+    };
+
     let bytes = std::fs::read(input)
         .with_context(|| format!("reading snapshot file {}", input.display()))?;
 
     let url = format!("{}/instances/restore", super::server_base(server));
     let client = ctx.build_client(Duration::from_secs(120))?;
 
+    let mut req = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .header("X-TensorWasm-As-Instance", as_instance);
+    if let Some(hex_key) = &hmac_key_hex {
+        req = req.header(HMAC_KEY_HEADER, hex_key);
+    }
+    if require_signature {
+        req = req.header(REQUIRE_SIGNATURE_HEADER, "true");
+    }
     let resp = ctx
-        .apply(
-            client
-                .post(&url)
-                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                .header("X-TensorWasm-As-Instance", as_instance)
-                .body(bytes),
-        )
+        .apply(req.body(bytes))
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
@@ -308,6 +376,57 @@ fn local_err(msg: impl Into<String>) -> anyhow::Error {
     })
 }
 
+/// Load a 32-byte HMAC-SHA256 key from disk.
+///
+/// The file content is interpreted in one of two ways:
+///
+/// * If the file (with leading/trailing whitespace trimmed) is exactly
+///   64 characters of hex (`0-9`, `a-f`, `A-F`), it's decoded as hex into
+///   32 raw bytes. This is the recommended human-editable format.
+/// * Otherwise, if the file is exactly 32 bytes long, those bytes are used
+///   verbatim.
+///
+/// Any other length is rejected with a [`codes::LOCAL_VALIDATION_FAILED`]
+/// error so an operator who accidentally points the flag at, say, a
+/// passphrase or PEM file gets a clear message instead of a silently
+/// truncated key.
+pub(crate) fn load_hmac_key(path: &Path) -> Result<[u8; 32]> {
+    let raw = std::fs::read(path)
+        .with_context(|| format!("reading HMAC key file {}", path.display()))?;
+
+    // Try the hex path first: a file that's pure ASCII hex (after trimming
+    // surrounding whitespace) is the documented happy path. Mixed binary
+    // files containing 64 ASCII-hex bytes plus a trailing newline still
+    // resolve via this branch because `trim` strips the newline.
+    if let Ok(text) = std::str::from_utf8(&raw) {
+        let trimmed = text.trim();
+        if trimmed.len() == 64 {
+            let bytes = hex::decode(trimmed).map_err(|e| {
+                local_err(format!(
+                    "HMAC key file {} looks like hex but is not valid: {e}",
+                    path.display()
+                ))
+            })?;
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            return Ok(out);
+        }
+    }
+
+    if raw.len() == 32 {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&raw);
+        return Ok(out);
+    }
+
+    Err(local_err(format!(
+        "HMAC key file {} must be either 64 hex characters or 32 raw bytes; \
+         got {} bytes",
+        path.display(),
+        raw.len()
+    )))
+}
+
 /// Build a "feature not yet exposed by API" error tagged with the
 /// FEATURE_NOT_EXPOSED exit code. Used when the server returns 404 on the
 /// snapshot routes.
@@ -369,5 +488,62 @@ mod tests {
             "/definitely/not/a/real/path/snapshot.tensor-wasm",
         ));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn load_hmac_key_accepts_64_hex_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.hex");
+        // 64 hex chars = 32 bytes of 0x42.
+        let hex_key = "42".repeat(32);
+        std::fs::write(&path, &hex_key).unwrap();
+        let k = load_hmac_key(&path).unwrap();
+        assert_eq!(k, [0x42u8; 32]);
+    }
+
+    #[test]
+    fn load_hmac_key_trims_trailing_newline_on_hex_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.hex");
+        let mut content = "ab".repeat(32);
+        content.push('\n');
+        std::fs::write(&path, &content).unwrap();
+        let k = load_hmac_key(&path).unwrap();
+        assert_eq!(k, [0xabu8; 32]);
+    }
+
+    #[test]
+    fn load_hmac_key_accepts_32_raw_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.bin");
+        let raw = [0x99u8; 32];
+        std::fs::write(&path, raw).unwrap();
+        let k = load_hmac_key(&path).unwrap();
+        assert_eq!(k, raw);
+    }
+
+    #[test]
+    fn load_hmac_key_rejects_wrong_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.bad");
+        std::fs::write(&path, b"too short").unwrap();
+        let err = load_hmac_key(&path).unwrap_err();
+        let tagged: &SnapshotExit = err.downcast_ref().expect("typed error");
+        assert_eq!(tagged.code, codes::LOCAL_VALIDATION_FAILED);
+        assert!(tagged.message.contains("64 hex characters or 32 raw bytes"));
+    }
+
+    #[test]
+    fn load_hmac_key_rejects_invalid_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.bad");
+        // 64 chars but with a non-hex `z`.
+        let mut s = "a".repeat(63);
+        s.push('z');
+        std::fs::write(&path, &s).unwrap();
+        let err = load_hmac_key(&path).unwrap_err();
+        let tagged: &SnapshotExit = err.downcast_ref().expect("typed error");
+        assert_eq!(tagged.code, codes::LOCAL_VALIDATION_FAILED);
+        assert!(tagged.message.contains("not valid"));
     }
 }

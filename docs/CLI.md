@@ -87,6 +87,10 @@ Percentiles use the nearest-rank method on the sorted sample buffer. For a stead
 
 Capture or restore an instance's state from a `.tensor-wasm` archive. `tensor-wasm snapshot save` writes the running instance's snapshot to the named output path via `tensor-wasm-snapshot::Writer`; `tensor-wasm snapshot restore` reads the archive, verifies the CRC32 integrity check, and rehydrates the instance through `tensor-wasm-snapshot::Reader`. Both commands surface validation errors (bad magic, version mismatch, CRC failure) as non-zero exits with a chained-cause message.
 
+#### Signed snapshots: `--hmac-key-file` and `--require-signature`
+
+Both `snapshot save` and `snapshot restore` accept `--hmac-key-file <PATH>` pointing at a 32-byte HMAC-SHA256 key. The file is interpreted as 64 hex characters when its trimmed length matches, otherwise as 32 raw bytes; any other length is rejected locally with exit code `2` (`LOCAL_VALIDATION_FAILED`) before the CLI dials the server. The hex-encoded key is forwarded as the `X-TensorWasm-Snapshot-HMAC-Key` request header — the actual `SnapshotWriter::with_hmac_sha256_key` / `SnapshotReader::with_hmac_sha256_key` plumbing lives server-side. `snapshot restore` additionally accepts `--require-signature`, which sends `X-TensorWasm-Snapshot-Require-Signature: true` so the server refuses to rehydrate any archive that does not carry an HMAC trailer (equivalent to calling `SnapshotReader::require_signature` on the server). See the `tensor-wasm-snapshot` crate's `FORMAT.md` for the on-disk layout of the signed v3 frame.
+
 ### `tensor-wasm metrics --server <url>`
 
 Fetch and pretty-print the `/metrics` endpoint of a TensorWasm server. The output is the raw Prometheus text exposition; pipe to `grep '^tensor_wasm_'` to filter to TensorWasm's own series.
