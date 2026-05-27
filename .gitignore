@@ -10,3 +10,4 @@ Cargo.lock.bak
 /perf.data*
 /flamegraph.svg
 bench-out/
+.claude/
