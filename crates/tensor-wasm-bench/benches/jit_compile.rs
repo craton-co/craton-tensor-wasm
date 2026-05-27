@@ -33,15 +33,21 @@ fn vector_add_blueprint(lanes: u32) -> TensorWasmKernelBlueprint {
 }
 
 fn matmul_blueprint() -> TensorWasmKernelBlueprint {
-    TensorWasmKernelBlueprint::new("matmul_16x16x16")
+    // Approximates a 16x16 inner-loop matmul body as a stack of FMAs
+    // without invoking the wmma `MatMul` op — PTX emission for that op
+    // is deferred to v0.4 and the emitter explicitly refuses it (see
+    // `tensor_wasm_jit::ptx_emit::EmitError::NotYetImplemented`). The
+    // shape (loads → many FMAs → store) keeps the cache-key fingerprint
+    // and the emit cost in the same order of magnitude as a real matmul
+    // kernel so the bench remains representative for S13's cache hit/
+    // miss measurements.
+    let mut bp = TensorWasmKernelBlueprint::new("matmul_16x16x16")
         .push(TensorWasmOp::LoadUnified { lanes: 4 })
-        .push(TensorWasmOp::LoadUnified { lanes: 4 })
-        .push(TensorWasmOp::MatMul {
-            m: 16,
-            n: 16,
-            k: 16,
-        })
-        .push(TensorWasmOp::StoreUnified { lanes: 4 })
+        .push(TensorWasmOp::LoadUnified { lanes: 4 });
+    for _ in 0..16 {
+        bp = bp.push(TensorWasmOp::VecFma { lanes: 4 });
+    }
+    bp.push(TensorWasmOp::StoreUnified { lanes: 4 })
         .with_grid(GridHint {
             total_threads: 4096,
             preferred_block_size: 128,
@@ -78,7 +84,7 @@ fn bench_emit_text(c: &mut Criterion) {
     for (name, bp) in blueprints {
         group.bench_with_input(BenchmarkId::from_parameter(name), bp, |b, bp| {
             b.iter(|| {
-                let ptx = emit(bp);
+                let ptx = emit(bp).expect("emit");
                 criterion::black_box(ptx);
             });
         });
@@ -119,7 +125,7 @@ fn bench_cache_hit_vs_miss(c: &mut Criterion) {
         b.iter_batched_ref(
             KernelCache::new,
             |cache| {
-                let ptx = emit(&bp);
+                let ptx = emit(&bp).expect("emit");
                 let entry = CachedKernel {
                     fingerprint: bp.fingerprint(),
                     ptx: Arc::new(ptx),
@@ -136,7 +142,7 @@ fn bench_cache_hit_vs_miss(c: &mut Criterion) {
     let warm_cache = KernelCache::with_capacity(16);
     let warm_entry = CachedKernel {
         fingerprint: bp.fingerprint(),
-        ptx: Arc::new(emit(&bp)),
+        ptx: Arc::new(emit(&bp).expect("emit")),
         compiled: CompiledHandle::default(),
     };
     warm_cache.put(key, warm_entry);

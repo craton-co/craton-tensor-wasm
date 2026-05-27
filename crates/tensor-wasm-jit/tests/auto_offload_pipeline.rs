@@ -55,7 +55,7 @@ fn pipeline_offload_path() {
     let blueprint = lower_block(&block).expect("lower");
     assert!(!blueprint.is_empty());
 
-    let ptx = emit(&blueprint);
+    let ptx = emit(&blueprint).expect("emit");
     assert!(ptx.text.contains(".target sm_80"));
     assert!(ptx.text.contains(".visible .entry matmul_inner"));
 
@@ -150,6 +150,6 @@ fn matrix_multiply_wat_pipeline_smoke() {
     let block = matmul_inner_block();
     assert_eq!(classify_default(&block), DetectorVerdict::Offload);
     let bp = lower_block(&block).expect("lower");
-    let ptx = emit(&bp);
+    let ptx = emit(&bp).expect("emit");
     assert!(ptx.text.contains("vector_add") || ptx.text.contains(".entry matmul_inner"));
 }

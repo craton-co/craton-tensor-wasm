@@ -355,30 +355,44 @@ fn analyse(
                             block.loop_trip_count,
                         );
                         match lower_block(&lower_block_input) {
-                            Ok(blueprint) => {
-                                let fp = blueprint.fingerprint();
-                                let ptx = emit(&blueprint);
-                                let key = CacheKey {
-                                    blueprint: fp,
-                                    sm_version: opts.sm_version,
-                                };
-                                cache.put(
-                                    key,
-                                    CachedKernel {
-                                        fingerprint: fp,
-                                        ptx: Arc::new(ptx),
-                                        compiled: CompiledHandle::default(),
-                                    },
-                                );
-                                fingerprint = Some(fp);
-                                info!(
-                                    target: "tensor_wasm_jit::rewrite",
-                                    function = func_index_in_global_space,
-                                    op_count,
-                                    fingerprint = fp,
-                                    "pre-populated kernel cache for offload candidate"
-                                );
-                            }
+                            Ok(blueprint) => match emit(&blueprint) {
+                                Ok(ptx) => {
+                                    let fp = blueprint.fingerprint();
+                                    let key = CacheKey {
+                                        blueprint: fp,
+                                        sm_version: opts.sm_version,
+                                    };
+                                    cache.put(
+                                        key,
+                                        CachedKernel {
+                                            fingerprint: fp,
+                                            ptx: Arc::new(ptx),
+                                            compiled: CompiledHandle::default(),
+                                        },
+                                    );
+                                    fingerprint = Some(fp);
+                                    info!(
+                                        target: "tensor_wasm_jit::rewrite",
+                                        function = func_index_in_global_space,
+                                        op_count,
+                                        fingerprint = fp,
+                                        "pre-populated kernel cache for offload candidate"
+                                    );
+                                }
+                                Err(e) => {
+                                    // Emission refused (e.g. MatMul not yet
+                                    // implemented) — keep this function on the
+                                    // CPU path. This is the deopt-at-rewrite
+                                    // signal at the emit stage.
+                                    debug!(
+                                        target: "tensor_wasm_jit::rewrite",
+                                        function = func_index_in_global_space,
+                                        op_count,
+                                        reason = %e,
+                                        "offload candidate rejected by PTX emitter"
+                                    );
+                                }
+                            },
                             Err(e) => {
                                 // Lowering refused — keep this function on the
                                 // CPU path. This is the deopt-at-rewrite signal.
