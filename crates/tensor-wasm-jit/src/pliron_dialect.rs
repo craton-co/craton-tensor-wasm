@@ -15,11 +15,16 @@
 //! # What this module IS
 //!
 //! - The final trait signature ([`WasmToPliron`]) that the v0.4+ port will
-//!   implement. The string-to-string shape is intentional placeholder: the
-//!   real implementation replaces the input/output types with Pliron's
-//!   `Operation` / `Module` types once the crate dep lands. Call sites that
-//!   want to write backend-agnostic lowering code today can target this
-//!   trait and the v0.4 diff is a body + types swap, not a refactor.
+//!   implement. As of wave 1 of the Pliron pipeline the trait is keyed on a
+//!   real [`cranelift_codegen::ir::Function`] input and a real
+//!   [`crate::lowered_ir::LoweredFunction`] output — the
+//!   [`&str`]→[`String`] placeholder shape that landed in v0.3.1 is gone.
+//!   The interim [`crate::lowered_ir::LoweredFunction`] IR is the stable
+//!   contract under our control; wave 3 will graft a
+//!   `LoweredFunction → pliron::Operation` converter onto the same trait
+//!   without disturbing call sites. Code that wants to write
+//!   backend-agnostic lowering today can target this trait and the v0.4
+//!   diff is a body swap, not a refactor.
 //! - A [`StubLowerer`] that implements the trait, always returning
 //!   [`PlironLoweringError::NotYetImplemented`] with an actionable message
 //!   pointing to RFC 0001.
@@ -130,7 +135,10 @@
 
 #![cfg(feature = "cuda-oxide-backend")]
 
+use cranelift_codegen::ir::Function;
 use thiserror::Error;
+
+use crate::lowered_ir::LoweredFunction;
 
 /// Errors produced by the (still-scaffolded) Cranelift → Pliron
 /// `dialect-mir` lowering.
@@ -192,17 +200,19 @@ impl PlironLoweringError {
 
 /// Lowering entry point trait.
 ///
-/// Implementors translate a Cranelift IR module (today: serialised as a
-/// `&str` placeholder; v0.4: replaced with the real Cranelift module
-/// type and a Pliron `Module` return type) into Pliron `dialect-mir`
-/// suitable for handing off to cuda-oxide's downstream `mem2reg` →
-/// `dialect-llvm` → LLVM IR → PTX pipeline.
+/// Implementors translate a Cranelift IR function into the wave 1 interim
+/// IR ([`LoweredFunction`]) suitable for handing off to cuda-oxide's
+/// downstream `mem2reg` → `dialect-llvm` → LLVM IR → PTX pipeline. Wave 3
+/// of the Pliron pipeline will graft a `LoweredFunction → pliron::Operation`
+/// converter on top of this trait without disturbing the call sites; see
+/// RFC 0001 step 4 and the [`crate::lowered_ir`] module docs for the
+/// rationale for routing through an interim IR rather than coding directly
+/// against the alpha, git-pinned Pliron `Operation` / `Module` types.
 ///
-/// The string-to-string signature is intentional **placeholder** for the
-/// v0.3.1 scaffold landing. The v0.4 port will replace the parameter
-/// types with the real Pliron `Operation`/`Module` types once the crate
-/// dep is added — see RFC 0001 step 4 and the module-level docs for why
-/// the dep is deferred today.
+/// The wave-1 signature is final on the input side — it now takes a real
+/// [`cranelift_codegen::ir::Function`] reference rather than the v0.3.1
+/// `&str` placeholder — and final on the output side modulo the interim
+/// IR. The v0.4 port replaces the trait body, not its shape.
 ///
 /// # Send + Sync
 ///
@@ -215,14 +225,17 @@ impl PlironLoweringError {
 /// the unit tests in this module include a compile-time assertion that
 /// [`StubLowerer`] satisfies it.
 pub trait WasmToPliron {
-    /// Lower a Cranelift IR module to a Pliron `dialect-mir` module.
+    /// Lower a Cranelift IR function to a [`LoweredFunction`] in the
+    /// wave 1 interim IR.
     ///
-    /// **v0.3.1 contract:** the parameter is a `&str` placeholder for the
-    /// eventual Cranelift module type; the success return is a `String`
-    /// placeholder for the eventual Pliron `Module`. Today every
-    /// implementation returns
-    /// [`PlironLoweringError::NotYetImplemented`].
-    fn lower(&self, cranelift_module: &str) -> Result<String, PlironLoweringError>;
+    /// **Wave 1 contract:** the parameter is the real
+    /// [`cranelift_codegen::ir::Function`] (no longer a `&str`
+    /// placeholder); the success return is the real [`LoweredFunction`]
+    /// (no longer a `String` placeholder). Today every implementation
+    /// still returns [`PlironLoweringError::NotYetImplemented`] — the
+    /// per-family `lower_*` modules will populate real lowerings in
+    /// follow-up wave-1 agents.
+    fn lower(&self, func: &Function) -> Result<LoweredFunction, PlironLoweringError>;
 }
 
 /// Zero-state stub implementor of [`WasmToPliron`].
@@ -236,23 +249,25 @@ pub trait WasmToPliron {
 pub struct StubLowerer;
 
 impl WasmToPliron for StubLowerer {
-    fn lower(&self, _cranelift_module: &str) -> Result<String, PlironLoweringError> {
-        // Intentionally swallow the module argument — the v0.4 port will
-        // parse it. Keeping the parameter name in the trait so the
-        // rustdoc surface is final.
+    fn lower(&self, _func: &Function) -> Result<LoweredFunction, PlironLoweringError> {
+        // Intentionally swallow the function argument — the per-family
+        // `lower_*` agents will consume it. Keeping the parameter name in
+        // the trait so the rustdoc surface is final.
         Err(PlironLoweringError::NotYetImplemented("StubLowerer::lower"))
     }
 }
 
-/// Convenience entry point: lower a Cranelift IR module to Pliron
-/// `dialect-mir` via the default [`StubLowerer`].
+/// Convenience entry point: lower a Cranelift IR function to a
+/// [`LoweredFunction`] via the default [`StubLowerer`].
 ///
 /// **Scaffold only.** Always returns
 /// `Err(PlironLoweringError::NotYetImplemented("cranelift_to_dialect_mir"))`.
 /// The v0.4 port will rewrite the body to construct the real lowering
 /// pipeline; the signature is intentionally already final so the
 /// detector → lowering call site is stable across the port.
-pub fn cranelift_to_dialect_mir(_module: &str) -> Result<String, PlironLoweringError> {
+pub fn cranelift_to_dialect_mir(
+    _func: &Function,
+) -> Result<LoweredFunction, PlironLoweringError> {
     // The dedicated `cranelift_to_dialect_mir` sentinel (rather than
     // delegating to StubLowerer) keeps the error tag grep-able to the
     // entry point — useful when triaging which surface the caller hit.
@@ -264,6 +279,20 @@ pub fn cranelift_to_dialect_mir(_module: &str) -> Result<String, PlironLoweringE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cranelift_codegen::ir::{Function, Signature, UserFuncName};
+    use cranelift_codegen::isa::CallConv;
+
+    /// Build a minimal empty Cranelift `Function` fixture for the
+    /// scaffold-error tests. Wave-1 follow-up agents that flesh out the
+    /// per-family lowerings will replace these fixtures with richer
+    /// programs; the shape here only needs to satisfy the type-level
+    /// signature of [`WasmToPliron::lower`].
+    fn trivial_function() -> Function {
+        Function::with_name_signature(
+            UserFuncName::user(0, 0),
+            Signature::new(CallConv::SystemV),
+        )
+    }
 
     /// The stub `lower` always returns the documented sentinel variant.
     /// The v0.4 port deletes this test (or rewrites it to assert a
@@ -271,9 +300,8 @@ mod tests {
     #[test]
     fn stub_lowerer_returns_not_yet_implemented() {
         let lowerer = StubLowerer;
-        let err = lowerer
-            .lower("function %trivial() {}")
-            .expect_err("scaffold must error");
+        let func = trivial_function();
+        let err = lowerer.lower(&func).expect_err("scaffold must error");
         match err {
             PlironLoweringError::NotYetImplemented(tag) => {
                 assert_eq!(tag, "StubLowerer::lower");
@@ -288,8 +316,8 @@ mod tests {
     /// distinct from the trait stub.
     #[test]
     fn cranelift_to_dialect_mir_returns_not_yet_implemented() {
-        let err = cranelift_to_dialect_mir("function %trivial() {}")
-            .expect_err("scaffold must error");
+        let func = trivial_function();
+        let err = cranelift_to_dialect_mir(&func).expect_err("scaffold must error");
         match err {
             PlironLoweringError::NotYetImplemented(tag) => {
                 assert_eq!(tag, "cranelift_to_dialect_mir");
