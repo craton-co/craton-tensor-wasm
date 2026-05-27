@@ -332,21 +332,16 @@ matrix.
 ### 5.2 Toolchain prereqs
 
 cuda-oxide pins `nightly-2026-04-03` in its own
-`rust-toolchain.toml`. TensorWasm's workspace pins
-`nightly-2026-03-15`, so Path C requires a **local toolchain
-override** — building this path on the workspace default fails with
-a cryptic missing-feature error. Per RFC 0001 "Toolchain plan" step
-3, the workspace default bumps to a cuda-oxide-compatible nightly
-at v0.4; until then the override is the contract.
+`rust-toolchain.toml`. TensorWasm's workspace now pins the same
+channel (`nightly-2026-04-03`, bumped 2026-05-25 per RFC 0001
+"Toolchain plan" step 3 from the prior `nightly-2026-03-15` pin),
+so Path C builds on the workspace default toolchain — no
+`RUSTUP_TOOLCHAIN` override or branch-local `rust-toolchain.toml`
+edit is required.
 
 ```bash
-# One-shot override via env var:
-RUSTUP_TOOLCHAIN=nightly-2026-04-03 cargo oxide build --release
-
-# Or branch-local rust-toolchain.toml:
-#   [toolchain]
-#   channel = "nightly-2026-04-03"
-#   components = ["rust-src", "rustc-dev", "llvm-tools-preview"]
+# Workspace default toolchain is fine; no override needed:
+cargo oxide build --release
 ```
 
 Components required on the override toolchain:
@@ -901,7 +896,7 @@ not write CUDA kernels at all, the lowering pass auto-offloads them.
 - [`crates/tensor-wasm-wasi-gpu/src/host.rs`](../crates/tensor-wasm-wasi-gpu/src/host.rs) — launch impl: validation, parsing, `cuLaunchKernel`, sync.
 - [`crates/tensor-wasm-wasi-gpu/tests/kernel_args_e2e.rs`](../crates/tensor-wasm-wasi-gpu/tests/kernel_args_e2e.rs) — e2e tests for scalar / pointer argv and the `#[ignore]` pattern.
 - [`rfcs/0001-cuda-oxide-integration.md`](../rfcs/0001-cuda-oxide-integration.md) — Path C provenance: the v0.5 cust-successor RFC that motivates the `cuda-oxide-backend` feature and the v0.4 toolchain bump.
-- [`crates/tensor-wasm-mem/README-cuda-oxide.md`](../crates/tensor-wasm-mem/README-cuda-oxide.md) — user-facing reference for the `cuda-oxide-backend` feature flag, current stub behaviour, and the `RUSTUP_TOOLCHAIN` override.
+- [`crates/tensor-wasm-mem/README-cuda-oxide.md`](../crates/tensor-wasm-mem/README-cuda-oxide.md) — user-facing reference for the `cuda-oxide-backend` feature flag, current stub behaviour, and the toolchain-alignment status (the workspace pin matches cuda-oxide's; no override required).
 - [`crates/tensor-wasm-jit/src/pliron_dialect.rs`](../crates/tensor-wasm-jit/src/pliron_dialect.rs) — module-doc scaffold for the v0.4 Wasm-to-`dialect-mir` lowering pass that expands auto-offload coverage beyond the three blueprints.
 
 ---

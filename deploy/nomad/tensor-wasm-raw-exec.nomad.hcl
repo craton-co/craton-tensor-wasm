@@ -32,7 +32,7 @@
 # the same -var flag for both drivers.
 variable "image_tag" {
   type    = string
-  default = "0.1.0"
+  default = "0.3.5"
 }
 
 # GPU backend. One of "cust" | "cudarc" | "cuda-oxide" | "" (default; no
@@ -77,7 +77,7 @@ job "tensor-wasm" {
       tags = [
         "tensor-wasm",
         "api",
-        "v0.1.0",
+        "v0.3.5",
         "raw_exec",
       ]
 
@@ -112,7 +112,7 @@ job "tensor-wasm" {
 
       # Download the prebuilt binary. The URL below is a placeholder; the
       # ghcr.io/craton-co/* registry and the GitHub Releases page are not
-      # yet provisioned (v0.1.0 era). Either:
+      # yet provisioned (v0.3.5 era). Either:
       #   (a) self-host the artifact (object storage, internal mirror) and
       #       replace `source` + `options.checksum` accordingly, or
       #   (b) bake the binary into a base AMI / machine image and replace

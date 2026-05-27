@@ -34,7 +34,7 @@ until the metric ships. See [Metric inventory](#metric-inventory).
      checkout, or
    - **Paste JSON / URL:** paste the raw contents of the file, or the
      raw-file URL (e.g.
-     `https://github.com/craton-software/craton-tensor-wasm/raw/main/docs/dashboards/tensor-wasm-overview.json`).
+     `https://github.com/craton-co/craton-tensor-wasm/raw/main/docs/dashboards/tensor-wasm-overview.json`).
 4. Grafana prompts for the `DS_PROMETHEUS` datasource variable —
    select the Prometheus datasource that scrapes your TensorWasm
    process's `GET /metrics` endpoint. Any Prometheus datasource works;

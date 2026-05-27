@@ -1,14 +1,14 @@
 # Craton TensorWasm
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Rust: nightly](https://img.shields.io/badge/Rust-nightly--2026--03--15-orange.svg)](rust-toolchain.toml)
+[![Rust: nightly](https://img.shields.io/badge/Rust-nightly--2026--04--03-orange.svg)](rust-toolchain.toml)
 [![Build](https://img.shields.io/badge/Build-GitHub_Actions-lightgrey.svg)](https://github.com/craton-co/craton-tensor-wasm/actions)
 [![SBOM](https://img.shields.io/github/actions/workflow/status/craton-co/craton-tensor-wasm/sbom.yml?branch=main&label=SBOM)](.github/workflows/sbom.yml)
 [![API reference](https://img.shields.io/github/actions/workflow/status/craton-co/craton-tensor-wasm/api-reference.yml?branch=main&label=api-reference)](.github/workflows/api-reference.yml)
 
 > A GPU-accelerated serverless WebAssembly runtime.
 
-**Status: v0.3.0 — released 2026-05-25.** Consolidates the implementable
+**Status: v0.3.5 — released 2026-05-25.** Consolidates the implementable
 items from the v0.2 / v0.3 / v0.4 PATH-TO-V1 milestones into a single
 shipped version.
 
@@ -20,18 +20,18 @@ cold-starts, and OpenTelemetry tracing wired end-to-end.
 
 ## Status
 
-**v0.3.0** — auth, observability, ops, and supply-chain hardening shipped.
+**v0.3.5** — auth, observability, ops, and supply-chain hardening shipped.
 The host-only execution path is solid (≈ 150 tests across 10 crates, all
 green on a CUDA-free developer laptop). CUDA-bound paths (real
 `cudaMallocManaged`, real PTX `ptxas` validation, real kernel launches)
 are gated behind `--features unified-memory` and exercised by the CUDA
 self-hosted runner once it lands (see `docs/CUDARC-SPIKE.md` for the
-concrete compile-friction status as of the 0.3.0 cut). See
+concrete compile-friction status as of the 0.3.5 cut). See
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) and
 [`bench-results/tail-latency.json`](bench-results/tail-latency.json) for
 the honest measured numbers.
 
-What 0.3.0 ships on top of 0.1.0:
+What 0.3.5 ships on top of 0.1.0:
 
 - **Auth & multi-tenancy.** Per-tenant scoped bearer tokens (W2.1) with
   `tenant_scope_denied` 403s; structured audit log opt-in via
@@ -55,7 +55,7 @@ What 0.3.0 ships on top of 0.1.0:
 ## 5-minute quickstart
 
 ### Prerequisites
-- Rust toolchain via `rustup` (the repo pins `nightly-2026-03-15`).
+- Rust toolchain via `rustup` (the repo pins `nightly-2026-04-03`).
 - (Optional) CUDA 12.0+ for the GPU-accelerated path — see [`docs/CUDA-SETUP.md`](docs/CUDA-SETUP.md).
 
 ### Build & test

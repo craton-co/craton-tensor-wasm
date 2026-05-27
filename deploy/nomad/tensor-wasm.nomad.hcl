@@ -8,8 +8,8 @@
 # Submit with:
 #   nomad job run deploy/nomad/tensor-wasm.nomad.hcl
 #
-# The image tag `0.1.0` is a placeholder. The ghcr.io/craton-co/* registry is
-# not yet provisioned (v0.1.0 era); see README.md "Placeholder image" for the
+# The image tag `0.3.5` is a placeholder. The ghcr.io/craton-co/* registry is
+# not yet provisioned (v0.3.5 era); see README.md "Placeholder image" for the
 # build-and-push workflow against your own registry.
 #
 # Single-instance constraint: the runtime is single-host today (in-process
@@ -23,7 +23,7 @@
 # placeholder pin documented in README.md "Image and artifact placeholders".
 variable "image_tag" {
   type    = string
-  default = "0.1.0"
+  default = "0.3.5"
 }
 
 # GPU backend. One of "cust" | "cudarc" | "cuda-oxide" | "" (default; no
@@ -89,7 +89,7 @@ job "tensor-wasm" {
       tags = [
         "tensor-wasm",
         "api",
-        "v0.1.0",
+        "v0.3.5",
       ]
 
       # /healthz semantics per docs/SLO.md sec 2.2: returns 200 while the

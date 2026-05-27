@@ -20,7 +20,7 @@ they can be grep-replaced before sending.
 | Field | Value |
 |---|---|
 | Project | Craton TensorWasm |
-| Repository | `https://github.com/craton/craton-tensor-wasm` |
+| Repository | `https://github.com/craton-co/craton-tensor-wasm` |
 | Version under review | `v0.5.0-beta` (commit SHA fixed at engagement kick-off; see §5) |
 | License | Apache-2.0 |
 | Sponsor | Craton Software Company |

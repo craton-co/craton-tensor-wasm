@@ -515,7 +515,7 @@ the chart or table. Schema:
 {
   "report_id": "tensor-wasm-vs-wasmtime-2026-06-01",
   "tensor_wasm_sha": "abcd123...",
-  "tensor_wasm_toolchain": "nightly-2026-03-15",
+  "tensor_wasm_toolchain": "nightly-2026-04-03",
   "hardware": {
     "cpu": "AMD Threadripper 7980X (64-core)",
     "cpu_governor": "performance",

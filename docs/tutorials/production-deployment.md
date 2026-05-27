@@ -576,7 +576,7 @@ spec:
           labels: { severity: page }
           annotations:
             summary: "TensorWasm error budget burning at 14.4x"
-            runbook_url: "https://github.com/craton-software/craton-tensor-wasm/blob/main/docs/runbooks/availability-fast-burn.md"
+            runbook_url: "https://github.com/craton-co/craton-tensor-wasm/blob/main/docs/runbooks/availability-fast-burn.md"
         - alert: TensorWasmAvailabilitySlowBurn   # docs/SLO.md sec 5.2
           expr: |
             (sum(rate(tensor_wasm_http_requests_total{status=~"5.."}[6h])) / sum(rate(tensor_wasm_http_requests_total[6h])) > (6 * 0.005))
@@ -586,7 +586,7 @@ spec:
           labels: { severity: page }
           annotations:
             summary: "TensorWasm error budget burning at 6x"
-            runbook_url: "https://github.com/craton-software/craton-tensor-wasm/blob/main/docs/runbooks/availability-slow-burn.md"
+            runbook_url: "https://github.com/craton-co/craton-tensor-wasm/blob/main/docs/runbooks/availability-slow-burn.md"
         - alert: TensorWasmAvailabilityVerySlowBurn   # docs/SLO.md sec 5.3
           expr: |
             (sum(rate(tensor_wasm_http_requests_total{status=~"5.."}[3d])) / sum(rate(tensor_wasm_http_requests_total[3d])) > (1 * 0.005))
@@ -596,7 +596,7 @@ spec:
           labels: { severity: ticket }
           annotations:
             summary: "TensorWasm error budget being consumed"
-            runbook_url: "https://github.com/craton-software/craton-tensor-wasm/blob/main/docs/runbooks/availability-very-slow-burn.md"
+            runbook_url: "https://github.com/craton-co/craton-tensor-wasm/blob/main/docs/runbooks/availability-very-slow-burn.md"
     - name: tensor-wasm.latency
       interval: 30s
       rules:
@@ -609,7 +609,7 @@ spec:
           labels: { severity: page }
           annotations:
             summary: "TensorWasm /invoke P95 > 500 ms"
-            runbook_url: "https://github.com/craton-software/craton-tensor-wasm/blob/main/docs/runbooks/invoke-latency-spike.md"
+            runbook_url: "https://github.com/craton-co/craton-tensor-wasm/blob/main/docs/runbooks/invoke-latency-spike.md"
         - alert: TensorWasmHealthzSlow   # docs/SLO.md sec 5.4
           expr: |
             histogram_quantile(0.95, sum by (le) (rate(tensor_wasm_http_request_duration_seconds_bucket{route="/healthz",method="GET"}[30m]))) > 0.01
@@ -617,7 +617,7 @@ spec:
           labels: { severity: ticket }
           annotations:
             summary: "TensorWasm /healthz P95 > 10 ms"
-            runbook_url: "https://github.com/craton-software/craton-tensor-wasm/blob/main/docs/runbooks/healthz-slow.md"
+            runbook_url: "https://github.com/craton-co/craton-tensor-wasm/blob/main/docs/runbooks/healthz-slow.md"
         - alert: TensorWasmDispatchLatencySpike   # docs/SLO.md sec 5.5 (host-only)
           expr: |
             histogram_quantile(0.95, sum by (le) (rate(tensor_wasm_kernel_latency_seconds_bucket[5m]))) > 0.00005
@@ -627,7 +627,7 @@ spec:
           labels: { severity: page }
           annotations:
             summary: "TensorWasm dispatch P95 > 50 us"
-            runbook_url: "https://github.com/craton-software/craton-tensor-wasm/blob/main/docs/runbooks/dispatch-latency-spike.md"
+            runbook_url: "https://github.com/craton-co/craton-tensor-wasm/blob/main/docs/runbooks/dispatch-latency-spike.md"
 ```
 
 ```bash

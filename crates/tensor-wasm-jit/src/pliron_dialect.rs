@@ -7,8 +7,10 @@
 //! auto-offload pipeline tracked in [RFC
 //! 0001](../../../../rfcs/0001-cuda-oxide-integration.md) ("Pliron lever and
 //! the auto-offload pipeline" / "Future possibilities"). It is gated behind
-//! the opt-in `cuda-oxide-backend` feature so the default workspace build
-//! stays on the workspace's pinned `nightly-2026-03-15` toolchain.
+//! the opt-in `cuda-oxide-backend` feature because the parity port has not
+//! landed yet; the workspace toolchain pin (`nightly-2026-04-03`) already
+//! matches cuda-oxide's own pin, so enabling the feature on the default
+//! workspace toolchain builds.
 //!
 //! # What this module IS
 //!
