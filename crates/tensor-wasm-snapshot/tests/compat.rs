@@ -170,36 +170,45 @@ fn raw_magic_and_version_match_source_constants() {
     );
 }
 
-/// Decompress the golden fixture, bump the on-wire version byte by 1, re-
-/// compress, and confirm the reader refuses the result with a `Serialization`
-/// error whose message mentions `version`.
+/// Decompress the golden fixture, overwrite the on-wire version byte with a
+/// value outside the supported set (V2 / V3), re-compress, and confirm the
+/// reader refuses the result with a `Serialization` error whose message
+/// mentions `version`.
 ///
 /// This is the regression guard against accidentally weakening the version
 /// check (e.g. someone making it a warning instead of an error). If this test
 /// fails, the reader has lost its strict-version contract and the compat
 /// promise in `docs/SNAPSHOT-COMPATIBILITY.md` is no longer enforceable.
+///
+/// # Implementation note
+///
+/// The earlier "bump by +1" approach collided with V3: the V2 fixture's
+/// version byte was `0x02`, +1 gave `0x03` which equals
+/// [`SNAPSHOT_VERSION_V3`](crate::format::SNAPSHOT_VERSION_V3), and the
+/// reader then rejected on the signed-snapshot path ("snapshot is signed
+/// (v3) but reader has no HMAC key") rather than the version-dispatch
+/// catch-all. We now write `V3 + 1` directly, deterministically landing in
+/// the "unknown version" branch regardless of which supported version the
+/// fixture was minted against.
 #[test]
 
 fn bumped_version_byte_is_rejected() {
+    use tensor_wasm_snapshot::format::SNAPSHOT_VERSION_V3;
+
     let bytes = load_fixture(MINIMAL_FIXTURE);
     let mut decompressed = zstd::decode_all(bytes.as_slice()).expect("zstd decode golden");
 
-    // Bump the version field (bytes 4..8, little-endian) by exactly one.
-    // We modify byte index 4 — the LSB of the u32 — which deterministically
-    // produces `SNAPSHOT_VERSION + 1` as long as the LSB does not overflow,
-    // which it never does for any plausible version number.
+    // Bincode `legacy()` config encodes structs as fixint-LE in declaration
+    // order, and the `Snapshot` struct begins with `magic: u32, version:
+    // u32`. So bytes 0..4 are the magic and 4..8 are the version field.
     assert!(decompressed.len() >= 8, "payload too short");
-    let original_version = u32::from_le_bytes([
-        decompressed[4],
-        decompressed[5],
-        decompressed[6],
-        decompressed[7],
-    ]);
-    let bumped_version = original_version
-        .checked_add(1)
-        .expect("version + 1 must not overflow");
-    let bumped_bytes = bumped_version.to_le_bytes();
-    decompressed[4..8].copy_from_slice(&bumped_bytes);
+
+    // Overwrite the version with V3 + 1 — definitely outside the supported
+    // set {V2, V3} and outside any plausible near-future bump. The catch-
+    // all arm in `SnapshotReader::restore` should fire with a "version
+    // mismatch" message containing the word "version".
+    let unsupported_version: u32 = SNAPSHOT_VERSION_V3 + 1;
+    decompressed[4..8].copy_from_slice(&unsupported_version.to_le_bytes());
 
     let recompressed = zstd::encode_all(decompressed.as_slice(), 3).expect("zstd re-encode");
 
