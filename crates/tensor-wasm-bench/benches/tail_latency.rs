@@ -49,6 +49,37 @@
 //! sampling rather than real router work, set `TENSOR_WASM_TRACING=off` and
 //! re-run this bench — the delta is the tracing tax.
 //!
+//! ## Backend axis (W4.4 — RFC 0001 Unresolved questions)
+//!
+//! The bench carries a second dimension beyond workload: the **backend** that
+//! the surrounding tensor-wasm-mem layer was compiled against. The label is
+//! resolved at compile time from the active feature set and falls into one
+//! of three slots:
+//!
+//! | feature flag (`cargo bench --features ...`) | `BACKEND_LABEL` |
+//! |---|---|
+//! | (none, default)                             | `"unified-memory"` |
+//! | `cudarc-backend`                            | `"cudarc"` |
+//! | `cuda-oxide-backend`                        | `"cuda-oxide"` |
+//!
+//! The label flows into three places: (a) the Criterion benchmark group name
+//! (`tail_latency_<backend>`), so split-by-backend report aggregators see a
+//! distinct group per run; (b) every emitted `TAIL_LATENCY` JSON line as a
+//! `"backend":` field, so CI log scrapers can demultiplex three runs by
+//! prefix-grep alone; (c) the `bench-results/tail-latency.json` schema as a
+//! top-level `backend` field plus a `backend` field on every metric entry,
+//! so the three result files diff cleanly. Picking exactly one of the three
+//! feature flags is the operator's responsibility — enabling multiple at
+//! once is technically valid for the underlying mem crate but the bench
+//! follows a priority order (cuda-oxide > cudarc > unified-memory) and the
+//! report file calls out which slot won so the choice is auditable.
+//!
+//! The hard work of running the bench three times and producing three
+//! result files (one per backend) is per-invocation operator work, not
+//! something the bench file does itself. The CI matrix wiring is wave-4
+//! ops work; see `docs/BENCHMARKING.md#tail-latency` for the manual
+//! recipe in the meantime.
+//!
 //! ## Output
 //!
 //! For each metric this bench prints **one JSON line** to stdout prefixed by
@@ -84,13 +115,49 @@ const SAMPLES: usize = 10_000;
 /// do not pollute the first few samples (which would land in the tail).
 const WARMUP: usize = 1_000;
 
+/// Compile-time backend discriminator (W4.4 — RFC 0001 Unresolved questions
+/// extension). Resolved by `#[cfg(feature = ...)]` over the bench crate's
+/// `cudarc-backend` and `cuda-oxide-backend` feature flags; defaults to
+/// `"unified-memory"` (the historical cust-backed path, see the workspace
+/// nightly-2026-04-03 alignment story in RFC 0001). The label is used as
+/// (1) a Criterion benchmark-group suffix, (2) a `"backend":` field on every
+/// stdout JSON line, and (3) a top-level + per-metric field in the rendered
+/// `bench-results/tail-latency.json` schema.
+///
+/// Priority order when multiple backend features are accidentally enabled
+/// simultaneously: `cuda-oxide` > `cudarc` > `unified-memory`. cuda-oxide is
+/// the v0.5 cust successor (RFC 0001), so an operator who flipped both
+/// `cudarc-backend` AND `cuda-oxide-backend` almost certainly meant the
+/// latter and the bench reports under that name. The mem crate permits all
+/// three features active at once — the priority here is a reporting choice
+/// only, not a build-time exclusion. The chosen slot is also logged to
+/// stderr at bench startup so the run is unambiguous in CI logs.
+///
+/// The historical `unified-memory` label is the cust-backed path. Per RFC
+/// 0001 Unresolved questions, that label is on a v0.4-deprecation-warning /
+/// v0.5-removal track; the constant survives until then for backwards
+/// compatibility with the v0.3.x baseline files.
+#[cfg(feature = "cuda-oxide-backend")]
+const BACKEND_LABEL: &str = "cuda-oxide";
+#[cfg(all(feature = "cudarc-backend", not(feature = "cuda-oxide-backend")))]
+const BACKEND_LABEL: &str = "cudarc";
+#[cfg(all(not(feature = "cudarc-backend"), not(feature = "cuda-oxide-backend")))]
+const BACKEND_LABEL: &str = "unified-memory";
+
 /// One line of the structured JSON output. Field names match the format
 /// documented in `bench-results/README.md` so downstream parsers (Grafana
 /// import scripts, the v0.3 observability dashboards) can consume it
-/// without translation.
+/// without translation. The `backend` field was added in W4.4 (RFC 0001
+/// Unresolved questions extension) and is the compile-time
+/// [`BACKEND_LABEL`] of the run; it is always present today even though the
+/// schema is still flagged "schemaless" upstream (wave-4 ops work
+/// formalises the schema). Downstream parsers that pre-date W4.4 should
+/// treat `backend` as optional and fall back to `"unified-memory"` when it
+/// is missing — that matches the W4.6 historical default.
 #[derive(Debug, Clone)]
 struct TailResult {
     metric: String,
+    backend: &'static str,
     samples: usize,
     p50_ns: u128,
     p95_ns: u128,
@@ -102,8 +169,9 @@ struct TailResult {
 impl TailResult {
     fn to_json(&self) -> String {
         format!(
-            "{{\"metric\":\"{}\",\"samples\":{},\"p50_ns\":{},\"p95_ns\":{},\"p99_ns\":{},\"p99_9_ns\":{},\"max_ns\":{}}}",
+            "{{\"metric\":\"{}\",\"backend\":\"{}\",\"samples\":{},\"p50_ns\":{},\"p95_ns\":{},\"p99_ns\":{},\"p99_9_ns\":{},\"max_ns\":{}}}",
             self.metric,
+            self.backend,
             self.samples,
             self.p50_ns,
             self.p95_ns,
@@ -157,6 +225,7 @@ where
     let max_ns = samples.last().copied().unwrap_or_default().as_nanos();
     TailResult {
         metric: metric.to_string(),
+        backend: BACKEND_LABEL,
         samples: SAMPLES,
         p50_ns: percentile_nearest_rank(&samples, 0.50),
         p95_ns: percentile_nearest_rank(&samples, 0.95),
@@ -278,6 +347,15 @@ fn workspace_bench_results_dir() -> Option<PathBuf> {
 /// Pretty-print the full result set as a stable JSON document so a reviewer
 /// can `diff` two runs by eye. The schema is documented in
 /// `bench-results/README.md`.
+///
+/// The W4.4 `backend` field is rendered both as a top-level discriminator
+/// (so a reader sees which compile-time slot the run targeted without
+/// scanning every metric) and as a per-metric field on each entry (so a
+/// downstream parser that joins many files by `<metric, backend>` doesn't
+/// need to reach back into the document root). The redundant per-metric
+/// `backend` field is intentional — wave-4 ops work formalises the schema
+/// and may keep both fields, or may demote the per-metric one once the
+/// regression-gate Python parser is updated.
 fn render_file(results: &[TailResult]) -> String {
     let metrics = results
         .iter()
@@ -289,10 +367,12 @@ fn render_file(results: &[TailResult]) -> String {
             "{{\n",
             "  \"// generated\": \"P99.9 tail-latency snapshot (see crates/tensor-wasm-bench/benches/tail_latency.rs).\",\n",
             "  \"// algorithm\": \"nearest-rank percentile per ISO/IEC 25062 over {} sorted samples per metric\",\n",
+            "  \"// backend-axis\": \"W4.4 RFC 0001 extension -- run the bench once per backend (default / --features cudarc-backend / --features cuda-oxide-backend) and diff the three files; see docs/BENCHMARKING.md for the operator recipe\",\n",
+            "  \"backend\": \"{}\",\n",
             "  \"metrics\": [\n{}\n  ]\n",
             "}}\n",
         ),
-        SAMPLES, metrics,
+        SAMPLES, BACKEND_LABEL, metrics,
     )
 }
 
@@ -321,6 +401,18 @@ fn tail_latency_bench(c: &mut Criterion) {
         .build()
         .expect("build multi-thread tokio runtime for e2e");
 
+    // W4.4: announce the active backend label up front so CI logs that
+    // capture stderr line up with the JSON `backend` field. This is
+    // strictly informational — the bench behaviour is identical across
+    // labels today (the underlying mem-crate selection is wave-4 ops
+    // work); the label exists so operators running the bench three times
+    // (once per `--features` flag) can demultiplex the three result files
+    // without parsing each one.
+    eprintln!(
+        "TAIL_LATENCY backend={} (compile-time; flip via --features cudarc-backend / cuda-oxide-backend)",
+        BACKEND_LABEL,
+    );
+
     let results = vec![
         measure_dispatch_serial(&serial_rt),
         measure_dispatch_concurrent(&concurrent_rt),
@@ -348,8 +440,14 @@ fn tail_latency_bench(c: &mut Criterion) {
 
     // Register a single no-op group so Criterion has *something* to run and
     // doesn't emit "no benches matched". `measurement_time` is dropped to
-    // the minimum since the real work is already done above.
-    let mut group = c.benchmark_group("tail_latency");
+    // the minimum since the real work is already done above. The group name
+    // carries the W4.4 backend label as a suffix so split-by-group report
+    // aggregators (`target/criterion/tail_latency_<backend>/`) see a
+    // distinct directory per backend — three sequential `cargo bench` runs
+    // (default / `--features cudarc-backend` / `--features cuda-oxide-backend`)
+    // produce three sibling criterion directories that diff cleanly.
+    let group_name = format!("tail_latency_{}", BACKEND_LABEL);
+    let mut group = c.benchmark_group(group_name);
     group.measurement_time(Duration::from_millis(500));
     group.sample_size(10);
     group.bench_function("noop_marker", |b| {
@@ -379,6 +477,33 @@ mod tests {
         let samples = vec![Duration::from_nanos(7), Duration::from_nanos(13)];
         // p=0.0 clamps the rank to 1 → samples[0].
         assert_eq!(percentile_nearest_rank(&samples, 0.0), 7);
+    }
+
+    /// W4.4 sanity: the compile-time backend label must be one of the three
+    /// slots RFC 0001 enumerates. Catches typos in any future feature-flag
+    /// rename (e.g. if `cuda-oxide-backend` is shortened to `cuoxide`).
+    #[test]
+    fn backend_label_is_one_of_three_known_values() {
+        assert!(
+            matches!(BACKEND_LABEL, "unified-memory" | "cudarc" | "cuda-oxide"),
+            "unexpected BACKEND_LABEL={BACKEND_LABEL:?}; expected one of unified-memory/cudarc/cuda-oxide per RFC 0001",
+        );
+    }
+
+    /// W4.4 JSON-serialisation contract: `to_json` must emit the backend
+    /// field so downstream parsers can demultiplex by backend. Guards
+    /// against a future refactor accidentally dropping the field.
+    #[test]
+    fn tail_result_json_carries_backend_field() {
+        let r = TailResult {
+            metric: "test/metric".to_string(),
+            backend: "unified-memory",
+            samples: 10,
+            p50_ns: 1, p95_ns: 2, p99_ns: 3, p99_9_ns: 4, max_ns: 5,
+        };
+        let s = r.to_json();
+        assert!(s.contains("\"backend\":\"unified-memory\""), "missing backend field: {s}");
+        assert!(s.contains("\"metric\":\"test/metric\""), "missing metric field: {s}");
     }
 }
 
