@@ -16,7 +16,7 @@
 //! invokes exported functions.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tensor_wasm_core::types::{InstanceId, TenantId};
 
@@ -35,8 +35,19 @@ pub struct InstanceState {
     pub instance_id: InstanceId,
     /// Walltime the instance was created.
     pub created_at: Instant,
-    /// Soft deadline (epoch-driven). `None` means "no host-imposed deadline".
+    /// Soft deadline (epoch-driven) for the **current** call.
+    ///
+    /// `None` means "no host-imposed deadline". This is re-armed at the start
+    /// of each [`TensorWasmExecutor::call_export`](crate::executor::TensorWasmExecutor::call_export)
+    /// from [`InstanceState::deadline_duration`], so back-to-back calls each
+    /// get a fresh wall-clock window instead of inheriting the elapsed time
+    /// from a previous call.
     pub deadline: Option<Instant>,
+    /// Per-call deadline as a [`Duration`], retained so the executor can
+    /// re-arm the absolute [`InstanceState::deadline`] (and the wasmtime
+    /// epoch deadline) at the start of each call. `None` for instances
+    /// spawned without a deadline.
+    pub deadline_duration: Option<Duration>,
     /// Total kernel dispatches issued by this instance (cumulative).
     pub kernel_dispatches: AtomicU64,
     /// Total bytes of GPU memory this instance has allocated.
@@ -58,6 +69,7 @@ impl InstanceState {
             instance_id,
             created_at: Instant::now(),
             deadline: None,
+            deadline_duration: None,
             kernel_dispatches: AtomicU64::new(0),
             gpu_bytes_allocated: AtomicU64::new(0),
             limiter: TensorWasmResourceLimiter::new(usize::MAX),
@@ -74,6 +86,14 @@ impl InstanceState {
     /// Set a deadline; returns `self` for builder-style use.
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
+        self
+    }
+
+    /// Record the per-call deadline duration so subsequent calls can re-arm
+    /// the wall-clock deadline (and matching wasmtime epoch ticks) instead
+    /// of inheriting the elapsed window from spawn time.
+    pub fn with_deadline_duration(mut self, d: Duration) -> Self {
+        self.deadline_duration = Some(d);
         self
     }
 
