@@ -191,6 +191,53 @@ fn restore_rejects_magic_mismatch() {
 }
 
 #[test]
+fn restore_rejects_tampered_total_uncompressed_bytes() {
+    // Hand-build a Snapshot whose blob lengths sum to a value that does *not*
+    // match `metadata.total_uncompressed_bytes`. The reader must reject it so
+    // callers that trust the metadata to size buffers or report compression
+    // ratios cannot be misled by a tampered field. CRC32 is computed over the
+    // blob bytes (not the metadata), so a mismatched total will sail past the
+    // CRC check — the dedicated metadata check is what catches it.
+    let wasm_memory = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+    let gpu_memory = vec![9u8; 16];
+    let registers = vec![0xABu8; 4];
+    let actual_total = (wasm_memory.len() + gpu_memory.len() + registers.len()) as u64;
+    let crc32 = tensor_wasm_snapshot::payload_crc32(&wasm_memory, &gpu_memory, &registers);
+    let snap = Snapshot {
+        magic: SNAPSHOT_MAGIC,
+        version: SNAPSHOT_VERSION,
+        wasm_memory,
+        gpu_memory,
+        registers,
+        metadata: SnapshotMetadata {
+            tenant_id: TenantId(1),
+            instance_id: InstanceId(1),
+            created_unix_ms: 0,
+            // Deliberately wrong: claim a much larger payload than the blobs
+            // actually carry.
+            total_uncompressed_bytes: actual_total + 1024,
+        },
+        crc32,
+    };
+    let cfg = bincode::config::legacy();
+    let encoded = bincode::serde::encode_to_vec(&snap, cfg).expect("bincode");
+    let compressed = zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL).expect("zstd");
+
+    let err = SnapshotReader::new()
+        .restore(&compressed)
+        .expect_err("restore must reject mismatched total_uncompressed_bytes");
+    match err {
+        TensorWasmError::Serialization(msg) => {
+            assert!(
+                msg.contains("total_uncompressed_bytes") && msg.contains("mismatch"),
+                "unexpected error message: {msg}",
+            );
+        }
+        other => panic!("expected Serialization error, got {other:?}"),
+    }
+}
+
+#[test]
 fn valid_snapshot_still_round_trips() {
     // Regression guard: the new validation must not block legitimate captures.
     let bytes = capture_tiny();

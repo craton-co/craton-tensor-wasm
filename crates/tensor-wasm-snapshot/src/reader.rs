@@ -221,6 +221,39 @@ impl SnapshotReader {
             ));
         }
 
+        // Cross-check the declared `total_uncompressed_bytes` against the
+        // actual blob sums. Each `.len()` is already known to fit under its
+        // per-blob cap (checked above), so the `checked_add`s here cannot
+        // realistically overflow on a 64-bit host — but we use them anyway to
+        // keep the arithmetic robust against future cap changes, and surface
+        // any overflow as a format error rather than a wrap-around. Callers
+        // that trust the metadata to size buffers or report compression ratios
+        // would otherwise be misled by a tampered field.
+        let actual_total = snapshot
+            .wasm_memory
+            .len()
+            .checked_add(snapshot.gpu_memory.len())
+            .and_then(|s| s.checked_add(snapshot.registers.len()))
+            .ok_or_else(|| {
+                TensorWasmError::Serialization(
+                    "snapshot blob length sum overflowed usize".into(),
+                )
+            })?;
+        if (actual_total as u64) != snapshot.metadata.total_uncompressed_bytes {
+            return Err(TensorWasmError::Serialization(
+                format!(
+                    "snapshot metadata.total_uncompressed_bytes mismatch: \
+                     expected {} (wasm_memory={} + gpu_memory={} + registers={}), got {}",
+                    actual_total,
+                    snapshot.wasm_memory.len(),
+                    snapshot.gpu_memory.len(),
+                    snapshot.registers.len(),
+                    snapshot.metadata.total_uncompressed_bytes,
+                )
+                .into(),
+            ));
+        }
+
         debug!(
             decompressed = decompressed.len(),
             wasm = snapshot.wasm_memory.len(),
