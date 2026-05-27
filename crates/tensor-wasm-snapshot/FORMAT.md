@@ -16,7 +16,7 @@ zstd(
       registers:    Vec<u8>,    // serde_bytes — length-prefixed byte string
       metadata: SnapshotMetadata {
         tenant_id:                 TenantId(u64),
-        instance_id:               InstanceId(u64),
+        instance_id:               InstanceId(u128),
         created_unix_ms:           u64,
         total_uncompressed_bytes:  u64,
       },
