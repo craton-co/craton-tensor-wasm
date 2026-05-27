@@ -55,6 +55,13 @@ pub const WASM_MIN_HEADER_BYTES: usize = 8;
 /// than the spawn handoff.
 pub const BASE64_OFFLOAD_THRESHOLD: usize = 256 * 1024;
 
+/// Maximum byte-length of a tenant-supplied function name. Names are echoed
+/// back on every read of [`FunctionRecord`], so an unchecked name field
+/// would let a caller pin arbitrarily many MiB of strings in the in-memory
+/// registry. 256 bytes is generous for any realistic display label while
+/// keeping the worst-case footprint of a million records under ~256 MiB.
+pub const MAX_FUNCTION_NAME_BYTES: usize = 256;
+
 // ---------------------------------------------------------------------------
 // State records
 // ---------------------------------------------------------------------------
@@ -464,6 +471,42 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     )
 }
 
+/// Validate a tenant-supplied function name before it is committed to the
+/// in-memory registry.
+///
+/// Three classes of input are rejected with `400 invalid_name`:
+///
+/// * empty / whitespace-only names — there is nothing for an operator to
+///   recognise the record by;
+/// * names longer than [`MAX_FUNCTION_NAME_BYTES`] — the name is echoed back
+///   on every `FunctionRecord` read, so an unbounded field would let a
+///   caller anchor arbitrary memory in the registry by submitting many
+///   records with multi-MiB names;
+/// * names containing ASCII / Unicode control characters — these break log
+///   readability and would let a caller smuggle NULs or escape sequences
+///   into downstream consumers.
+fn validate_function_name(name: &str) -> Result<(), ApiError> {
+    if name.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_name",
+            "function name must not be empty",
+        ));
+    }
+    if name.len() > MAX_FUNCTION_NAME_BYTES {
+        return Err(ApiError::bad_request(
+            "invalid_name",
+            "function name exceeds 256 bytes",
+        ));
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Err(ApiError::bad_request(
+            "invalid_name",
+            "function name contains control characters",
+        ));
+    }
+    Ok(())
+}
+
 /// Decode `wasm_b64`, offloading to a blocking pool when the encoded payload
 /// is large enough that the spawn handoff is cheaper than blocking the I/O
 /// thread. The threshold is [`BASE64_OFFLOAD_THRESHOLD`] *encoded* bytes.
@@ -494,12 +537,7 @@ pub async fn create_function(
     payload: Result<Json<CreateFunctionRequest>, JsonRejection>,
 ) -> ApiResult<Json<CreateFunctionResponse>> {
     let Json(req) = payload?;
-    if req.name.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "invalid_name",
-            "name must be non-empty",
-        ));
-    }
+    validate_function_name(&req.name)?;
     let bytes = decode_wasm_b64(req.wasm_b64).await?;
     if bytes.len() < WASM_MIN_HEADER_BYTES {
         return Err(ApiError::bad_request(
