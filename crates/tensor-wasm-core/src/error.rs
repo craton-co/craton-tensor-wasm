@@ -61,11 +61,20 @@ pub enum TensorWasmError {
     },
 
     /// An instance accessed memory or resources belonging to another tenant.
-    #[error("tenant isolation violation: tenant {tenant_id} attempted to access {resource}")]
+    ///
+    /// **`Display` is intentionally sanitised.** The HTTP layer surfaces error
+    /// `Display` to tenants as part of 4xx response bodies; including
+    /// `tenant_id` or `resource` here would let tenant A learn tenant B's id
+    /// and on-disk path layout. The structured fields remain on the variant
+    /// so server-side `tracing::error!(?err, ...)` (which uses `Debug`) still
+    /// gets the full context for operator triage.
+    #[error("tenant isolation violation")]
     TenantIsolationViolation {
-        /// Offending tenant identifier.
+        /// Offending tenant identifier. Logged server-side via `Debug`; never
+        /// included in `Display`.
         tenant_id: TenantId,
-        /// Free-form description of the resource that was accessed out of scope.
+        /// Free-form description of the resource that was accessed out of
+        /// scope. Logged server-side via `Debug`; never included in `Display`.
         resource: Box<str>,
     },
 
@@ -144,14 +153,34 @@ mod tests {
     }
 
     #[test]
-    fn display_isolation_violation() {
+    fn display_isolation_violation_is_sanitised() {
+        // Display is surfaced to tenants via 4xx response bodies; it must NOT
+        // leak the offending tenant id or the resource path (the latter often
+        // encodes another tenant's on-disk layout). See the regression test in
+        // `tests/error_display_does_not_leak.rs` for the full leak-shaped
+        // assertions; this inline test pins the exact Display string.
         let e = TensorWasmError::TenantIsolationViolation {
             tenant_id: crate::types::TenantId(42),
             resource: "/dev/shm/other-tenant".into(),
         };
-        let s = e.to_string();
-        assert!(s.contains("42"));
-        assert!(s.contains("/dev/shm/other-tenant"));
+        assert_eq!(e.to_string(), "tenant isolation violation");
+    }
+
+    #[test]
+    fn debug_isolation_violation_still_carries_fields() {
+        // Debug IS used for server-side `tracing::error!(?err)` and must
+        // continue to expose the structured fields for operator triage —
+        // only Display is sanitised.
+        let e = TensorWasmError::TenantIsolationViolation {
+            tenant_id: crate::types::TenantId(42),
+            resource: "/dev/shm/other-tenant".into(),
+        };
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("42"), "Debug should expose tenant_id: {dbg}");
+        assert!(
+            dbg.contains("/dev/shm/other-tenant"),
+            "Debug should expose resource: {dbg}",
+        );
     }
 
     #[test]
