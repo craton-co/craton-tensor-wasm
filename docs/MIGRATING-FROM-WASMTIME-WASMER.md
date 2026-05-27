@@ -199,7 +199,7 @@ matches usually have a better answer elsewhere
 - **AMD / Intel / Apple GPU backends today.** Wait. v1.0 is NVIDIA
   CUDA only; v2 will ship vendor abstraction.
 - **A stable Rust toolchain.** We are pinned to
-  `nightly-2026-03-15` through v1.0 with a quarterly bump cadence.
+  `nightly-2026-04-03` through v1.0 with a quarterly bump cadence.
   Stable Rust is a v2 effort.
 
 ## 6. Library-user migration (embedded Wasmtime)

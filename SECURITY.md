@@ -142,12 +142,15 @@ ships with Wasmtime's upstream fuzz corpus only.
 
 ## Supported versions
 
-Only the `0.1.x` line receives security fixes during the preview window.
-Older pre-release tags are not supported. When `0.2.0` ships, this matrix
-will be revised; until then the table below applies.
+The `0.3.x` line is the current release line and receives security fixes
+during the preview window. The `0.1.x` line is also supported during the
+v0.1 → v0.3 transition. Older pre-release tags are not supported. When
+`0.4.0` ships, this matrix will be revised; until then the table below
+applies.
 
 | Version | Supported |
 |---------|-----------|
+| 0.3.x   | Yes       |
 | 0.1.x   | Yes       |
 | < 0.1   | No        |
 

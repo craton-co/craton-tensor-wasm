@@ -4,7 +4,7 @@ Craton TensorWasm is a Cargo workspace of 10 crates implementing a GPU-accelerat
 
 ## Prerequisites
 
-- Rust toolchain: pinned in `rust-toolchain.toml` (currently `nightly-2026-03-15`). Rustup picks it up automatically the first time you run `cargo` in the workspace.
+- Rust toolchain: pinned in `rust-toolchain.toml` (currently `nightly-2026-04-03`). Rustup picks it up automatically the first time you run `cargo` in the workspace.
 - For CUDA builds: see [CUDA-SETUP.md](./CUDA-SETUP.md).
 - For no-CUDA host: nothing extra needed beyond Rust.
 
@@ -94,7 +94,7 @@ Common build issues with copy-paste fixes:
 
 - **`failed to run custom build command for cust`** — toolkit not installed or CUDA_ROOT not exported. See [CUDA-SETUP.md](./CUDA-SETUP.md).
 - **`error: linker not found`** — install MSVC build tools (Windows) or `build-essential` (Linux).
-- **``could not find `Cargo.toml`​``** — run cargo commands from the workspace root (`C:/Projects/bali/` or wherever you cloned it), not a subdirectory.
+- **``could not find `Cargo.toml`​``** — run cargo commands from the workspace root (`C:/craton/tensor-wasm/` or wherever you cloned it), not a subdirectory.
 - **`error: package collision`** — `cargo clean` and rebuild; usually after a `rust-toolchain.toml` channel bump.
 
 ## Platform support tiers

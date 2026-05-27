@@ -6,13 +6,13 @@
 //! This module is the empty-stub landing site for the v0.5 cust-successor
 //! migration tracked in [RFC
 //! 0001](../../../../rfcs/0001-cuda-oxide-integration.md). It is gated behind
-//! the opt-in `cuda-oxide-backend` feature so the default workspace build
-//! stays on the workspace's pinned `nightly-2026-03-15` toolchain — cuda-oxide
-//! itself pins `nightly-2026-04-03`, and enabling this feature on the
-//! workspace nightly will not build. See the workspace [`Cargo.toml`] comment
-//! on the `cuda-host` dependency for the rustup override required to exercise
-//! this code path locally, and [`README-cuda-oxide.md`] for the contributor
-//! workflow.
+//! the opt-in `cuda-oxide-backend` feature because the parity port (per
+//! RFC 0001 "Rollout — v0.4 (parity)") has not landed yet; the workspace
+//! toolchain itself now pins `nightly-2026-04-03` (matching cuda-oxide's own
+//! pin, bumped 2026-05-25 from `nightly-2026-03-15`), so enabling this
+//! feature on the workspace default builds — no rustup override required.
+//! See the workspace [`Cargo.toml`] comment on the `cuda-host` dependency
+//! and [`README-cuda-oxide.md`] for the contributor workflow.
 //!
 //! # What this module IS
 //!

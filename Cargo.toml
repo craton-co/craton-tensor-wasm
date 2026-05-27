@@ -69,16 +69,14 @@ cudarc = { version = "0.13", default-features = false, features = ["driver", "cu
 # kernel-authoring crates (`cuda-device`, `cuda-macros`) are NOT pulled in
 # here; the W4.5 "Path C" kernel-authoring surface lands in a follow-up.
 #
-# TOOLCHAIN CONFLICT: cuda-oxide pins `nightly-2026-04-03` in its own
-# rust-toolchain.toml. TensorWasm pins `nightly-2026-03-15`. The
-# `cuda-oxide-backend` feature on `tensor-wasm-mem` is opt-in for v0.3.x
-# precisely because of this gap — enabling the feature requires a local
-# toolchain bump (`RUSTUP_TOOLCHAIN=nightly-2026-04-03 cargo build
-# --features cuda-oxide-backend`) or a `rust-toolchain.toml` override on
-# the contributor's branch. The workspace default toolchain bump to a
-# nightly that satisfies cuda-oxide is scheduled for v0.4 per RFC 0001
-# "Toolchain plan" step 3. DO NOT bump rust-toolchain.toml as part of
-# adding this dependency.
+# TOOLCHAIN ALIGNMENT: cuda-oxide pins `nightly-2026-04-03` in its own
+# rust-toolchain.toml. TensorWasm now pins the same channel (bumped
+# 2026-05-25 from `nightly-2026-03-15`), so the `cuda-oxide-backend`
+# feature on `tensor-wasm-mem` builds on the workspace default toolchain
+# — no `RUSTUP_TOOLCHAIN` override or branch-local rust-toolchain.toml
+# edit needed. The feature is still opt-in through v0.3.x because the
+# parity port (per RFC 0001 "Rollout — v0.4 (parity)") has not landed
+# yet; the toolchain alignment is the prerequisite, not the port.
 #
 # Pliron (cuda-oxide's MLIR-like IR framework) is pinned in cuda-oxide's
 # own Cargo.toml to a git revision rather than crates.io. That pin

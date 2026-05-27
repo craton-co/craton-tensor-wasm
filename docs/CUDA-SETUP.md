@@ -423,8 +423,8 @@ if ! { ldconfig -p | grep -q libcuda.so; } && ! [ -f /usr/lib/x86_64-linux-gnu/l
 fi
 
 echo "== rustup toolchain =="
-rustup show active-toolchain | grep -q "nightly-2026-03-15" || \
-  { echo "WARN: rust-toolchain.toml pins nightly-2026-03-15; you are on a different toolchain"; }
+rustup show active-toolchain | grep -q "nightly-2026-04-03" || \
+  { echo "WARN: rust-toolchain.toml pins nightly-2026-04-03; you are on a different toolchain"; }
 
 echo "== smoke build (no-CUDA workspace) =="
 cargo build --workspace --quiet || { echo "FAIL: workspace does not build without CUDA"; exit 1; }
@@ -470,8 +470,8 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "== rustup toolchain ==" -ForegroundColor Cyan
 $active = (rustup show active-toolchain).Split(' ')[0]
-if ($active -notlike "*nightly-2026-03-15*") {
-  Write-Warning "rust-toolchain.toml pins nightly-2026-03-15; you are on $active"
+if ($active -notlike "*nightly-2026-04-03*") {
+  Write-Warning "rust-toolchain.toml pins nightly-2026-04-03; you are on $active"
 }
 
 Write-Host "== smoke build (no-CUDA workspace) ==" -ForegroundColor Cyan

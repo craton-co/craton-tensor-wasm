@@ -74,7 +74,7 @@ inspected.
 ## What's deterministic out of the box
 
 A surprising amount, on modern rustc. Given a pinned
-`rust-toolchain.toml` (we pin `nightly-2026-03-15`), a committed
+`rust-toolchain.toml` (we pin `nightly-2026-04-03`), a committed
 `Cargo.lock` that fixes the entire transitive dependency graph
 (4,650 lines as of this writing), and `cargo build --locked`, the
 following are deterministic without any extra effort:
@@ -217,7 +217,7 @@ ls -l target/x86_64-unknown-linux-gnu/release/tensor-wasm
 sha256sum target/x86_64-unknown-linux-gnu/release/tensor-wasm
 ```
 
-The pinned Rust toolchain (`rust-toolchain.toml` → `nightly-2026-03-15`)
+The pinned Rust toolchain (`rust-toolchain.toml` → `nightly-2026-04-03`)
 is picked up automatically by `rustup` the first time `cargo` is invoked
 in the workspace. You do not need to install it explicitly.
 
@@ -293,7 +293,7 @@ toolchain, a distroless runtime image with only the binary.
 FROM rust:1-slim-bookworm AS builder
 
 # Pin the toolchain. The COPY of rust-toolchain.toml below triggers
-# rustup to install nightly-2026-03-15 on first cargo invocation.
+# rustup to install nightly-2026-04-03 on first cargo invocation.
 WORKDIR /build/tensor-wasm
 COPY rust-toolchain.toml .
 COPY Cargo.toml Cargo.lock ./
@@ -454,7 +454,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-03-15
+          toolchain: nightly-2026-04-03
 
       - name: Build A
         run: |

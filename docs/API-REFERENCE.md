@@ -270,7 +270,7 @@ recent stable (non-pre-release) version.
   similar) is a candidate for a follow-up workstream but is out of
   scope here.
 - **Nightly-pinned rustdoc.** The bundle is built with
-  `nightly-2026-03-15` (the workspace's pinned toolchain). HTML output
+  `nightly-2026-04-03` (the workspace's pinned toolchain). HTML output
   may differ between rustdoc versions; consumers should treat the
   archive as opaque HTML, not as a stable input format for tooling.
 - **OpenAPI render is Redocly-specific.** Switching to rapidoc or

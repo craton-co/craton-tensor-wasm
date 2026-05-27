@@ -102,7 +102,7 @@ does **not** include:
   See [`BENCHMARKING.md`](BENCHMARKING.md#where-tensor-wasm-wins-where-it-wont).
 - **First-class JavaScript / Python guest runtimes.** Bring your own
   Wasm; we don't ship language runtimes.
-- **A Rust-stable build.** TensorWasm is pinned to `nightly-2026-03-15` for
+- **A Rust-stable build.** TensorWasm is pinned to `nightly-2026-04-03` for
   reasons documented in `rust-toolchain.toml`. v1.0 stays on a pinned
   nightly with a documented upgrade cadence (quarterly). Moving to
   stable is a v2 effort gated on Wasmtime dropping its own nightly

@@ -60,10 +60,11 @@ cudarc-backend = ["dep:cudarc"]
 # empty module only — the unified-memory port lands at v0.4. The feature
 # is intentionally mutually compatible with `unified-memory` and
 # `cudarc-backend`; enabling all three at once is valid (and is what CI
-# will exercise once the toolchain story is settled). Enabling this
-# feature on the workspace's pinned nightly-2026-03-15 toolchain WILL
-# fail to build — see the workspace Cargo.toml comment for the
-# nightly-2026-04-03 override required by cuda-oxide.
+# will exercise once the parity port lands). The workspace's pinned
+# nightly-2026-04-03 toolchain matches cuda-oxide's own pin, so the
+# feature builds on the default workspace toolchain — no override
+# required. See the workspace Cargo.toml comment for the alignment
+# history.
 cuda-oxide-backend = ["dep:cuda-host", "dep:cuda-core", "dep:cuda-async"]
 
 [package.metadata.docs.rs]
