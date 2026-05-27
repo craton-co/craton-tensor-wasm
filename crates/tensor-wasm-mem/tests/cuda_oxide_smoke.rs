@@ -1,58 +1,68 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
 
-//! Smoke tests for the `cuda-oxide-backend` scaffold.
+//! Smoke tests for the `cuda-oxide-backend` scaffold and the
+//! `cuda-oxide-host-backend` real-impl path.
 //!
-//! These tests are compiled only when the `cuda-oxide-backend` feature is
-//! enabled. As of v0.3.1 the backend is a scaffold only — the unified-memory
-//! port lands at v0.4 per RFC 0001
-//! (`rfcs/0001-cuda-oxide-integration.md`). The three unignored tests below
-//! assert that:
+//! The file is compiled only when at least the dep-less
+//! `cuda-oxide-backend` feature is on. Tests pivot on whether the strict-
+//! superset `cuda-oxide-host-backend` feature is also enabled:
 //!
-//! 1. The public types are reachable from outside the crate (i.e. the
-//!    feature flag is plumbed and the module declaration in `lib.rs` is
-//!    correct);
-//! 2. The scaffold `allocate` returns the documented sentinel error string
-//!    rather than panicking or succeeding silently;
-//! 3. The scaffold `apply_advice` returns the same sentinel error string.
+//! * Without `cuda-oxide-host-backend`, the scaffold path is active and
+//!   the tests assert the documented `NOT_YET_WIRED` sentinel comes back
+//!   from `allocate`, that the public types are exported, and that the
+//!   buffer layout is non-zero.
 //!
-//! The `#[ignore]` test below documents the hardware-and-port-gated round
-//! trip that will replace tests 2 and 3 at v0.4.
+//! * With `cuda-oxide-host-backend`, the real `cuMemAllocManaged` path is
+//!   active and the tests additionally exercise zero-size rejection on
+//!   the host plus the ignored hardware-gated round-trip
+//!   (`#[ignore = "requires CUDA hardware"]`) that the S22 CUDA runner
+//!   will pick up via `cargo test --features cuda-oxide-host-backend --
+//!   --ignored`.
 //!
-//! Mirrors the shape of `tests/cudarc_smoke.rs` so the v0.4 PR diff is easy
-//! to review.
+//! Mirrors the shape of `tests/cudarc_smoke.rs` so the v0.4 PR diff is
+//! easy to review.
 //!
-//! Run on the cuda-oxide-pinned nightly:
+//! Run on a contributor box (no LIBCLANG / CUDA Toolkit required):
 //!
 //! ```ignore
-//! RUSTUP_TOOLCHAIN=nightly-2026-04-03 cargo test \
-//!     -p tensor-wasm-mem --features cuda-oxide-backend \
+//! cargo test -p tensor-wasm-mem --features cuda-oxide-backend \
 //!     --test cuda_oxide_smoke
+//! ```
+//!
+//! Run on a host with LIBCLANG_PATH + CUDA_TOOLKIT_PATH and a CUDA-
+//! capable GPU:
+//!
+//! ```ignore
+//! cargo test -p tensor-wasm-mem --features cuda-oxide-host-backend \
+//!     --test cuda_oxide_smoke -- --ignored
 //! ```
 
 #![cfg(feature = "cuda-oxide-backend")]
 
 use tensor_wasm_mem::cuda_oxide_backend::{
-    apply_advice, CudaOxideAdvice, CudaOxideUnifiedBuffer,
+    apply_advice, prefetch_async, CudaOxideAdvice, CudaOxideUnifiedBuffer,
 };
-use tensor_wasm_mem::unified::UnifiedError;
+use tensor_wasm_mem::unified::{DeviceId, UnifiedError};
 
-/// The buffer type compiles, links, and has a non-zero layout. This is the
-/// headline "the scaffold code path is wired" assertion — if this fails
-/// the workspace has a broken feature flag or a missing module declaration
+/// The buffer type compiles, links, and has a non-zero layout. Holds on
+/// both the scaffold and host-backend builds — if this fails the
+/// workspace has a broken feature flag or a missing module declaration
 /// in `lib.rs`.
 #[test]
 fn cuda_oxide_buffer_type_has_nonzero_size() {
     assert!(std::mem::size_of::<CudaOxideUnifiedBuffer>() > 0);
 }
 
-/// The scaffold `allocate` returns the documented sentinel error string,
-/// proving the stub is observable from outside the crate (so the v0.4
-/// porting author can grep for the call sites that need updating).
+/// On the dep-less scaffold build, `allocate(1024)` returns the
+/// documented sentinel error string. On the host-backend build this test
+/// is skipped — the real impl returns either `Ok` or a real driver
+/// error, never the `NOT_YET_WIRED` sentinel.
+#[cfg(not(feature = "cuda-oxide-host-backend"))]
 #[test]
 fn cuda_oxide_allocate_returns_not_yet_wired() {
     let err = CudaOxideUnifiedBuffer::allocate(1024)
-        .expect_err("scaffold allocate must error until v0.4 port");
+        .expect_err("scaffold allocate must error until host-backend port");
     match err {
         UnifiedError::Cuda(msg) => {
             assert!(
@@ -68,13 +78,10 @@ fn cuda_oxide_allocate_returns_not_yet_wired() {
     }
 }
 
-/// The scaffold `apply_advice` is exported as a free function with the
-/// expected signature. We do NOT invoke it here — the scaffold cannot
-/// construct a `CudaOxideUnifiedBuffer` (every `allocate` errors), and
-/// fabricating one via `MaybeUninit` would be UB even though the stub
-/// body never reads its arguments. This is a type-level export check,
-/// mirroring `cudarc_apply_advice_is_exported` in `cudarc_smoke.rs`. The
-/// v0.4 port replaces this test with a real allocate + apply round-trip.
+/// `apply_advice` is exported as a free function with the expected
+/// signature. Type-level export check — we do NOT invoke it here because
+/// the scaffold cannot construct a `CudaOxideUnifiedBuffer`. Mirrors
+/// `cudarc_apply_advice_is_exported` in `cudarc_smoke.rs`.
 #[test]
 fn cuda_oxide_apply_advice_is_exported() {
     let _f: fn(
@@ -83,20 +90,64 @@ fn cuda_oxide_apply_advice_is_exported() {
     ) -> Result<(), UnifiedError> = apply_advice;
 }
 
-/// Placeholder for the v0.4 hardware round-trip test: allocate, write,
-/// read, drop. Will only pass once the v0.4 port lands AND the host has
-/// cuda-oxide v0.2+ + a CUDA-capable GPU + the nightly-2026-04-03
-/// toolchain. Kept here so the v0.4 PR author has an obvious un-ignore
-/// target.
+/// `prefetch_async` is exported as a free function with the expected
+/// signature. Same type-level export rationale as `apply_advice` above.
 #[test]
-#[ignore = "requires cuda-oxide v0.2+ and the v0.4 port"]
-fn cuda_oxide_round_trip_on_device_v0_4() {
-    let _b = CudaOxideUnifiedBuffer::allocate(128)
-        .expect("v0.4 port: allocate(128) must succeed on cuda-oxide v0.2+ with hardware");
-    // v0.4 port will:
-    //   assert_eq!(_b.len(), 128);
-    //   _b.as_mut_slice().copy_from_slice(&[0x5A; 128]);
-    //   assert!(_b.as_slice().iter().all(|&v| v == 0x5A));
-    //   apply_advice(&_b, CudaOxideAdvice::ReadMostly)
-    //       .expect("set_read_mostly on Pascal+");
+fn cuda_oxide_prefetch_async_is_exported() {
+    let _f: fn(
+        &CudaOxideUnifiedBuffer,
+        DeviceId,
+    ) -> Result<(), UnifiedError> = prefetch_async;
+}
+
+/// Under the host-backend feature, zero-byte allocations are rejected
+/// without any driver call. Runs on host-only CI as long as the
+/// host-backend feature is on and the build host can compile the
+/// cuda-oxide crates (LIBCLANG + CUDA Toolkit). The cudarc-backend has
+/// the same test under the matching name.
+#[cfg(feature = "cuda-oxide-host-backend")]
+#[test]
+fn cuda_oxide_zero_size_rejected_without_driver() {
+    let err = CudaOxideUnifiedBuffer::allocate(0).expect_err("zero should be rejected");
+    assert!(
+        matches!(err, UnifiedError::ZeroSize),
+        "expected ZeroSize, got: {err:?}"
+    );
+}
+
+/// Hardware-gated round trip: allocate, write, read, drop. Compiles only
+/// when the host-backend feature is on. Requires a CUDA driver and at
+/// least one visible GPU; marked `#[ignore]` per the repo convention so
+/// host-only CI does not try to dlopen `libcuda`.
+#[cfg(feature = "cuda-oxide-host-backend")]
+#[test]
+#[ignore = "requires CUDA hardware"]
+fn cuda_oxide_round_trip_on_device() {
+    let mut b = CudaOxideUnifiedBuffer::allocate(128).expect("alloc");
+    assert_eq!(b.len(), 128);
+    assert!(!b.is_empty());
+    b.as_mut_slice().copy_from_slice(&[0x5Au8; 128]);
+    assert!(b.as_slice().iter().all(|&v| v == 0x5A));
+}
+
+/// Hardware-gated advice round trip: allocate then apply
+/// `CU_MEM_ADVISE_SET_READ_MOSTLY`. Compute capability ≥ 6.0 required.
+#[cfg(feature = "cuda-oxide-host-backend")]
+#[test]
+#[ignore = "requires CUDA hardware"]
+fn cuda_oxide_apply_advice_read_mostly_on_device() {
+    let b = CudaOxideUnifiedBuffer::allocate(256).expect("alloc");
+    apply_advice(&b, CudaOxideAdvice::ReadMostly)
+        .expect("set_read_mostly should succeed on Pascal+");
+}
+
+/// Hardware-gated prefetch round trip: prefetch to device 0, then back
+/// to the host (`DeviceId(u32::MAX)` sentinel for `CU_DEVICE_CPU`).
+#[cfg(feature = "cuda-oxide-host-backend")]
+#[test]
+#[ignore = "requires CUDA hardware"]
+fn cuda_oxide_prefetch_round_trip_on_device() {
+    let b = CudaOxideUnifiedBuffer::allocate(64).expect("alloc");
+    prefetch_async(&b, DeviceId(0)).expect("prefetch_to_device");
+    prefetch_async(&b, DeviceId(u32::MAX)).expect("prefetch_to_host");
 }

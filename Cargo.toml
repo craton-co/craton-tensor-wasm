@@ -117,9 +117,18 @@ cudarc = { version = "0.13", default-features = false, features = ["driver", "cu
 # the cuda-oxide-backend feature is enabled; we do NOT redeclare it here
 # (cargo.lock captures it). `deny.toml` allowlists that specific rev so
 # `cargo deny check sources` doesn't reject the build.
-cuda-host  = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
-cuda-core  = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
-cuda-async = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
+cuda-host   = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
+cuda-core   = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
+cuda-async  = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
+# `cuda-device` and `cuda-macros` are the kernel-authoring side of
+# cuda-oxide (device-side primitives + `#[kernel]` / `cuda_launch!`
+# proc-macros). Added at W4.1 (2026-05-27) so the new
+# `tensor-wasm-mem/cuda-oxide-host-backend` feature can toggle the
+# complete cuda-oxide surface with a single flag. Same git pin / SHA as
+# the other three host crates above so dependabot cannot drift them
+# apart.
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
+cuda-macros = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
 
 # HTTP / API
 axum = { version = "0.7", features = ["macros", "tracing"] }

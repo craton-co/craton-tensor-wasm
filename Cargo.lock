@@ -379,7 +379,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1071,6 +1071,14 @@ source = "git+https://github.com/NVlabs/cuda-oxide?rev=4a56e4220aab8ce5d085a411e
 dependencies = [
  "anyhow",
  "cuda-bindings",
+]
+
+[[package]]
+name = "cuda-device"
+version = "0.1.0"
+source = "git+https://github.com/NVlabs/cuda-oxide?rev=4a56e4220aab8ce5d085a411e7f806cebb647d14#4a56e4220aab8ce5d085a411e7f806cebb647d14"
+dependencies = [
+ "cuda-macros",
 ]
 
 [[package]]
@@ -2132,6 +2140,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
+name = "llvm-sys"
+version = "221.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2abcc34a3b190f03c2a61b555f218f529589ff13657bdd2ff8ac3e85f2abe6bb"
+dependencies = [
+ "anyhow",
+ "cc",
+ "lazy_static",
+ "libc",
+ "regex-lite",
+ "semver",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2497,6 +2519,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pliron-llvm"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9d3502c163f76af8bb18f5f0138cb0bca3a370f668cd79944885e4d2efb0dda"
+dependencies = [
+ "bitflags 2.11.1",
+ "llvm-sys",
+ "log",
+ "pliron",
+ "rustc-hash 2.1.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "plotters"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2643,7 +2679,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -2888,6 +2924,12 @@ dependencies = [
  "memchr",
  "regex-syntax",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"
@@ -3528,6 +3570,7 @@ dependencies = [
  "lru",
  "parking_lot",
  "pliron",
+ "pliron-llvm",
  "tensor-wasm-core",
  "thiserror 1.0.69",
  "tokio",
@@ -3544,7 +3587,9 @@ dependencies = [
  "anyhow",
  "cuda-async",
  "cuda-core",
+ "cuda-device",
  "cuda-host",
+ "cuda-macros",
  "cudarc",
  "cust",
  "parking_lot",
