@@ -379,11 +379,11 @@ fn analyse(
                                     );
                                     cache.put(
                                         key,
-                                        CachedKernel {
-                                            fingerprint: fp,
-                                            ptx: Arc::new(ptx),
-                                            compiled: CompiledHandle::default(),
-                                        },
+                                        CachedKernel::new(
+                                            fp,
+                                            Arc::new(ptx),
+                                            CompiledHandle::default(),
+                                        ),
                                     );
                                     fingerprint = Some(fp);
                                     info!(

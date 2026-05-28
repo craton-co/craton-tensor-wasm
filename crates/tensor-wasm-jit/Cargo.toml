@@ -22,6 +22,10 @@ cranelift-codegen.workspace = true
 dashmap.workspace = true
 lru.workspace = true
 parking_lot.workspace = true
+# Atomic file writes for the on-disk L2 kernel cache (jit S-3 disk-
+# persistence layer). Reused from the workspace dep added by the snapshot
+# crate.
+tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wasmparser.workspace = true

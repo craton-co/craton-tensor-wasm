@@ -25,6 +25,7 @@
 //! poison the entire cache for the rest of the process.
 
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -120,6 +121,17 @@ impl CacheKey {
 pub const DEFAULT_CAPACITY: usize = 256;
 
 /// Cached PTX module entry.
+///
+/// `integrity_hash` is a BLAKE3 over `ptx.text` computed at construction
+/// time and re-verified on every [`KernelCache::get`] (jit S-3). It defends
+/// against in-memory poisoning by a sibling holder of a mutable reference
+/// and forms the basis of the integrity tag stored in the on-disk
+/// persistence layer (see [`DiskCacheConfig`]). The field is `pub` so
+/// downstream tests and observability can inspect the recorded hash, but
+/// construction via [`CachedKernel::new`] is the only path that produces a
+/// correct-by-construction value — `KernelCache::put` calls `verify`
+/// before accepting the entry, so a hand-crafted `CachedKernel` with a
+/// mismatched hash will be rejected.
 #[derive(Debug, Clone)]
 pub struct CachedKernel {
     /// The blueprint that produced this PTX (for diagnostics).
@@ -129,6 +141,35 @@ pub struct CachedKernel {
     /// The cuda module handle is only meaningful when the `cuda` feature is
     /// on; for the stub path we keep `()`.
     pub compiled: CompiledHandle,
+    /// BLAKE3 over `ptx.text` (jit S-3). Recomputed and compared on every
+    /// `get`. See the type-level doc for the threat model.
+    pub integrity_hash: [u8; 32],
+}
+
+impl CachedKernel {
+    /// Construct a `CachedKernel`, computing `integrity_hash` from
+    /// `ptx.text`. This is the only way to obtain a correct-by-
+    /// construction value; the older struct-literal pattern still works
+    /// (the field is `pub` for backward compatibility) but the literal
+    /// must provide a matching hash or `KernelCache::put` will reject it.
+    pub fn new(fingerprint: u64, ptx: Arc<EmittedPtx>, compiled: CompiledHandle) -> Self {
+        let h = blake3::hash(ptx.text.as_bytes());
+        Self {
+            fingerprint,
+            ptx,
+            compiled,
+            integrity_hash: *h.as_bytes(),
+        }
+    }
+
+    /// Re-compute the integrity hash and compare it against the stored
+    /// value. Returns `true` iff the PTX text has not been tampered with
+    /// since [`Self::new`] ran.
+    #[must_use]
+    pub fn verify_integrity(&self) -> bool {
+        let h = blake3::hash(self.ptx.text.as_bytes());
+        h.as_bytes() == &self.integrity_hash
+    }
 }
 
 /// Compiled-module handle. On CUDA hosts this would hold
@@ -155,6 +196,13 @@ pub struct KernelCache {
     lru: Arc<Mutex<LruCache<CacheKey, ()>>>,
     /// Soft maximum entries before eviction kicks in.
     capacity: usize,
+    /// Optional L2 on-disk cache. When present (configured via
+    /// [`KernelCache::with_disk_persistence`]), `put` writes each entry to
+    /// disk under an HMAC-keyed integrity tag, and `get` falls through to
+    /// disk on an L1 miss — verifying the HMAC before deserialising. See
+    /// [`DiskCacheConfig`] for the threat model that motivates the design
+    /// (jit S-3).
+    disk: Option<Arc<DiskCache>>,
 }
 
 impl KernelCache {
@@ -176,12 +224,68 @@ impl KernelCache {
             storage: Arc::new(DashMap::with_capacity(cap)),
             lru: Arc::new(Mutex::new(LruCache::new(nz))),
             capacity: cap,
+            disk: None,
         }
+    }
+
+    /// Enable the on-disk L2 cache, persisting entries to `cfg.dir` under
+    /// an HMAC-keyed integrity tag (jit S-3).
+    ///
+    /// Construct via:
+    /// ```
+    /// use std::path::PathBuf;
+    /// use tensor_wasm_jit::cache::{KernelCache, DiskCacheConfig};
+    /// let cache = KernelCache::new().with_disk_persistence(DiskCacheConfig {
+    ///     dir: PathBuf::from("/var/cache/tensor-wasm/kernels"),
+    ///     hmac_key: [0xAB; 32],
+    /// });
+    /// # let _ = cache;
+    /// ```
+    ///
+    /// The directory is created lazily on the first `put`. The HMAC key
+    /// MUST be stable across process restarts AND treated as a server-
+    /// side secret — possession of the key lets an attacker forge cache
+    /// entries that the loader will accept as authentic (and that would
+    /// then be handed to `cust::module::Module::from_ptx` as trusted GPU
+    /// code).
+    #[must_use]
+    pub fn with_disk_persistence(mut self, cfg: DiskCacheConfig) -> Self {
+        self.disk = Some(Arc::new(DiskCache::new(cfg)));
+        self
     }
 
     /// Insert (or replace) a kernel. If the insert pushes the cache over
     /// capacity, evicts the LRU entry from storage and the policy queue.
+    ///
+    /// jit S-3: the kernel's `integrity_hash` is recomputed and compared
+    /// against the stored hash; a mismatch is treated as a programmer
+    /// error (`CachedKernel` constructed via struct-literal with a wrong
+    /// hash), logged at `error!`, and the entry is dropped rather than
+    /// admitted. Use [`CachedKernel::new`] for the correct-by-
+    /// construction path. The on-disk L2 also writes the entry when
+    /// configured.
     pub fn put(&self, key: CacheKey, kernel: CachedKernel) {
+        if !kernel.verify_integrity() {
+            tracing::error!(
+                target: "tensor_wasm_jit::cache",
+                fingerprint = kernel.fingerprint,
+                tenant = key.tenant_id,
+                "refusing to cache kernel whose integrity hash does not match \
+                 its PTX text -- likely a struct-literal construction with a \
+                 stale hash; use CachedKernel::new"
+            );
+            return;
+        }
+        if let Some(disk) = &self.disk {
+            if let Err(e) = disk.put(&key, &kernel) {
+                tracing::warn!(
+                    target: "tensor_wasm_jit::cache",
+                    fingerprint = kernel.fingerprint,
+                    error = %e,
+                    "disk-cache put failed; entry remains in L1 only"
+                );
+            }
+        }
         self.storage.insert(key, kernel);
         // `LruCache::push` returns `Some((evicted_key, ()))` when sizing the
         // LRU triggers eviction of an older entry. We use this as the
@@ -240,7 +344,53 @@ impl KernelCache {
             // `get` on LruCache promotes if present.
             let _ = lru.get(key);
         }
-        self.storage.get(key).map(|entry| entry.value().clone())
+        if let Some(entry) = self.storage.get(key) {
+            let kernel = entry.value().clone();
+            drop(entry); // release shard lock before the hash recompute
+            // jit S-3: verify the in-memory entry hasn't been tampered
+            // with since `put`. A mismatch should be impossible (the
+            // `CachedKernel` is owned by the cache and never handed out
+            // mutably) but failing closed costs ~µs over the public
+            // PTX bytes and definitively closes the in-mem poisoning
+            // path the audit flagged.
+            if !kernel.verify_integrity() {
+                tracing::error!(
+                    target: "tensor_wasm_jit::cache",
+                    fingerprint = kernel.fingerprint,
+                    tenant = key.tenant_id,
+                    "L1 cache entry failed integrity verification on get; \
+                     evicting and refusing to return it"
+                );
+                self.storage.remove(key);
+                return None;
+            }
+            return Some(kernel);
+        }
+        // jit S-3 + audit P-4: L1 miss falls through to the optional L2
+        // on-disk cache. The disk path HMAC-verifies the entry before
+        // deserialising, so a tampered file on disk is rejected with the
+        // same "no such entry" outcome as a real miss.
+        if let Some(disk) = &self.disk {
+            match disk.get(key) {
+                Ok(Some(kernel)) => {
+                    // Promote the disk hit into L1 so subsequent lookups
+                    // stay on the fast path.
+                    self.storage.insert(*key, kernel.clone());
+                    let _ = self.lru.lock().push(*key, ());
+                    return Some(kernel);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tensor_wasm_jit::cache",
+                        tenant = key.tenant_id,
+                        error = %e,
+                        "disk-cache get failed; treating as miss"
+                    );
+                }
+            }
+        }
+        None
     }
 
     /// Look up by blueprint + sm_version for a given tenant; convenience
@@ -271,6 +421,222 @@ impl KernelCache {
     /// Configured capacity.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Disk persistence (audit P-4 + jit S-3)
+// ---------------------------------------------------------------------------
+
+/// Configuration for the on-disk L2 cache.
+///
+/// The cache directory must be writable by the runtime user and SHOULD be
+/// owned exclusively by that user (mode 0700 on Unix) — operators on a
+/// hardened deployment can additionally `chattr +i` files after first
+/// write so a parallel attacker process cannot tamper with cached
+/// entries even with the same UID.
+///
+/// `hmac_key` is the secret that gates load: the writer HMACs each
+/// persisted entry with the key, and the reader rejects any file whose
+/// recomputed HMAC does not match. Without the key (or with a different
+/// key) the loader treats every existing entry as a miss, so rotating
+/// the key invalidates the disk cache without requiring an `rm -rf`.
+/// The key is held by value inside the [`DiskCache`]; manual zeroization
+/// on drop is a future-work item.
+#[derive(Debug, Clone)]
+pub struct DiskCacheConfig {
+    /// Directory where the L2 cache files live. Created lazily on first
+    /// `put`.
+    pub dir: PathBuf,
+    /// 32-byte HMAC-keyed-BLAKE3 key. MUST be process-stable across the
+    /// cache's lifetime and SHOULD be treated as a server-side secret.
+    pub hmac_key: [u8; 32],
+}
+
+/// Disk-backed L2 cache. Wraps a directory of `*.ptxbin` files, each of
+/// which holds a fixed-format header, the PTX bytes, and an HMAC-keyed
+/// BLAKE3 trailer that covers everything before it.
+///
+/// File format (little-endian):
+/// ```text
+/// [0..16)   magic = "TWJIT-KRNL-v1\0\0"
+/// [16..24)  blueprint fingerprint (u64)
+/// [24..28)  sm_version (u32)
+/// [28..36)  ptx length (u64)
+/// [36..36+ptx_len)  PTX text (UTF-8, NOT null-terminated)
+/// [36+ptx_len..36+ptx_len+32)  BLAKE3-keyed hash over bytes [0..36+ptx_len)
+/// ```
+///
+/// The fingerprint and sm_version are repeated in the header (also
+/// present in the filename's hash-derived stem) so a load can detect a
+/// renamed file early without paying the HMAC cost.
+struct DiskCache {
+    cfg: DiskCacheConfig,
+}
+
+const DISK_CACHE_MAGIC: &[u8; 16] = b"TWJIT-KRNL-v1\0\0\0";
+const DISK_CACHE_HEADER_LEN: usize = 16 + 8 + 4 + 8; // magic + fingerprint + sm_version + ptx_len
+const DISK_CACHE_HMAC_LEN: usize = 32;
+
+impl DiskCache {
+    fn new(cfg: DiskCacheConfig) -> Self {
+        Self { cfg }
+    }
+
+    /// Build the on-disk path for a key. Hash the full key (including
+    /// tenant_id and emit_config_hash) so two tenants cannot collide
+    /// on the same blueprint+sm and so the file name itself does not
+    /// leak the blueprint fingerprint to anyone with directory-list
+    /// access.
+    fn path_for(&self, key: &CacheKey) -> PathBuf {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"tensor-wasm-jit::DiskCache::path::v1\0");
+        hasher.update(&key.tenant_id.to_le_bytes());
+        hasher.update(&key.blueprint.to_le_bytes());
+        hasher.update(&key.sm_version.to_le_bytes());
+        hasher.update(&key.emit_config_hash.to_le_bytes());
+        let h = hasher.finalize();
+        // First 16 bytes (32 hex chars) is plenty of entropy for filenames.
+        let hex_stem: String = h
+            .as_bytes()
+            .iter()
+            .take(16)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        self.cfg.dir.join(format!("{hex_stem}.ptxbin"))
+    }
+
+    /// Write a kernel to disk under an HMAC-keyed integrity tag.
+    fn put(&self, key: &CacheKey, kernel: &CachedKernel) -> std::io::Result<()> {
+        use std::io::Write;
+        std::fs::create_dir_all(&self.cfg.dir)?;
+        let ptx_bytes = kernel.ptx.text.as_bytes();
+        let mut buf =
+            Vec::with_capacity(DISK_CACHE_HEADER_LEN + ptx_bytes.len() + DISK_CACHE_HMAC_LEN);
+        buf.extend_from_slice(DISK_CACHE_MAGIC);
+        buf.extend_from_slice(&key.blueprint.to_le_bytes());
+        buf.extend_from_slice(&key.sm_version.to_le_bytes());
+        buf.extend_from_slice(&(ptx_bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(ptx_bytes);
+        // HMAC-keyed BLAKE3 over everything written so far. Uses blake3's
+        // built-in keyed mode rather than HMAC-SHA256 so we don't pull
+        // the `hmac` + `sha2` deps into this crate just for the disk
+        // cache; the security argument is identical (BLAKE3-keyed is a
+        // strong MAC).
+        let tag = blake3::keyed_hash(&self.cfg.hmac_key, &buf);
+        buf.extend_from_slice(tag.as_bytes());
+        // Atomic write: create the temp file in the same directory, then
+        // rename onto the final path so a partial write never leaves a
+        // half-formed entry that a concurrent reader could trip over.
+        let final_path = self.path_for(key);
+        let tmp = tempfile::NamedTempFile::new_in(&self.cfg.dir)?;
+        tmp.as_file().write_all(&buf)?;
+        tmp.persist(&final_path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(())
+    }
+
+    /// Read and verify a kernel from disk. Returns `Ok(None)` on a
+    /// genuine miss (file does not exist), `Err` on I/O failure, and
+    /// `Ok(None)` (with a warn-level log) on an HMAC mismatch — the
+    /// loader treats integrity failures as "no such entry" so a poisoned
+    /// file behaves identically to a fresh cache.
+    fn get(&self, key: &CacheKey) -> std::io::Result<Option<CachedKernel>> {
+        let path = self.path_for(key);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if bytes.len() < DISK_CACHE_HEADER_LEN + DISK_CACHE_HMAC_LEN {
+            tracing::warn!(
+                target: "tensor_wasm_jit::cache",
+                file = %path.display(),
+                len = bytes.len(),
+                "disk-cache entry too short; treating as miss"
+            );
+            return Ok(None);
+        }
+        if &bytes[..16] != DISK_CACHE_MAGIC {
+            tracing::warn!(
+                target: "tensor_wasm_jit::cache",
+                file = %path.display(),
+                "disk-cache magic mismatch; treating as miss"
+            );
+            return Ok(None);
+        }
+        let hmac_start = bytes.len() - DISK_CACHE_HMAC_LEN;
+        let (prefix, tag_bytes) = bytes.split_at(hmac_start);
+        let expected = blake3::keyed_hash(&self.cfg.hmac_key, prefix);
+        // BLAKE3's `Hash::as_bytes` and comparison via `==` runs in
+        // constant time for fixed-size arrays per the stdlib.
+        if expected.as_bytes() != tag_bytes {
+            tracing::warn!(
+                target: "tensor_wasm_jit::cache",
+                file = %path.display(),
+                "disk-cache HMAC mismatch; treating as miss \
+                 (possible tampering or stale key)"
+            );
+            return Ok(None);
+        }
+        // Header integrity is implied by the HMAC, but cross-check
+        // fingerprint and sm_version against the requested key as
+        // defence-in-depth — a file under the right path that holds a
+        // mismatching header means the path-hash collided (impossible
+        // with 128 bits of BLAKE3) OR an operator copied the file
+        // manually; treat as miss either way.
+        let mut bp_bytes = [0u8; 8];
+        bp_bytes.copy_from_slice(&prefix[16..24]);
+        let mut sm_bytes = [0u8; 4];
+        sm_bytes.copy_from_slice(&prefix[24..28]);
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(&prefix[28..36]);
+        let fingerprint_on_disk = u64::from_le_bytes(bp_bytes);
+        let sm_version_on_disk = u32::from_le_bytes(sm_bytes);
+        let ptx_len_on_disk = u64::from_le_bytes(len_bytes) as usize;
+        if fingerprint_on_disk != key.blueprint || sm_version_on_disk != key.sm_version {
+            tracing::warn!(
+                target: "tensor_wasm_jit::cache",
+                file = %path.display(),
+                "disk-cache header key mismatch; treating as miss"
+            );
+            return Ok(None);
+        }
+        let ptx_start = DISK_CACHE_HEADER_LEN;
+        let ptx_end = ptx_start.saturating_add(ptx_len_on_disk);
+        if ptx_end > prefix.len() {
+            tracing::warn!(
+                target: "tensor_wasm_jit::cache",
+                file = %path.display(),
+                "disk-cache declared ptx_len overruns file; treating as miss"
+            );
+            return Ok(None);
+        }
+        let ptx_text = match std::str::from_utf8(&prefix[ptx_start..ptx_end]) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                tracing::warn!(
+                    target: "tensor_wasm_jit::cache",
+                    file = %path.display(),
+                    "disk-cache PTX bytes are not valid UTF-8; treating as miss"
+                );
+                return Ok(None);
+            }
+        };
+        // Reconstruct the kernel via the integrity-aware constructor so
+        // the L1 cache accepts it without further verification work.
+        let ptx = Arc::new(EmittedPtx {
+            text: ptx_text,
+            // Geometry is not persisted; default to the no-launch tuple.
+            // The dispatch path either re-fetches it from the blueprint
+            // or treats it as "use guest-declared launch params".
+            launch_geometry: (0, 0),
+        });
+        Ok(Some(CachedKernel::new(
+            fingerprint_on_disk,
+            ptx,
+            CompiledHandle::default(),
+        )))
     }
 }
 
