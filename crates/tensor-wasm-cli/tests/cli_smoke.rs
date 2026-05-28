@@ -450,3 +450,93 @@ fn snapshot_restore_rejects_missing_input() {
         .failure();
 }
 
+// -- `tensor-wasm kernel` smoke tests -----------------------------------
+//
+// v0.3.7 scaffold: every subcommand must exit 3 (FEATURE_NOT_EXPOSED)
+// with the documented "feature not yet exposed" message. These tests
+// pin the contract design partners depend on; when the v0.4 server
+// route lands, the assertions below will need to be updated to reflect
+// the real wire-level behaviour. See `crates/tensor-wasm-cli/src/cmd/kernel.rs`.
+
+#[test]
+fn kernel_publish_exits_feature_not_exposed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ptx = tmp.path().join("kernel.ptx");
+    std::fs::write(&ptx, b"// fake ptx").expect("write ptx");
+    let key = tmp.path().join("hmac.key");
+    std::fs::write(&key, "42".repeat(32)).expect("write key");
+
+    let assertion = tensor_wasm()
+        .args([
+            "kernel",
+            "publish",
+            "matmul.f32",
+            "1.0.0",
+            "--ptx-file",
+            ptx.to_str().unwrap(),
+            "--sm",
+            "80",
+            "--key-file",
+            key.to_str().unwrap(),
+            "--server",
+            DEAD_SERVER,
+        ])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("not yet exposed"));
+    let out = assertion.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("docs/KERNEL-REGISTRY.md"),
+        "message should cross-link to the doc:\n{combined}"
+    );
+}
+
+#[test]
+fn kernel_list_exits_feature_not_exposed() {
+    tensor_wasm()
+        .args(["kernel", "list", "--server", DEAD_SERVER])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("not yet exposed"));
+}
+
+#[test]
+fn kernel_verify_exits_feature_not_exposed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let key = tmp.path().join("hmac.key");
+    std::fs::write(&key, "42".repeat(32)).expect("write key");
+    tensor_wasm()
+        .args([
+            "kernel",
+            "verify",
+            "matmul.f32@1.0.0",
+            "--key-file",
+            key.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("not yet exposed"));
+}
+
+#[test]
+fn kernel_help_lists_all_subactions() {
+    // Help is the design-partner-facing surface — if `publish`, `list`,
+    // or `verify` ever silently disappear from the binary, this test
+    // catches it before docs/KERNEL-REGISTRY.md drifts.
+    tensor_wasm()
+        .args(["kernel", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("publish"))
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("verify"));
+}
+

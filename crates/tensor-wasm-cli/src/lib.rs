@@ -60,6 +60,17 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::snapshot::SnapshotAction,
     },
+    /// Publish, list, or verify entries in the signed kernel registry.
+    ///
+    /// Roadmap feature #3, v0.3.7 scaffold — every subcommand exits
+    /// with code 3 (`FEATURE_NOT_EXPOSED`) until the server-side
+    /// `/kernels` route lands in v0.4. See `docs/KERNEL-REGISTRY.md`
+    /// for the manifest schema, signing envelope, and rollout plan.
+    Kernel {
+        /// Kernel sub-action.
+        #[command(subcommand)]
+        action: cmd::kernel::KernelAction,
+    },
     /// Fetch and pretty-print Prometheus metrics from a TensorWasm server.
     Metrics(cmd::metrics::MetricsArgs),
     /// Live operator dashboard over `/healthz` + `/metrics` (refreshes in place).

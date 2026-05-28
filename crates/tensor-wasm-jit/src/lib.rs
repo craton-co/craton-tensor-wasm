@@ -34,6 +34,17 @@ pub mod rewrite;
 #[cfg(any(test, feature = "differential-oracle"))]
 pub mod differential;
 
+// Signed kernel registry (roadmap feature #3). Scaffold only in v0.3.7:
+// the in-memory `KernelRegistry` trait + `InMemoryRegistry` impl land so
+// design partners can target a stable surface; the on-disk store, signing
+// CLI, and server-side `/kernels` endpoint are v0.4 deliverables. Gated
+// behind the `kernel-registry` feature because the HMAC/SHA-2/serde
+// dependency chain is otherwise pure surface-area cost for the default
+// build (which doesn't yet exercise this path). See
+// `docs/KERNEL-REGISTRY.md` for the v0.4 wiring plan.
+#[cfg(feature = "kernel-registry")]
+pub mod registry;
+
 #[doc(hidden)]
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod pliron_dialect;
