@@ -1,274 +1,291 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <!-- Copyright 2026 Craton Software Company -->
 
-# Continuation prompt — TensorWasm v0.3.7 → v0.4
+# Continuation prompt — TensorWasm v0.3.7 security/perf/v0.4-feature orchestration handoff
 
-> Hand-off document for the next orchestrator session. Picks up where the
-> 2026-05-28 session ended.
+> Hand-off document for the next orchestrator session. Picks up after the
+> 2026-05-28 audit-driven multi-agent orchestration. The previous session
+> dispatched ~40 parallel Opus agents that landed security fixes, perf
+> wins, and v0.4 feature deliverables on the `dev` branch. **The tree has
+> NOT been built or tested.** First action on resumption: run `cargo
+> check --workspace` and fix.
 
 ## 1. State of the repo at hand-off
 
 - **Branch**: `dev`
-- **HEAD**: `167dda7 fix(api): openapi_validation_test EXPECTED_ROUTES -> expected_routes() call sites`
-- **Workspace version**: `0.3.6` (was bumped in B1.7 from 0.3.5; never bumped again — `Cargo.toml.workspace.package.version` + `CITATION.cff` need to flip to `0.3.7` when you tag).
-- **Build status** (as of the last verification this session):
-  - `cargo build --workspace --no-default-features` → exit 0
-  - `cargo check --workspace --tests --no-default-features` → exit 0
-  - `cargo check --workspace --tests --all-features` → exit 0
-- **Commits this session**: 79 (B1.1 → B7.9).
-- **Workspace crates**: 11. Added `tensor-wasm-artifacts` in B6.6 (content-addressed signed artifact store).
-- **Docs in `docs/`**: 49 markdown files. Added: `STREAMING.md`, `COOPERATIVE-YIELD.md`, `GPU-QUOTAS.md`, `INSTANCE-POOL.md`, `KERNEL-REGISTRY.md`, `DIFFERENTIAL-ORACLE.md`, `OPENAI-COMPAT.md`, `ARTIFACT-STORE.md`, `RELEASE.md`, `TESTING.md`, `FUZZING.md`, `CONFIG.md`.
+- **HEAD**: `c7c19d3 merge T33: wire typed --args end-to-end through CLI / HTTP / SpawnConfig`
+- **Commits ahead of `main`**: 73 (40-ish feature/fix commits + 33 merge commits).
+- **Build status**: **UNKNOWN — never invoked `cargo` during the orchestration.** Agents were instructed code-only, and the orchestrator deferred verification to this handoff. See § 5 below for the recipe.
 
-## 2. First thing to do on resumption
+## 2. What landed (28 of 32 tasks complete + 4 manual entries)
 
-**Bump to 0.3.7.** All of batches 5–7 documented themselves as "v0.3.7 scaffolds" but `Cargo.toml` is still pinned at `0.3.6`. Touch the following files:
+### From the v0.3.7 security audit (28 items, 100% complete)
 
-- `Cargo.toml` → `workspace.package.version = "0.3.7"`, plus all 8 internal `[workspace.dependencies]` pins (`tensor-wasm-{core,mem,exec,wasi-gpu,jit,snapshot,tenant,api}`) from `version = "0.3.6"` to `version = "0.3.7"`. `tensor-wasm-artifacts = { path = "crates/tensor-wasm-artifacts", version = "0.3.7" }` (it was added at 0.3.6 too — bump in lockstep).
-- `CITATION.cff` → `version: 0.3.7`, `date-released: <today>`.
-- `README.md` → status banner line near the top.
-- `ARCHITECTURE.md` → trailer "current as of v0.3.7".
-- `ACTIONABLE-ITEMS-PENDING.md` → date header.
-- `docs/RISKS.md` → "Last updated" trailer.
-- `SECURITY.md` → supported-versions table row.
-- `Dockerfile` → ARG WORKSPACE_VERSION and image-tag examples.
-- `deploy/helm/tensor-wasm/Chart.yaml` → appVersion.
-- `deploy/helm/tensor-wasm/values.yaml` + `README.md` → era-tag comments.
-- `deploy/k8s/20-deployment.yaml` → app.kubernetes.io/version labels + image tag.
-- `deploy/nomad/*.nomad.hcl` → Consul tag + default.
-- `docs/runbooks/ghcr-registry-provisioning.md` → workspace-version note + image-tag examples.
-- `crates/tensor-wasm-api/openapi.json` → `info.version`.
-- `crates/tensor-wasm-cli/man/tensor-wasm.1` → .TH header + VERSION section.
-- `crates/tensor-wasm-snapshot/FORMAT.md` → "pre-v0.3.6" parenthetical.
+| Task | Severity | Crate | Summary |
+|---|---|---|---|
+| T1 | **Critical** | api | `/kernels*` routes moved under `tenant_scope`; `publish` requires kernel-publish scope; dev-mode rejects publishes. |
+| T2 | High | api | `/v1/completions` + `/v1/chat/completions` gated behind `tenant_scope`. |
+| T3 | High | api | `From<ExecError> for ApiError` scrubs internal IDs / deadlines / quotas; logs forensics server-side. |
+| T4 | High | mem | `UnifiedMemoryPool::reset(&mut self)`; `slab_ptr` → `pub(crate) unsafe fn`. |
+| T5 | High | mem | `Backing` enum sealed into private `mod backing`; aliasing invariant documented. |
+| T6 | High | mem | `PooledLinearMemory::Drop` calls `pool.release(offset, size)`. |
+| T7 | High | exec | Re-applied `#[deprecated]` attrs on `call_export` / `call_export_then_terminate` (dropped in merge `66af7db`). |
+| T8 | Medium | snapshot | v3 detection now requires 4-byte magic at `bytes[len-37..len-33]`; trailer grew to 37 bytes. **BREAKING for unmigrated v3 captures.** |
+| T9 | Medium | snapshot | `MAX_INPUT_BYTES` 4 GiB → 1 GiB; opt-in `SnapshotReader::with_max_age(Duration)`; `SystemTime::now()` failure → `Serialization` error. |
+| T10 | Medium | artifacts | `MAX_PAYLOAD_LEN = 256 MiB`, `MAX_DECOMPRESSED_LEN = 1 GiB`, streaming `zstd::stream::read::Decoder`, `checked_sub` on hmac_start. |
+| T11 | Medium | tenant | `register_with_capability` orphan-check is now atomic under `inner.entry()`; `unregister` inserts tombstone before removing entry. |
+| T12 | Medium | jit | Registry envelope v2: `b"twasm-kmf-v2"` magic + length-prefixed canonicalisation + covers `publisher` + `published_unix_ms`. **BREAKING** for v1 manifests. |
+| T13 | Medium | jit | `DiskCacheConfig::hmac_key` wrapped in `Zeroize`; custom `Debug` redacts; rustdoc example sanitised. |
+| T14 | Medium | mem | Dropped redundant cudarc full-allocation memset; only `init_zero_bytes` is zeroed (relies on `pool.rs` cross-tenant zero-fill). |
+| T15 | Low | wasi-gpu | Removed stray `<<<<<<< HEAD` from `wit/wasi-cuda.wit:89`; added `wit_file_has_no_merge_conflict_markers` regression test. |
+| T16 | Low | api | Startup `tracing::warn!` when `TENSOR_WASM_API_TOKENS` is set but `TENSOR_WASM_API_TRUSTED_HOSTS` is unset. |
+| T17 | Low | cli | `bounded_text` / `bounded_bytes` helpers; `MAX_RESPONSE_BODY_BYTES = 16 MiB`; new `ApiClientError::ResponseTooLarge`. |
+| T18 | Low | cli | `sanitise_terminal_output(&str) -> String` strips ASCII control bytes from server-returned strings before `println!`. |
+| T19 | Perf | api | `host_validate` moved outermost (ahead of `trace_layer`); `BASE64_OFFLOAD_THRESHOLD` 256 KiB → 32 KiB. |
+| T20 | Perf | jit | `KernelCache::get` returns `Option<Arc<CachedKernel>>`; `hex::encode_to_slice` in `path_for`; pre-sized `lower_body` String; `cache_hits_total`/`cache_misses_total` counters. |
+| T21 | Perf | snapshot | Pre-size compressed `Vec` from `total_uncompressed_bytes / 4`; `SnapshotRef` borrow on artifact path (no `.to_vec()`). |
+| T22 | Perf | artifacts | Streaming HMAC + zstd via `BufReader`/`Decoder` + `MacWriter` tee in `put`; direct-to-file (no intermediate `Vec`). |
+| T23 | Perf | wasi-gpu | `parse_argv` takes `&[u8]` (no Vec copy); pre-size `KernelParamStorage::backing`. |
+| T24 | Perf | cli | `BufWriter::with_capacity(64 KiB, ...)` around snapshot save tempfile (~16× fewer syscalls). |
+| T25 | Perf | core | `String::with_capacity(8 KiB)` on `encode_text`. |
+| T26 | Perf | mem | Cached per-ordinal `Arc<CudaDevice>` / `Arc<CudaContext>`; `UnifiedMemoryPool` bump/live/issued_total now `AtomicUsize`/`AtomicU64` (CAS loop). |
+| T27 | Perf | tenant | `OnceLock`-cached MPS decision; opportunistic tombstone prune on `unregister`/`register`. |
+| T28 | Hygiene | api | Regenerated `crates/tensor-wasm-api/openapi.json` from authoritative YAML; new `openapi_json_yaml_sync.rs` regression test; `scripts/regen-openapi-json.{sh,ps1}`. |
+| T31 | Hygiene | api tests | Three trivial lint warnings silenced (`_router` rename, `#[allow(unused_mut)]` on cfg-feature-gated mut). |
+| T32 | Hygiene | cli | `documentation = "https://docs.rs/tensor-wasm"` → `https://docs.rs/tensor-wasm-cli`. |
 
-Pattern is exactly what B1.7 did for 0.3.5 → 0.3.6. Read commit `ad40bed` (`chore(release): reconcile v0.3.5 → v0.3.6`) for the full file inventory.
+### From `docs/PATH-TO-V1.md` §3.1 v0.4 deliverables (6 of 9 complete)
 
-After the bump, **do NOT add a new CHANGELOG entry** — the existing `[0.3.7]` section (added in B7.8) is already populated and labeled correctly.
+| Task | PATH-TO-V1 # | Summary |
+|---|---|---|
+| T34 | #2 streaming | `/functions/{id}/invoke-stream` plumbed end-to-end via `StreamingContext`; guest `emit-chunk` → SSE `event: chunk`; deadline-elapsed → `event: error`. |
+| T35 | #3 kernel registry | `DiskRegistry` (HMAC v2 envelope, `DiskArtifactStore`-backed, restart-safe, pagination, publisher allowlist). Selected when `TENSOR_WASM_API_KERNEL_REGISTRY_DIR` is set. |
+| T36 | #4 cooperative deadlines | Executor's Instant deadline → `SchedulerContext` + `BackPressure` (DEADLINE_NEAR_WINDOW = 50 ms). New `BackPressureError::DeadlineNear` / `DeadlineElapsed`. |
+| T38 | #6 differential oracle | proptest harness for vector_add/conv2d/matmul + per-blueprint `ToleranceTable` (1-4 ULP). CUDA verdicts marked `#[ignore]` pending S22 runner. |
+| T39 | #8 cuMemPool quota | `TenantMemPool::new(ordinal, cap_bytes)` calls `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)`. `UnifiedBuffer::new_in_tenant_pool` routes via `cuMemAllocFromPoolAsync`. Requires `--features gpu-mem-pool` + CUDA 11.2+. |
+| T40 | #9 snapshot artifact-backing | `artifact-backing` is now in `default` features; new writes use the unified envelope; reads still accept v2/v3. `with_legacy_envelope()` for opt-out. **BREAKING for default writer behavior.** |
+| T33 | #1 typed args | `--args <JSON>` CLI flag; HTTP `/invoke{,-async,-stream}` body `args: [...]`; `SpawnConfig::with_args(Vec<WasmArg>)`. |
 
-## 3. Deferred items (the actual carry-forward work)
+## 3. Currently in flight (3 background agents — may have landed by the time you read this)
 
-### 3.1 B7.3 — Migrate `jit::cache::DiskCache` to `tensor_wasm_artifacts::DiskArtifactStore` [HIGH PRIORITY]
+| Task | Agent ID | Worktree branch | Description |
+|---|---|---|---|
+| T30 | `a22579d0b864ef3f7` | `worktree-agent-a22579d0b864ef3f7` | B7.3 — migrate `tensor-wasm-jit::DiskCache` to `DiskArtifactStore` backend. Heavy refactor preserving T12/T13/T20 invariants. |
+| T41 | `a9ae79a3579510399` | `worktree-agent-a9ae79a3579510399` | OpenAI request translator into internal invoke protocol. Model-map env-var, streaming via T34. Depends on T34. |
 
-**Why deferred**: The B7.3 worktree was created on an older dev snapshot (commit `bb4bd99`) that predates B5.3 (key partition + parallel emit + zeroize) and B6.8 (`verify_on_get` opt-out). Both of those reworked `crates/tensor-wasm-jit/src/cache.rs` substantially. Merging the B7.3 worktree would have clobbered both — its rewrite of `DiskCache` came from a world where neither existed.
+**On resumption:** check `git branch | grep worktree-agent` and `git log --all --oneline | head -40` to find their final commit SHAs. Merge each (expect CHANGELOG conflicts — see § 6.2).
 
-**Why this matters**: B7.4 already landed the parallel migration on the snapshot side (opt-in via `artifact-backing` feature). Until B7.3 lands, the JIT cache uses its own bespoke envelope (`magic(16) || fingerprint(8) || sm_version(4) || grid_x(4) || block_x(4) || ptx_len(8) || ptx_text(N) || hmac(32)` from B3.3) and the snapshot side uses the shared artifact store. The whole point of B6.6's artifact store was to converge these — having one consumer migrated and the other not is half a job.
+## 4. Queued / pending (not started this session)
 
-**What needs to happen**:
+### T29 — Workspace version bump 0.3.6 → 0.3.7
 
-1. Read the current `crates/tensor-wasm-jit/src/cache.rs` in full (~960 lines now — substantial after B3.3 / B5.3 / B6.8 layered on top of each other). Pay attention to:
-   - `DiskCache::put` and `get` — the bespoke envelope writer/reader.
-   - `DiskCache::path_for` — currently includes `blake3(hmac_key)[..8]` in the path stem (B5.3 partition).
-   - `KernelCacheConfig.verify_on_get` (B6.8) — needs to survive the migration.
-   - `KernelCacheConfig.registry` (B7.2) — also needs to survive.
-   - The `Zeroizing<[u8; 32]>` HMAC key wrapper (B5.3).
-2. Read `crates/tensor-wasm-artifacts/src/lib.rs` to see the `DiskArtifactStore` API.
-3. Design the JIT-side payload struct (likely `JitPayload { fingerprint, sm_version, grid_x, block_x, ptx_text }`, bincode-encoded) that becomes the artifact store's opaque body.
-4. Refactor `DiskCache` to hold a `DiskArtifactStore` + an in-memory `Mutex<HashMap<CacheKey, ContentHash>>` keymap. v0.4 follow-up: persist the keymap via a sidecar JSON so cache survives restart (today's in-memory keymap means an L2 cache rebuilt from disk is functionally empty until requests re-populate it).
-5. Legacy magic detection: if `ArtifactError::BadMagic` (or whatever the current artifact store returns), emit `tracing::warn!(target: "tensor_wasm_jit::cache", "legacy on-disk cache format; entry will be re-emitted via the artifact store")` and return `Ok(None)`.
-6. Existing tests that need updating:
-   - `crates/tensor-wasm-jit/tests/cache_integrity.rs` — the forged-blob test flips a byte at a specific offset. With the artifact store envelope, the offset changes. Either recompute or just assert any single-byte flip yields BadHmac.
-   - `crates/tensor-wasm-jit/tests/cache_launch_geometry_persisted.rs` — round-trips grid/block through disk; just verify it still works against the new envelope.
-   - `crates/tensor-wasm-jit/tests/disk_cache_keyed_path.rs` — distinct-key partitioning; the artifact store does this natively via the key-fingerprint filename suffix, so the test should still pass with possibly minor path-format updates.
-7. New test `crates/tensor-wasm-jit/tests/disk_cache_artifact_envelope.rs` — assert the resulting file starts with `tensor-wasm-artifacts`'s magic header (not the old JIT-specific one) and decodes via `DiskArtifactStore::get` directly.
-8. Documentation: update `docs/ARTIFACT-STORE.md` to mark "JIT cache migration: LANDED in v0.3.7" (or whatever version it ends up in). Update `crates/tensor-wasm-jit/src/cache.rs` module doc.
+Long touchlist (per the previous `continue_prompt.md` §2 and commit `ad40bed` as the template):
 
-**Estimated effort**: ~4-6 hours for one engineer. The tricky bit is preserving B5.3's parallel-emit thread-safety guarantees through the new envelope — `DiskArtifactStore::put` returns a `ContentHash`, and the keymap insertion must be atomic with respect to concurrent puts of the same `CacheKey`.
+- `Cargo.toml` → `workspace.package.version = "0.3.7"` + 9 internal `[workspace.dependencies]` `version = "0.3.7"` pins.
+- `CITATION.cff`, `README.md`, `ARCHITECTURE.md`, `ACTIONABLE-ITEMS-PENDING.md`, `docs/RISKS.md`, `SECURITY.md`, `Dockerfile`.
+- `deploy/helm/tensor-wasm/{Chart.yaml,values.yaml,README.md}`.
+- `deploy/k8s/20-deployment.yaml`, `deploy/nomad/*.nomad.hcl`.
+- `docs/runbooks/ghcr-registry-provisioning.md`.
+- `crates/tensor-wasm-api/openapi.json` AND `openapi/tensor-wasm-api.yaml` (both have `info.version`).
+- `crates/tensor-wasm-cli/man/tensor-wasm.1`.
+- `crates/tensor-wasm-snapshot/FORMAT.md`.
 
-### 3.2 v0.4 work that's "scaffold landed" but needs real wiring
+This was deliberately deferred to last to avoid colliding with every concurrent agent's `Cargo.toml` edits. **Do it AFTER you've cleaned up any T30/T41 merge mess and confirmed `cargo check` is green.**
 
-All eight of these are usable surface-area today but need follow-up to fulfill their v0.4 promise:
+### T37 — `InstancePool` through executor `invoke` path (PATH-TO-V1 §3.1 #5)
 
-#### 3.2.1 Streaming `/invoke-stream` mid-execution flush
-- **Today**: route at `crates/tensor-wasm-api/src/routes.rs::invoke_function_stream` returns a single `event: scaffold` frame with `{"status":"not_yet_wired"}`.
-- **What's missing**: the `tensor-wasm-wasi-gpu::streaming::StreamingContext` channel from B6.1 needs to be plumbed into `SpawnConfig` (`tensor-wasm-exec::executor`), thence to `WasiCudaContext` (or a new `TensorStreamingContext`) attached to the Wasmtime store, and finally consumed by the route handler that maps it to the SSE/chunked response body.
-- **Threat model**: the chunks already go through `sanitize_path`-equivalent log injection defence per `docs/STREAMING.md`; verify when wiring.
-- **Tests to add**: end-to-end SSE with a guest that actually calls `wasi:tensor/host.emit-chunk`. Today's test only verifies the route mount + content-type.
+Not launched because it conflicts with T34 (both touch `crates/tensor-wasm-exec/src/executor.rs` invoke-path) and T33 (both touch `SpawnConfig`). With T33 and T34 merged, T37 is now unblocked. Spec is in the original prompt — repeated here:
 
-#### 3.2.2 Signed kernel registry — production server-side storage
-- **Today**: in-memory `InMemoryRegistry` only. `/kernels` POST publishes into a `Mutex<HashMap>` that vanishes on restart.
-- **What's missing**: on-disk backing via `DiskArtifactStore` (item 3.1 above is a prerequisite). Multi-publisher allowlist via a startup config (today every caller with the HMAC key can publish). Pagination on `GET /kernels` (today returns the whole list).
-- **Cross-link**: `docs/KERNEL-REGISTRY.md` § "v0.4 wiring plan".
+- `InstancePool::acquire` currently falls through to `executor.spawn_instance` (it's a scaffold per `instance_pool.rs:117-129`).
+- Implement: per-`(tenant, module-hash)` `crossbeam_channel::Sender<TensorWasmInstance>`, pre-spawn loop, reset-on-return semantics. Reset is the hard part — instance state must be scrubbed back to module-initial before re-use.
+- Cross-link: `docs/INSTANCE-POOL.md` § "v0.4 implementation plan".
 
-#### 3.2.3 `cuMemPool` driver enforcement against real CUDA hardware
-- **Today**: `crates/tensor-wasm-mem/src/cuda_mem_pool.rs` has the `TenantMemPool` type, FFI calls, and feature gating. Marked `#[ignore]` on integration tests.
-- **What's missing**: actually verify the cudarc FFI calls compile against `cudarc 0.13`'s real bindings (the agent inferred the type names from convention). Run the `#[ignore]`d tests on the S22 self-hosted runner once it's online.
-- **Cross-link**: `docs/GPU-QUOTAS.md` § "v0.4 follow-up", `ACTIONABLE-ITEMS-PENDING.md` items 2.1-2.3.
+### Other deferred items NOT tasked this session
 
-#### 3.2.4 Pliron auto-offload pipeline (roadmap #7 — NOT scaffolded yet)
-- **Today**: `crates/tensor-wasm-jit/src/pliron_*.rs` modules exist with `NotYetWired` stubs only (B2.5 made them `#[doc(hidden)]`).
-- **What's missing**: this is RFC 0001 wave 3+. Read `rfcs/0001-cuda-oxide-integration.md` and `docs/PLIRON-PIPELINE.md`. ~2-3 months of work.
-- **Status**: `🔵 not started` in `ACTIONABLE-ITEMS-PENDING.md`.
+- **PATH-TO-V1 §3.1 #7 — Pliron-based auto-offload pipeline.** Months of work; blocked on cuda-oxide v0.2 upstream. Not appropriate for agent dispatch.
+- **PATH-TO-V1 §3.1 #11 WASI-NN compat layer.** 6 weeks, high risk; spec is moving.
+- **PATH-TO-V1 §3.1 #12 SPIR-V guest-side dispatch.** Anti-goal per the doc.
+- **PATH-TO-V1 §3.1 #13 QUIC sidecar.** v1.x territory.
+- **v0.2 milestone — kernel-args marshalling `KernelArgsUnsupported` removal.** Partially done host-side (T23 made `parse_argv` slice-based); full removal requires real CUDA `cuLaunchKernel` dispatch with typed argv, which needs the S22 runner.
 
-#### 3.2.5 `InstancePool` warm-pool channel
-- **Today**: `crates/tensor-wasm-exec/src/instance_pool.rs::InstancePool::acquire` falls through to `executor.spawn_instance`.
-- **What's missing**: the per-`(tenant, module-hash)` `crossbeam_channel::Sender<TensorWasmInstance>`, the pre-spawn loop, and the reset-on-return semantics. Reset is the hard part — instance state (linear memory, globals, tables) must be scrubbed back to module-initial before re-use, OR the guest must guarantee reentrancy.
-- **Cross-link**: `docs/INSTANCE-POOL.md` § "v0.4 implementation plan".
-
-#### 3.2.6 `DifferentialOracle` two-path runner
-- **Today**: `crates/tensor-wasm-jit/src/differential.rs::DifferentialOracle::compare` always returns `OracleVerdict::Skipped("no-cuda; v0.4 wires this against the S22 runner")`.
-- **What's missing**: actually run the blueprint on both the Wasmtime CPU interpreter and the JIT'd PTX, capture outputs, compare bit-for-bit. Requires the S22 runner.
-- **Cross-link**: `docs/DIFFERENTIAL-ORACLE.md` § "v0.4 implementation plan".
-
-#### 3.2.7 OpenAI gateway shim — actual translation
-- **Today**: `crates/tensor-wasm-api/src/openai.rs::completions_handler` and `chat_completions_handler` both return `501 openai_not_yet_wired` regardless of input.
-- **What's missing**: the `model` → deployed-function translation table (config-driven, probably env or a YAML). Then call `executor.call_export_with_args` with the prompt as a `WasmArg::I32`-encoded pointer/length pair (or whatever the guest export ABI demands). Finally, marshal the result into the OpenAI response envelope.
-- **Why this matters**: per the original review § 6, **this is the single highest-ROI item** in the roadmap — it shifts the addressable market from Wasmtime/Wasmer migrators to Modal/Replicate/Beam users with Python OpenAI clients. Build this before recruiting design partners.
-- **Cross-link**: `docs/OPENAI-COMPAT.md` § "v0.4 implementation plan".
-
-#### 3.2.8 Snapshot artifact-backing default cutover
-- **Today**: opt-in via the `artifact-backing` feature on `tensor-wasm-snapshot`. The legacy v2/v3 inline envelope is the default.
-- **What's missing**: once operators have migrated, flip the default. v0.4 milestone per `crates/tensor-wasm-snapshot/FORMAT.md`.
-
-### 3.3 Speculative / R&D — roadmap items #11, #12, #13 (not started)
-
-- **#11 WASI-NN compatibility** — 6 weeks; high risk (spec moving). Gives existing ONNX/llama.cpp/OpenVINO WASI-NN guests a CUDA-accelerated path.
-- **#12 Direct guest-side GPU dispatch via SPIR-V** — 6 months+; very high risk. Speculative; depends on a CG proposal landing.
-- **#13 Distributed dispatch sidecar over QUIC** — 2-3 months; medium risk. Single-hop GPU bursting; v1.x scope, not v1.0.
-
-## 4. Known issues / gotchas
-
-### 4.1 Linter warnings worth fixing (cosmetic)
-
-```
-warning: unused variable: `router`
-   --> crates\tensor-wasm-api\tests\get_job_cross_tenant.rs:118:5
-warning: unused variable: `router`
-  --> crates\tensor-wasm-api\tests\scoped_tokens_test.rs:85:5
-warning: variable does not need to be mutable
-  --> crates\tensor-wasm-api\tests\openapi_validation_test.rs:90:9
-```
-
-All three: prefix with `_router` / drop the `mut`. Five-second fixes; not done because they're test-only and don't affect compile.
-
-### 4.2 The `pliron_*` `cuda-oxide-backend`-gated module surface
-
-Per B2.5 these are `#[doc(hidden)]` but still `pub mod`. Many of the internal items (`StubLowerer`, `NotYetWired` variants, etc.) are reachable from external crates if someone bypasses docs. Consider:
-
-- Either feature-gate to `cuda-oxide-backend-unstable` and document as preview, OR
-- Wrap in a `#[cfg(doc)]`-style attribute that hides the whole feature stack from generated docs.
-
-### 4.3 130 locked agent worktrees in `.claude/worktrees/`
-
-`git worktree list` shows 130 locked agent worktrees (from this session and prior). They are inside `.claude/worktrees/` which is gitignored, so they don't pollute the repo. But they consume disk space (~hundreds of MB total). The harness left them locked; a manual `git worktree remove --force --force <path>` per directory will clean them up. Optional.
-
-### 4.4 `tensor-wasm-cli` `documentation` field references the wrong crate
-
-`crates/tensor-wasm-cli/Cargo.toml` has `documentation = "https://docs.rs/tensor-wasm"`. The crate name is `tensor-wasm-cli`. Harmless while `publish = false`, but if you ever flip that bit, the URL must change. Tracked in the original review § 4.
-
-### 4.5 `B6.4 / B6.5 / B6.6` cross-file dependencies
-
-These three batches landed scaffolds that reference one another:
-- `tensor-wasm-mem::cuda_mem_pool::TenantMemPool` is feature-gated on `cudarc-backend` and uses `cudarc::driver::sys::*` types that were inferred (not verified against a real cudarc 0.13 compile). When you light up the S22 runner, the first thing to do is `cargo check --features gpu-mem-pool` on a CUDA host. Expect type-name fixes.
-- `tensor-wasm-tenant::TenantContext.mem_pool: Option<Arc<TenantMemPool>>` is the consumer.
-- `tensor-wasm-mem::wasm_memory::TensorWasmMemoryCreator::with_tenant_context` accounts every `UnifiedBuffer` allocation against `TenantContext::consume_gpu_bytes` (in-process) but does NOT yet route through the `cuMemPool` (driver-level). The two layers are independent; the in-process counter is the only enforcement today.
-
-### 4.6 OpenAPI yaml drift
-
-`crates/tensor-wasm-api/openapi.json` and `openapi/tensor-wasm-api.yaml` are TWO copies of the same schema. The yaml is the authoritative one per `openapi_validation_test`, but the json gets regenerated from it (or hand-edited — be careful which). When you add/modify routes, edit the yaml and let the test guide whether the json needs an update.
-
-### 4.7 Tests that don't run by default
-
-The following test suites are `#[ignore]`d and require special setup:
-
-- `crates/tensor-wasm-mem/tests/cudarc_multi_gpu.rs` — needs CUDA hardware
-- `crates/tensor-wasm-mem/tests/cuda_mem_pool_scaffold.rs` — needs CUDA hardware
-- `crates/tensor-wasm-snapshot/tests/compat.rs` — golden fixtures (4 tests now properly `#[ignore]`d per B3.5)
-- `crates/tensor-wasm-wasi-gpu/tests/wasi_gpu_smoke.rs` — most tests `#[ignore]` for CUDA, but a few non-CUDA tests run
-- `crates/tensor-wasm-wasi-gpu/tests/kernel_args_e2e.rs` — same
-- `crates/tensor-wasm-jit/tests/lowering_e2e.rs` — requires both `cuda-oxide-backend` and `test-utils` features
-- `crates/tensor-wasm-jit/tests/differential_scaffold.rs` — requires `differential-oracle` feature
-- `crates/tensor-wasm-tenant/tests/loom_consume_release.rs` — requires `loom` feature
-- `crates/tensor-wasm-tenant/tests/cap_binding_strict.rs` — requires `strict-cap-binding` feature
-
-Run them with `cargo test -- --ignored` (CUDA host) or per-feature.
-
-## 5. Verification recipe for the next session
-
-After making any change, run in order:
+## 5. **Verification recipe — do this first on resumption**
 
 ```bash
-# 1. No-features build (most consumers' default)
+git checkout dev
+
+# 1. Confirm in-flight agents finished and merge their branches.
+git branch | grep worktree-agent
+#   For each remaining worktree branch, merge with --no-ff. Expect CHANGELOG conflicts (see §6.2).
+
+# 2. No-features build (most consumers' default).
 cargo build --workspace --no-default-features
 
-# 2. Check tests compile (catches integration-test breakage)
+# 3. Tests compile (catches integration-test breakage).
 cargo check --workspace --tests --no-default-features
 
-# 3. Feature-gated builds — exercise every opt-in path
+# 4. All-features check (exercises every opt-in: gpu-mem-pool, cudarc-backend,
+#    cuda-oxide-backend, differential-oracle, artifact-backing, kernel-registry,
+#    kernel-registry-api, strict-cap-binding, loom).
 cargo check --workspace --tests --all-features
 
-# 4. Doc builds (catches missing-docs lints and broken intra-doc links)
+# 5. Doc builds.
 cargo doc --workspace --no-deps --no-default-features
 
-# 5. Linting
+# 6. Lint + format.
 cargo clippy --workspace --tests --no-default-features -- -D warnings
-
-# 6. Format check
 cargo fmt --all -- --check
 
-# 7. Security audit
+# 7. Security audit.
 cargo audit
 cargo deny check
 ```
 
-If you're working on a CUDA-touching change, add:
+**If anything fails, dispatch fix agents** following the original orchestration pattern (worktree isolation, code-only). The orchestration history committed during this session includes failures resolved via 6-7 small fix-PR-shaped commits — the same loop applies.
+
+## 6. Known issues and gotchas
+
+### 6.1 The tree has never been built this session
+
+Every commit is logically wired by the agent but has not been syntax-checked. Expect a non-zero count of compile errors at first `cargo check`. Likely failure modes:
+
+- **`tensor-wasm-mem` `gpu-mem-pool` feature** (T39, manually applied as `b082f66`) — the cudarc 0.13.9 FFI symbol names were verified by the agent against the actual cargo registry source, but the call sites use `cuda_sys::lib()` wrapping which may differ from what the worktree base assumed. Build with `--features gpu-mem-pool` to surface.
+- **`tensor-wasm-snapshot` (T40) — `artifact-backing` is now default.** Five v3-shape tests were updated to use `.with_legacy_envelope()`. If any test was missed, expect "no field `with_legacy_envelope`" or "expected v3 magic" failures.
+- **`tensor-wasm-jit` (T20) — `KernelCache::get` returns `Option<Arc<CachedKernel>>`.** Every caller was reportedly updated via the agent's grep; if any was missed, expect "expected struct, found Arc" or "no method named `.ptx`" on an `Option`.
+- **`tensor-wasm-jit` (T30, in-flight) — DiskCache rewritten to wrap DiskArtifactStore.** The agent's spec preserved the public API but the migration is the largest single change of this session. Multiple existing tests may need adjustments (per the spec it touches 3 existing tests + adds 1 new).
+- **`tensor-wasm-mem` (T4 + T6 + T26) — pool.rs has accumulated three concurrent reworks.** `reset(&mut self)`, `Drop`-decrements-live, atomic counters. If T4's `&mut self` callers were updated for T4 but a NEW caller introduced by T6/T26 still uses `&self`, expect a borrow-checker error.
+
+### 6.2 CHANGELOG.md merge conflicts are routine
+
+Every code-changing agent added an entry to `[Unreleased]`. The branches all base-off-of-dev but the orchestrator merged them sequentially, so each merge after the first has CHANGELOG conflicts. Resolution pattern:
+
+1. Keep BOTH agents' entries.
+2. Maintain Keep-a-Changelog ordering: `### Added` → `### Changed` → `### Deprecated` → `### Removed` → `### Fixed` → `### Security`.
+3. Watch for STACKED `<<<<<<< HEAD` markers — twice this session a conflict-resolution Edit failed mid-flight and the resulting commit included an unresolved marker. Always `grep -n '<<<<<<<\|=======\|>>>>>>>' CHANGELOG.md` AFTER each merge.
+
+### 6.3 T39 was manually applied to dev (not via worktree merge)
+
+Mid-session, the working tree had uncommitted changes matching T39's spec (mem cuMemPool driver pin + tenant `with_driver_enforced_gpu_cap` + `docs/GPU-QUOTAS.md`). The orchestrator committed those as `b082f66 feat(mem): T39 ... (manual apply)`. The T39 agent later confirmed its worktree commit `c91f54f` is content-equivalent. **Action:** the worktree branch `worktree-agent-ac66361ede9c1757c` exists but is NOT merged (it's content-equivalent to `b082f66`); safe to delete with `git worktree remove --force` + `git branch -D`.
+
+### 6.4 Stale tests likely
+
+- `crates/tensor-wasm-api/tests/invoke_envelope_shape.rs::invoke_envelope_matches_empty_body_response` — per the T33 agent's report, this test posts `args: [1.0, 2.0, "three"]` expecting 200, but the T33-landed string-arg rejection now legitimately returns `400 invalid_args`. Either delete the test or update the expectation.
+- v3-shape snapshot tests that didn't get T40's `.with_legacy_envelope()` treatment.
+- Any test that constructs `DiskCacheConfig { hmac_key: [0xAB; 32], .. }` as a struct literal — after T13, `DiskCacheConfig` has a `Drop` impl that requires `std::mem::take`-based construction in callers (cf. T13 report).
+
+### 6.5 Items that the v0.3.7 audit found but were intentionally deferred
+
+These were flagged as STUBS in the audit but are intentional v0.4 work, not bugs:
+
+- `tensor-wasm-exec::auto_offload.rs` — "consultation-only", activation pending `tensor_wasm_jit::rewrite`.
+- `tensor-wasm-mem::cuda_oxide_backend.rs` — entire backend is `NOT_YET_WIRED` until cuda-oxide v0.2.
+- `tensor-wasm-jit::pliron_*.rs` — 19+ `NotYetWired` variants; depends on cuda-oxide v0.2 + Pliron stability.
+- `tensor-wasm-bench/benches/streaming_invoke.rs` — `todo!()` inside `b.iter`; saved only by not being registered in `Cargo.toml`. If you ever add it to `[[bench]]`, replace the `todo!()` first.
+- `tensor-wasm-bench/benches/call_export_args.rs` — on disk but unregistered AND depends on crates not in `[dev-dependencies]`.
+
+### 6.6 Worktree cleanup
+
+`git worktree list` will show many worktrees from this session (~25-30 in `.claude/worktrees/`). They are inside `.claude/worktrees/` which is gitignored, so they don't pollute the repo. They consume disk space. Clean with:
 
 ```bash
-cargo check --features cudarc-backend
-cargo check --features cuda-oxide-backend
-cargo test --features cudarc-backend -- --ignored   # on CUDA host
+for path in $(git worktree list --porcelain | awk '/worktree /{print $2}' | grep '\.claude/worktrees/'); do
+    git worktree remove --force --force "$path"
+done
+git branch | grep '^  worktree-agent-\|^  fix/' | xargs -r git branch -D
 ```
 
-## 6. Suggested next-batch priorities
+### 6.7 OpenAPI YAML / JSON sync
 
-In order of ROI (per the review's batch-7 closing recommendation, which still stands):
+T28 added a regression test (`openapi_json_yaml_sync.rs`) and helper scripts (`scripts/regen-openapi-json.{sh,ps1}`). After landing T33 (added `args` field to invoke envelopes), T34 (replaced invoke-stream description), T40 (snapshot format change touches API documentation), and potentially T41 (replaces /v1/* 501 description), the YAML and JSON may have drifted. Run:
 
-1. **Bump 0.3.6 → 0.3.7 and tag** (1 hour). Pre-req: nothing.
-2. **B7.3 jit DiskCache → artifact store** (4-6 hours). Pre-req: bump done, or skip the version mess and just do it on 0.3.6.
-3. **OpenAI gateway translation table** (~2 weeks). Highest ROI of any v0.4 feature.
-4. **Streaming `/invoke-stream` wiring through `StreamingContext`** (~3 weeks). Composes with the OpenAI gateway — both need streaming for the LLM use case.
-5. **`InstancePool` warm-pool channel** (~2 weeks). Pushes P99 below Modal/Beam.
-6. **Differential JIT oracle real two-path runner** (~3 weeks). Audit credibility before the v0.5 pen-test.
-7. **Pliron pipeline wave 3 onwards** (months). Long pole; start picking at it in parallel with the above.
+```bash
+bash scripts/regen-openapi-json.sh
+cargo test -p tensor-wasm-api openapi_json_yaml_sync
+```
 
-## 7. Files / commits to re-read before starting
+### 6.8 The audit's audit
 
-- `docs/PATH-TO-V1.md` § "Post-v0.3.6 strategic features" — the full feature dossier with each item's status, cross-links, and v0.4 plan.
-- `ACTIONABLE-ITEMS-PENDING.md` — the operator-facing pending-items list, status-colored.
-- `CHANGELOG.md` `[0.3.7]` section — what landed.
-- `docs/RISKS.md` — the current risk register, including the cust 0.3.x EOL story that gates several of the cudarc / cuda-oxide moves.
-- `rfcs/0001-cuda-oxide-integration.md` — the master plan for items #3 (kernel registry), #6 (differential oracle), #7 (pliron), #8 (GPU quotas).
+The original 11-crate audit (start of session) had findings categorized as Critical / High / Medium / Low. Of those:
 
-## 8. Session-level orchestration notes
+- **Critical (1)**: T1, fixed.
+- **High (6)**: T2, T3, T4, T5, T6, T7 — all fixed.
+- **Medium (7)**: T8-T14 — all fixed.
+- **Low (4)**: T15-T18 — all fixed.
+- **Code review themes (cross-cutting)** — most addressed: OpenAPI drift (T28), stale doc strings (T13 commit msg notes the HMAC vs BLAKE3 doc mismatch on jit cache; verify still accurate after T30), merge artifacts (T7, T15).
+- **Perf wins (clear)**: T19-T27 — all dispatched and merged.
 
-If you re-spawn agents in worktrees:
+### 6.9 Tasks that don't run by default (test ignore-list, unchanged from prior session)
 
-- **Always `git pull` / rebase the worktree's base on current `dev` before letting the agent start writing.** Several batch-7 agents based on `bb4bd99` (which predates batch 5 substantially) produced unmergeable rewrites — that's how B7.3 ended up deferred. Either (a) instruct the agent to `git checkout dev && git pull` first, or (b) accept that the harness creates worktrees from the current dev HEAD and verify before launch.
-- **Conflicts on merge usually mean the agent worked from a stale base.** When two agents touch the same file (which happens for cross-cutting items like `api/src/lib.rs`, `api/src/routes.rs`, `api/src/server.rs`, `jit/Cargo.toml`, `docs/PATH-TO-V1.md`, `bench-results/baseline.json`), the cleanest resolution is usually `git checkout --ours` (keep dev's state) followed by re-applying the agent's specific additions by hand. The session did this many times.
-- **Three Cargo.toml gotchas worth knowing**:
-  1. `subtle` was added as a hard dep in B5.3 and re-added as `optional = true` by B6.3's `kernel-registry` feature. Cargo errored with "duplicate key" until manually resolved.
-  2. `tensor-wasm-artifacts` is a workspace member, listed in both `[workspace.members]` and `[workspace.dependencies]`. When new crates depend on it, add `tensor-wasm-artifacts = { workspace = true }` to the consumer's deps.
-  3. `bincode` is at workspace version 2 with the `serde` feature globally enabled. Per-crate Cargo.toml entries should be `bincode.workspace = true`, NOT `bincode = "2"`.
+```
+crates/tensor-wasm-mem/tests/cudarc_multi_gpu.rs                    [#[ignore], CUDA hw]
+crates/tensor-wasm-mem/tests/cuda_mem_pool_scaffold.rs              [#[ignore], CUDA hw]
+crates/tensor-wasm-mem/tests/cuda_mem_pool_driver_pin.rs            [#[ignore], CUDA hw — NEW from T39]
+crates/tensor-wasm-mem/tests/cudarc_visible_window_only.rs          [#[ignore], CUDA hw — NEW from T14]
+crates/tensor-wasm-snapshot/tests/compat.rs                         [golden fixtures]
+crates/tensor-wasm-wasi-gpu/tests/wasi_gpu_smoke.rs                 [#[ignore] CUDA paths]
+crates/tensor-wasm-wasi-gpu/tests/kernel_args_e2e.rs                [#[ignore] CUDA paths]
+crates/tensor-wasm-jit/tests/lowering_e2e.rs                        [cuda-oxide-backend + test-utils]
+crates/tensor-wasm-jit/tests/differential_scaffold.rs               [differential-oracle]
+crates/tensor-wasm-jit/tests/differential_proptest.rs               [differential-oracle — NEW from T38]
+crates/tensor-wasm-tenant/tests/loom_consume_release.rs             [loom]
+crates/tensor-wasm-tenant/tests/cap_binding_strict.rs               [strict-cap-binding]
+crates/tensor-wasm-artifacts/tests/streaming_perf.rs                [#[ignore] perf — NEW from T22]
+crates/tensor-wasm-artifacts/tests/size_caps.rs (one of two)        [#[ignore] needs 1+ GiB allocation]
+crates/tensor-wasm-snapshot/tests/max_input_tightened.rs            [#[ignore] needs ~1.5 GiB RAM]
+```
 
-## 9. Recap of what this session added (just the numbers)
+## 7. Suggested next-batch priorities
+
+In order:
+
+1. **Verify the tree builds** (§5). Likely 2-5 fix-PRs needed. Each is a small fix agent in a worktree.
+2. **Merge T30 (JIT DiskCache → artifact store) + T41 (OpenAI translator)** if not already done. Both are sitting on background agents.
+3. **Land T37 (InstancePool wiring through invoke)** — the last v0.4 PATH-TO-V1 deliverable in scope.
+4. **Land T29 (version bump 0.3.6 → 0.3.7)** — paperwork, last.
+5. **Tag v0.3.7.** All security, perf, and v0.4 feature work for this milestone is now LANDED.
+
+After v0.3.7:
+- **v0.4 milestone (per PATH-TO-V1.md)**: kernel-args marshalling against real CUDA hardware, baseline measurements from S22 runner, MPS E2E validation, CUDA-SETUP.md rewrite. ALL of these need the S22 self-hosted CUDA runner online. Block on that.
+- **v0.5 milestone**: external pen-test, beta deploy, fuzz corpus 24h+, cross-version snapshot compat matrix.
+
+## 8. Files / commits worth re-reading on resumption
+
+- `docs/PATH-TO-V1.md` § 3.1 — the v0.4 feature dossier, now with most items landed.
+- `ACTIONABLE-ITEMS-PENDING.md` — operator-facing pending list. After T35/T36/T34/T38/T39/T40/T33/T41, most rows flip from 🟡 scaffold-landed to 🟢 wired.
+- `CHANGELOG.md` `[Unreleased]` — comprehensive list of what this session landed. 14-ish entries; reorder if you adopt T29's version bump (move them under `## [0.3.7]` and reset `[Unreleased]`).
+- `docs/RISKS.md` — the cust 0.3.x EOL risk now has a partial mitigation: T26 cached device handles + T39 cuMemPool show that the cudarc-backend path is usable enough to ship a v0.4 default.
+
+## 9. Session-level orchestration notes for the next operator
+
+If you spawn agents in worktrees again:
+
+- **Branch from current `dev`, not `main`.** Several agents this session branched from `main` (which lacks every commit in this hand-off) and produced commits that needed rebasing before merge. The first commit in each agent's prompt should be `git checkout dev && git pull` if not already on dev.
+- **One executor.rs-touching agent at a time.** `crates/tensor-wasm-exec/src/executor.rs` was the most contended file this session — T1 (no), T7 (deprecation), T33 (args), T34 (streaming), T36 (deadline), T37 (instance pool, never launched) all want it. Sequence them.
+- **Single CHANGELOG.md owner per merge wave.** Letting every agent write `[Unreleased]` produces N-1 conflicts. Alternative for future sessions: have agents write CHANGELOG entries to a per-task file (`changelog-fragments/T34.md` etc.) and have a final consolidating step.
+- **Worktree branches' base detection.** Agents reported their worktree's HEAD relative to `dev` only sporadically. Twice this session an agent's "I worked from dev" was actually "I worked from main" and the resulting merge had to re-base. Tighten the prompt: "Run `git log --oneline -1 dev` and `git rev-parse HEAD` and INCLUDE both in your report. If they differ, `git reset --hard dev` BEFORE writing any code."
+- **Manual application path.** When in doubt about an agent's correctness, `git diff` the worktree, copy the changed files into the main tree directly, and commit yourself. T39 went this route mid-session and it worked.
+
+## 10. Recap of what this session added (by the numbers)
 
 | Metric | Count |
 |---|---|
-| Commits to `dev` | 79 |
-| Files newly created | 88 |
-| Files modified | 176 |
-| New crates | 1 (`tensor-wasm-artifacts`) |
-| New `pub mod` modules | ~10 (`openai`, `streaming`, `scheduler`, `registry` x2, `instance_pool`, `differential`, `cuda_mem_pool`, `kernels`, `differential`) |
-| New HTTP routes | `/v1/completions`, `/v1/chat/completions`, `/functions/:id/invoke-stream`, `/kernels` (3 methods) |
-| New WIT packages | `wasi:tensor@0.1.0`, `wasi:scheduler@0.1.0` (in-crate copies) |
-| New cargo features | `kernel-registry`, `kernel-registry-api`, `differential-oracle`, `artifact-backing`, `gpu-mem-pool`, `test-utils`, `strict-cap-binding`, `loom` |
-| New env vars consumed | `TENSOR_WASM_API_TRUSTED_XFCC_PROXIES`, `TENSOR_WASM_API_KERNEL_HMAC_KEY` |
-| New deprecation attributes | 2 (`call_export`, `call_export_then_terminate`) |
-| Roadmap features scaffolded | 9 of 13 (items #1, #2, #3, #4, #5, #6, #8, #9, #10) |
-| Roadmap features not started | 4 of 13 (items #7, #11, #12, #13) |
-| Test files added | ~30 (integration, fuzz, property, scaffold) |
-| Docs added | 12 |
-| Stale `.claude/worktrees/agent-*` gitlinks scrubbed | 94 |
+| Commits to `dev` | ~73 |
+| Tasks defined | 41 |
+| Tasks completed | 35 (28 audit + 6 v0.4 feature + T33/T34 + T31/T32 hygiene) |
+| Tasks in-flight at handoff | 2 (T30, T41) |
+| Tasks pending at handoff | 2 (T29, T37) |
+| Critical vulnerabilities closed | 1 (`/kernels` tenant gap — T1) |
+| High vulnerabilities closed | 6 |
+| Medium vulnerabilities closed | 7 |
+| Low / hygiene items closed | 7 |
+| Perf clear-wins shipped | 9 |
+| v0.4 feature deliverables landed | 7 |
+| New files | ~30 (mostly tests + one new script directory entry) |
+| Lines added to dev (rough) | ~6000 |
+| Worktree branches left in `.claude/worktrees/` | ~25-30 |
 
 ---
 
-_End of continuation prompt. The tree is build-clean. Pick up wherever the
-priorities in § 6 make the most sense for the next milestone._
+_End of continuation prompt. The tree has the security / perf / v0.4 work
+ready in `dev` but has NOT been built. First action on resumption is
+§ 5 (verification recipe). Then merge the in-flight T30/T41, do T37 +
+T29, tag v0.3.7._
