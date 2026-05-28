@@ -178,17 +178,100 @@ impl AuthContext {
     }
 }
 
-/// Static configuration for the per-token rate limiter.
+/// Per-tenant (secondary) rate-limit configuration.
 ///
-/// Loaded from `TENSOR_WASM_API_RATE_LIMIT_QPS` and
-/// `TENSOR_WASM_API_RATE_LIMIT_BURST` at server startup. If either knob is
-/// zero (or unset) the limiter is disabled — see [`RateLimitConfig::is_disabled`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RateLimitConfig {
-    /// Steady-state requests-per-second admitted per token.
-    pub qps: u32,
-    /// Maximum burst — the bucket capacity, in permits.
+/// Sits in front of the per-token bucket as the *primary* defence against a
+/// noisy-neighbour tenant saturating a shared token's overall quota. The
+/// per-token bucket (see [`RateLimitConfig`]) is retained as a backstop.
+///
+/// Composite bucket key is `(TokenId, TenantId)` — so a single token used by
+/// two tenants does not let one tenant drain the other's allowance.
+///
+/// **Field semantics:**
+/// * `burst == 0` => disabled (this layer admits unconditionally). The per-
+///   token backstop still applies if it is itself configured.
+/// * `qps == 0.0` => non-zero burst is a one-shot allowance with **no
+///   refill**. Useful for tests; in production an operator who wants no
+///   per-tenant ceiling should set `burst = 0` to disable the layer outright.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PerTenantRateLimitConfig {
+    /// Maximum burst — the per-tenant bucket capacity, in permits.
     pub burst: u32,
+    /// Steady-state requests-per-second admitted per `(token, tenant)` pair.
+    /// `0.0` disables refill (the bucket drains and stays empty until process
+    /// restart).
+    pub qps: f64,
+}
+
+impl PerTenantRateLimitConfig {
+    /// Default per-tenant burst. Deliberately conservative so a misbehaving
+    /// tenant on a shared token cannot trample neighbours; operators tune
+    /// upward as their multi-tenant workload demands.
+    pub const DEFAULT_BURST: u32 = 20;
+
+    /// Default per-tenant steady-state QPS. Matches the conservative
+    /// [`DEFAULT_BURST`](Self::DEFAULT_BURST) shape — sized for the small
+    /// internal tenant fleet today; operators raise it as needed.
+    pub const DEFAULT_QPS: f64 = 10.0;
+
+    /// Disabled config: per-tenant layer admits unconditionally.
+    pub const fn disabled() -> Self {
+        Self {
+            burst: 0,
+            qps: 0.0,
+        }
+    }
+
+    /// `true` if the per-tenant layer is disabled. Determined solely by
+    /// `burst == 0`: a non-zero burst with `qps == 0.0` is a valid (no-
+    /// refill) configuration, not a disabled one.
+    pub const fn is_disabled(&self) -> bool {
+        self.burst == 0
+    }
+}
+
+impl Default for PerTenantRateLimitConfig {
+    /// Default to the conservative active configuration
+    /// (`burst = 20`, `qps = 10.0`). Operators reach the fully-disabled
+    /// posture via [`PerTenantRateLimitConfig::disabled`].
+    fn default() -> Self {
+        Self {
+            burst: Self::DEFAULT_BURST,
+            qps: Self::DEFAULT_QPS,
+        }
+    }
+}
+
+/// Static configuration for the rate limiter.
+///
+/// Two layers, both enforced (whichever is tighter wins):
+///
+/// 1. **Per-tenant bucket** keyed on `(TokenId, TenantId)`
+///    ([`per_tenant_default`](Self::per_tenant_default)) — primary defence.
+///    Prevents one tenant from saturating a shared token's quota.
+/// 2. **Per-token bucket** keyed on `TokenId` ([`qps`](Self::qps),
+///    [`burst`](Self::burst)) — backstop. Caps aggregate usage by a single
+///    token across all tenants.
+///
+/// Token-level knobs come from `TENSOR_WASM_API_RATE_LIMIT_QPS` and
+/// `TENSOR_WASM_API_RATE_LIMIT_BURST` at server startup; per-tenant defaults
+/// to [`PerTenantRateLimitConfig::default`]. If both knobs are zero (or
+/// unset) the token-level backstop is disabled, but the per-tenant layer is
+/// still in force unless explicitly cleared — see
+/// [`RateLimitConfig::is_disabled`].
+///
+/// Note: this type is no longer `Eq` because [`PerTenantRateLimitConfig::qps`]
+/// is `f64`. Use `PartialEq` for comparisons in tests.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RateLimitConfig {
+    /// Steady-state requests-per-second admitted per token (backstop layer).
+    pub qps: u32,
+    /// Maximum burst — the per-token bucket capacity, in permits.
+    pub burst: u32,
+    /// Default per-tenant configuration applied to every `(token, tenant)`
+    /// pair. The primary defence against a single tenant exhausting a
+    /// shared token's quota.
+    pub per_tenant_default: PerTenantRateLimitConfig,
 }
 
 impl RateLimitConfig {
@@ -204,26 +287,44 @@ impl RateLimitConfig {
     /// Default burst applied when [`ENV_BURST`] is unset but [`ENV_QPS`] is set.
     pub const DEFAULT_BURST: u32 = 200;
 
-    /// Disabled config: both fields zero. The middleware is a pass-through.
+    /// Disabled config: every layer off. The middleware is a pass-through.
     pub const fn disabled() -> Self {
-        Self { qps: 0, burst: 0 }
+        Self {
+            qps: 0,
+            burst: 0,
+            per_tenant_default: PerTenantRateLimitConfig::disabled(),
+        }
     }
 
-    /// `true` if the limiter is disabled (either knob is zero).
+    /// `true` if every layer of the limiter is disabled and the middleware
+    /// would unconditionally admit. Used by [`rate_limit`] to short-circuit
+    /// the bucket lookup entirely.
     pub const fn is_disabled(&self) -> bool {
+        self.is_token_layer_disabled() && self.per_tenant_default.is_disabled()
+    }
+
+    /// `true` if the per-token (backstop) layer is disabled.
+    pub const fn is_token_layer_disabled(&self) -> bool {
         self.qps == 0 || self.burst == 0
     }
 
     /// Load from the process environment.
     ///
-    /// * Both vars unset / either `"0"` / either unparseable => [`Self::disabled`].
+    /// * Both vars unset / either `"0"` / either unparseable => token-layer
+    ///   disabled. The per-tenant layer still defaults to
+    ///   [`PerTenantRateLimitConfig::default`].
     /// * Otherwise: missing-but-other-side-set falls back to
     ///   [`DEFAULT_QPS`](Self::DEFAULT_QPS) / [`DEFAULT_BURST`](Self::DEFAULT_BURST).
     pub fn from_env() -> Self {
+        let per_tenant_default = PerTenantRateLimitConfig::default();
         let qps_raw = std::env::var(Self::ENV_QPS).ok();
         let burst_raw = std::env::var(Self::ENV_BURST).ok();
         if qps_raw.is_none() && burst_raw.is_none() {
-            return Self::disabled();
+            return Self {
+                qps: 0,
+                burst: 0,
+                per_tenant_default,
+            };
         }
         let qps = qps_raw
             .as_deref()
@@ -233,30 +334,41 @@ impl RateLimitConfig {
             .as_deref()
             .map(|s| s.trim().parse::<u32>().unwrap_or(0))
             .unwrap_or(Self::DEFAULT_BURST);
-        let cfg = Self { qps, burst };
-        if cfg.is_disabled() {
+        let cfg = Self {
+            qps,
+            burst,
+            per_tenant_default,
+        };
+        if cfg.is_token_layer_disabled() {
             tracing::warn!(
                 target: "tensor_wasm_api::rate_limit",
                 qps,
                 burst,
-                "{} / {} parsed but yields a disabled limiter (qps==0 or burst==0)",
+                "{} / {} parsed but yields a disabled token-layer limiter (qps==0 or burst==0); per-tenant layer still active",
                 Self::ENV_QPS,
                 Self::ENV_BURST,
             );
-            return Self::disabled();
+            return Self {
+                qps: 0,
+                burst: 0,
+                per_tenant_default,
+            };
         }
         tracing::info!(
             target: "tensor_wasm_api::rate_limit",
             qps,
             burst,
-            "per-token rate limiter enabled",
+            per_tenant_burst = per_tenant_default.burst,
+            per_tenant_qps = per_tenant_default.qps,
+            "rate limiter enabled (per-token backstop + per-tenant primary)",
         );
         cfg
     }
 }
 
 impl Default for RateLimitConfig {
-    /// Default is *disabled*. Operators opt in by setting both env vars.
+    /// Default is *disabled*. Operators opt in by setting both env vars (or
+    /// by constructing a config explicitly).
     fn default() -> Self {
         Self::disabled()
     }
@@ -337,15 +449,28 @@ pub enum AdmitResult {
     },
 }
 
-/// In-process per-token rate limiter.
+/// In-process two-layer rate limiter.
 ///
-/// Cheaply cloneable: every clone shares the same underlying [`DashMap`] and
-/// [`Clock`] via [`Arc`].
+/// Layer 1 (primary): `(TokenId, TenantId)` bucket — keeps a shared token
+/// from being drained by a single tenant.
+///
+/// Layer 2 (backstop): `TokenId` bucket — caps aggregate usage by a single
+/// token across all tenants. Inherited from the v0.4 design; kept active so
+/// pre-multi-tenant operators see no behavioural regression.
+///
+/// Cheaply cloneable: every clone shares the same underlying [`DashMap`]s
+/// and [`Clock`] via [`Arc`].
 #[derive(Clone)]
 pub struct RateLimiter {
     cfg: RateLimitConfig,
     clock: Arc<dyn Clock>,
+    /// Per-token (backstop) buckets.
     buckets: Arc<DashMap<TokenId, Mutex<BucketState>>>,
+    /// Per-(token, tenant) (primary) buckets. We use a composite key so a
+    /// single shared token still gets per-tenant isolation. With the dev
+    /// sentinel token, this also separates internal-cron tenants from
+    /// external traffic that lands on `TokenId::DEV`.
+    per_tenant_buckets: Arc<DashMap<(TokenId, TenantId), Mutex<BucketState>>>,
 }
 
 impl std::fmt::Debug for RateLimiter {
@@ -353,6 +478,7 @@ impl std::fmt::Debug for RateLimiter {
         f.debug_struct("RateLimiter")
             .field("cfg", &self.cfg)
             .field("buckets", &self.buckets.len())
+            .field("per_tenant_buckets", &self.per_tenant_buckets.len())
             .finish()
     }
 }
@@ -369,10 +495,11 @@ impl RateLimiter {
             cfg,
             clock,
             buckets: Arc::new(DashMap::new()),
+            per_tenant_buckets: Arc::new(DashMap::new()),
         }
     }
 
-    /// `true` if the configured policy admits every request unconditionally.
+    /// `true` if every configured layer admits unconditionally.
     pub fn is_disabled(&self) -> bool {
         self.cfg.is_disabled()
     }
@@ -382,45 +509,160 @@ impl RateLimiter {
         self.cfg
     }
 
-    /// Attempt to claim one permit for `token`.
-    pub fn try_admit(&self, token: TokenId) -> AdmitResult {
+    /// Attempt to claim one permit for the `(token, tenant)` pair.
+    ///
+    /// Both the per-tenant (primary) and per-token (backstop) buckets must
+    /// admit. If either rejects we return [`AdmitResult::Reject`] carrying
+    /// the **smaller** of the two retry [`Duration`]s — per the
+    /// per-tenant-bucket design note, the smaller backoff is the earliest
+    /// the client could plausibly retry, even though it may still face the
+    /// other bucket on the next attempt.
+    ///
+    /// To avoid leaking a permit on one layer when the other rejects, we
+    /// hold both layers' inner mutexes across the decision and only deduct
+    /// when *both* would admit. The lock-order is `(token, tenant)` then
+    /// `token`; since these live in two distinct [`DashMap`]s and every
+    /// caller takes them in the same order, no cycle is possible.
+    pub fn try_admit(&self, token: TokenId, tenant: TenantId) -> AdmitResult {
         if self.is_disabled() {
             return AdmitResult::Admit;
         }
         let now = self.clock.now();
-        // Per-bucket lookup. DashMap's entry API handles concurrent insert.
-        let entry = self.buckets.entry(token).or_insert_with(|| {
-            Mutex::new(BucketState {
-                // Fresh bucket starts full: a new caller gets to spend the
-                // whole burst before throttling kicks in.
-                tokens: self.cfg.burst as f64,
-                last_refill: now,
-            })
-        });
-        let mut state = entry
-            .value()
-            .lock()
-            .expect("RateLimiter bucket mutex poisoned");
-        // Refill.
-        let elapsed = now.saturating_duration_since(state.last_refill);
-        if elapsed > Duration::ZERO {
-            let refill = elapsed.as_secs_f64() * self.cfg.qps as f64;
-            state.tokens = (state.tokens + refill).min(self.cfg.burst as f64);
-            state.last_refill = now;
-        }
-        if state.tokens >= 1.0 {
-            state.tokens -= 1.0;
-            AdmitResult::Admit
+
+        // Acquire entries for whichever layers are active. We hold the
+        // DashMap entries (RefMut) for the full critical section so the
+        // inner Mutex guards stay valid; the underlying shards stay locked
+        // only for the brief Mutex lock/unlock, not the whole decision.
+        let per_tenant_burst = self.cfg.per_tenant_default.burst as f64;
+        let per_tenant_qps = self.cfg.per_tenant_default.qps;
+        let token_burst = self.cfg.burst as f64;
+        let token_qps = self.cfg.qps as f64;
+
+        let per_tenant_entry = if self.cfg.per_tenant_default.is_disabled() {
+            None
         } else {
-            // Compute how long until one full permit refills. Tokens deficit
-            // is `1.0 - state.tokens` (in (0, 1]); time = deficit / qps.
-            let deficit = 1.0 - state.tokens;
-            let secs = (deficit / self.cfg.qps as f64).ceil() as u64;
-            AdmitResult::Reject {
-                // Always suggest at least 1s so misbehaving clients back off
-                // a measurable amount even when qps is very high.
-                retry_after_secs: secs.max(1),
+            Some(
+                self.per_tenant_buckets
+                    .entry((token, tenant))
+                    .or_insert_with(|| {
+                        Mutex::new(BucketState {
+                            tokens: per_tenant_burst,
+                            last_refill: now,
+                        })
+                    }),
+            )
+        };
+        let token_entry = if self.cfg.is_token_layer_disabled() {
+            None
+        } else {
+            Some(self.buckets.entry(token).or_insert_with(|| {
+                Mutex::new(BucketState {
+                    tokens: token_burst,
+                    last_refill: now,
+                })
+            }))
+        };
+
+        // Lock both buckets, in a fixed order, for the whole decision.
+        let mut per_tenant_guard = per_tenant_entry.as_ref().map(|e| {
+            e.value()
+                .lock()
+                .expect("RateLimiter per-tenant bucket mutex poisoned")
+        });
+        let mut token_guard = token_entry.as_ref().map(|e| {
+            e.value()
+                .lock()
+                .expect("RateLimiter token bucket mutex poisoned")
+        });
+
+        let per_tenant_decision = per_tenant_guard
+            .as_deref_mut()
+            .map(|s| refill_and_decide(s, per_tenant_burst, per_tenant_qps, now));
+        let token_decision = token_guard
+            .as_deref_mut()
+            .map(|s| refill_and_decide(s, token_burst, token_qps, now));
+
+        let per_tenant_admit = per_tenant_decision.as_ref().map_or(true, |d| d.admittable);
+        let token_admit = token_decision.as_ref().map_or(true, |d| d.admittable);
+
+        if per_tenant_admit && token_admit {
+            if let Some(state) = per_tenant_guard.as_deref_mut() {
+                state.tokens -= 1.0;
             }
+            if let Some(state) = token_guard.as_deref_mut() {
+                state.tokens -= 1.0;
+            }
+            return AdmitResult::Admit;
+        }
+
+        // At least one layer rejected. Per spec: signal with the SMALLER of
+        // the two retry durations. (An admitting layer contributes nothing
+        // — its implied duration is zero; we only consider durations from
+        // layers that themselves rejected.)
+        let mut chosen: Option<Duration> = None;
+        for d in [per_tenant_decision.as_ref(), token_decision.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if !d.admittable {
+                chosen = Some(match chosen {
+                    None => d.retry_after,
+                    Some(prev) => prev.min(d.retry_after),
+                });
+            }
+        }
+        let retry = chosen.unwrap_or(Duration::from_secs(1));
+        let secs = retry.as_secs_f64().ceil() as u64;
+        AdmitResult::Reject {
+            // Always suggest at least 1s so misbehaving clients back off a
+            // measurable amount even when qps is very high.
+            retry_after_secs: secs.max(1),
+        }
+    }
+}
+
+/// Per-layer decision returned by `refill_and_decide`.
+struct BucketDecision {
+    /// `true` if this layer alone would admit the request.
+    admittable: bool,
+    /// Retry hint for this layer if `!admittable`. Zero when `admittable`.
+    retry_after: Duration,
+}
+
+/// Refill the bucket in place (updating `last_refill`) and report whether
+/// it currently has at least one full permit. Does *not* deduct — the
+/// caller subtracts one only after both layers agree to admit.
+fn refill_and_decide(
+    state: &mut BucketState,
+    burst: f64,
+    qps: f64,
+    now: Instant,
+) -> BucketDecision {
+    let elapsed = now.saturating_duration_since(state.last_refill);
+    if elapsed > Duration::ZERO && qps > 0.0 {
+        state.tokens = (state.tokens + elapsed.as_secs_f64() * qps).min(burst);
+    } else {
+        state.tokens = state.tokens.min(burst);
+    }
+    state.last_refill = now;
+    if state.tokens >= 1.0 {
+        BucketDecision {
+            admittable: true,
+            retry_after: Duration::ZERO,
+        }
+    } else {
+        let deficit = 1.0 - state.tokens;
+        let retry = if qps > 0.0 {
+            Duration::from_secs_f64((deficit / qps).max(0.0))
+        } else {
+            // No refill ever — surface a large but finite hint. We pick 1h
+            // so it is visibly "go away" without being u64::MAX. Tests for
+            // the no-refill case only assert reject, never the magnitude.
+            Duration::from_secs(3600)
+        };
+        BucketDecision {
+            admittable: false,
+            retry_after: retry,
         }
     }
 }
