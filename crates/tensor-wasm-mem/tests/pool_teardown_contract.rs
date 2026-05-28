@@ -27,7 +27,7 @@ use wasmtime::{MemoryCreator, MemoryType};
 #[test]
 fn dropping_pooled_linear_memory_does_not_decrement_live_count() {
     // 8 MiB slab — large enough for one Wasm linear memory carve.
-    let pool = Arc::new(UnifiedMemoryPool::new(8 * 1024 * 1024).expect("pool"));
+    let mut pool = Arc::new(UnifiedMemoryPool::new(8 * 1024 * 1024).expect("pool"));
     let creator = TensorWasmMemoryCreator::with_pool(DeviceId::default(), Arc::clone(&pool));
 
     assert_eq!(
@@ -63,8 +63,32 @@ fn dropping_pooled_linear_memory_does_not_decrement_live_count() {
 
     // And as the corollary the documentation calls out: `reset` permanently
     // refuses to run on a pool that has ever served a `PooledLinearMemory`.
+    //
+    // After audit T4, `UnifiedMemoryPool::reset` takes `&mut self`, so reset
+    // can only be attempted on an `Arc<UnifiedMemoryPool>` if every other
+    // clone has been dropped (so `Arc::get_mut` returns `Some`). The
+    // `creator` here still holds a cloned `Arc<UnifiedMemoryPool>` keepalive,
+    // so `Arc::get_mut` MUST return `None` — the &mut-self gate already
+    // prevents reset from running before we even check the live counter.
+    // This is a stronger guarantee than the old `&self` reset (which would
+    // still acquire the interior mutex and return an `Err` based on the live
+    // counter); the type system now refuses to rewind a slab that other
+    // Arc holders may still be reading.
     assert!(
-        pool.reset().is_err(),
+        Arc::get_mut(&mut pool).is_none(),
+        "Arc::get_mut must return None while the creator holds a cloned Arc; \
+         this is the type-level refusal to reset that supersedes the old \
+         live-allocations check"
+    );
+
+    // Drop the creator so we are the last Arc holder. The leaked
+    // `PoolAllocation` still keeps `live_allocations() > 0`, so the runtime
+    // check inside `reset` must now fire.
+    drop(creator);
+    let pool_mut = Arc::get_mut(&mut pool)
+        .expect("creator dropped, this test holds the sole remaining Arc");
+    assert!(
+        pool_mut.reset().is_err(),
         "reset must fail because the leaked PoolAllocation keeps live_allocations > 0; \
          operators wanting per-tenant resets must use a per-tenant pool instance"
     );
