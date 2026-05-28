@@ -529,6 +529,7 @@ impl TenantRegistry {
     /// (which returns the *prune count* and is admin-gated); the raw
     /// tombstone count is an internal implementation detail that should
     /// not bleed into stable API.
+    #[cfg(test)]
     pub(crate) fn tombstone_count(&self) -> usize {
         self.tombstones.len()
     }
@@ -982,9 +983,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                reg.register_with_capability(ctx(RACE_ID))
-                    .map(|_| ())
-                    .map_err(|e| e)
+                reg.register_with_capability(ctx(RACE_ID)).map(|_| ())
             }));
         }
         let mut ok_count = 0usize;
@@ -1049,6 +1048,7 @@ mod tests {
     ///     is recorded; OR
     ///   - unregister wins (slot was empty so it returns None), then
     ///     register succeeds.
+    ///
     /// The invariant we test: no observable state ever has the slot
     /// vacant AND a stale tombstone Weak whose target is the newly
     /// inserted Arc (i.e. a register that "succeeded" only to be

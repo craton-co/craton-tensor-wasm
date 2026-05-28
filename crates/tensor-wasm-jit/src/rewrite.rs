@@ -309,10 +309,8 @@ fn analyse(
                     }
                 }
             }
-            Payload::MemorySection(reader) => {
-                if reader.count() > 0 {
-                    has_memory = true;
-                }
+            Payload::MemorySection(reader) if reader.count() > 0 => {
+                has_memory = true;
             }
             Payload::FunctionSection(reader) => {
                 for ty_idx in reader {

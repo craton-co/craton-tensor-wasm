@@ -884,16 +884,15 @@ impl Drop for DiskCacheConfig {
 ///    (`*.<key-fp>.bin`) holding the streaming-encoded HMAC-SHA256 +
 ///    zstd envelope around the V2 kernel-manifest framing.
 ///
-/// The V2 kernel-manifest framing (16-byte `TWJIT-KRNL-v2\0\0\0` magic
-/// + length-prefixed body: blueprint, sm_version, grid_x, block_x,
+/// The V2 kernel-manifest framing (16-byte `TWJIT-KRNL-v2\0\0\0` magic +
+/// length-prefixed body: blueprint, sm_version, grid_x, block_x,
 /// ptx_len, ptx bytes) is built ABOVE the artifact store: a `put` first
 /// serialises the kernel into a V2 envelope `Vec<u8>`, then hands that
-/// to [`DiskArtifactStore::put`] which streams it through an
-/// HMAC-tee + zstd encoder onto disk. A `get` reverses the layering:
-/// look up the sidecar to get the [`ContentHash`], call
-/// [`DiskArtifactStore::get`] which streaming-verifies the outer HMAC
-/// + decompresses, then parse the inner V2 envelope to recover the
-/// kernel.
+/// to [`DiskArtifactStore::put`] which streams it through an HMAC-tee +
+/// zstd encoder onto disk. A `get` reverses the layering: look up the
+/// sidecar to get the [`ContentHash`], call [`DiskArtifactStore::get`]
+/// which streaming-verifies the outer HMAC + decompresses, then parse
+/// the inner V2 envelope to recover the kernel.
 ///
 /// ## Why two files
 ///
@@ -1121,7 +1120,7 @@ impl DiskCache {
             // Wrap as `io::Error` so the existing `Result<(), io::Error>`
             // signature of `DiskCache::put` (and the warn-level log path
             // in `KernelCache::put`) stays unchanged.
-            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+            std::io::Error::other(e.to_string())
         })?;
         // Step 3: stamp the sidecar atomically. The sidecar is small
         // (48 bytes) and lives at a path derived from the cache key, so
@@ -1136,7 +1135,7 @@ impl DiskCache {
         let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
         tmp.as_file_mut().write_all(&sidecar)?;
         tmp.persist(&sidecar_path)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         Ok(())
     }
 
