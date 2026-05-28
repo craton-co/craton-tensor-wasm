@@ -291,12 +291,24 @@ pub fn build_router_with_trusted_proxies(
 
     // OpenAI-compat shim stack (B4.9). The two `/v1/...` routes accept
     // off-the-shelf OpenAI SDK requests; those clients send
-    // `Authorization: Bearer <api_key>` but NEVER an `X-TensorWasm-Tenant`
-    // header, so the routes must be mounted OUTSIDE the `tenant_scope`
-    // middleware — the layer would otherwise reject every OpenAI request
-    // with `missing_tenant` 400. Tenant resolution comes from the bearer
-    // token's `TokenScope` instead (wired in v0.4); see
+    // `Authorization: Bearer <api_key>` and typically NO
+    // `X-TensorWasm-Tenant` header. The `tenant_scope` middleware tolerates
+    // the absent-header case under the default policy
+    // (`TENSOR_WASM_API_REQUIRE_TENANT` unset) by inserting
+    // `TenantId(0)` into the request extensions, which is exactly the
+    // resolution the v0.4 wiring step will want as a fallback — the
+    // handler then runs the `authorize_tenant` gate against the bearer
+    // token's `TokenScope` so a scoped token that does not cover tenant 0
+    // still receives `403 tenant_scope_denied` (not `501`). T2 security
+    // fix: the gate must exist on these routes *before* v0.4 wires real
+    // execution; otherwise the locked URL surface inherits a hole. See
     // `crates/tensor-wasm-api/src/openai.rs` and `docs/OPENAI-COMPAT.md`.
+    //
+    // Operators that set `TENSOR_WASM_API_REQUIRE_TENANT=1` deliberately
+    // opt into the stricter posture: the OpenAI routes then require the
+    // header too, and clients must use the gateway's native shim that
+    // injects `X-TensorWasm-Tenant` (or migrate to scoped tokens once v0.4
+    // surfaces tenant resolution from the bearer scope itself).
     //
     // Bearer auth, rate-limit, and audit still apply so an unauthenticated
     // OpenAI client receives `401` (not `501`), and the v0.4 wiring step
@@ -325,6 +337,7 @@ pub fn build_router_with_trusted_proxies(
         )
         .layer(concurrency_limit_layer(INVOKE_CONCURRENCY_LIMIT))
         .layer(axum::middleware::from_fn(bearer_auth))
+        .layer(axum::middleware::from_fn(tenant_scope))
         .layer(axum::middleware::from_fn(rate_limit))
         .layer(axum::middleware::from_fn(audit_log_middleware));
 
