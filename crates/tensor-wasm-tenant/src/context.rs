@@ -41,6 +41,8 @@
 use loom::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(feature = "loom"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "gpu-mem-pool")]
+use std::sync::Arc;
 
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::metrics::{TenantLabels, TensorWasmMetrics};
@@ -242,6 +244,22 @@ pub struct TenantContext {
     /// the honest naming and the upgrade path.
     #[allow(dead_code)]
     cuda_mem_pool_quota_bytes: Option<u64>,
+
+    /// v0.4 driver-level GPU memory pool, when the `gpu-mem-pool`
+    /// feature is enabled AND
+    /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`] was
+    /// called. The pool's release-threshold caps every allocation that
+    /// routes through `cuMemAllocFromPoolAsync` at the driver level —
+    /// belt-and-braces complement to the in-process `bytes_in_use`
+    /// counter, so a tenant that somehow obtained a raw CUDA driver
+    /// handle still cannot exceed the cap. The `Arc` lets the same
+    /// pool be shared between this context and any future per-stream
+    /// allocator that wires through `tensor-wasm-mem`. v0.3.8 status:
+    /// pool creation + drop are wired; the allocator side is the v0.4
+    /// follow-up tracked in `tensor-wasm-mem::cuda_mem_pool`.
+    #[cfg(feature = "gpu-mem-pool")]
+    #[allow(dead_code)]
+    mem_pool: Option<Arc<tensor_wasm_mem::cuda_mem_pool::TenantMemPool>>,
 
     // Real `cust::context::Context` under the `cuda` feature; otherwise a
     // unit stub so the rest of the crate compiles on CUDA-less hosts.
@@ -611,6 +629,26 @@ impl TenantContext {
         self.cuda_mem_pool_quota_bytes
     }
 
+    /// Driver-level GPU memory pool wrapper, when configured via
+    /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`].
+    ///
+    /// Returns `Some(&Arc<TenantMemPool>)` only when:
+    ///
+    /// 1. The crate was compiled with `--features gpu-mem-pool`, AND
+    /// 2. The builder successfully created a `cuMemPool` via the
+    ///    cudarc FFI (i.e. `cuMemPoolCreate` returned `CUDA_SUCCESS`).
+    ///
+    /// Otherwise returns `None`. The v0.4 allocator path in
+    /// `tensor-wasm-mem::cuda_mem_pool` consults this getter to decide
+    /// between `cuMemAllocManaged` (unified-memory path) and
+    /// `cuMemAllocFromPoolAsync` (driver-enforced cap path).
+    #[cfg(feature = "gpu-mem-pool")]
+    pub fn mem_pool(
+        &self,
+    ) -> Option<&Arc<tensor_wasm_mem::cuda_mem_pool::TenantMemPool>> {
+        self.mem_pool.as_ref()
+    }
+
     /// Push this tenant's CUDA context onto the calling thread's context
     /// stack, returning a RAII guard that pops it on drop. Returns `None`
     /// if the tenant has no `cust::context::Context` (i.e. either the
@@ -832,6 +870,13 @@ pub struct TenantContextBuilder {
     #[cfg(feature = "cuda")]
     cuda_device_index: Option<u32>,
     metrics: Option<TensorWasmMetrics>,
+    /// v0.4 driver-enforced GPU cap; populated by
+    /// [`Self::with_driver_enforced_gpu_cap`] when the `gpu-mem-pool`
+    /// feature is on. Held as the constructed `TenantMemPool` so the
+    /// builder hands the same `Arc` to both this context and any
+    /// future co-located allocator that the v0.4 follow-up wires up.
+    #[cfg(feature = "gpu-mem-pool")]
+    mem_pool: Option<Arc<tensor_wasm_mem::cuda_mem_pool::TenantMemPool>>,
 }
 
 impl TenantContextBuilder {
@@ -850,6 +895,8 @@ impl TenantContextBuilder {
             #[cfg(feature = "cuda")]
             cuda_device_index: None,
             metrics: None,
+            #[cfg(feature = "gpu-mem-pool")]
+            mem_pool: None,
         }
     }
 
@@ -931,6 +978,40 @@ impl TenantContextBuilder {
         self
     }
 
+    /// Create a real CUDA `cuMemPool` for this tenant, configured with
+    /// `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = cap`, so allocations
+    /// past the cap fail at the driver level (`CUDA_ERROR_OUT_OF_MEMORY`).
+    ///
+    /// This is the v0.4 driver-level complement to the in-process
+    /// quota counter enforced by [`TenantContext::consume_bytes`]: a
+    /// tenant that somehow obtained a raw CUDA driver handle and
+    /// bypassed [`TenantContext::consume_bytes`] still cannot exceed
+    /// the cap because the driver itself refuses oversized
+    /// `cuMemAllocFromPoolAsync` calls.
+    ///
+    /// Mirrors the cust/cudarc precedence rule used elsewhere in the
+    /// crate: the in-process counter is the primary enforcement; the
+    /// `cuMemPool` is the belt-and-suspenders layer. v0.3.8 status:
+    /// pool creation + drop are wired; the allocator side is the v0.4
+    /// follow-up tracked in
+    /// [`tensor_wasm_mem::cuda_mem_pool::TenantMemPool`].
+    ///
+    /// Returns the wrapped error from
+    /// [`tensor_wasm_mem::cuda_mem_pool::MemPoolError`] if the cudarc
+    /// FFI rejects the pool creation or attribute-set. On success the
+    /// builder retains the `Arc<TenantMemPool>` so the eventual
+    /// `TenantContext` and any co-located v0.4 allocator share the
+    /// exact same pool handle.
+    #[cfg(feature = "gpu-mem-pool")]
+    pub fn with_driver_enforced_gpu_cap(
+        mut self,
+        cap: u64,
+    ) -> Result<Self, tensor_wasm_mem::cuda_mem_pool::MemPoolError> {
+        let pool = tensor_wasm_mem::cuda_mem_pool::TenantMemPool::new(cap)?;
+        self.mem_pool = Some(Arc::new(pool));
+        Ok(self)
+    }
+
     /// Set the CUDA device index this tenant's context should be built
     /// against. Only meaningful when the `cuda` feature is enabled and
     /// the isolation is `ContextIsolated`. Defaults to device 0.
@@ -994,6 +1075,8 @@ impl TenantContextBuilder {
             gpu_memory_bytes_cap: self.gpu_memory_bytes_cap,
             gpu_bytes_in_use: AtomicU64::new(0),
             cuda_mem_pool_quota_bytes: self.cuda_mem_pool_quota_bytes,
+            #[cfg(feature = "gpu-mem-pool")]
+            mem_pool: self.mem_pool,
             cu_context,
             metrics: self.metrics,
             metrics_labels,
