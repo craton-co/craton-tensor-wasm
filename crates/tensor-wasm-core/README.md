@@ -16,7 +16,7 @@ Enable from a workspace member with:
 tensor-wasm-core = { workspace = true, features = ["otlp"] }
 ```
 
-See [docs/BUILD.md](../../docs/BUILD.md) for the project-wide flag taxonomy and how the workspace composes feature unification across crates.
+See [docs/BUILD.md](https://github.com/craton-co/craton-tensor-wasm/blob/main/docs/BUILD.md) for the project-wide flag taxonomy and how the workspace composes feature unification across crates.
 
 ## Dependencies
 

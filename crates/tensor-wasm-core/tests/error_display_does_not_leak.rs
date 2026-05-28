@@ -18,6 +18,8 @@
 //! derived `Debug` impl, which is what `tracing::error!(?err, ...)` uses for
 //! server-side operator logs.
 
+use std::io;
+
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::types::TenantId;
 
@@ -48,6 +50,45 @@ fn display_does_not_leak_tenant_or_resource() {
         rendered.contains(STABLE_GREP_TOKEN) || rendered.contains("violation"),
         "Display must contain a stable identifier (\"isolation\" or \
          \"violation\") so callers can pivot to server-side logs: {rendered:?}",
+    );
+}
+
+#[test]
+fn display_io_does_not_leak_path_or_os_string() {
+    // `TensorWasmError::Io` wraps `std::io::Error`, whose `Display` impl
+    // echoes the underlying OS error string verbatim. When the error came
+    // from a filesystem operation that string very often includes the
+    // offending path (e.g. `/secret/path` for a `NotFound` on an
+    // unauthorised lookup). Surfacing that into a tenant-facing 4xx body
+    // would leak host layout. The sanitised `Display` must keep the
+    // `ErrorKind` (a closed, non-sensitive enum) and drop the inner
+    // string.
+    let err: TensorWasmError = io::Error::new(io::ErrorKind::NotFound, "/secret/path").into();
+    let rendered = format!("{}", err);
+
+    assert!(
+        !rendered.contains("/secret/path"),
+        "Display leaked filesystem path to tenant-facing output: {rendered:?}",
+    );
+
+    // Positive contract: the ErrorKind variant name MUST appear so
+    // operator dashboards can pivot on it.
+    assert!(
+        rendered.contains("NotFound"),
+        "Display must surface the ErrorKind variant name: {rendered:?}",
+    );
+}
+
+#[test]
+fn debug_io_still_carries_inner_string_for_operators() {
+    // `Debug` is what `tracing::error!(?err)` records on the server side;
+    // the inner OS string MUST still be reachable there so operators can
+    // diagnose I/O failures. Only `Display` is sanitised.
+    let err: TensorWasmError = io::Error::new(io::ErrorKind::NotFound, "/secret/path").into();
+    let rendered = format!("{:?}", err);
+    assert!(
+        rendered.contains("/secret/path"),
+        "Debug must still expose the inner OS string for server-side triage: {rendered:?}",
     );
 }
 

@@ -204,10 +204,7 @@ pub async fn http_metrics_middleware(req: Request, next: Next) -> Response {
 
     let route = route_label(&req, &cfg.routes);
     let method = req.method().as_str().to_string();
-    let in_flight_labels = HttpInFlightLabels {
-        route: route.clone().into(),
-        method: method.clone().into(),
-    };
+    let in_flight_labels = HttpInFlightLabels::new(route.clone(), method.clone());
 
     // `get_or_create_owned` returns an owned `Gauge` (cheap: `Gauge` wraps
     // `Arc<AtomicI64>`) so we can release the family's internal RwLock
@@ -239,11 +236,7 @@ pub async fn http_metrics_middleware(req: Request, next: Next) -> Response {
     let elapsed_secs = elapsed.as_secs_f64().max(0.0);
 
     let status = response.status().as_u16().to_string();
-    let labels = HttpRequestLabels {
-        route: route.into(),
-        method: method.into(),
-        status: status.into(),
-    };
+    let labels = HttpRequestLabels::new(route, method, status);
     cfg.metrics
         .http_requests_total()
         .get_or_create(&labels)
