@@ -205,6 +205,15 @@ multi-tenant deployments and an outside security review.
       clap definitions, committed under `crates/tensor-wasm-cli/man/`.
 - [ ] **OpenAPI spec validated** against the live router in CI (a
       generated client compiles + round-trips a synthetic request).
+- [ ] **Per-tenant GPU memory quota enforced at the driver level.**
+      v0.3.7 scaffolds the config (`TenantContextBuilder::with_gpu_memory_bytes_cap`)
+      and the in-process counter; v0.4 pins it via CUDA 11.2+
+      `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`
+      so a tenant cannot bypass the cap by calling the driver
+      directly. Gated on the cust → cudarc / cuda-oxide migration
+      (Open decision #1) — `cust 0.3.x` does not surface the
+      `cuMemPool*` API. Full design in
+      [`docs/GPU-QUOTAS.md`](GPU-QUOTAS.md).
 
 ### v0.5.0-beta — "External validation"
 

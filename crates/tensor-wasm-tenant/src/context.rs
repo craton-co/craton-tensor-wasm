@@ -147,6 +147,31 @@ pub struct TenantContext {
     memory_quota_bytes: u64,
     bytes_in_use: AtomicU64,
 
+    /// Maximum GPU memory in bytes this tenant may allocate concurrently.
+    /// `None` = no GPU memory cap (operator trust). v0.3.7 records and
+    /// reports usage; v0.4 enforces via cuMemPool's
+    /// `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`.
+    ///
+    /// Distinct from [`Self::memory_quota_bytes`]: that one is the
+    /// host-side / CPU quota the executor enforces against
+    /// `consume_bytes`. This field is consulted by the GPU allocator
+    /// path (`tensor-wasm-mem::TensorWasmMemoryCreator::with_tenant_context`)
+    /// against `gpu_bytes_in_use` on every `UnifiedBuffer::new_on`.
+    gpu_memory_bytes_cap: Option<u64>,
+    /// Bytes currently accounted as in-use against the GPU cap. Mirrors
+    /// the CPU [`Self::bytes_in_use`] counter; updated by
+    /// [`Self::consume_gpu_bytes`] / [`Self::release_gpu_bytes`] via the
+    /// same CAS-loop pattern, and (when a metrics handle is wired in
+    /// via [`TenantContextBuilder::with_metrics`]) republished as the
+    /// per-tenant series of
+    /// [`tensor_wasm_core::metrics::TensorWasmMetrics::gpu_memory_bytes_per_tenant`]
+    /// on every transition. v0.3.7 record-only: the value is the source
+    /// of truth for the in-process refusal of over-cap allocations, but
+    /// the CUDA driver itself sees no cap until v0.4 wires the
+    /// `cuMemPoolSetAttribute` path described on
+    /// [`Self::gpu_memory_bytes_cap`].
+    gpu_bytes_in_use: AtomicU64,
+
     /// Recorded-only CUDA memory-pool release-threshold value. `None`
     /// means "use the driver default" (typically unbounded retention).
     /// The cust 0.3.x crate does not expose the `cuMemPool*` API, so
@@ -212,6 +237,131 @@ impl TenantContext {
     /// Bytes currently accounted as in-use against the quota.
     pub fn bytes_in_use(&self) -> u64 {
         self.bytes_in_use.load(Ordering::Acquire)
+    }
+
+    /// Per-tenant GPU memory cap in bytes, or `None` for "no cap"
+    /// (operator-trust deployment).
+    ///
+    /// Set via [`TenantContextBuilder::with_gpu_memory_bytes_cap`]. The
+    /// in-process allocator path
+    /// (`tensor-wasm-mem::TensorWasmMemoryCreator::with_tenant_context`)
+    /// reads this on every allocation and refuses to allocate when the
+    /// would-be new total of [`Self::gpu_bytes_in_use`] would exceed it.
+    /// The CUDA driver itself does NOT see this cap until v0.4 wires
+    /// `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`
+    /// (CUDA 11.2+). See `docs/GPU-QUOTAS.md` for the v0.4 plan.
+    pub fn gpu_memory_bytes_cap(&self) -> Option<u64> {
+        self.gpu_memory_bytes_cap
+    }
+
+    /// Bytes currently accounted as in-use against the GPU cap.
+    ///
+    /// Mirrors [`Self::bytes_in_use`] for the GPU side of the quota.
+    /// Updated by [`Self::consume_gpu_bytes`] /
+    /// [`Self::release_gpu_bytes`].
+    pub fn gpu_bytes_in_use(&self) -> u64 {
+        self.gpu_bytes_in_use.load(Ordering::Acquire)
+    }
+
+    /// Atomically reserve `n` GPU bytes against the per-tenant cap.
+    ///
+    /// Returns `Err(TensorWasmError::GpuMemoryExhausted)` if
+    /// [`Self::gpu_memory_bytes_cap`] is set and the allocation would
+    /// push usage above it. When the cap is `None` ("no cap"), the
+    /// counter is still bumped (so dashboards and the per-tenant gauge
+    /// surface real utilisation) but the request is never refused. The
+    /// add is performed with `checked_add` so a malicious or buggy
+    /// caller cannot wrap the counter by repeatedly requesting close
+    /// to `u64::MAX` — the second such call observes the overflow and
+    /// returns `GpuMemoryExhausted` while leaving the counter unchanged.
+    ///
+    /// Mirrors [`Self::consume_bytes_inner`] for the GPU side; the
+    /// atomic discipline is intentionally identical so a single mental
+    /// model covers both counters.
+    ///
+    /// # v0.3.7 vs v0.4 contract
+    ///
+    /// In v0.3.7 this is the *only* enforcement: the allocator path
+    /// must call `consume_gpu_bytes` before handing back the buffer,
+    /// and a tenant who bypasses the allocator (e.g. by calling the
+    /// CUDA driver directly) is not capped. v0.4 will additionally
+    /// pin a driver-level cap via
+    /// `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`
+    /// at build time, closing the bypass. See `docs/GPU-QUOTAS.md`.
+    pub fn consume_gpu_bytes(&self, n: u64) -> Result<(), TensorWasmError> {
+        let limit = self.gpu_memory_bytes_cap;
+        let mut current = self.gpu_bytes_in_use.load(Ordering::Acquire);
+        loop {
+            let next = match current.checked_add(n) {
+                Some(v) => v,
+                None => {
+                    return Err(TensorWasmError::GpuMemoryExhausted {
+                        requested: n,
+                        limit: limit.unwrap_or(u64::MAX),
+                        current,
+                    });
+                }
+            };
+            if let Some(cap) = limit {
+                if next > cap {
+                    return Err(TensorWasmError::GpuMemoryExhausted {
+                        requested: n,
+                        limit: cap,
+                        current,
+                    });
+                }
+            }
+            match self.gpu_bytes_in_use.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.publish_gpu_memory_gauge(next);
+                    return Ok(());
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Atomically release `n` GPU bytes back to the cap.
+    ///
+    /// Saturating on underflow — callers must not release more than
+    /// they consumed, but a bookkeeping mismatch is not fatal. Mirrors
+    /// [`Self::release_bytes_inner`] for the GPU side: CAS loop on
+    /// `gpu_bytes_in_use`, computing `saturating_sub` on each iteration.
+    /// The earlier `fetch_sub` + post-hoc clamp shape is intentionally
+    /// avoided here for the same reason described on the CPU sibling
+    /// method — a concurrent `consume_gpu_bytes` race must not be
+    /// silently erased by a clamping `store`.
+    pub fn release_gpu_bytes(&self, bytes: u64) {
+        let mut current = self.gpu_bytes_in_use.load(Ordering::Acquire);
+        let after = loop {
+            let next = current.saturating_sub(bytes);
+            match self.gpu_bytes_in_use.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if current < bytes {
+                        tracing::warn!(
+                            target: "tensor_wasm_tenant::context",
+                            tenant = %self.tenant_id,
+                            before = current,
+                            bytes,
+                            "release_gpu_bytes underflow clamped",
+                        );
+                    }
+                    break next;
+                }
+                Err(observed) => current = observed,
+            }
+        };
+        self.publish_gpu_memory_gauge(after);
     }
 
     /// Atomically reserve `n` bytes against the quota.
@@ -318,6 +468,31 @@ impl TenantContext {
     /// call is a single relaxed atomic store — cheap enough to live on
     /// the allocation hot path.
     fn publish_memory_gauge(&self, new_total: u64) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .gpu_memory_bytes_per_tenant()
+                .get_or_create(&self.metrics_labels)
+                .set(new_total);
+        }
+    }
+
+    /// Push the current `gpu_bytes_in_use` total into the per-tenant
+    /// gauge series.
+    ///
+    /// Centralised so [`Self::consume_gpu_bytes`] and
+    /// [`Self::release_gpu_bytes`] share one update path; mirrors
+    /// [`Self::publish_memory_gauge`] for the GPU side.
+    ///
+    /// NOTE: today both the CPU and GPU counters write to the same
+    /// `gpu_memory_bytes_per_tenant` series — last-write-wins. The
+    /// historical CPU path was named that way before this crate grew a
+    /// dedicated GPU counter; splitting into two series
+    /// (`gpu_memory_bytes_per_tenant` for this counter,
+    /// `cpu_memory_bytes_per_tenant` for the existing CPU one) is a
+    /// v0.4 follow-up tracked in `docs/GPU-QUOTAS.md` — it requires a
+    /// dashboard / alert-rule churn that is out of scope for this
+    /// quota-scaffold patch.
+    fn publish_gpu_memory_gauge(&self, new_total: u64) {
         if let Some(metrics) = &self.metrics {
             metrics
                 .gpu_memory_bytes_per_tenant()
@@ -554,6 +729,10 @@ pub struct TenantContextBuilder {
     stream_id: u64,
     memory_quota_bytes: u64,
     cuda_mem_pool_quota_bytes: Option<u64>,
+    /// See [`TenantContext::gpu_memory_bytes_cap`]. `None` (the default)
+    /// keeps the historical "no cap" behaviour; set via
+    /// [`TenantContextBuilder::with_gpu_memory_bytes_cap`].
+    gpu_memory_bytes_cap: Option<u64>,
     #[cfg(feature = "cuda")]
     cuda_device_index: Option<u32>,
     metrics: Option<TensorWasmMetrics>,
@@ -571,10 +750,29 @@ impl TenantContextBuilder {
             stream_id: 0,
             memory_quota_bytes: Self::DEFAULT_QUOTA_BYTES,
             cuda_mem_pool_quota_bytes: None,
+            gpu_memory_bytes_cap: None,
             #[cfg(feature = "cuda")]
             cuda_device_index: None,
             metrics: None,
         }
+    }
+
+    /// Set the per-tenant GPU memory cap in bytes.
+    ///
+    /// `None` (the default) means no cap — the tenant's GPU memory
+    /// usage is recorded on [`TenantContext::gpu_bytes_in_use`] but the
+    /// allocator never refuses an over-cap request. Setting `Some(bytes)`
+    /// makes the allocator path
+    /// (`tensor-wasm-mem::TensorWasmMemoryCreator::with_tenant_context`)
+    /// return [`tensor_wasm_core::error::TensorWasmError::GpuMemoryExhausted`]
+    /// for any [`TenantContext::consume_gpu_bytes`] that would push the
+    /// total above `bytes`.
+    ///
+    /// See `docs/GPU-QUOTAS.md` for the v0.3.7 record-only semantics and
+    /// the v0.4 `cuMemPool` enforcement plan.
+    pub fn with_gpu_memory_bytes_cap(mut self, bytes: u64) -> Self {
+        self.gpu_memory_bytes_cap = Some(bytes);
+        self
     }
 
     /// Wire a shared [`TensorWasmMetrics`] registry into the context so
@@ -699,6 +897,8 @@ impl TenantContextBuilder {
             stream_id: self.stream_id,
             memory_quota_bytes: self.memory_quota_bytes,
             bytes_in_use: AtomicU64::new(0),
+            gpu_memory_bytes_cap: self.gpu_memory_bytes_cap,
+            gpu_bytes_in_use: AtomicU64::new(0),
             cuda_mem_pool_quota_bytes: self.cuda_mem_pool_quota_bytes,
             cu_context,
             metrics: self.metrics,

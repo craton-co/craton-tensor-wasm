@@ -42,6 +42,9 @@
 
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::Arc;
+
+use tensor_wasm_tenant::TenantContext;
 
 /// Errors raised by `UnifiedBuffer` operations.
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +99,19 @@ pub struct UnifiedBuffer {
     // See the module-level precedence table for the full matrix.
     #[allow(dead_code)]
     backing: Backing,
+    /// Tenant context for GPU memory accounting. When `Some`, the
+    /// buffer's `Drop` impl calls
+    /// [`TenantContext::release_gpu_bytes`] for `size` bytes. Set only
+    /// by [`UnifiedBuffer::new_on_with_tenant_context`] — the legacy
+    /// [`UnifiedBuffer::new`] / [`UnifiedBuffer::new_on`] constructors
+    /// leave this `None` so existing call sites (tests, benches,
+    /// untenanted use of the pool) are unaffected.
+    ///
+    /// Held in an `Arc` so the buffer can outlive whichever
+    /// `TensorWasmMemoryCreator` constructed it — the creator's clone
+    /// chain ends when the last `UnifiedBuffer` (or Wasm linear
+    /// memory) finishes its `release_gpu_bytes` decrement.
+    tenant_ctx: Option<Arc<TenantContext>>,
 }
 
 // SAFETY: the inner pointer is owned by this struct and not shared without
@@ -340,7 +356,89 @@ impl UnifiedBuffer {
             size,
             device_id,
             backing,
+            tenant_ctx: None,
         })
+    }
+
+    /// Allocate `size` bytes on the named device, consulting the
+    /// tenant's GPU memory cap before touching the underlying CUDA
+    /// driver.
+    ///
+    /// Roadmap feature #8 path: this is the tenant-aware analogue of
+    /// [`Self::new_on`]. The lifecycle is:
+    ///
+    /// 1. Call [`TenantContext::consume_gpu_bytes`] for `size` bytes.
+    ///    On `Err(GpuMemoryExhausted)` return the structured error
+    ///    untouched so the caller can convert it into a `4xx` response
+    ///    body without scraping a message string. No CUDA driver call
+    ///    happens on the rejection path — important because the only
+    ///    realistic in-process recovery is to fail fast.
+    /// 2. Allocate the underlying [`Backing`]. If the driver itself
+    ///    fails (OOM at the cuMemAllocManaged level, ZeroSize, etc.),
+    ///    we **must** undo the `consume_gpu_bytes` so the counter does
+    ///    not drift above true utilisation. Failure to release here
+    ///    would let a tenant's `gpu_bytes_in_use` ratchet up past the
+    ///    cap on repeated driver-OOM and the cap would deny later
+    ///    legitimate allocations.
+    /// 3. Stash the `Arc<TenantContext>` on the buffer so `Drop` can
+    ///    call [`TenantContext::release_gpu_bytes`]. This is the
+    ///    release half of the accounting; the CAS-loop in
+    ///    `release_gpu_bytes` saturates on underflow, so a Drop after
+    ///    an extraordinary release path (e.g. process shutdown) is
+    ///    bookkeeping-safe.
+    ///
+    /// v0.3.7 record-only contract: the CUDA driver itself never sees
+    /// the cap until v0.4 wires `cuMemPoolSetAttribute`. See
+    /// `docs/GPU-QUOTAS.md`.
+    pub fn new_on_with_tenant_context(
+        size: usize,
+        device_id: DeviceId,
+        tenant_ctx: Arc<TenantContext>,
+    ) -> Result<Self, tensor_wasm_core::error::TensorWasmError> {
+        Self::new_with_visible_window_on_with_tenant_context(size, size, device_id, tenant_ctx)
+    }
+
+    /// Tenant-aware variant of [`Self::new_with_visible_window_on`].
+    ///
+    /// Consults the tenant's GPU memory cap before allocating; on a cap
+    /// violation returns
+    /// [`tensor_wasm_core::error::TensorWasmError::GpuMemoryExhausted`]
+    /// with the requested-vs-limit-vs-current triple, with no driver
+    /// call performed. On a successful allocation the resulting
+    /// [`UnifiedBuffer`]'s `Drop` returns `size` bytes to the tenant
+    /// via [`TenantContext::release_gpu_bytes`].
+    pub fn new_with_visible_window_on_with_tenant_context(
+        size: usize,
+        visible_bytes: usize,
+        device_id: DeviceId,
+        tenant_ctx: Arc<TenantContext>,
+    ) -> Result<Self, tensor_wasm_core::error::TensorWasmError> {
+        // Caller-bug guard: zero-byte allocations are rejected upstream
+        // by `Backing::allocate`, but we also do not want to bump the
+        // tenant counter for a request we are about to refuse.
+        if size == 0 {
+            return Err(UnifiedError::ZeroSize.into());
+        }
+        // Step 1: reserve against the cap (or counter-only when no cap).
+        tenant_ctx.consume_gpu_bytes(size as u64)?;
+        // Step 2: hand off to the legacy constructor. On driver failure
+        // we must roll back the `consume_gpu_bytes` step, otherwise the
+        // counter drifts above the real utilisation. Mapping
+        // `UnifiedError` → `TensorWasmError` is the existing
+        // `impl From<UnifiedError>` at the bottom of this module.
+        match Backing::allocate(size, visible_bytes) {
+            Ok((ptr, backing)) => Ok(Self {
+                ptr,
+                size,
+                device_id,
+                backing,
+                tenant_ctx: Some(tenant_ctx),
+            }),
+            Err(e) => {
+                tenant_ctx.release_gpu_bytes(size as u64);
+                Err(e.into())
+            }
+        }
     }
 
     /// Length in bytes.
@@ -510,6 +608,21 @@ impl fmt::Debug for UnifiedBuffer {
             .field("size", &self.size)
             .field("device_id", &self.device_id)
             .finish()
+    }
+}
+
+impl Drop for UnifiedBuffer {
+    fn drop(&mut self) {
+        // Tenant-accounting release. Only runs for buffers constructed
+        // through [`Self::new_on_with_tenant_context`] (or the
+        // visible-window variant); the legacy `new` / `new_on` paths
+        // leave `tenant_ctx == None` so this is a single `Option` check
+        // on the drop hot path — no atomic, no allocation. The
+        // underlying CUDA / heap free runs unconditionally via the
+        // `backing` field's own drop.
+        if let Some(ctx) = self.tenant_ctx.as_ref() {
+            ctx.release_gpu_bytes(self.size as u64);
+        }
     }
 }
 
