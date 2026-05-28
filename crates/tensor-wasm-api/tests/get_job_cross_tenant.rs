@@ -115,7 +115,7 @@ async fn dispatch_async(
 }
 
 fn poll_job(
-    router: &axum::Router,
+    _router: &axum::Router,
     job_id: &str,
     bearer: &str,
     tenant: u64,

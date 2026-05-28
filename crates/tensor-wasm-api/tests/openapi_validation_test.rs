@@ -87,6 +87,10 @@ fn read_spec() -> String {
 /// asserts still require the spec to mention them — so a stale spec
 /// after a feature removal would still be caught.
 fn expected_routes() -> Vec<(&'static str, &'static str)> {
+    // `mut` is only needed when the `kernel-registry-api` feature is on
+    // (the cfg-gated block below pushes additional rows). Allow the
+    // unused-mut lint so the feature-off build stays clean.
+    #[allow(unused_mut)]
     let mut routes: Vec<(&'static str, &'static str)> = vec![
         ("GET", "/healthz"),
         ("GET", "/metrics"),
