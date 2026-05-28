@@ -27,12 +27,19 @@
 //! on-disk namespace cleanly.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
 use thiserror::Error;
 use tracing::warn;
 use zeroize::Zeroizing;
+
+/// I/O buffer size used by both the streaming `put` writer and the
+/// streaming `get` reader. 64 KiB matches the slab the zstd CLI prefers
+/// and is large enough to keep syscall overhead negligible on big blobs
+/// without wasting RAM on tiny ones.
+const STREAM_BUF_LEN: usize = 64 * 1024;
 
 /// Magic bytes identifying a TensorWasm unified-artifact blob.
 ///
@@ -167,20 +174,30 @@ pub trait ArtifactStore: Send + Sync {
 }
 
 // =====================================================================
-// HMAC helper — shared by `DiskArtifactStore` put and get paths.
+// HMAC helpers and tee adapters — shared by `DiskArtifactStore` put and
+// get paths so the streaming sides cannot drift on hash/key choice.
 // =====================================================================
 
-/// Compute the HMAC-SHA256 tag over `bytes` with `key`. Centralised so
-/// the put and get paths cannot drift apart; both call this helper.
-fn hmac_tag(key: &[u8; 32], bytes: &[u8]) -> [u8; ARTIFACT_HMAC_LEN] {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
+/// HMAC-SHA256 instance type used by both the streaming `put` and `get`
+/// paths. Centralising the type alias keeps the two sides from drifting
+/// on hash/key choice.
+type ArtifactMac = hmac::Hmac<sha2::Sha256>;
+
+/// Construct a fresh incremental HMAC instance over `key`. Both the
+/// streaming put and streaming get build one of these and feed bytes in
+/// chunk-by-chunk via `Mac::update`, then `finalize_into_tag`.
+fn new_mac(key: &[u8; 32]) -> ArtifactMac {
+    use hmac::Mac;
     // `new_from_slice` only errors on invalid key length; ours is a
     // fixed 32 bytes so the unwrap is sound (mirrors the same pattern
     // in `tensor-wasm-snapshot::SnapshotWriter::capture`).
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key[..])
-        .expect("HMAC-SHA256 accepts any 32-byte key");
-    mac.update(bytes);
+    <ArtifactMac as Mac>::new_from_slice(&key[..])
+        .expect("HMAC-SHA256 accepts any 32-byte key")
+}
+
+/// Finalise an incremental HMAC into the fixed-length tag.
+fn finalize_into_tag(mac: ArtifactMac) -> [u8; ARTIFACT_HMAC_LEN] {
+    use hmac::Mac;
     let out = mac.finalize().into_bytes();
     let mut tag = [0u8; ARTIFACT_HMAC_LEN];
     tag.copy_from_slice(out.as_slice());
@@ -195,6 +212,76 @@ fn hmac_tag(key: &[u8; 32], bytes: &[u8]) -> [u8; ARTIFACT_HMAC_LEN] {
 fn key_fingerprint_hex(key: &[u8; 32]) -> String {
     let h = blake3::hash(&key[..]);
     h.as_bytes()[..8].iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// `Write` adapter that tees every byte into both an inner writer (the
+/// `BufWriter<File>` backing the temp envelope) and an HMAC instance
+/// (the streaming MAC over the same bytes).
+///
+/// This is what lets `put` avoid the intermediate framed `Vec`: as zstd
+/// emits compressed bytes through its encoder, the encoder writes into a
+/// `MacWriter` whose downstream is the on-disk file. The HMAC sees the
+/// exact byte sequence that lands on disk (header + zstd body) without
+/// any second pass over a materialised buffer.
+struct MacWriter<'a, W: Write> {
+    inner: W,
+    mac: &'a mut ArtifactMac,
+}
+
+impl<'a, W: Write> MacWriter<'a, W> {
+    fn new(inner: W, mac: &'a mut ArtifactMac) -> Self {
+        Self { inner, mac }
+    }
+}
+
+impl<W: Write> Write for MacWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Write to the underlying sink first. If the file-write fails we
+        // do NOT update the MAC, so a torn write doesn't leave the MAC
+        // covering bytes that didn't actually reach disk.
+        let n = self.inner.write(buf)?;
+        // Only feed the prefix that the writer actually accepted; this
+        // matches the contract of `Write::write` and keeps the MAC in
+        // sync with the file's byte stream.
+        use hmac::Mac;
+        self.mac.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// `Read` adapter that tees every byte read from an inner reader into
+/// an HMAC instance.
+///
+/// `get` uses this so the body bytes feeding the zstd decoder also feed
+/// the HMAC in a single pass — no second walk of the prefix to compute
+/// the expected tag. The HMAC sees whatever bytes were actually
+/// delivered to the consumer (the decoder), which is exactly the
+/// invariant we need for the MAC to be byte-compatible with `put`.
+struct MacReader<'a, R: Read> {
+    inner: R,
+    mac: &'a mut ArtifactMac,
+}
+
+impl<'a, R: Read> MacReader<'a, R> {
+    fn new(inner: R, mac: &'a mut ArtifactMac) -> Self {
+        Self { inner, mac }
+    }
+}
+
+impl<R: Read> Read for MacReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        // Feed exactly the bytes the upstream observed. A short read is
+        // fine; the MAC simply sees fewer bytes this round and picks up
+        // the rest on the next call.
+        use hmac::Mac;
+        self.mac.update(&buf[..n]);
+        Ok(n)
+    }
 }
 
 // =====================================================================
@@ -241,11 +328,10 @@ impl ArtifactStore for DiskArtifactStore {
     fn put(&self, payload: &[u8]) -> Result<ContentHash, ArtifactError> {
         // Reject oversized payloads BEFORE any allocation or I/O. An
         // attacker who can drive `put` could otherwise request an
-        // allocation proportional to `payload.len()` (via the framed
-        // buffer below) and OOM the process. The check is on the
-        // already-borrowed `payload` slice — we do not materialise the
-        // caller's bytes ourselves — so this is a pure refusal, not a
-        // second allocation.
+        // allocation proportional to `payload.len()` and OOM the
+        // process. The check is on the already-borrowed `payload`
+        // slice — we do not materialise the caller's bytes ourselves —
+        // so this is a pure refusal, not a second allocation.
         if payload.len() > MAX_PAYLOAD_LEN {
             warn!(
                 target: "tensor_wasm_artifacts",
@@ -269,49 +355,98 @@ impl ArtifactStore for DiskArtifactStore {
         })?;
         let hash = ContentHash::of(payload);
 
-        // Buffer the framed bytes in memory: header + zstd(body) + HMAC.
-        // For very large payloads this still holds the compressed body
-        // in RAM, matching the snapshot writer's behaviour. A streaming
-        // variant can be added later without changing the on-disk
-        // layout.
-        let mut buf: Vec<u8> = Vec::with_capacity(ARTIFACT_HEADER_LEN + payload.len() / 2 + ARTIFACT_HMAC_LEN);
-        buf.extend_from_slice(&ARTIFACT_MAGIC);
-        buf.extend_from_slice(&ARTIFACT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&hash.0);
-
-        // Compress payload directly into the framed buffer. Identical
-        // shape to `SnapshotWriter::capture` — encode into the encoder,
-        // then `finish` to flush the zstd footer.
-        let mut encoder = zstd::stream::write::Encoder::new(&mut buf, DEFAULT_ZSTD_LEVEL)
-            .map_err(|e| {
-                warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed");
-                ArtifactError::Io
-            })?;
-        encoder.write_all(payload).map_err(|e| {
-            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd write failed");
-            ArtifactError::Io
-        })?;
-        encoder.finish().map_err(|e| {
-            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd finish failed");
-            ArtifactError::Io
-        })?;
-
-        // HMAC over everything written so far (header + zstd body).
-        let tag = hmac_tag(&self.hmac_key, &buf);
-        buf.extend_from_slice(&tag);
-
-        // Atomic write: temp-then-rename in the same directory, mirroring
-        // the JIT L2 disk-cache pattern so a partial write can never
-        // leave a half-formed entry that a concurrent reader trips over.
+        // T22 streaming write: header + zstd(body) + HMAC tag stream
+        // directly through a buffered `MacWriter` into a `NamedTempFile`,
+        // with no intermediate `Vec<u8>` for the framed envelope. The
+        // HMAC sees the exact bytes that land on disk; the writer is
+        // wrapped so every chunk also feeds `Mac::update` on its way
+        // through. Result: peak heap during `put` is bounded by the
+        // 64 KiB BufWriter slab plus zstd's internal window, regardless
+        // of payload size.
         let final_path = self.path_for(&hash);
         let mut tmp = tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| {
             warn!(target: "tensor_wasm_artifacts", error = %e, "tempfile create failed");
             ArtifactError::Io
         })?;
-        tmp.as_file_mut().write_all(&buf).map_err(|e| {
-            warn!(target: "tensor_wasm_artifacts", error = %e, "tempfile write failed");
+        let mut mac = new_mac(&self.hmac_key);
+
+        // Streaming sink composition:
+        //   file <- BufWriter <- MacWriter (tees to MAC) <- zstd encoder
+        //
+        // The encoder writes compressed bytes into `tee`, which forks
+        // each byte into the 64 KiB BufWriter (then the on-disk file)
+        // AND the running HMAC. No materialised framed buffer.
+        {
+            let buf_writer =
+                BufWriter::with_capacity(STREAM_BUF_LEN, tmp.as_file_mut());
+            let mut tee = MacWriter::new(buf_writer, &mut mac);
+
+            // Header (magic || version || content_hash) is written
+            // through the tee so the HMAC covers the same prefix the
+            // old one-shot path did.
+            tee.write_all(&ARTIFACT_MAGIC).map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "header magic write failed");
+                ArtifactError::Io
+            })?;
+            tee.write_all(&ARTIFACT_VERSION.to_le_bytes()).map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "header version write failed");
+                ArtifactError::Io
+            })?;
+            tee.write_all(&hash.0).map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "header hash write failed");
+                ArtifactError::Io
+            })?;
+
+            // Compress the payload streaming-style through the encoder.
+            // `zstd::stream::write::Encoder` consumes raw bytes and
+            // emits compressed bytes downstream — those compressed bytes
+            // pass through `tee`, so they're both written to disk AND
+            // hashed into the MAC in one pass.
+            let mut encoder =
+                zstd::stream::write::Encoder::new(&mut tee, DEFAULT_ZSTD_LEVEL).map_err(|e| {
+                    warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed");
+                    ArtifactError::Io
+                })?;
+            encoder.write_all(payload).map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "zstd write failed");
+                ArtifactError::Io
+            })?;
+            // `finish()` flushes the zstd footer through the tee. After
+            // this point the MAC has consumed exactly `magic || version
+            // || content_hash || zstd_body` — byte-identical to what
+            // the old buffered path used to hash.
+            encoder.finish().map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "zstd finish failed");
+                ArtifactError::Io
+            })?;
+
+            // Drop the BufWriter explicitly via the tee so its 64 KiB
+            // slab is flushed BEFORE we append the HMAC tag below.
+            // `BufWriter::drop` swallows flush errors, so call `flush`
+            // explicitly first to surface any deferred write failure.
+            tee.flush().map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "buf flush failed");
+                ArtifactError::Io
+            })?;
+            // `tee` (and the BufWriter inside it) goes out of scope here,
+            // releasing the `&mut File` borrow so we can write the tag
+            // directly to `tmp.as_file_mut()` below.
+        }
+
+        // Finalise the MAC over `header || zstd_body` and append the
+        // 32-byte tag. The tag is NOT fed back into the MAC (and indeed
+        // bypasses the `MacWriter`); it's the trailer the `get` reader
+        // strips before recomputing.
+        let tag = finalize_into_tag(mac);
+        tmp.as_file_mut().write_all(&tag).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "hmac tag write failed");
             ArtifactError::Io
         })?;
+
+        // Atomic publish: temp-then-rename in the same directory,
+        // mirroring the JIT L2 disk-cache pattern so a partial write
+        // can never leave a half-formed entry that a concurrent reader
+        // trips over.
         tmp.persist(&final_path).map_err(|e| {
             // `tempfile::PersistError` wraps the underlying `io::Error`
             // plus the temp handle; the `Display` impl forwards to the
@@ -324,8 +459,16 @@ impl ArtifactStore for DiskArtifactStore {
 
     fn get(&self, hash: &ContentHash) -> Result<Vec<u8>, ArtifactError> {
         let path = self.path_for(hash);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
+
+        // T22 streaming read: open the file behind a 64 KiB BufReader
+        // and stream the prefix (header + zstd body) through a
+        // `MacReader` -> `zstd::Decoder` chain. The HMAC is built up as
+        // bytes flow into the decoder, so we never materialise the
+        // whole compressed body in RAM. Only the decoded payload is
+        // buffered (capped at MAX_DECOMPRESSED_LEN), and even that is
+        // only released to the caller AFTER the trailing tag verifies.
+        let file = match File::open(&path) {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ArtifactError::NotFound(hash.to_string()));
             }
@@ -334,108 +477,215 @@ impl ArtifactStore for DiskArtifactStore {
                     target: "tensor_wasm_artifacts",
                     file = %path.display(),
                     error = %e,
-                    "read failed"
+                    "open failed"
                 );
                 return Err(ArtifactError::Io);
             }
         };
-
-        // Minimum-length gate: header + at least one byte of zstd frame + HMAC.
-        if bytes.len() < ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN {
+        let file_len = file.metadata().map_err(|e| {
             warn!(
                 target: "tensor_wasm_artifacts",
                 file = %path.display(),
-                len = bytes.len(),
+                error = %e,
+                "metadata failed"
+            );
+            ArtifactError::Io
+        })?.len();
+
+        // Minimum-length gate: header + at least one byte of zstd frame + HMAC.
+        // Mirrors the old in-memory check; rejected here before we
+        // start any keyed work or decoder setup.
+        let min_len = (ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN) as u64;
+        if file_len < min_len {
+            warn!(
+                target: "tensor_wasm_artifacts",
+                file = %path.display(),
+                len = file_len,
                 "artifact too short for header+hmac"
             );
             return Err(ArtifactError::BadMagic);
         }
 
-        // Magic check before any keyed work — keeps the verifier cheap
-        // for foreign blobs and matches the snapshot reader's order.
-        // `PartialEq<[B; N]> for [A]` lets us compare the leading slice
-        // against the magic array directly.
-        if bytes[..16] != ARTIFACT_MAGIC {
+        // Compute the byte ranges in the file:
+        //   [0 .. ARTIFACT_HEADER_LEN)                — header
+        //   [ARTIFACT_HEADER_LEN .. prefix_end)        — zstd body
+        //   [prefix_end .. file_len)                   — HMAC tag (32 B)
+        //
+        // `prefix_end` is what the MAC must cover.
+        let prefix_end = file_len - ARTIFACT_HMAC_LEN as u64;
+        let body_len = prefix_end - ARTIFACT_HEADER_LEN as u64;
+
+        let mut reader = BufReader::with_capacity(STREAM_BUF_LEN, file);
+        let mut mac = new_mac(&self.hmac_key);
+
+        // ---- Read and validate the fixed header. ----
+        let mut header = [0u8; ARTIFACT_HEADER_LEN];
+        reader.read_exact(&mut header).map_err(|e| {
+            warn!(
+                target: "tensor_wasm_artifacts",
+                file = %path.display(),
+                error = %e,
+                "header read failed"
+            );
+            ArtifactError::Io
+        })?;
+        if header[..16] != ARTIFACT_MAGIC {
             return Err(ArtifactError::BadMagic);
         }
-
-        let version = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let version = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
         if version != ARTIFACT_VERSION {
             return Err(ArtifactError::BadVersion(version));
         }
-
         let mut hash_on_disk = [0u8; 32];
-        hash_on_disk.copy_from_slice(&bytes[20..52]);
+        hash_on_disk.copy_from_slice(&header[20..52]);
+        // Feed the header into the MAC — same prefix the writer hashed.
+        {
+            use hmac::Mac;
+            mac.update(&header);
+        }
 
-        // HMAC verification: split off the trailing tag, recompute over
-        // the prefix, compare in constant time.
+        // ---- Stream the zstd body through MacReader -> Decoder. ----
         //
-        // Defence-in-depth: the upstream `bytes.len() < HEADER_LEN +
-        // HMAC_LEN` gate already guarantees `bytes.len() >=
-        // ARTIFACT_HMAC_LEN`, so the subtraction below could be a
-        // straight `-`. Using `checked_sub` means a future relaxation
-        // of that gate (e.g. moving it after the magic check, or
-        // accidentally widening it) cannot turn this into a panic on
-        // attacker-controlled input. The fallback maps to `BadMagic`
-        // because reaching this point with an under-length buffer
-        // would mean the framing is structurally broken in the same
-        // way a missing magic implies.
-        let hmac_start = bytes
-            .len()
-            .checked_sub(ARTIFACT_HMAC_LEN)
-            .ok_or(ArtifactError::BadMagic)?;
-        let (prefix, tag_bytes) = bytes.split_at(hmac_start);
-        let expected = hmac_tag(&self.hmac_key, prefix);
+        // `Read::take(body_len)` clips the source to exactly the zstd
+        // body, so the decoder cannot accidentally read into the
+        // trailing HMAC tag. The `MacReader` tees those same bytes into
+        // the running HMAC, so by the time the decoder returns EOF we
+        // have the MAC for the full prefix.
+        //
+        // The decoder output goes into another `Take(cap + 1)` so a
+        // zstd-bomb cannot blow past `MAX_DECOMPRESSED_LEN`. Same
+        // probe-by-one shape T10 uses on the snapshot reader.
+        let cap = MAX_DECOMPRESSED_LEN;
+        let probe_limit = u64::try_from(cap)
+            .ok()
+            .and_then(|c| c.checked_add(1))
+            .unwrap_or(u64::MAX);
+        // Scope the decoder/MacReader chain so it drops (releasing the
+        // mutable borrows on `reader` and `mac`) before we drain any
+        // residual body bytes and read the HMAC tag.
+        //
+        // Decoder failures are deferred: a tampered body byte will
+        // typically make zstd return a frame-format error, but the
+        // pre-existing contract is that an unauthenticated artifact
+        // returns `BadHmac` — not `Decompression`. So we capture the
+        // decode result here, drain the rest of the body through the
+        // MAC so the running tag stays byte-aligned with the writer,
+        // verify the HMAC, and only THEN surface the decode error.
+        // That preserves the "BadHmac wins over Decompression on
+        // tampered input" invariant the tamper-rejection tests assert.
+        let initial_capacity = cap.min(1024 * 1024);
+        let mut payload: Vec<u8> = Vec::with_capacity(initial_capacity);
+        let mut decode_result: Result<(), ArtifactError> = Ok(());
+        {
+            let body_take = Read::take(&mut reader, body_len);
+            let mac_reader = MacReader::new(body_take, &mut mac);
+            match zstd::stream::read::Decoder::new(mac_reader) {
+                Ok(decoder) => {
+                    if let Err(e) =
+                        decoder.take(probe_limit).read_to_end(&mut payload)
+                    {
+                        warn!(target: "tensor_wasm_artifacts", error = %e, "zstd decode failed");
+                        decode_result = Err(ArtifactError::Decompression(e.to_string()));
+                    }
+                }
+                Err(e) => {
+                    warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed");
+                    decode_result = Err(ArtifactError::Decompression(e.to_string()));
+                }
+            }
+            // `decoder` (if it existed) was consumed by `.take(...)`,
+            // which was a temporary consumed by `read_to_end`. The
+            // MacReader/Take chain is gone now; the `&mut reader` and
+            // `&mut mac` borrows are released at the end of this block.
+        }
+        // Whatever happened, the decoder/MacReader/Take chain is now
+        // dropped — `mac` and `reader` are reborrowable below.
+
+        // ---- Drain any residual body bytes the decoder skipped. ----
+        //
+        // For a well-formed zstd frame the decoder consumes every body
+        // byte (frames are self-delimiting and end at the body's
+        // boundary, which we enforce via the `body_take` adapter). But
+        // when decoding aborts early (tampered frame, truncated input)
+        // the BufReader may sit somewhere inside the body, leaving the
+        // HMAC's running state short of what the writer hashed.
+        //
+        // Drain whatever's left in the body region through a fresh
+        // MacReader so the MAC sees the FULL body bytes — the same
+        // prefix the writer's MAC covered. This is what lets a
+        // decompression-failure-on-tamper still surface as `BadHmac`
+        // instead of `Decompression`, matching the old buffered code's
+        // failure-mode ordering.
+        use std::io::Seek;
+        let consumed = reader.stream_position().map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "stream_position failed");
+            ArtifactError::Io
+        })?;
+        if consumed < prefix_end {
+            let gap = prefix_end - consumed;
+            let drain_take = Read::take(&mut reader, gap);
+            let mut drain_mac = MacReader::new(drain_take, &mut mac);
+            // Discard the bytes — we only care about feeding the MAC.
+            let mut scratch = [0u8; STREAM_BUF_LEN];
+            loop {
+                let n = drain_mac.read(&mut scratch).map_err(|e| {
+                    warn!(target: "tensor_wasm_artifacts", error = %e, "tail drain failed");
+                    ArtifactError::Io
+                })?;
+                if n == 0 {
+                    break;
+                }
+            }
+        } else if consumed > prefix_end {
+            // Decoder over-read past the body's bound (shouldn't happen
+            // because `body_take` caps it). Reposition so the next
+            // read_exact pulls the tag; the MAC has over-counted and
+            // will trip BadHmac below, which is the safe failure mode.
+            reader.seek(std::io::SeekFrom::Start(prefix_end)).map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "seek to tag failed");
+                ArtifactError::Io
+            })?;
+        }
+
+        let mut tag_bytes = [0u8; ARTIFACT_HMAC_LEN];
+        reader.read_exact(&mut tag_bytes).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "tag read failed");
+            ArtifactError::Io
+        })?;
+
+        let expected = finalize_into_tag(mac);
         use subtle::ConstantTimeEq;
-        // Length is structural metadata (the file's size), not secret
-        // content, so checking it before `ct_eq` is safe. `ct_eq`
-        // itself requires equal-length inputs to be meaningful.
-        let length_ok = tag_bytes.len() == ARTIFACT_HMAC_LEN;
         // `expected` is `[u8; 32]`; `ConstantTimeEq` is implemented on
-        // `[u8]` (the slice). `as_slice()` lowers the array to that
-        // slice without copying. Mirrors the call shape in
-        // `tensor-wasm-snapshot::reader` exactly.
-        let mac_ok = length_ok && bool::from(expected.as_slice().ct_eq(tag_bytes));
+        // `[u8]`. Slice-vs-slice keeps the comparison constant-time.
+        let mac_ok = bool::from(expected.as_slice().ct_eq(&tag_bytes[..]));
         if !mac_ok {
             warn!(
                 target: "tensor_wasm_artifacts",
                 file = %path.display(),
                 "HMAC mismatch (possible tampering or stale key)"
             );
+            // CRITICAL: drop the decoded payload WITHOUT returning it —
+            // a failed MAC means we have not authenticated the bytes
+            // we just decompressed, and the existing invariant is
+            // "HMAC verified BEFORE any decoded bytes are exposed to
+            // callers". Returning here (with `payload` going out of
+            // scope) preserves that invariant. BadHmac is also the
+            // right answer when decode failed on a tampered body — the
+            // old buffered path always returned BadHmac before reaching
+            // the decompressor.
             return Err(ArtifactError::BadHmac);
         }
 
-        // Decompress the body that sits between the header and the HMAC
-        // tag. Use a streaming decoder with a hard ceiling via
-        // `Read::take` so a zstd "zip bomb" (a tiny compressed blob
-        // that decompresses to gigabytes — ratios past 30000x are
-        // achievable) cannot grow the destination buffer past
-        // `MAX_DECOMPRESSED_LEN`. We deliberately probe one byte past
-        // the cap so the round-trip can decompress to exactly the cap
-        // (allowed) while strictly-larger outputs are detected and
-        // rejected. Mirrors the pattern in
-        // `tensor_wasm_snapshot::reader` (see its `cap`/`probe_limit`
-        // block).
-        let body = &prefix[ARTIFACT_HEADER_LEN..];
-        let cap = MAX_DECOMPRESSED_LEN;
-        let probe_limit = u64::try_from(cap)
-            .ok()
-            .and_then(|c| c.checked_add(1))
-            .unwrap_or(u64::MAX);
-        let decoder = zstd::stream::read::Decoder::new(body).map_err(|e| {
-            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed");
-            ArtifactError::Decompression(e.to_string())
-        })?;
-        // Pre-size to a small constant (1 MiB, capped by `cap`) to avoid
-        // grow-by-doubling churn while still refusing to trust any
-        // attacker-supplied frame-size hint. The `Take` ceiling
-        // guarantees we cannot allocate past `cap + 1` bytes regardless.
-        let initial_capacity = cap.min(1024 * 1024);
-        let mut payload: Vec<u8> = Vec::with_capacity(initial_capacity);
-        decoder.take(probe_limit).read_to_end(&mut payload).map_err(|e| {
-            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd decode failed");
-            ArtifactError::Decompression(e.to_string())
-        })?;
+        // MAC verified. Now surface any deferred decode error — a
+        // legitimate decoder failure on an UNTAMPERED body (e.g. a zstd
+        // version mismatch in a future migration) still reports as
+        // `Decompression`, same as the old path.
+        decode_result?;
+
+        // Decompressed-size cap check happens AFTER MAC verification so
+        // a tampered payload can't make us return `TooLarge` before
+        // `BadHmac`. The `Take(probe_limit)` adapter already prevented
+        // any allocation past `cap + 1` bytes regardless.
         if payload.len() > cap {
             warn!(
                 target: "tensor_wasm_artifacts",
