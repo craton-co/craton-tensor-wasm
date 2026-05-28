@@ -21,10 +21,29 @@ macro_rules! id_newtype {
             Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
         )]
         #[serde(transparent)]
-        pub struct $name(pub $inner);
+        pub struct $name(
+            /// Raw inner integer.
+            ///
+            /// **`#[doc(hidden)]` is intentional.** The field stays
+            /// `pub` so existing tuple-construction call sites (and
+            /// `serde(transparent)` deserialisation, which round-trips
+            /// the bare integer) continue to compile, but the field is
+            /// excluded from the rustdoc surface so new code is steered
+            /// toward [`Self::new`] / [`Self::get`]. The v0.4 strict-mode
+            /// follow-up is expected to flip this to a private field
+            /// once the `TenantId(...)` literal sites in the workspace
+            /// have migrated.
+            #[doc(hidden)]
+            pub $inner,
+        );
 
         impl $name {
             /// Construct from the raw inner integer.
+            ///
+            /// Prefer this over the `Self(inner)` tuple-construction
+            /// path for any new code — it leaves room for a future
+            /// validating constructor (e.g. rejecting reserved sentinel
+            /// ids) without breaking the workspace.
             pub const fn new(inner: $inner) -> Self {
                 Self(inner)
             }

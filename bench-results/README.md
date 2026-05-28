@@ -37,6 +37,25 @@ build fails when measured medians exceed the per-metric ceiling.
   below for the schema, the skip-line convention, and the regeneration
   recipe.
 
+## Diagnostic benches (no artefact committed)
+
+A handful of benches in `crates/tensor-wasm-bench/benches/` are kept for
+local diagnosis only — they have no committed JSON artefact and are not
+read by the CI regression gate. They live in the same `[[bench]]`
+section of `crates/tensor-wasm-bench/Cargo.toml` as the gated benches
+so they ship in the workspace and a developer can run them on demand.
+
+| Bench | Source | What it measures |
+|---|---|---|
+| `metrics_label_validation` | [`crates/tensor-wasm-bench/benches/metrics_label_validation.rs`](../crates/tensor-wasm-bench/benches/metrics_label_validation.rs) | `HttpRequestLabels::try_new` over a 100-route allow-list. Pins the `RouteAllowlist::lookup` `Vec` -> `HashSet` migration: `first` / `last` / `miss` samples should all land in the same noise band post-migration. |
+
+Regenerate any of these the same way as a gated bench — e.g.
+`cargo bench -p tensor-wasm-bench --bench metrics_label_validation` —
+and read the numbers off Criterion's HTML report at
+`target/criterion/<group>/<id>/report/index.html`. Diagnostic benches
+deliberately do not gate CI; they exist so a future regression is
+catchable with a single command, not so every PR pays for them.
+
 ## Metric inventory
 
 Every entry in `baseline.json` is `<group>/<id>`, exactly as Criterion

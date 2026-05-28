@@ -67,6 +67,16 @@ harness = false
 name = "dispatch_future_backends"
 harness = false
 
+[[bench]]
+# Hot-path validator for `HttpRequestLabels::try_new` against a 100-route
+# allow-list. Pins the `RouteAllowlist::lookup` migration from a
+# `Vec<&'static str>` linear scan to a `HashSet<&'static str>` index so a
+# regression that drags the lookup back to `O(n)` is caught here. Not on
+# the CI regression-gate path -- diagnostic only; see
+# `bench-results/README.md` for the broader convention.
+name = "metrics_label_validation"
+harness = false
+
 [features]
 # Default off so the existing `cargo bench -p tensor-wasm-bench` pipeline
 # stays cuda-toolkit-free on CI runners and developer laptops.
