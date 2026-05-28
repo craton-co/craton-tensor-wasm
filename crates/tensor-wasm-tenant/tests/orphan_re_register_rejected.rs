@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
 //! Regression tests for tenant 1.6 #9 — unregister-while-mutating race.
 //!
 //! `unregister(T)` removes the registry entry but in-flight callers may

@@ -123,8 +123,11 @@ impl RegistryAdminCapability {
 /// without ferrying a `&'static` reference.
 ///
 /// Construction returns a tuple `(TenantRegistry, RegistryAdminCapability)`;
-/// see [`Self::new`].
-#[derive(Debug, Clone, Default)]
+/// see [`Self::new`]. `Default` is intentionally not derived: a registry
+/// produced by `Default::default()` would have no associated
+/// [`RegistryAdminCapability`], contradicting the documented contract
+/// that every registry is constructed alongside exactly one cap.
+#[derive(Debug, Clone)]
 pub struct TenantRegistry {
     inner: Arc<DashMap<TenantId, Arc<TenantContext>>>,
     /// Weak refs to previously-unregistered contexts. On re-`register` of
@@ -146,7 +149,11 @@ impl TenantRegistry {
     /// `DashMap`, but does NOT clone the cap — admin authority stays with
     /// whoever the original constructor handed it to.
     pub fn new() -> (Self, RegistryAdminCapability) {
-        (Self::default(), RegistryAdminCapability::mint())
+        let reg = Self {
+            inner: Arc::new(DashMap::new()),
+            tombstones: Arc::new(DashMap::new()),
+        };
+        (reg, RegistryAdminCapability::mint())
     }
 
     /// Insert `ctx` into the registry.
@@ -386,7 +393,7 @@ mod tests {
         // Threat model: a workload holding `Arc<TenantContext>` for tenant A
         // (perhaps by guessing B's numeric id and calling `registry.get`)
         // must not be able to drive B's quota counter using A's capability.
-        let reg = TenantRegistry::new();
+        let (reg, _admin_cap) = TenantRegistry::new();
         let (a_ctx, a_cap) = reg.register_with_capability(ctx(1001)).unwrap();
         let (b_ctx, b_cap) = reg.register_with_capability(ctx(1002)).unwrap();
 

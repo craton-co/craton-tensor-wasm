@@ -40,10 +40,14 @@ fn thirty_two_threads_contend_for_the_same_tenant_id() {
         let failures = Arc::clone(&failures);
         let winners = Arc::clone(&winners);
         handles.push(thread::spawn(move || {
-            let ctx = make_ctx();
             // Line all threads up at the gate so the race is as tight as
-            // the OS scheduler allows.
+            // the OS scheduler allows. Allocate the context *after* the
+            // barrier so the heap allocation isn't paid before the race
+            // window opens — otherwise threads scheduled first would be
+            // deep inside `register` before later threads even reach the
+            // gate, narrowing contention.
             barrier.wait();
+            let ctx = make_ctx();
             match reg.register(ctx) {
                 Ok(arc) => {
                     successes.fetch_add(1, Ordering::Relaxed);
@@ -52,6 +56,11 @@ fn thirty_two_threads_contend_for_the_same_tenant_id() {
                 Err(RegistryError::AlreadyRegistered(id)) => {
                     assert_eq!(id, TENANT);
                     failures.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(RegistryError::OrphanStillAlive(id)) => {
+                    // No prior unregister happened in this test, so an
+                    // orphan-rejection here is a registry-invariant bug.
+                    panic!("unexpected OrphanStillAlive({id:?}) — no tombstone should exist");
                 }
             }
         }));
