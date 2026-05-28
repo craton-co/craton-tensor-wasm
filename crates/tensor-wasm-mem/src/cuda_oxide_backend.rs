@@ -78,9 +78,14 @@ fn leaked_set() -> &'static Mutex<HashSet<u64>> {
     LEAKED_CUDA_ALLOCATIONS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-#[allow(dead_code)] // Wired into the Drop impl; the scaffold path can't reach the
-                    // call site today because no construction succeeds. Kept for
-                    // the v0.4 port — see RFC 0001.
+// In the host-backend build, `record_leak` is called from
+// `CudaOxideUnifiedBuffer::drop` on every `cuMemFree_v2` failure (mem H4
+// invariant — see the `Drop` impl in the `host_backend` module). In the
+// scaffold-only build no construction succeeds, so the call site is
+// unreachable and the function genuinely is dead code; the gated allow
+// keeps `-D warnings` happy on contributor boxes that build without the
+// host-backend feature.
+#[cfg_attr(not(feature = "cuda-oxide-host-backend"), allow(dead_code))]
 fn record_leak(ptr: u64) {
     leaked_set().lock().insert(ptr);
 }
@@ -305,11 +310,20 @@ mod host_backend {
     // FFI takes `CUmem_advise` (an `i32`-typedef'd enum) so we cast to
     // the bindings' enum type via `as _` at the call site rather than
     // depending on the enum path.
-    const CU_MEM_ADVISE_SET_READ_MOSTLY: u32 = 1;
-    const CU_MEM_ADVISE_SET_PREFERRED_LOCATION: u32 = 3;
-    const CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION: u32 = 4;
-    const CU_MEM_ADVISE_SET_ACCESSED_BY: u32 = 5;
-    const CU_MEM_ADVISE_UNSET_ACCESSED_BY: u32 = 6;
+    //
+    // The `_INLINE` suffix is load-bearing: the cudarc crate's
+    // `CUmem_advise_enum` variants share the same bare names (e.g.
+    // `CU_MEM_ADVISE_SET_READ_MOSTLY`), so if the drift-guard `const _`
+    // block below pulled them into scope with `use ...::*`, those variants
+    // would shadow the inline literals and turn every assertion into a
+    // tautological `X == X`. Naming the inline constants distinctly is
+    // what makes the cross-check actually compare a literal against the
+    // bindgen-derived enum value.
+    const CU_MEM_ADVISE_SET_READ_MOSTLY_INLINE: u32 = 1;
+    const CU_MEM_ADVISE_SET_PREFERRED_LOCATION_INLINE: u32 = 3;
+    const CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION_INLINE: u32 = 4;
+    const CU_MEM_ADVISE_SET_ACCESSED_BY_INLINE: u32 = 5;
+    const CU_MEM_ADVISE_UNSET_ACCESSED_BY_INLINE: u32 = 6;
 
     // mem M5 drift guard. When the `cudarc-backend` feature is also
     // enabled, the cudarc crate's `cuda_sys` re-exports the matching
@@ -324,43 +338,39 @@ mod host_backend {
     // truth and the drift guard simply doesn't run — that's
     // acceptable because nothing on the host can issue a `cuMemAdvise`
     // call without one of the wrapper backends being present.
+    //
+    // Note: we deliberately do NOT `use cudarc::driver::sys::CUmem_advise_enum::*`
+    // here. Doing so would bring the variant names (which match the cudarc
+    // bindgen output, e.g. `CU_MEM_ADVISE_SET_READ_MOSTLY`) into scope and,
+    // because Rust resolves the LHS of `==` against the nearest binding,
+    // every assertion would degenerate to `X == X`. Instead we reference
+    // the inline `_INLINE` literals on the LHS and the fully qualified
+    // cudarc enum path on the RHS so the comparison actually runs.
     #[cfg(feature = "cudarc-backend")]
     const _: () = {
-        use cudarc::driver::sys::CUmem_advise_enum::*;
-        assert!(CU_MEM_ADVISE_SET_READ_MOSTLY == CU_MEM_ADVISE_SET_READ_MOSTLY_FROM_CUDARC as u32);
         assert!(
-            CU_MEM_ADVISE_SET_PREFERRED_LOCATION
-                == CU_MEM_ADVISE_SET_PREFERRED_LOCATION_FROM_CUDARC as u32
+            CU_MEM_ADVISE_SET_READ_MOSTLY_INLINE
+                == cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_READ_MOSTLY as u32
         );
         assert!(
-            CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION
-                == CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION_FROM_CUDARC as u32
+            CU_MEM_ADVISE_SET_PREFERRED_LOCATION_INLINE
+                == cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_PREFERRED_LOCATION
+                    as u32
         );
-        assert!(CU_MEM_ADVISE_SET_ACCESSED_BY == CU_MEM_ADVISE_SET_ACCESSED_BY_FROM_CUDARC as u32);
         assert!(
-            CU_MEM_ADVISE_UNSET_ACCESSED_BY == CU_MEM_ADVISE_UNSET_ACCESSED_BY_FROM_CUDARC as u32
+            CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION_INLINE
+                == cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION
+                    as u32
+        );
+        assert!(
+            CU_MEM_ADVISE_SET_ACCESSED_BY_INLINE
+                == cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_ACCESSED_BY as u32
+        );
+        assert!(
+            CU_MEM_ADVISE_UNSET_ACCESSED_BY_INLINE
+                == cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_UNSET_ACCESSED_BY as u32
         );
     };
-    // Alias the cudarc symbols so the const block above type-checks:
-    // we cannot use `as` casts directly inside `const` against an
-    // enum repr — instead re-export under explicit names that the
-    // `const _` assertion compares.
-    #[cfg(feature = "cudarc-backend")]
-    const CU_MEM_ADVISE_SET_READ_MOSTLY_FROM_CUDARC: cudarc::driver::sys::CUmem_advise_enum =
-        cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_READ_MOSTLY;
-    #[cfg(feature = "cudarc-backend")]
-    const CU_MEM_ADVISE_SET_PREFERRED_LOCATION_FROM_CUDARC: cudarc::driver::sys::CUmem_advise_enum =
-        cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_PREFERRED_LOCATION;
-    #[cfg(feature = "cudarc-backend")]
-    const CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION_FROM_CUDARC:
-        cudarc::driver::sys::CUmem_advise_enum =
-        cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION;
-    #[cfg(feature = "cudarc-backend")]
-    const CU_MEM_ADVISE_SET_ACCESSED_BY_FROM_CUDARC: cudarc::driver::sys::CUmem_advise_enum =
-        cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_ACCESSED_BY;
-    #[cfg(feature = "cudarc-backend")]
-    const CU_MEM_ADVISE_UNSET_ACCESSED_BY_FROM_CUDARC: cudarc::driver::sys::CUmem_advise_enum =
-        cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_UNSET_ACCESSED_BY;
 
     /// Process-wide counter of `cuMemFree_v2` failures observed in
     /// [`CudaOxideUnifiedBuffer`]'s `Drop`. A non-zero value indicates
@@ -582,28 +592,69 @@ mod host_backend {
     }
 
     impl Drop for CudaOxideUnifiedBuffer {
+        /// Free the underlying `cuMemAllocManaged` allocation via
+        /// `cuMemFree_v2`.
+        ///
+        /// # Invariants (mirrors `cudarc_backend::CudarcUnifiedBuffer::drop`)
+        ///
+        /// - Never panics. A `Drop` panic during unwinding would abort the
+        ///   process; we degrade to a recorded leak instead.
+        /// - On any non-`CUDA_SUCCESS` from `cuMemFree_v2` the raw pointer
+        ///   is added to the process-global [`leaked_cuda_allocations`]
+        ///   set so operators can audit (mem H4). The failure is logged
+        ///   at `error!` level — a failed free is a security-relevant
+        ///   event because the driver may recycle the same VA for another
+        ///   tenant carrying residual bytes.
+        /// - After a failed free, `self.ptr` is replaced with
+        ///   `NonNull::dangling()`. This is defence-in-depth: if some
+        ///   future refactor reaches this Drop a second time (it shouldn't
+        ///   — Rust guarantees Drop runs at most once per value), the
+        ///   sentinel ensures we don't re-submit the same orphaned
+        ///   pointer to the driver and don't double-record the leak
+        ///   against the original address.
         fn drop(&mut self) {
+            let raw_ptr = self.ptr.as_ptr();
+            let raw_ptr_u64 = raw_ptr as u64;
+            // Re-bind the context to this thread first because Drop may
+            // run on a worker thread that never bound the context
+            // (cuda-core's own DeviceBuffer Drop does the same). Bind
+            // failure is logged but does not skip the free attempt — the
+            // driver may still accept the call against a previously bound
+            // context, and on a hard failure we fall through to the
+            // leak-recording branch anyway.
+            let _ = self.ctx.bind_to_thread();
             // SAFETY: `ptr` was returned by `cuMemAllocManaged` and has
             // not been freed yet; the cached `Arc<CudaContext>` we hold
             // ensures the primary context is still alive when we call
-            // `cuMemFree_v2`. We also re-bind the context to this
-            // thread first because Drop may run on a worker thread that
-            // never bound the context (cuda-core's own DeviceBuffer Drop
-            // does the same).
-            let _ = self.ctx.bind_to_thread();
+            // `cuMemFree_v2`.
             let res = unsafe {
-                cuda_sys::cuMemFree_v2(self.ptr.as_ptr() as cuda_sys::CUdeviceptr)
+                cuda_sys::cuMemFree_v2(raw_ptr as cuda_sys::CUdeviceptr)
             };
             if res != cuda_sys::cudaError_enum_CUDA_SUCCESS {
+                // Failed free: the driver still considers the VA mapped,
+                // so the next allocator pass could hand it to another
+                // tenant carrying residual bytes. Both the lock-free
+                // counter (for alerting) AND the per-VA audit set (for
+                // forensics) are updated. Drop cannot fail, so we surface
+                // via tracing + the audit set rather than unwinding
+                // (mem H4).
                 let failures = FREE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::warn!(
+                record_leak(raw_ptr_u64);
+                tracing::error!(
                     target: "tensor_wasm_mem::cuda_oxide_backend",
                     ?res,
-                    ptr = ?self.ptr.as_ptr(),
+                    ptr = ?raw_ptr,
                     size = self.size,
                     total_failures = failures,
-                    "cuMemFree_v2 failed in CudaOxideUnifiedBuffer::drop",
+                    "cuMemFree_v2 failed in CudaOxideUnifiedBuffer::drop -- VA leaked, \
+                     recorded in leaked_cuda_allocations() for operator audit (mem H4)",
                 );
+                // Defence-in-depth: replace with a dangling sentinel so
+                // any hypothetical double-drop short-circuits and does
+                // not re-submit the same orphaned pointer to the driver.
+                // Rust guarantees Drop runs at most once per value, so
+                // this is belt-and-braces.
+                self.ptr = NonNull::dangling();
             }
         }
     }
@@ -629,16 +680,18 @@ mod host_backend {
         let ptr = buf.ptr.as_ptr() as cuda_sys::CUdeviceptr;
         let size = buf.size;
         let (advice_kind, device) = match advice {
-            CudaOxideAdvice::ReadMostly => (CU_MEM_ADVISE_SET_READ_MOSTLY, 0i32),
+            CudaOxideAdvice::ReadMostly => (CU_MEM_ADVISE_SET_READ_MOSTLY_INLINE, 0i32),
             CudaOxideAdvice::PreferredLocation(d) => {
-                (CU_MEM_ADVISE_SET_PREFERRED_LOCATION, d.0 as i32)
+                (CU_MEM_ADVISE_SET_PREFERRED_LOCATION_INLINE, d.0 as i32)
             }
-            CudaOxideAdvice::AccessedBy(d) => (CU_MEM_ADVISE_SET_ACCESSED_BY, d.0 as i32),
+            CudaOxideAdvice::AccessedBy(d) => {
+                (CU_MEM_ADVISE_SET_ACCESSED_BY_INLINE, d.0 as i32)
+            }
             CudaOxideAdvice::UnsetPreferredLocation => {
-                (CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION, 0i32)
+                (CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION_INLINE, 0i32)
             }
             CudaOxideAdvice::UnsetAccessedBy(d) => {
-                (CU_MEM_ADVISE_UNSET_ACCESSED_BY, d.0 as i32)
+                (CU_MEM_ADVISE_UNSET_ACCESSED_BY_INLINE, d.0 as i32)
             }
         };
         // SAFETY: ptr/size are derived from a valid live
