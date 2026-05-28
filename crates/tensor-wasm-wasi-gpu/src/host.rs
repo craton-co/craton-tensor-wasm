@@ -358,10 +358,12 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
          entry_len: i32|
          -> i64 {
             if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
-                caller
-                    .data()
-                    .wasi_cuda()
-                    .record_error("wasi-cuda capability not granted");
+                // wasi-gpu 1.5: do NOT record_error on the disabled-capability
+                // path. Matching the FN_LAST_ERROR_* gate, a recorded
+                // message would (a) burn allocations + mutex traffic for a
+                // hostile guest that hammers disabled calls, and (b)
+                // become readable if the embedder ever flips the capability
+                // back on. The NotAvailable code is the signal callers get.
                 return AbiError::NotAvailable.code() as i64;
             }
             match load_ptx_impl(&mut caller, ptx_ptr, ptx_len, entry_ptr, entry_len) {
@@ -390,10 +392,8 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
          -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
             Box::new(async move {
                 if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
-                    caller
-                        .data()
-                        .wasi_cuda()
-                        .record_error("wasi-cuda capability not granted");
+                    // wasi-gpu 1.5: see the load_ptx branch above for why
+                    // we skip record_error here.
                     return AbiError::NotAvailable.code();
                 }
                 launch_impl_async(
@@ -417,10 +417,7 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
 
     linker.func_wrap(MODULE, FN_SYNC, |caller: Caller<'_, T>| -> i32 {
         if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
-            caller
-                .data()
-                .wasi_cuda()
-                .record_error("wasi-cuda capability not granted");
+            // wasi-gpu 1.5: see the load_ptx branch above for the rationale.
             return AbiError::NotAvailable.code();
         }
         sync_impl(&caller).map_or_else(|e| e.code(), |_| 0)

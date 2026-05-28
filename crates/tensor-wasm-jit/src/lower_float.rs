@@ -123,43 +123,43 @@ pub fn lower_float_inst(
     let lowered = match opcode {
         Opcode::Fadd => LoweredOp::AddF {
             ty,
-            lhs: lookup(value_map, args[0]),
-            rhs: lookup(value_map, args[1]),
+            lhs: lookup(value_map, args[0])?,
+            rhs: lookup(value_map, args[1])?,
             result,
         },
         Opcode::Fsub => LoweredOp::SubF {
             ty,
-            lhs: lookup(value_map, args[0]),
-            rhs: lookup(value_map, args[1]),
+            lhs: lookup(value_map, args[0])?,
+            rhs: lookup(value_map, args[1])?,
             result,
         },
         Opcode::Fmul => LoweredOp::MulF {
             ty,
-            lhs: lookup(value_map, args[0]),
-            rhs: lookup(value_map, args[1]),
+            lhs: lookup(value_map, args[0])?,
+            rhs: lookup(value_map, args[1])?,
             result,
         },
         Opcode::Fdiv => LoweredOp::DivF {
             ty,
-            lhs: lookup(value_map, args[0]),
-            rhs: lookup(value_map, args[1]),
+            lhs: lookup(value_map, args[0])?,
+            rhs: lookup(value_map, args[1])?,
             result,
         },
         Opcode::Fma => LoweredOp::Fma {
             ty,
-            a: lookup(value_map, args[0]),
-            b: lookup(value_map, args[1]),
-            c: lookup(value_map, args[2]),
+            a: lookup(value_map, args[0])?,
+            b: lookup(value_map, args[1])?,
+            c: lookup(value_map, args[2])?,
             result,
         },
         Opcode::Fneg => LoweredOp::FNeg {
             ty,
-            src: lookup(value_map, args[0]),
+            src: lookup(value_map, args[0])?,
             result,
         },
         Opcode::Fabs => LoweredOp::FAbs {
             ty,
-            src: lookup(value_map, args[0]),
+            src: lookup(value_map, args[0])?,
             result,
         },
         // Unreachable: the earlier `match` already filtered the opcode
@@ -171,15 +171,22 @@ pub fn lower_float_inst(
 }
 
 /// Resolve a Cranelift `Value` to its already-assigned
-/// [`LoweredValueId`]. Panics on a missing entry — see
-/// [`lower_float_inst`] for the rationale.
-fn lookup(map: &HashMap<Value, LoweredValueId>, v: Value) -> LoweredValueId {
-    *map.get(&v).unwrap_or_else(|| {
-        panic!(
-            "lower_float_inst: operand {v:?} not found in value_map -- \
-             caller walker must lower defs before uses"
-        )
-    })
+/// [`LoweredValueId`]. Returns `None` if the operand was not
+/// pre-mapped (jit S-4: a malformed Cranelift function with a
+/// backward branch whose block-param references a not-yet-seen
+/// value used to panic the worker; now it gracefully degrades to
+/// `lower_float_inst` returning `None`, which the walker treats
+/// as "skip this instruction" — same as for unsupported ops).
+fn lookup(map: &HashMap<Value, LoweredValueId>, v: Value) -> Option<LoweredValueId> {
+    let id = map.get(&v).copied();
+    if id.is_none() {
+        tracing::debug!(
+            target: "tensor_wasm_jit::lower_float",
+            value = ?v,
+            "operand not pre-mapped; skipping float instruction"
+        );
+    }
+    id
 }
 
 #[cfg(test)]

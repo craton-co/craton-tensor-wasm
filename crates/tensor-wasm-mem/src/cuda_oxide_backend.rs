@@ -311,6 +311,57 @@ mod host_backend {
     const CU_MEM_ADVISE_SET_ACCESSED_BY: u32 = 5;
     const CU_MEM_ADVISE_UNSET_ACCESSED_BY: u32 = 6;
 
+    // mem M5 drift guard. When the `cudarc-backend` feature is also
+    // enabled, the cudarc crate's `cuda_sys` re-exports the matching
+    // enum variants — cross-check at compile time so a CUDA toolkit
+    // bump that renumbers the enum (or a sibling backend that gets a
+    // new bindgen output) fails to build rather than silently firing
+    // the wrong advice. The cust backend's enum lives behind the
+    // `cuda` feature; we cross-check there too if it's on.
+    //
+    // When neither sibling backend is enabled (this crate's default
+    // build), the inline literals above are the single source of
+    // truth and the drift guard simply doesn't run — that's
+    // acceptable because nothing on the host can issue a `cuMemAdvise`
+    // call without one of the wrapper backends being present.
+    #[cfg(feature = "cudarc-backend")]
+    const _: () = {
+        use cudarc::driver::sys::CUmem_advise_enum::*;
+        assert!(CU_MEM_ADVISE_SET_READ_MOSTLY == CU_MEM_ADVISE_SET_READ_MOSTLY_FROM_CUDARC as u32);
+        assert!(
+            CU_MEM_ADVISE_SET_PREFERRED_LOCATION
+                == CU_MEM_ADVISE_SET_PREFERRED_LOCATION_FROM_CUDARC as u32
+        );
+        assert!(
+            CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION
+                == CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION_FROM_CUDARC as u32
+        );
+        assert!(CU_MEM_ADVISE_SET_ACCESSED_BY == CU_MEM_ADVISE_SET_ACCESSED_BY_FROM_CUDARC as u32);
+        assert!(
+            CU_MEM_ADVISE_UNSET_ACCESSED_BY == CU_MEM_ADVISE_UNSET_ACCESSED_BY_FROM_CUDARC as u32
+        );
+    };
+    // Alias the cudarc symbols so the const block above type-checks:
+    // we cannot use `as` casts directly inside `const` against an
+    // enum repr — instead re-export under explicit names that the
+    // `const _` assertion compares.
+    #[cfg(feature = "cudarc-backend")]
+    const CU_MEM_ADVISE_SET_READ_MOSTLY_FROM_CUDARC: cudarc::driver::sys::CUmem_advise_enum =
+        cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_READ_MOSTLY;
+    #[cfg(feature = "cudarc-backend")]
+    const CU_MEM_ADVISE_SET_PREFERRED_LOCATION_FROM_CUDARC: cudarc::driver::sys::CUmem_advise_enum =
+        cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_PREFERRED_LOCATION;
+    #[cfg(feature = "cudarc-backend")]
+    const CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION_FROM_CUDARC:
+        cudarc::driver::sys::CUmem_advise_enum =
+        cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION;
+    #[cfg(feature = "cudarc-backend")]
+    const CU_MEM_ADVISE_SET_ACCESSED_BY_FROM_CUDARC: cudarc::driver::sys::CUmem_advise_enum =
+        cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_ACCESSED_BY;
+    #[cfg(feature = "cudarc-backend")]
+    const CU_MEM_ADVISE_UNSET_ACCESSED_BY_FROM_CUDARC: cudarc::driver::sys::CUmem_advise_enum =
+        cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_UNSET_ACCESSED_BY;
+
     /// Process-wide counter of `cuMemFree_v2` failures observed in
     /// [`CudaOxideUnifiedBuffer`]'s `Drop`. A non-zero value indicates
     /// leaked managed allocations — the driver refused to release them.
