@@ -82,7 +82,7 @@ async fn deploy_trivial_function(router: &axum::Router, bearer: &str) -> String 
 }
 
 fn invoke_with_tenant(
-    router: &axum::Router,
+    _router: &axum::Router,
     function_id: &str,
     bearer: &str,
     tenant: u64,
