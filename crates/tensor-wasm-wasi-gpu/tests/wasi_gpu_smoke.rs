@@ -6,7 +6,6 @@
 //! [`vector_add_correctness`] is gated `#[ignore]` and runs in dedicated
 //! CUDA CI.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tensor_wasm_core::types::InstanceId;
@@ -212,9 +211,13 @@ async fn launch_after_load_invalid_for_other_owner() {
 
 #[test]
 fn ptx_fixture_exists() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernels/vector_add.ptx");
-    assert!(path.exists(), "PTX fixture missing at {}", path.display());
-    let contents = std::fs::read_to_string(&path).unwrap();
+    // Embed the in-crate fixture at compile time. Using `include_bytes!`
+    // (rather than a runtime `../../kernels/...` read) keeps the published
+    // tarball self-contained — `cargo publish` rejects file paths that
+    // escape the crate root.
+    const PTX: &[u8] = include_bytes!("fixtures/vector_add.ptx");
+    assert!(!PTX.is_empty(), "PTX fixture must not be empty");
+    let contents = std::str::from_utf8(PTX).expect("PTX is ASCII");
     assert!(contents.contains(".target sm_80"));
     assert!(contents.contains(".entry vector_add"));
 }
@@ -280,7 +283,7 @@ async fn vector_add_correctness() {
     //
     // On no-CUDA hosts the body exercises everything the registry layer
     // can do without a device:
-    //   1. Read kernels/vector_add.ptx from disk.
+    //   1. Load the embedded `tests/fixtures/vector_add.ptx` bytes.
     //   2. Construct a fresh WasiCudaContext + KernelRegistry.
     //   3. Register a KernelEntry recording the PTX byte count + entry name.
     //   4. Assert the assigned KernelId is positive.
@@ -291,9 +294,11 @@ async fn vector_add_correctness() {
     //   6. Build a Wasm fixture (extending WASI_CUDA_WAT) that calls
     //      wasi_cuda_load_ptx + wasi_cuda_launch on the registered kernel.
     //   7. Assert C[i] == A[i] + B[i] for all i in 0..N.
-    let ptx_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernels/vector_add.ptx");
-    let ptx_bytes =
-        std::fs::read(&ptx_path).unwrap_or_else(|e| panic!("read {}: {e}", ptx_path.display()));
+    // Embed the in-crate PTX fixture at compile time so the published
+    // tarball stays self-contained (`cargo publish` rejects paths that
+    // escape the crate root).
+    const VECTOR_ADD_PTX: &[u8] = include_bytes!("fixtures/vector_add.ptx");
+    let ptx_bytes = VECTOR_ADD_PTX.to_vec();
     assert!(!ptx_bytes.is_empty(), "PTX fixture must not be empty");
 
     let ctx = WasiCudaContext::new(InstanceId(1));

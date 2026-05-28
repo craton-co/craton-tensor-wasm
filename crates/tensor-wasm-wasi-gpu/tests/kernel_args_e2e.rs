@@ -559,7 +559,7 @@ async fn pointer_argv_real_cuda_launch() {
 /// test binary is self-contained — no path-relative `read` that breaks
 /// when `cargo test` is invoked from outside the workspace root.
 #[cfg(feature = "cuda")]
-const VECTOR_ADD_PTX: &[u8] = include_bytes!("../../../kernels/vector_add.ptx");
+const VECTOR_ADD_PTX: &[u8] = include_bytes!("fixtures/vector_add.ptx");
 
 /// End-to-end Wasm -> wasi-cuda -> `cuLaunchKernel` -> result-readback
 /// proof on real CUDA. Closes the v0.3.2 audit Problem #14.

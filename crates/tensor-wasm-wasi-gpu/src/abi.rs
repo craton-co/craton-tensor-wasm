@@ -213,11 +213,12 @@ mod tests {
     /// trips before the linker error reaches downstream users.
     #[test]
     fn module_version_matches_wit_package_decl() {
-        const WIT: &str = include_str!("../../../wit/wasi-cuda.wit");
+        const WIT: &str = include_str!("../wit/wasi-cuda.wit");
         // Path is relative to this source file (`crates/tensor-wasm-wasi-gpu/src/abi.rs`):
-        //   ../        -> crates/tensor-wasm-wasi-gpu/
-        //   ../../     -> crates/
-        //   ../../../  -> workspace root, where `wit/` lives.
+        //   ../  -> crates/tensor-wasm-wasi-gpu/, where the in-crate
+        //          `wit/wasi-cuda.wit` copy lives. Kept in-crate so the
+        //          published tarball is self-contained (`cargo publish`
+        //          rejects paths that escape the crate root).
         let pkg_line = WIT
             .lines()
             .find(|l| l.trim_start().starts_with("package wasi:cuda@"))
