@@ -483,17 +483,14 @@ fn build_router_full(
     // can rely on the same actor/tenant/audit pipeline as the native
     // routes once tenant inference moves out of the header layer.
     //
-    // Concurrency budget: share INVOKE_CONCURRENCY_LIMIT — the v0.4
-    // implementation will execute the same `TensorWasmExecutor` spawn path
-    // as native `/invoke`, so the budgets should track in lockstep. While
-    // the scaffold returns 501 in ~µs the cap is effectively a no-op.
-    // Explicit `Router::<Arc<AppState>>::new()` because neither OpenAI
-    // handler takes a `State` extractor (the scaffold has no AppState
-    // dependency yet), so the compiler cannot infer the state type from
-    // the handler signatures alone. The annotation lines the sub-router
-    // up with `protected_router` and `probe_router` for the outer
-    // `.merge(...)` call — without it `Router::merge` complains about
-    // mismatched state generics.
+    // Concurrency budget: share INVOKE_CONCURRENCY_LIMIT — T41 executes
+    // the same `TensorWasmExecutor` spawn path as native `/invoke`, so
+    // the budgets track in lockstep. Both OpenAI handlers now take a
+    // `State<Arc<AppState>>` extractor (T41) so they can read the
+    // `openai_model_map` and dispatch through the shared executor; the
+    // explicit `Router::<Arc<AppState>>::new()` annotation lines the
+    // sub-router up with `protected_router` and `probe_router` for the
+    // outer `.merge(...)` call.
     let openai_router: Router<Arc<AppState>> = Router::new()
         .route(
             "/v1/completions",

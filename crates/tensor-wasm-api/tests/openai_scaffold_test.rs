@@ -2,24 +2,28 @@
 // Copyright 2026 Craton Software Company
 
 //! Integration coverage for the OpenAI-compatible inference gateway shim
-//! (B4.9 scaffold).
+//! after T41 wired translation through the internal invoke protocol.
 //!
-//! v0.3.5 ships `POST /v1/completions` and `POST /v1/chat/completions` as
-//! scaffolds that return `501 Not Implemented` with the OpenAI-shape error
-//! envelope (`{ "error": { "message", "type", "param", "code" } }`). v0.4
-//! wires the actual `model` → deployed-function translation. These tests
-//! pin the wire surface so the v0.4 implementation cannot accidentally
-//! reshape the error envelope or change the URL surface.
+//! v0.3.5 shipped `POST /v1/completions` and `POST /v1/chat/completions`
+//! as scaffolds returning `501 Not Implemented`. T41 (v0.4) replaced the
+//! 501 path with a real translation step: an empty model map yields
+//! `404 model_not_found`; a populated map dispatches the call.
+//!
+//! Coverage in this file pins the wire-format invariants that survived
+//! the rewire — the OpenAI error envelope shape, the malformed-body
+//! rejection path, the optional-field schema — without taking a
+//! dependency on the executor (the happy path lives in the new
+//! `openai_completions_*` integration tests).
 //!
 //! Coverage:
 //!
-//! 1. `POST /v1/completions` with a well-formed OpenAI body → `501` and
-//!    `error.code == "openai_not_yet_wired"`.
-//! 2. `POST /v1/chat/completions` with a well-formed OpenAI body → `501`
-//!    same shape.
-//! 3. `POST /v1/completions` with malformed JSON → `400` and the OpenAI
-//!    error envelope shape (NOT the native `{ error: { kind, message } }`
-//!    shell — OpenAI SDKs will not parse the native shape).
+//! 1. Unknown model on `POST /v1/completions` → `404 model_not_found`
+//!    with the OpenAI envelope.
+//! 2. Same on `POST /v1/chat/completions`.
+//! 3. Malformed JSON on either endpoint → `400 invalid_request_error`
+//!    with the OpenAI envelope.
+//! 4. Empty body still parses (no required fields) and reaches the
+//!    model-resolution step.
 
 use std::sync::Arc;
 
@@ -81,7 +85,11 @@ fn assert_openai_envelope(body: &Value, expected_code: &str) {
 }
 
 #[tokio::test]
-async fn completions_valid_body_returns_501_not_yet_wired() {
+async fn completions_unknown_model_returns_404_model_not_found() {
+    // Default dev router carries an empty `openai_model_map`; every
+    // model id misses and the handler must surface
+    // `404 model_not_found` with the OpenAI envelope (`type:
+    // invalid_request_error`, `code: model_not_found`).
     let payload = json!({
         "model": "gpt-3.5-turbo",
         "prompt": "Once upon a time",
@@ -94,22 +102,23 @@ async fn completions_valid_body_returns_501_not_yet_wired() {
         .expect("router serves /v1/completions");
     assert_eq!(
         resp.status(),
-        StatusCode::NOT_IMPLEMENTED,
-        "scaffold must return 501 for /v1/completions",
+        StatusCode::NOT_FOUND,
+        "unknown model must surface as 404 model_not_found",
     );
     let body = body_json(resp.into_body()).await;
-    assert_openai_envelope(&body, "openai_not_yet_wired");
-    // Pin the OpenAI `type` value too so the v0.4 wiring step can be
-    // distinguished from this scaffold response by clients that branch on
-    // either field.
+    assert_openai_envelope(&body, "model_not_found");
     assert_eq!(
         body.pointer("/error/type").and_then(Value::as_str),
-        Some("not_implemented"),
+        Some("invalid_request_error"),
+    );
+    assert_eq!(
+        body.pointer("/error/param").and_then(Value::as_str),
+        Some("model"),
     );
 }
 
 #[tokio::test]
-async fn chat_completions_valid_body_returns_501_not_yet_wired() {
+async fn chat_completions_unknown_model_returns_404_model_not_found() {
     let payload = json!({
         "model": "gpt-4",
         "messages": [
@@ -124,14 +133,14 @@ async fn chat_completions_valid_body_returns_501_not_yet_wired() {
         .expect("router serves /v1/chat/completions");
     assert_eq!(
         resp.status(),
-        StatusCode::NOT_IMPLEMENTED,
-        "scaffold must return 501 for /v1/chat/completions",
+        StatusCode::NOT_FOUND,
+        "unknown model must surface as 404 model_not_found on /chat too",
     );
     let body = body_json(resp.into_body()).await;
-    assert_openai_envelope(&body, "openai_not_yet_wired");
+    assert_openai_envelope(&body, "model_not_found");
     assert_eq!(
         body.pointer("/error/type").and_then(Value::as_str),
-        Some("not_implemented"),
+        Some("invalid_request_error"),
     );
 }
 
@@ -155,11 +164,11 @@ async fn completions_malformed_body_returns_400_openai_envelope() {
     assert_eq!(
         resp.status(),
         StatusCode::BAD_REQUEST,
-        "malformed body must surface as 400, not 501",
+        "malformed body must surface as 400, not 404 / 501",
     );
     let body = body_json(resp.into_body()).await;
     // OpenAI envelope shape. `code` should be the invalid-request code,
-    // not the not-yet-wired code, so clients can tell the two apart.
+    // not the model_not_found code, so clients can tell the two apart.
     assert!(
         body.get("error").is_some(),
         "400 must use the OpenAI envelope, not the native one: {body}",
@@ -197,26 +206,26 @@ async fn chat_completions_malformed_body_returns_400_openai_envelope() {
 }
 
 #[tokio::test]
-async fn completions_minimal_body_still_returns_501() {
+async fn completions_minimal_body_reaches_model_resolution() {
     // Every field is `#[serde(default)]` on the request struct so an
-    // empty object must parse and reach the 501 — not get rejected at the
-    // extractor. This pins the "fields are optional at the wire layer"
-    // contract documented in the OpenAPI yaml.
+    // empty object must parse and reach model resolution — not get
+    // rejected at the extractor. With an empty model map this surfaces
+    // as `404 model_not_found` (the empty `model` field is also
+    // unknown).
     let resp = dev_router()
         .oneshot(json_post("/v1/completions", json!({})))
         .await
         .expect("router serves /v1/completions");
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = body_json(resp.into_body()).await;
-    assert_openai_envelope(&body, "openai_not_yet_wired");
+    assert_openai_envelope(&body, "model_not_found");
 }
 
 #[tokio::test]
-async fn chat_completions_empty_messages_array_returns_501() {
-    // The scaffold does not validate semantics; an empty `messages` array
-    // still parses. The v0.4 wiring step will tighten validation; this
-    // test is allowed to start failing then (replace with a 400
-    // assertion).
+async fn chat_completions_empty_messages_array_reaches_model_resolution() {
+    // The handler does not gate on `messages` cardinality; an empty
+    // array still reaches the model-resolution step. With an empty map
+    // this surfaces as 404 model_not_found.
     let resp = dev_router()
         .oneshot(json_post(
             "/v1/chat/completions",
@@ -224,5 +233,5 @@ async fn chat_completions_empty_messages_array_returns_501() {
         ))
         .await
         .expect("router serves /v1/chat/completions");
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

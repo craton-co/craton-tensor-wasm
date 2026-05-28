@@ -76,6 +76,7 @@ pub mod http_metrics;
 pub mod kernels;
 pub mod middleware;
 pub mod openai;
+pub mod openai_translator;
 pub mod rate_limit;
 pub mod routes;
 pub mod server;
@@ -103,6 +104,11 @@ pub use middleware::{
 };
 pub use openai::{
     ChatCompletionsRequest, ChatMessage, CompletionsRequest, OpenAiError, OpenAiErrorBody,
+};
+pub use openai_translator::{
+    assemble_chat_prompt, model_map_from_env, parse_model_map_env,
+    translate_chat_completions_request, translate_completions_request, ModelMap,
+    TranslatedRequest, ENV_OPENAI_MODEL_MAP,
 };
 pub use rate_limit::{
     AuthContext, PerTenantRateLimitConfig, RateLimitConfig, RateLimiter, TokenId,
