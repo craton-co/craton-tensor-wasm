@@ -144,17 +144,26 @@ pub struct CachedKernel {
     /// BLAKE3 over `ptx.text` (jit S-3). Recomputed and compared on every
     /// `get`. See the type-level doc for the threat model.
     ///
-    /// `#[doc(hidden)]` because the only correct-by-construction path is
-    /// [`CachedKernel::new`]; downstream callers should not need to touch
-    /// the field directly. The field stays `pub` (rather than going
-    /// private with an accessor) so the existing forged-blob regression
-    /// tests can still hand-craft a `CachedKernel` with a deliberately
-    /// wrong hash and assert that `KernelCache::put` rejects it.
+    /// The field is `pub` for backward compatibility with v0.1 struct-literal
+    /// callers and so the forged-blob regression tests can hand-craft a
+    /// `CachedKernel` with a deliberately wrong hash and assert
+    /// [`KernelCache::put`] rejects it. It is hidden from generated docs and
+    /// excluded from the stable surface; prefer [`Self::integrity_hash`] for
+    /// read access and [`Self::new`] for construction.
     #[doc(hidden)]
     pub integrity_hash: [u8; 32],
 }
 
 impl CachedKernel {
+    /// Borrow the stored BLAKE3 integrity hash over `ptx.text`. Prefer this
+    /// over reaching for the (hidden) field directly — the field is
+    /// retained as `pub` for source compatibility only and may be sealed
+    /// to `pub(crate)` in a future minor release.
+    #[must_use]
+    pub fn integrity_hash(&self) -> &[u8; 32] {
+        &self.integrity_hash
+    }
+
     /// Construct a `CachedKernel`, computing `integrity_hash` from
     /// `ptx.text`. This is the only way to obtain a correct-by-
     /// construction value; the older struct-literal pattern still works
