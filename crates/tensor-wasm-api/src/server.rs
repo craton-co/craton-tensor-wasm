@@ -18,7 +18,7 @@ use crate::middleware::{
     tenant_scope, INVOKE_CONCURRENCY_LIMIT, PROBE_CONCURRENCY_LIMIT, READ_CONCURRENCY_LIMIT,
     WRITE_CONCURRENCY_LIMIT,
     timeout_layer, trace_layer_with_propagation, AuthConfig, CorsConfig, TenantConfig,
-    MAX_REQUEST_BODY_BYTES,
+    TrustedHosts, MAX_REQUEST_BODY_BYTES,
 };
 use crate::rate_limit::{rate_limit, RateLimitConfig, RateLimiter};
 use crate::routes::{
@@ -169,6 +169,14 @@ pub fn build_router_with_audit(
         // Default (env unset) is permissive — the previous behaviour —
         // because most local-dev deployments don't set the env var.
         // Production behind a layered proxy should set the allowlist.
+        //
+        // The parsed allowlist travels as an `axum::Extension<TrustedHosts>`
+        // so tests can override at build time
+        // (`router.layer(axum::Extension(TrustedHosts::from_hosts([...])))`)
+        // without poisoning the process environment. Inserted BEFORE the
+        // `from_fn(host_validate)` layer so the middleware sees it on the
+        // request extensions when it runs.
+        .layer(axum::Extension(TrustedHosts::from_env()))
         .layer(axum::middleware::from_fn(host_validate))
         .layer(body_limit_layer(MAX_REQUEST_BODY_BYTES))
         .layer(timeout_layer(Duration::from_secs(30)))
