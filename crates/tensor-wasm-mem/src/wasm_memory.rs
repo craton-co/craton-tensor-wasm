@@ -139,6 +139,61 @@ impl TensorWasmLinearMemory {
         })
     }
 
+    /// Tenant-aware variant of [`Self::new_on`].
+    ///
+    /// Routes the underlying [`UnifiedBuffer`] allocation through
+    /// [`UnifiedBuffer::new_with_visible_window_on_with_tenant_context`]
+    /// so the tenant's GPU memory cap is consulted before allocation
+    /// and `release_gpu_bytes(cap)` is called on Drop. The same
+    /// `HARD_MAX_LINEAR_MEMORY_BYTES` ceiling and `min > max` checks
+    /// run first so a cap violation never races against a guest-bug
+    /// rejection.
+    ///
+    /// Roadmap feature #8 path: invoked by
+    /// `TensorWasmMemoryCreator::with_tenant_context` /
+    /// `TensorWasmMemoryCreator::with_pool_and_tenant_context` whenever
+    /// they fall through to the no-pool fresh-allocation branch.
+    pub fn new_on_with_tenant_context(
+        minimum_bytes: usize,
+        maximum_bytes: Option<usize>,
+        device_id: DeviceId,
+        tenant_ctx: Arc<tensor_wasm_tenant::TenantContext>,
+    ) -> Result<Self, tensor_wasm_core::error::TensorWasmError> {
+        let max = maximum_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+        if max > HARD_MAX_LINEAR_MEMORY_BYTES {
+            return Err(UnifiedError::TooLarge {
+                requested: max as u64,
+                limit: HARD_MAX_LINEAR_MEMORY_BYTES as u64,
+            }
+            .into());
+        }
+        if minimum_bytes > HARD_MAX_LINEAR_MEMORY_BYTES {
+            return Err(UnifiedError::TooLarge {
+                requested: minimum_bytes as u64,
+                limit: HARD_MAX_LINEAR_MEMORY_BYTES as u64,
+            }
+            .into());
+        }
+        if minimum_bytes > max {
+            return Err(UnifiedError::Allocation(format!(
+                "minimum {minimum_bytes} > maximum {max}"
+            ))
+            .into());
+        }
+        let cap = max.max(1);
+        let buffer = UnifiedBuffer::new_with_visible_window_on_with_tenant_context(
+            cap,
+            minimum_bytes,
+            device_id,
+            tenant_ctx,
+        )?;
+        Ok(Self {
+            buffer,
+            current_size: minimum_bytes,
+            maximum_size: max,
+        })
+    }
+
     /// Current logical size in bytes.
     pub fn current_size(&self) -> usize {
         self.current_size
@@ -415,6 +470,24 @@ struct MemoryCreatorState {
     pool: Option<Arc<UnifiedMemoryPool>>,
     /// Tunable knobs (per-instance cap, etc.). See [`MemoryCreatorConfig`].
     config: MemoryCreatorConfig,
+    /// Tenant context for GPU memory accounting (roadmap feature #8).
+    /// Set via [`TensorWasmMemoryCreator::with_tenant_context`]; when
+    /// present, every fresh [`UnifiedBuffer`] allocation (the fallback
+    /// path when the pool is exhausted, or the no-pool path) routes
+    /// through
+    /// [`UnifiedBuffer::new_on_with_tenant_context`], which calls
+    /// `consume_gpu_bytes` before allocating and `release_gpu_bytes`
+    /// on Drop.
+    ///
+    /// **Pool path is intentionally unmetered.** Pool-carved memories
+    /// share one slab allocation that was already paid for at pool
+    /// construction; counting each carve against the cap would
+    /// double-count the slab. The pool teardown documented on
+    /// `UnifiedMemoryPool` already enforces the all-or-nothing
+    /// lifecycle. A future GPU-quota refinement may apportion the slab
+    /// across tenants at pool-construction time; that is tracked in
+    /// `docs/GPU-QUOTAS.md` "v0.4 follow-up".
+    tenant_ctx: Option<Arc<tensor_wasm_tenant::TenantContext>>,
 }
 
 impl Default for TensorWasmMemoryCreator {
@@ -443,6 +516,56 @@ impl TensorWasmMemoryCreator {
                 device_id,
                 pool: None,
                 config,
+                tenant_ctx: None,
+            }),
+        }
+    }
+
+    /// Construct a tenant-aware creator that accounts every fresh
+    /// [`UnifiedBuffer`] against the tenant's GPU memory cap.
+    ///
+    /// Roadmap feature #8 builder: holds an `Arc<TenantContext>` and
+    /// routes the no-pool / pool-fallback allocation paths through
+    /// [`UnifiedBuffer::new_on_with_tenant_context`]. On a cap
+    /// violation the underlying error is
+    /// [`tensor_wasm_core::error::TensorWasmError::GpuMemoryExhausted`];
+    /// it surfaces here as a `String` because Wasmtime's
+    /// `MemoryCreator::new_memory` returns `Result<_, String>`.
+    ///
+    /// **Pool-carved memories are intentionally unmetered** — see the
+    /// note on [`MemoryCreatorState::tenant_ctx`] for the
+    /// rationale and the v0.4 follow-up.
+    pub fn with_tenant_context(
+        device_id: DeviceId,
+        tenant_ctx: Arc<tensor_wasm_tenant::TenantContext>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(MemoryCreatorState {
+                device_id,
+                pool: None,
+                config: MemoryCreatorConfig::default(),
+                tenant_ctx: Some(tenant_ctx),
+            }),
+        }
+    }
+
+    /// Tenant-aware variant of [`Self::with_pool`].
+    ///
+    /// Behaves like [`Self::with_pool`] for the pool-carve hot path
+    /// (no extra counter traffic) and like
+    /// [`Self::with_tenant_context`] for the fallback fresh-allocation
+    /// path.
+    pub fn with_pool_and_tenant_context(
+        device_id: DeviceId,
+        pool: Arc<UnifiedMemoryPool>,
+        tenant_ctx: Arc<tensor_wasm_tenant::TenantContext>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(MemoryCreatorState {
+                device_id,
+                pool: Some(pool),
+                config: MemoryCreatorConfig::default(),
+                tenant_ctx: Some(tenant_ctx),
             }),
         }
     }
@@ -472,6 +595,7 @@ impl TensorWasmMemoryCreator {
                 device_id,
                 pool: Some(pool),
                 config,
+                tenant_ctx: None,
             }),
         }
     }
@@ -628,8 +752,25 @@ unsafe impl MemoryCreator for TensorWasmMemoryCreator {
             }
         }
 
-        let mem = TensorWasmLinearMemory::new_on(minimum, maximum, self.inner.device_id)
-            .map_err(|e| e.to_string())?;
+        // Tenant-aware fresh allocation when a `TenantContext` was wired
+        // in (roadmap feature #8). The Wasmtime `MemoryCreator` API
+        // returns `Result<_, String>` so the structured
+        // `GpuMemoryExhausted { requested, limit, current }` collapses
+        // to a string here — non-Wasmtime callers that want the
+        // structured form should reach for
+        // `TensorWasmLinearMemory::new_on_with_tenant_context` directly.
+        let mem = if let Some(tenant_ctx) = self.inner.tenant_ctx.as_ref() {
+            TensorWasmLinearMemory::new_on_with_tenant_context(
+                minimum,
+                maximum,
+                self.inner.device_id,
+                Arc::clone(tenant_ctx),
+            )
+            .map_err(|e| e.to_string())?
+        } else {
+            TensorWasmLinearMemory::new_on(minimum, maximum, self.inner.device_id)
+                .map_err(|e| e.to_string())?
+        };
         Ok(Box::new(mem))
     }
 }

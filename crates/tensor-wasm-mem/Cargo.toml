@@ -18,6 +18,14 @@ categories = ["memory-management", "wasm"]
 [dependencies]
 anyhow.workspace = true
 tensor-wasm-core = { workspace = true }
+# Per-tenant GPU memory quota accounting (roadmap feature #8). The
+# `TensorWasmMemoryCreator::with_tenant_context` builder accepts an
+# `Arc<TenantContext>` so the allocator path can call
+# `consume_gpu_bytes` / `release_gpu_bytes` on every
+# `UnifiedBuffer` lifecycle event. Adding the dep here cannot
+# introduce a cycle: `tensor-wasm-tenant` itself only depends on
+# `tensor-wasm-core`.
+tensor-wasm-tenant = { workspace = true }
 parking_lot.workspace = true
 region = "3"
 thiserror.workspace = true

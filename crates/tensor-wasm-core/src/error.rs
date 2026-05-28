@@ -133,6 +133,39 @@ pub enum TensorWasmError {
         limit: u64,
     },
 
+    /// The tenant exceeded its per-tenant GPU memory cap.
+    ///
+    /// Distinct from [`Self::MemoryExhausted`] (the host-side / CPU
+    /// quota) so dashboards, alerts, and tenant-facing error responses
+    /// can distinguish "host RAM cap tripped" from "GPU memory cap
+    /// tripped". The cap is the value passed to
+    /// `TenantContextBuilder::with_gpu_memory_bytes_cap` (and recorded
+    /// on `TenantContext::gpu_memory_bytes_cap`); `current` is the
+    /// tenant's `gpu_bytes_in_use` *before* the rejected allocation
+    /// would have been added.
+    ///
+    /// v0.3.7 enforcement is in-process — the allocator path
+    /// (`tensor-wasm-mem::TensorWasmMemoryCreator::with_tenant_context`)
+    /// consults the counter on every `UnifiedBuffer::new_on` and refuses
+    /// to allocate when the cap would be exceeded. v0.4 will additionally
+    /// pin a CUDA driver-level cap via
+    /// `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`
+    /// (CUDA 11.2+).
+    #[error(
+        "gpu memory exhausted: requested {requested} bytes, limit {limit}, current {current}"
+    )]
+    GpuMemoryExhausted {
+        /// Bytes the tenant attempted to allocate on the GPU.
+        requested: u64,
+        /// Per-tenant GPU memory cap in bytes
+        /// (`TenantContext::gpu_memory_bytes_cap.unwrap()`).
+        limit: u64,
+        /// Bytes the tenant had already reserved on the GPU at the time
+        /// the allocation was rejected. The would-be new total is
+        /// `current + requested`.
+        current: u64,
+    },
+
     /// A GPU kernel exceeded its deadline.
     #[error("kernel timeout after {elapsed_ms} ms (deadline {deadline_ms} ms)")]
     KernelTimeout {
@@ -200,11 +233,21 @@ impl TensorWasmError {
     /// because the API layer otherwise returns `503` for hard 404-class
     /// failures and the CLI's retry loop spins on doomed requests.
     pub fn is_retryable(&self) -> bool {
+<<<<<<< HEAD
         match self {
             TensorWasmError::KernelTimeout { .. } | TensorWasmError::MemoryExhausted { .. } => true,
             TensorWasmError::Io(err) => is_retryable_io_kind(err.kind()),
             _ => false,
         }
+=======
+        matches!(
+            self,
+            TensorWasmError::KernelTimeout { .. }
+                | TensorWasmError::Io(_)
+                | TensorWasmError::MemoryExhausted { .. }
+                | TensorWasmError::GpuMemoryExhausted { .. }
+        )
+>>>>>>> worktree-agent-ab4d4301706272b03
     }
 
     /// Returns the inner diagnostic string for the four variants that wrap a
@@ -234,6 +277,7 @@ impl TensorWasmError {
             TensorWasmError::WasmTrap(_) => "wasm_trap",
             TensorWasmError::WasmCompile(_) => "wasm_compile",
             TensorWasmError::MemoryExhausted { .. } => "memory_exhausted",
+            TensorWasmError::GpuMemoryExhausted { .. } => "gpu_memory_exhausted",
             TensorWasmError::KernelTimeout { .. } => "kernel_timeout",
             TensorWasmError::TenantIsolationViolation { .. } => "tenant_isolation",
             TensorWasmError::Io(_) => "io",
