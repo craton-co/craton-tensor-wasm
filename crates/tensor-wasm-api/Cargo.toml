@@ -97,6 +97,16 @@ kernel-registry-api = ["dep:tensor-wasm-jit"]
 # duplicate entry — Cargo resolves both `cfg(test)` and `cfg(not(test))`
 # code against the same crate version.
 http-body-util = "0.1"
+# tensor-wasm-jit + blake3: only the kernel-registry-api integration
+# test (tests/kernel_registry_routes.rs) consumes these. The test is
+# itself gated behind `#[cfg(feature = "kernel-registry-api")]`; we
+# pull the jit crate with its `kernel-registry` sub-feature so the
+# `registry` module + `sign_manifest` helper are in scope, and blake3
+# so the test can recompute digests when constructing signed manifests.
+# Cargo deduplicates against the optional `[dependencies]` entry once
+# the api feature is on.
+tensor-wasm-jit = { workspace = true, features = ["kernel-registry"] }
+blake3.workspace = true
 # `temp-env` scopes process env-var mutations to a closure and serialises
 # concurrent users behind an internal Mutex. The header-hardening tests
 # use this for the `TENSOR_WASM_API_REQUIRE_TENANT=1` path (see

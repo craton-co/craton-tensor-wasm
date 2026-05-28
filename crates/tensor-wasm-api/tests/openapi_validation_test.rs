@@ -76,22 +76,44 @@ fn read_spec() -> String {
 /// `router_routes_match_expected_set` defends the parity between this
 /// list and the in-process router; `spec_paths_cover_router` defends
 /// the parity between this list and the spec.
-const EXPECTED_ROUTES: &[(&str, &str)] = &[
-    ("GET", "/healthz"),
-    ("GET", "/metrics"),
-    ("POST", "/functions"),
-    ("DELETE", "/functions/{id}"),
-    ("POST", "/functions/{id}/invoke"),
-    ("POST", "/functions/{id}/invoke-async"),
-    ("POST", "/functions/{id}/invoke-stream"),
-    ("GET", "/jobs/{id}"),
-    // OpenAI-compat shim (B4.9). Scaffold routes that return 501 with
-    // the OpenAI-shape error envelope. See
-    // `crates/tensor-wasm-api/src/openai.rs` and
-    // `docs/OPENAI-COMPAT.md` for the rollout plan.
-    ("POST", "/v1/completions"),
-    ("POST", "/v1/chat/completions"),
-];
+///
+/// The kernel-registry routes (B6.4) are mounted only when the
+/// `kernel-registry-api` Cargo feature is on. The OpenAPI spec
+/// documents them unconditionally (the spec is the public contract;
+/// gating it on a Cargo feature would hide the surface from API-doc
+/// tooling that builds without the feature). `expected_routes()`
+/// reconciles the two views: when the feature is off it filters the
+/// `/kernels` rows out of the in-process expectation but the parity
+/// asserts still require the spec to mention them — so a stale spec
+/// after a feature removal would still be caught.
+fn expected_routes() -> Vec<(&'static str, &'static str)> {
+    let mut routes: Vec<(&'static str, &'static str)> = vec![
+        ("GET", "/healthz"),
+        ("GET", "/metrics"),
+        ("POST", "/functions"),
+        ("DELETE", "/functions/{id}"),
+        ("POST", "/functions/{id}/invoke"),
+        ("POST", "/functions/{id}/invoke-async"),
+        ("POST", "/functions/{id}/invoke-stream"),
+        ("GET", "/jobs/{id}"),
+        // OpenAI-compat shim (B4.9). Scaffold routes that return 501 with
+        // the OpenAI-shape error envelope. See
+        // `crates/tensor-wasm-api/src/openai.rs` and
+        // `docs/OPENAI-COMPAT.md` for the rollout plan.
+        ("POST", "/v1/completions"),
+        ("POST", "/v1/chat/completions"),
+    ];
+    #[cfg(feature = "kernel-registry-api")]
+    {
+        // Kernel registry routes (B6.4 — roadmap feature #3). `POST` and
+        // `GET` share the `/kernels` path; the resolve route uses the
+        // `{name}/{version}` two-segment shape (axum 0.7 `:name/:version`).
+        routes.push(("POST", "/kernels"));
+        routes.push(("GET", "/kernels"));
+        routes.push(("GET", "/kernels/{name}/{version}"));
+    }
+    routes
+}
 
 /// Build the live router exactly as `server::build_router` does, but
 /// with deterministic config (no env reads) so the test does not get
@@ -469,7 +491,7 @@ fn spec_file_exists_and_is_nonempty() {
 fn spec_paths_cover_router() {
     let yaml = read_spec();
     let spec_paths = parse_spec_path_keys(&yaml);
-    let expected: BTreeSet<String> = EXPECTED_ROUTES
+    let expected: BTreeSet<String> = expected_routes()
         .iter()
         .map(|(_, p)| p.to_string())
         .collect();

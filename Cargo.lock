@@ -3311,6 +3311,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "blake3",
  "dashmap",
  "futures",
  "http-body-util",

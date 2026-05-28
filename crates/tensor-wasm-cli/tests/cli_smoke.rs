@@ -478,14 +478,15 @@ fn snapshot_restore_rejects_missing_input() {
 
 // -- `tensor-wasm kernel` smoke tests -----------------------------------
 //
-// v0.3.7 scaffold: every subcommand must exit 3 (FEATURE_NOT_EXPOSED)
-// with the documented "feature not yet exposed" message. These tests
-// pin the contract design partners depend on; when the v0.4 server
-// route lands, the assertions below will need to be updated to reflect
-// the real wire-level behaviour. See `crates/tensor-wasm-cli/src/cmd/kernel.rs`.
+// v0.3.8 (B6.4): the server-side `/kernels` endpoints landed, so the
+// CLI now performs real HTTP calls. These smoke tests exercise the new
+// surface against `DEAD_SERVER` (no service bound) so connection
+// failures stand in for "the wire is live" — the integration tests in
+// `crates/tensor-wasm-api/tests/kernel_registry_routes.rs` cover the
+// end-to-end success path. See `crates/tensor-wasm-cli/src/cmd/kernel.rs`.
 
 #[test]
-fn kernel_publish_exits_feature_not_exposed() {
+fn kernel_publish_against_dead_server_fails_cleanly() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ptx = tmp.path().join("kernel.ptx");
     std::fs::write(&ptx, b"// fake ptx").expect("write ptx");
@@ -508,48 +509,91 @@ fn kernel_publish_exits_feature_not_exposed() {
             DEAD_SERVER,
         ])
         .assert()
-        .failure()
-        .code(3)
-        .stderr(predicate::str::contains("not yet exposed"));
+        .failure();
     let out = assertion.get_output();
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    )
+    .to_lowercase();
+    assert!(
+        !combined.contains("panicked"),
+        "publish panicked instead of returning an error:\n{combined}"
     );
     assert!(
-        combined.contains("docs/KERNEL-REGISTRY.md"),
-        "message should cross-link to the doc:\n{combined}"
+        combined.contains("connect")
+            || combined.contains("connection")
+            || combined.contains("refused")
+            || combined.contains("reset")
+            || combined.contains("post http"),
+        "expected a connection-failure-shaped error, got:\n{combined}"
     );
 }
 
 #[test]
-fn kernel_list_exits_feature_not_exposed() {
-    tensor_wasm()
+fn kernel_list_against_dead_server_fails_cleanly() {
+    let assertion = tensor_wasm()
         .args(["kernel", "list", "--server", DEAD_SERVER])
         .assert()
-        .failure()
-        .code(3)
-        .stderr(predicate::str::contains("not yet exposed"));
+        .failure();
+    let out = assertion.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+    .to_lowercase();
+    assert!(
+        combined.contains("connect")
+            || combined.contains("connection")
+            || combined.contains("refused")
+            || combined.contains("reset")
+            || combined.contains("get http"),
+        "expected a connection-failure-shaped error, got:\n{combined}"
+    );
 }
 
 #[test]
-fn kernel_verify_exits_feature_not_exposed() {
+fn kernel_verify_succeeds_locally_when_manifest_signed_under_key() {
+    // `verify` is local-only (no network); pin the happy path so the
+    // exit-code contract for CI pipelines that gate releases on
+    // signature verification stays stable across releases.
+    use tensor_wasm_jit::registry::{sign_manifest, KernelManifest};
+
     let tmp = tempfile::tempdir().expect("tempdir");
-    let key = tmp.path().join("hmac.key");
-    std::fs::write(&key, "42".repeat(32)).expect("write key");
+    let key_path = tmp.path().join("hmac.key");
+    let key_hex = "42".repeat(32);
+    std::fs::write(&key_path, &key_hex).expect("write key");
+    let key = [0x42u8; 32];
+
+    let digest = *blake3::hash(b"// fake ptx\n").as_bytes();
+    let mut m = KernelManifest::new(
+        "matmul.f32".to_string(),
+        "1.0.0".to_string(),
+        80,
+        digest,
+        [0u8; 32],
+        0,
+        "smoke-test".to_string(),
+    );
+    m.signature = sign_manifest(&m, &key);
+    let manifest_path = tmp.path().join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_vec(&m).unwrap()).unwrap();
+
     tensor_wasm()
         .args([
             "kernel",
             "verify",
             "matmul.f32@1.0.0",
+            "--manifest-file",
+            manifest_path.to_str().unwrap(),
             "--key-file",
-            key.to_str().unwrap(),
+            key_path.to_str().unwrap(),
         ])
         .assert()
-        .failure()
-        .code(3)
-        .stderr(predicate::str::contains("not yet exposed"));
+        .success()
+        .stdout(predicate::str::contains("verifies under the supplied key"));
 }
 
 #[test]
