@@ -434,6 +434,24 @@ pub async fn bearer_auth(mut req: Request, next: Next) -> Response {
         return next.run(req).await;
     }
 
+    // api S-3: refuse requests with more than one `Authorization` header.
+    // `HeaderMap::get` returns the first occurrence — a buggy or hostile
+    // client sending two headers would silently get one accepted and the
+    // other invisible. Some proxies also concatenate duplicates with
+    // commas, which would round-trip through `parse_bearer_credentials`
+    // unpredictably. Reject outright.
+    let auth_count = req
+        .headers()
+        .get_all(axum::http::header::AUTHORIZATION)
+        .iter()
+        .count();
+    if auth_count > 1 {
+        return envelope(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "duplicate Authorization headers are not allowed",
+        );
+    }
     let header = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)

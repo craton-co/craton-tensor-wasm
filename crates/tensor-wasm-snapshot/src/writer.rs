@@ -441,6 +441,15 @@ impl SnapshotWriter {
                 TensorWasmError::Serialization("HMAC init failed".into())
             })?;
             mac.update(&compressed);
+            // snapshot 1.1: include the signature-kind discriminant byte in
+            // the HMAC input so a future second variant (e.g. Ed25519)
+            // cannot be substituted via trailer rewrite — that would
+            // otherwise be a downgrade primitive while two kinds coexist.
+            // Today there is only one kind, but mixing it in now means the
+            // reader can validate it without a wire-format break later
+            // (the reader's symmetric `mac.update(&[kind_byte])` lands in
+            // the same commit).
+            mac.update(&[SIGNATURE_KIND_HMAC_SHA256]);
             let sig = mac.finalize().into_bytes();
             compressed.reserve(1 + sig.len());
             compressed.push(SIGNATURE_KIND_HMAC_SHA256);

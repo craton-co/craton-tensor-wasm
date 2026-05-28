@@ -534,31 +534,59 @@ pub fn refuse_hmac_key_on_plaintext(server: &str) -> Result<()> {
 /// passphrase or PEM file gets a clear message instead of a silently
 /// truncated key.
 pub(crate) fn load_hmac_key(path: &Path) -> Result<[u8; 32]> {
-    let raw = std::fs::read(path)
-        .with_context(|| format!("reading HMAC key file {}", path.display()))?;
+    // cli 1.1.a: warn if the keyfile is readable by group/other on Unix.
+    // The file holds a 32-byte signing secret; world-readable means anyone
+    // on the host can forge snapshots that look authentic. We warn rather
+    // than refuse because (a) `umask 0` developer setups exist and (b) the
+    // operator may genuinely want the file group-readable for a service
+    // account. Loud warning, not hard failure.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode();
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    target: "tensor_wasm_cli::snapshot",
+                    file = %path.display(),
+                    mode = format!("{:o}", mode & 0o777),
+                    "HMAC key file is readable by group/other; tighten to 0600 \
+                     (chmod 600 <file>) — the file holds a 32-byte signing \
+                     secret and any reader can forge snapshots"
+                );
+            }
+        }
+    }
+    // cli 1.1.c: wrap the file read in a Zeroized RAII so the heap-resident
+    // copy of the key material is scrubbed on every return path, success
+    // or error. The returned `[u8; 32]` is the caller's responsibility.
+    let raw = Zeroized(
+        std::fs::read(path)
+            .with_context(|| format!("reading HMAC key file {}", path.display()))?,
+    );
 
     // Try the hex path first: a file that's pure ASCII hex (after trimming
     // surrounding whitespace) is the documented happy path. Mixed binary
     // files containing 64 ASCII-hex bytes plus a trailing newline still
     // resolve via this branch because `trim` strips the newline.
-    if let Ok(text) = std::str::from_utf8(&raw) {
+    if let Ok(text) = std::str::from_utf8(&raw.0) {
         let trimmed = text.trim();
         if trimmed.len() == 64 {
-            let bytes = hex::decode(trimmed).map_err(|e| {
+            let bytes = Zeroized(hex::decode(trimmed).map_err(|e| {
                 local_err(format!(
                     "HMAC key file {} looks like hex but is not valid: {e}",
                     path.display()
                 ))
-            })?;
+            })?);
             let mut out = [0u8; 32];
-            out.copy_from_slice(&bytes);
+            out.copy_from_slice(&bytes.0);
             return Ok(out);
         }
     }
 
-    if raw.len() == 32 {
+    if raw.0.len() == 32 {
         let mut out = [0u8; 32];
-        out.copy_from_slice(&raw);
+        out.copy_from_slice(&raw.0);
         return Ok(out);
     }
 
@@ -566,8 +594,32 @@ pub(crate) fn load_hmac_key(path: &Path) -> Result<[u8; 32]> {
         "HMAC key file {} must be either 64 hex characters or 32 raw bytes; \
          got {} bytes",
         path.display(),
-        raw.len()
+        raw.0.len()
     )))
+}
+
+/// Newtype wrapper that scrubs a `Vec<u8>` on Drop (cli 1.1.c).
+///
+/// Uses `std::ptr::write_volatile` per byte so a future-optimising compiler
+/// cannot elide the store as a dead write. This is the same pattern the
+/// `zeroize` crate's `volatile_write_bytes` uses; pulling the dep in just
+/// for this one call site is overkill, and the cli crate's heap-key
+/// lifetime is short enough (single subcommand) that a per-call
+/// implementation suffices. If the cli ever grows a long-running daemon
+/// path, switch to `zeroize::Zeroizing`.
+struct Zeroized(Vec<u8>);
+
+impl Drop for Zeroized {
+    fn drop(&mut self) {
+        for byte in self.0.iter_mut() {
+            // SAFETY: `byte` is a unique &mut u8 inside the Vec; writing 0
+            // through it is sound. `write_volatile` is also sound for any
+            // `T: Copy`, which `u8` is.
+            unsafe {
+                std::ptr::write_volatile(byte, 0);
+            }
+        }
+    }
 }
 
 /// Build a "feature not yet exposed by API" error tagged with the

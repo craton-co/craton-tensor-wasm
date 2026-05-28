@@ -569,6 +569,12 @@ impl SnapshotReader {
                 // HMAC covers every byte the zstd decoder consumed (the v2-shaped
                 // prefix), i.e. transitively magic, version, payload, and CRC32.
                 mac.update(&bytes[..prefix_len]);
+                // snapshot 1.1: also authenticate the signature-kind byte
+                // so a future second variant cannot be substituted via
+                // trailer rewrite (would otherwise be a downgrade primitive
+                // once two kinds coexist). The writer adds the same byte
+                // to its HMAC input; verification must match.
+                mac.update(&[kind_byte]);
                 let expected = mac.finalize().into_bytes();
                 // ConstantTimeEq returns `Choice` (0 or 1) without short-circuiting.
                 let ok: bool = expected

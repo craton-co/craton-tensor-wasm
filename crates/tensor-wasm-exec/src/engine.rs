@@ -181,11 +181,24 @@ impl TensorWasmEngine {
         }
 
         let engine = Engine::new(&wt_cfg)?;
-        Ok(Self {
+        let mut this = Self {
             engine,
             ticker_handle: None,
             config: cfg,
-        })
+        };
+        // exec S-4: auto-spawn the epoch ticker if we're already inside a
+        // Tokio runtime. Without the ticker, any `SpawnConfig::with_deadline`
+        // becomes silently inert — deadlines cannot fire. Operators who
+        // construct the engine OUTSIDE a runtime (synchronous startup) still
+        // have to call `spawn_epoch_ticker()` after `Runtime::block_on` /
+        // `Runtime::new()`; the `spawn_instance` path also emits a loud
+        // `tracing::error!` (see executor.rs) the first time a deadline is
+        // requested with no ticker running, so the silent-failure mode is
+        // closed defence-in-depth.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            this.spawn_epoch_ticker();
+        }
+        Ok(this)
     }
 
     /// Borrow the underlying wasmtime Engine. Cheap (it's `Arc`-shaped internally).
