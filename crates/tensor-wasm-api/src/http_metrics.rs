@@ -101,6 +101,7 @@ pub const DEFAULT_ROUTE_ALLOWLIST: &[&str] = &[
     "/functions/:id",
     "/functions/:id/invoke",
     "/functions/:id/invoke-async",
+    "/functions/:id/invoke-stream",
     "/jobs/:id",
 ];
 
@@ -274,6 +275,7 @@ mod tests {
             "/functions/:id",
             "/functions/:id/invoke",
             "/functions/:id/invoke-async",
+            "/functions/:id/invoke-stream",
             "/jobs/:id",
         ] {
             assert!(allow.allows(r), "default allow-list missing {r}");

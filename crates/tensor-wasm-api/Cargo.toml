@@ -22,6 +22,13 @@ tensor-wasm-core = { workspace = true }
 tensor-wasm-exec = { workspace = true }
 base64 = "0.22"
 dashmap.workspace = true
+# futures: needed by the streaming `/invoke-stream` handler to build an
+# `impl Stream<Item = Result<Event, _>>` that axum's `Sse` wraps, and an
+# `impl Stream<Item = Result<Bytes, _>>` that `Body::from_stream` wraps
+# on the non-SSE branch. The dev-dependency line below is dropped so
+# Cargo resolves both `cfg(test)` and `cfg(not(test))` code against the
+# same crate version.
+futures = { workspace = true }
 hyper.workspace = true
 opentelemetry = { workspace = true }
 # opentelemetry_sdk: needed only for `TraceContextPropagator` so the gateway
@@ -56,7 +63,10 @@ uuid.workspace = true
 wasmparser.workspace = true
 
 [dev-dependencies]
-futures = { workspace = true }
+# futures: now declared as a regular [dependencies] entry above for the
+# streaming `/invoke-stream` handler. The dev-dependency block keeps no
+# duplicate entry — Cargo resolves both `cfg(test)` and `cfg(not(test))`
+# code against the same crate version.
 http-body-util = "0.1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-test.workspace = true

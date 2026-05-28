@@ -27,11 +27,16 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
+    body::Body,
     extract::{rejection::JsonRejection, Extension, Path, State},
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    http::{header, HeaderMap, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     Json,
 };
+use futures::stream;
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::metrics::TensorWasmMetrics;
 use tensor_wasm_core::types::TenantId;
@@ -898,6 +903,152 @@ pub async fn invoke_function_async(
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "job_id": job_id.to_string() })),
     ))
+}
+
+/// `Accept` header value that selects the Server-Sent Events response
+/// shape on [`invoke_function_stream`]. Anything else (or absence) falls
+/// through to the raw chunked-transfer (`application/octet-stream`)
+/// branch.
+pub const SSE_MIME: &str = "text/event-stream";
+
+/// Content-Type emitted by the chunked-transfer branch of
+/// [`invoke_function_stream`] when the request did not negotiate SSE.
+pub const CHUNKED_MIME: &str = "application/octet-stream";
+
+/// Returns `true` when the supplied `Accept` header value asks for
+/// `text/event-stream`. Tolerates the standard `accept: a, b; q=…`
+/// shape: any comma-separated token that starts (after trim) with
+/// `text/event-stream` is taken as a match. Quality-value scoring is
+/// out of scope for the scaffold; if a client lists multiple types
+/// including SSE we serve SSE.
+fn accept_wants_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.split(',')
+                .any(|part| part.trim().to_ascii_lowercase().starts_with(SSE_MIME))
+        })
+        .unwrap_or(false)
+}
+
+/// `POST /functions/{id}/invoke-stream` — streaming invocation.
+///
+/// Mirrors the body / auth surface of [`invoke_function`]. The response
+/// shape is chosen from the request's `Accept` header:
+///
+/// * `Accept: text/event-stream` — Server-Sent Events. Each chunk the
+///   guest emits via `wasi:tensor/host.emit-chunk` becomes one `data:`
+///   line. A `keep-alive` comment is injected on idle so intermediate
+///   proxies don't reap the connection. Stream terminates with an
+///   `event: end` frame when the guest returns.
+/// * Anything else — `Content-Type: application/octet-stream`,
+///   chunked-transfer encoding. Each guest chunk is forwarded verbatim
+///   as one HTTP chunk frame.
+///
+/// ## v0.3.7 scaffold behaviour
+///
+/// The handler does NOT yet drive the executor through a streaming
+/// invocation path — that wiring lands in v0.4 alongside the
+/// `tensor_wasm_wasi_gpu::StreamingContext` hookup on `InstanceState`.
+/// For now the handler:
+///
+/// 1. Authorizes the caller (bearer + tenant scope) exactly like
+///    `/invoke`, so the route shares the existing security envelope.
+/// 2. Confirms the requested function exists.
+/// 3. Emits a single `scaffold` SSE event (or chunked frame) carrying
+///    `{"status":"not_yet_wired"}` and closes the stream.
+///
+/// Clients that hit this route today learn the wire shape (status
+/// code, content-type, event framing) without committing to a
+/// behaviour the executor cannot yet honour. Once v0.4 lands the
+/// scaffold body is replaced with a real `mpsc::Receiver` drain
+/// without any URL / method / body-shape change.
+///
+/// ## Security
+///
+/// Bytes the guest emits will eventually pass through a `sanitize_path`-
+/// style filter before they hit the wire — log-injection and ANSI-
+/// escape stripping is documented in `docs/STREAMING.md` and lives in
+/// the v0.4 follow-up. The scaffold returns only host-controlled
+/// bytes, so the filter is intentionally not in this code path yet.
+///
+/// ## Body handling
+///
+/// As with `/invoke` and `/invoke-async` (api S-31), the request body
+/// is intentionally not parsed by the handler — the per-route body cap
+/// in [`crate::middleware::body_limit_layer`] still rejects oversized
+/// payloads with `413 Payload Too Large` before the handler runs, so
+/// the streaming route inherits the same DoS-protection envelope as
+/// the synchronous and async invoke variants.
+#[tracing::instrument(
+    name = "http.invoke_function_stream",
+    skip(state, auth, headers),
+    fields(
+        function_id = %id,
+        tenant = tracing::field::Empty,
+        sse = tracing::field::Empty,
+    ),
+)]
+pub async fn invoke_function_stream(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<crate::rate_limit::AuthContext>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    tracing::Span::current().record("tenant", tracing::field::display(tenant));
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        ctx.authorize_tenant(tenant)?;
+    }
+
+    // 404 before any negotiation work, mirroring `/invoke`.
+    if !state.functions.contains_key(&id) {
+        return Err(ApiError::not_found(format!("function {id} not found")));
+    }
+
+    let wants_sse = accept_wants_sse(&headers);
+    tracing::Span::current().record("sse", tracing::field::display(wants_sse));
+
+    // The scaffold payload — host-controlled, no guest bytes — that the
+    // v0.4 follow-up will replace with a drain of the
+    // `mpsc::Receiver<Vec<u8>>` produced by `StreamingContext`.
+    let scaffold_payload =
+        serde_json::json!({ "status": "not_yet_wired", "function_id": id.to_string() })
+            .to_string();
+
+    if wants_sse {
+        // One `event: scaffold` frame, then end-of-stream. The
+        // `KeepAlive` layer is wired even though the stream closes
+        // immediately so the v0.4 swap (long-lived streams) inherits
+        // the correct keep-alive cadence without a separate edit.
+        let scaffold_event = Event::default()
+            .event("scaffold")
+            .data(scaffold_payload);
+        let end_event = Event::default().event("end").data("");
+        let s = stream::iter(vec![
+            Ok::<Event, std::convert::Infallible>(scaffold_event),
+            Ok(end_event),
+        ]);
+        Ok(Sse::new(s)
+            .keep_alive(KeepAlive::default())
+            .into_response())
+    } else {
+        // Chunked-transfer branch. axum infers `Transfer-Encoding:
+        // chunked` from the lack of `Content-Length` on a
+        // `Body::from_stream` response.
+        let chunk = format!("event: scaffold\ndata: {scaffold_payload}\n\n");
+        let s = stream::iter(vec![Ok::<axum::body::Bytes, std::io::Error>(
+            axum::body::Bytes::from(chunk),
+        )]);
+        let mut resp = Response::new(Body::from_stream(s));
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            CHUNKED_MIME.parse().expect("static mime parses"),
+        );
+        Ok(resp)
+    }
 }
 
 /// `GET /jobs/{id}` — poll an async invocation.
