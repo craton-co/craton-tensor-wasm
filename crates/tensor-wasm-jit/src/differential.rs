@@ -8,7 +8,8 @@
 //!   1. The original Wasm body on the Wasmtime CPU interpreter (the
 //!      ground truth).
 //!   2. The JIT-emitted PTX on the cust/cudarc backend.
-//! and asserts byte-equal output. Discrepancies are surfaced as
+//!
+//! …and asserts byte-equal output. Discrepancies are surfaced as
 //! `OracleDivergence` records the CI gate can publish on every PR.
 //!
 //! ## v0.3.7 / v0.4 status
@@ -92,10 +93,7 @@ impl DifferentialOracle {
         // by the existing scaffold tests in `differential_scaffold.rs`
         // which pass a blueprint + empty input to assert harness
         // wiring only.
-        let cpu_output = match reference_eval(bp, inputs) {
-            Ok(bytes) => Some(bytes),
-            Err(_) => None,
-        };
+        let cpu_output = reference_eval(bp, inputs).ok();
 
         // GPU path: requires both the `cuda-oxide-backend` feature AND
         // a usable CUDA device at runtime. Until the S22 runner is

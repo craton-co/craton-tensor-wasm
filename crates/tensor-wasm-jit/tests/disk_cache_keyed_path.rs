@@ -39,7 +39,7 @@ fn ptxbin_paths(dir: &PathBuf) -> Vec<PathBuf> {
         .expect("read tempdir")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ptxbin"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ptxbin"))
         .collect();
     paths.sort();
     paths

@@ -117,10 +117,9 @@ fn record_error_truncates_on_utf8_boundary() {
 fn load_ptx_rejects_oversized_entry_name() {
     // PTX kernel identifiers are short C-style identifiers — 256 is a
     // generous ceiling. A future bump above 512 should be deliberate.
-    assert!(
+    const _: () = assert!(
         MAX_ENTRY_NAME_BYTES <= 512,
-        "MAX_ENTRY_NAME_BYTES = {MAX_ENTRY_NAME_BYTES}; raising it past 512 \
-         should be a deliberate decision — update this test if intentional",
+        "MAX_ENTRY_NAME_BYTES raising past 512 should be a deliberate decision",
     );
     // And the predicate itself: a 64 MiB entry-name length must be
     // rejected by the same arithmetic the host uses.

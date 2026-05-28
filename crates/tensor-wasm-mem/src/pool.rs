@@ -441,6 +441,8 @@ impl UnifiedMemoryPool {
     /// The accessor is `pub(crate)` so external code cannot derive a slice
     /// that outlives a future `reset()`; in-crate callers (tests, FFI
     /// glue) must still satisfy the conditions above at every use site.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) unsafe fn slab_ptr(&self) -> *const u8 {
         self.slab.as_ptr()
     }
@@ -616,7 +618,7 @@ mod tests {
         let pool = UnifiedMemoryPool::new(4096).unwrap();
         // Power-of-two alignment beyond the 1 GiB cap must be rejected
         // (would otherwise overflow when computing the aligned bump).
-        let huge = (1usize << 31).max(1 << 30) + 1; // > 1 GiB
+        let huge = (1usize << 31) + 1; // > 2 GiB
         // Use a clean power-of-two above the cap.
         let too_big = 1usize << 31;
         assert!(pool.allocate(8, too_big).is_err());

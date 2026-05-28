@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_jit::cache::{CacheKey, KernelCache, KernelCacheConfig};
 use tensor_wasm_jit::registry::{
-    sign_manifest, BlueprintResolver, InMemoryBlueprintResolver, InMemoryRegistry,
+    sign_manifest, InMemoryBlueprintResolver, InMemoryRegistry,
     KernelManifest, KernelRegistry, RegistryError,
 };
 

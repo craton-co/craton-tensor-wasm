@@ -685,7 +685,7 @@ mod tests {
             LoweredArg::I32(-7),
             LoweredArg::U32(0xDEAD_BEEF),
             LoweredArg::I64(-1_000_000_000_000),
-            LoweredArg::U64(0xC0FFEE_BABE_F00D),
+            LoweredArg::U64(0x00C0_FFEE_BABE_F00D),
             LoweredArg::F32(core::f32::consts::PI),
             LoweredArg::F64(core::f64::consts::E),
         ];

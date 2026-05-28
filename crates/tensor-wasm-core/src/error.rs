@@ -441,7 +441,7 @@ mod tests {
             tenant_id: crate::types::TenantId(1),
             resource: "x".into(),
         };
-        let io = TensorWasmError::Io(io::Error::new(io::ErrorKind::Other, "x"));
+        let io = TensorWasmError::Io(io::Error::other("x"));
         assert!(mem.inner().is_none());
         assert!(kt.inner().is_none());
         assert!(iso.inner().is_none());

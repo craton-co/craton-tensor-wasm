@@ -148,6 +148,11 @@ pub trait UnifiedBacking: Send + Sync {
     /// Number of bytes in this allocation.
     fn len(&self) -> usize;
 
+    /// True iff [`Self::len`] is zero.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Borrow the host-visible slice. UVM means the bytes are accessible
     /// to both host and device; reads after a device write may need a
     /// `prefetch_to_host` first depending on the backing.

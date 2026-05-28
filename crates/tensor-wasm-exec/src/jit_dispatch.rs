@@ -226,8 +226,9 @@ where
                 // Lazily seed the arena: park it at the top of memory. If
                 // memory is smaller than the arena, grow by one page.
                 if mem_len < SCRATCH_ARENA_BYTES as u64 {
-                    let pages_needed =
-                        ((SCRATCH_ARENA_BYTES as u64 + 65535) / 65536).saturating_sub(mem_len / 65536);
+                    let pages_needed = (SCRATCH_ARENA_BYTES as u64)
+                        .div_ceil(65536)
+                        .saturating_sub(mem_len / 65536);
                     if pages_needed > 0
                         && memory.grow(&mut caller, pages_needed).is_err()
                     {
@@ -695,7 +696,8 @@ mod tests {
                         Some(c) => c,
                         None => {
                             if mem_len < SCRATCH_ARENA_BYTES as u64 {
-                                let pages = ((SCRATCH_ARENA_BYTES as u64 + 65535) / 65536)
+                                let pages = (SCRATCH_ARENA_BYTES as u64)
+                                    .div_ceil(65536)
                                     .saturating_sub(mem_len / 65536);
                                 if pages > 0 {
                                     memory.grow(&mut caller, pages).expect("grow");

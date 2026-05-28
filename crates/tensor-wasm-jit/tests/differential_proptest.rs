@@ -96,7 +96,7 @@ fn vector_add_blueprint(lanes: u32) -> TensorWasmKernelBlueprint {
         .push(TensorWasmOp::StoreUnified { lanes })
         .with_grid(GridHint {
             total_threads: lanes.max(1),
-            preferred_block_size: lanes.max(1).min(128),
+            preferred_block_size: lanes.clamp(1, 128),
         })
 }
 

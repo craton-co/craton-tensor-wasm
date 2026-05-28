@@ -16,7 +16,7 @@ use tensor_wasm_snapshot::payload_crc32;
 
 #[test]
 fn snapshot_version_minus_one_is_rejected() {
-    assert!(
+    const _: () = assert!(
         SNAPSHOT_VERSION >= 1,
         "test assumes there is a representable previous version",
     );

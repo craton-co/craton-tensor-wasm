@@ -83,7 +83,7 @@ fn t30_put_writes_sidecar_and_artifact_blob_with_v2_magic() {
         .expect("read tempdir")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ptxbin"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ptxbin"))
         .collect();
     assert_eq!(
         sidecars.len(),
@@ -114,7 +114,7 @@ fn t30_put_writes_sidecar_and_artifact_blob_with_v2_magic() {
         .expect("read tempdir")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "bin"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "bin"))
         .collect();
     assert_eq!(
         blobs.len(),
@@ -189,7 +189,7 @@ fn t30_tampered_artifact_blob_is_treated_as_miss() {
         .expect("read tempdir")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "bin"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "bin"))
         .collect();
     assert_eq!(blobs.len(), 1);
     let mut bytes = std::fs::read(&blobs[0]).expect("read blob");

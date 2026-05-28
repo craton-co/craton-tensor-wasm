@@ -88,7 +88,8 @@ fn independent_constructions_yield_independent_caps() {
 
     // And the caps are independently usable — one going out of scope
     // does not invalidate the other (they share no allocation).
-    drop(cap_a);
+    // (RegistryAdminCapability is Copy/Clone, no real Drop — name-shadow to "use" it.)
+    let _ = cap_a;
     let snap = reg_b.tenants(&cap_b);
     assert_eq!(snap.len(), 1);
     assert_eq!(snap[0].id(), TenantId(200));

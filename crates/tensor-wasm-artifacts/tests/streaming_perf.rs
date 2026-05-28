@@ -38,9 +38,9 @@ fn streaming_put_get_100_mib_round_trip() {
     // If the cap shrinks below 100 MiB in a future revision this test
     // should be revisited rather than silently passing on a smaller
     // payload.
-    assert!(
+    const _: () = assert!(
         PAYLOAD_LEN < MAX_PAYLOAD_LEN,
-        "test payload {PAYLOAD_LEN} must stay below put cap {MAX_PAYLOAD_LEN}"
+        "test payload must stay below put cap",
     );
 
     // Use a deterministic but non-trivial fill so zstd has to do real

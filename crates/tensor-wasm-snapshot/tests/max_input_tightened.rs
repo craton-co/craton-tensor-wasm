@@ -30,7 +30,7 @@ fn max_input_bytes_is_one_gib() {
     // that accidentally re-introduces `64 * 1024 * 1024 * 64` would
     // re-inflate the cap to 4 GiB without changing the existing
     // `max_input_rejected.rs` test outcome.
-    assert!(limits::MAX_INPUT_BYTES < 2 * 1024 * 1024 * 1024);
+    const _: () = assert!(limits::MAX_INPUT_BYTES < 2 * 1024 * 1024 * 1024);
 }
 
 /// Targeted variant of `max_input_rejected.rs` that probes the rejection

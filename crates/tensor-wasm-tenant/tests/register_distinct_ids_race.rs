@@ -47,8 +47,8 @@ fn thirty_two_threads_register_disjoint_ids_concurrently() {
     let failures = Arc::new(AtomicUsize::new(0));
     // Each thread parks its winning Arc here keyed by its own TenantId so
     // the post-race assertions can compare against the lookup result.
-    let winners: Arc<Mutex<Vec<(TenantId, Arc<TenantContext>)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    type Winners = Arc<Mutex<Vec<(TenantId, Arc<TenantContext>)>>>;
+    let winners: Winners = Arc::new(Mutex::new(Vec::new()));
 
     let mut handles = Vec::with_capacity(THREADS);
     for thread_idx in 0..THREADS {

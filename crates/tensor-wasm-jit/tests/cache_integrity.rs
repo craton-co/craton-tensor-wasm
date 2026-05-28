@@ -162,7 +162,7 @@ fn disk_cache_rejects_tampered_payload() {
     let entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "bin"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "bin"))
         .collect();
     assert_eq!(
         entries.len(),

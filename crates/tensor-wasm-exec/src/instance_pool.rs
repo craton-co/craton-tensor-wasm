@@ -92,7 +92,7 @@ pub type ModuleHash = [u8; 32];
 const POOL_RESET_DEADLINE: Duration = Duration::from_millis(10);
 
 /// Pool configuration. One pool per executor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct InstancePoolConfig {
     /// Pre-spawn N instances per (tenant, module-hash) tuple. Default 0
@@ -112,15 +112,6 @@ pub struct InstancePoolConfig {
     /// honour this cap before spawning a new tuple. Default 0 = unlimited
     /// (within the executor's `max_instances`).
     pub max_total_warm: usize,
-}
-
-impl Default for InstancePoolConfig {
-    fn default() -> Self {
-        Self {
-            warm_instances_per_tuple: 0,
-            max_total_warm: 0,
-        }
-    }
 }
 
 impl InstancePoolConfig {

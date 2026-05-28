@@ -919,6 +919,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3307,7 +3316,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-api"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -3343,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-artifacts"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "bincode",
  "blake3",
@@ -3361,7 +3370,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-bench"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "axum",
  "base64",
@@ -3381,7 +3390,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-cli"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3414,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-core"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "opentelemetry",
@@ -3434,10 +3443,11 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-exec"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "async-trait",
  "blake3",
+ "crossbeam-channel",
  "dashmap",
  "futures",
  "lru",
@@ -3459,7 +3469,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-jit"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "bincode",
  "blake3",
@@ -3491,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-mem"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "cuda-async",
@@ -3516,7 +3526,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-snapshot"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -3537,7 +3547,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-tenant"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "criterion",
  "cust",
@@ -3554,7 +3564,7 @@ dependencies = [
 
 [[package]]
 name = "tensor-wasm-wasi-gpu"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "async-trait",
  "cust",

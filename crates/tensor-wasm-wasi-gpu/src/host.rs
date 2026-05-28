@@ -300,7 +300,7 @@ impl WasiCudaContext {
                 .find(|i| msg.is_char_boundary(*i))
                 .unwrap_or(0);
             msg.truncate(cutoff);
-            msg.push_str("\u{2026}");
+            msg.push('\u{2026}');
         }
         warn!(target: "tensor_wasm_wasi_gpu::host", instance = %self.instance_id, %msg, "wasi-cuda error");
         // A panicked `record_error` call earlier in the launch path would
@@ -370,6 +370,8 @@ impl WasiCudaContext {
     /// deliberately not part of the public API: see
     /// [`Self::last_lowered_args`] for the use-after-grow rationale
     /// behind the public redaction.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn last_lowered_args_internal(&self) -> Vec<LoweredArg> {
         self.last_lowered_args
             .lock()

@@ -591,7 +591,7 @@ impl Drop for InstanceSlotGuard {
 /// no host allocation is attempted on its behalf.
 fn check_module_memory_within_cap(module: &Module, cap_bytes: usize) -> Result<(), ExecError> {
     let cap_u64 = cap_bytes as u64;
-    let mut check = |mt: &wasmtime::MemoryType| -> Result<(), ExecError> {
+    let check = |mt: &wasmtime::MemoryType| -> Result<(), ExecError> {
         let page_size = mt.page_size();
         // `minimum()` is in pages; multiply with overflow-safe saturating
         // arithmetic so a pathological declaration cannot wrap on cast.

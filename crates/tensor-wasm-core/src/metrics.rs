@@ -762,7 +762,7 @@ impl TensorWasmMetrics {
         let active_instances: Gauge<i64, AtomicI64> = Gauge::default();
         let gpu_memory_used_bytes: Gauge<u64, AtomicU64> = Gauge::default();
         let kernel_dispatches_total: Counter<u64> = Counter::default();
-        let kernel_latency_seconds = Histogram::new(kernel_buckets.into_iter());
+        let kernel_latency_seconds = Histogram::new(kernel_buckets);
         let instance_spawns_total: Counter<u64> = Counter::default();
         let instance_terminations_total: Counter<u64> = Counter::default();
         let offload_success_total: Counter<u64> = Counter::default();

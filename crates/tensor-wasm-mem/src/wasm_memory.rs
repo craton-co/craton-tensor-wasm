@@ -246,6 +246,7 @@ impl TensorWasmLinearMemory {
     /// against the guest's mutable view of its linear memory, which is UB.
     /// Intended uses: host-side inspection in tests and the trusted host
     /// helpers within this crate, between guest invocations.
+    #[cfg(test)]
     pub(crate) fn as_slice(&self) -> &[u8] {
         let size = self.current_size;
         // SAFETY: the underlying buffer covers `maximum_size >= size` bytes.

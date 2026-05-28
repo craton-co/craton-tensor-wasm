@@ -48,7 +48,7 @@ const MINIMAL_TENANT_ID: u64 = 0xA;
 const MINIMAL_INSTANCE_ID: u128 = 0xB;
 
 /// Tenant ID embedded in the richer fixture.
-const RICH_TENANT_ID: u64 = 0xC0FF_EE;
+const RICH_TENANT_ID: u64 = 0x00C0_FFEE;
 /// Instance ID embedded in the richer fixture.
 const RICH_INSTANCE_ID: u128 = 0xDEAD_BEEF_CAFE_F00D;
 
