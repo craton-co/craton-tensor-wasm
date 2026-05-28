@@ -33,8 +33,9 @@ If you only read one section: skip to [Anti-cheating checklist](#anti-cheating-c
 
 **In scope.** Side-by-side measurements of TensorWasm's published bench groups
 (`cold_start/*`, `dispatch/*`, `jit_compile/*`, `e2e/*`,
-`memory_bandwidth/*`, `tenant_registry/*`) against equivalent metrics in
-other runtimes, using a shared workload and hardware envelope.
+`memory_bandwidth/*`, `tenant_registry/*`, `call_export/*`,
+`invoke_stream/*`) against equivalent metrics in other runtimes, using a
+shared workload and hardware envelope.
 
 **Not in scope.** "Vibes" benchmarks (one-shot `time ./run.sh`),
 synthetic micro-benches that don't map to a real TensorWasm subsystem,
@@ -330,6 +331,65 @@ runs a hand-rolled sampling loop alongside the Criterion suite.
 
 ```sh
 cargo bench -p tensor-wasm-bench --bench tail_latency
+```
+
+### Typed-args call_export (`call_export/*`)
+
+Batch 6 introduced [`TensorWasmExecutor::call_export_with_args`], a
+slice-of-`WasmArg` entrypoint that replaces the legacy
+`typed::<(), ()>`-shaped `call_export` shim for any guest export with a
+non-trivial signature. The bench file
+[`crates/tensor-wasm-bench/benches/call_export_args.rs`](../crates/tensor-wasm-bench/benches/call_export_args.rs)
+pins the overhead of the new path so a future args-marshalling regression
+trips the gate before it ships:
+
+- **`call_export/noargs/call_export_with_args_empty`** — drives the
+  typed-args entrypoint with an empty arg slice on a `() -> ()` export
+  (`noop`). Compared against the legacy no-args shim this isolates the
+  per-call slice-iteration + signature-reflection cost.
+- **`call_export/args/two_i32`** — drives `call_export_with_args` with
+  `[WasmArg::I32(1), WasmArg::I32(2)]` against an `(i32, i32) -> i32`
+  export (`add`). Measures the actual marshalling work: enum → wasmtime
+  `Val`, slice-length check against the typed export, and the
+  `Val`-array-to-`Results` conversion on return.
+
+Both groups spawn + terminate the instance inside the timed loop so the
+absolute numbers are anchored to the same envelope as the `/invoke` HTTP
+path; the cross-group delta is the args-path overhead in isolation. The
+two `baseline.json` entries land with `regression_check: false` and zero
+medians as stubs — the first quiet-host capture (`run-quiet-bench.sh`)
+must populate real medians before the gate is flipped on.
+
+```sh
+cargo bench -p tensor-wasm-bench --bench call_export_args
+```
+
+### Streaming invoke (`invoke_stream/*`)
+
+Batch 7 restores the `/invoke-stream` route (B7.1 — in flight on a
+parallel branch at time of writing). The bench file
+[`crates/tensor-wasm-bench/benches/streaming_invoke.rs`](../crates/tensor-wasm-bench/benches/streaming_invoke.rs)
+pins the floor of the streaming path against the synchronous `/invoke`
+baseline so v0.4's actual chunk-emitter has a regression target:
+
+- **`invoke_stream/baseline_invoke`** — synchronous `/invoke` reference
+  number. Same handler depth, same registry lookup, same body drain.
+- **`invoke_stream/sse`** — `/invoke-stream` with
+  `Accept: text/event-stream`. Measures the SSE framing floor (v0.3.7
+  emits a single `event: scaffold` frame).
+- **`invoke_stream/chunked`** — `/invoke-stream` with the default
+  `Accept`. Measures the chunked-transfer-encoding fallback floor.
+
+The bench file currently ships as a `todo!()`-bodied placeholder because
+the `/invoke-stream` route is not yet on `build_router` in this worktree;
+running it surfaces a clear "B7.1: route not yet wired" panic rather than
+emitting misleading numbers against the legacy `/invoke` path. The
+`baseline.json` stubs carry `regression_check: false` until B7.1 merges
+and the placeholders are replaced with real router-driven sample loops
+(pattern after `tail_latency.rs::measure_invoke_not_found`).
+
+```sh
+cargo bench -p tensor-wasm-bench --bench streaming_invoke
 ```
 
 ### Cold vs warm
