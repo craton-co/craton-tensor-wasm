@@ -67,10 +67,7 @@ async fn pool_pre_spawns_warm_instances_on_first_acquire() {
     // tracks live channel occupancy.
     let engine = Arc::new(TensorWasmEngine::new().expect("engine"));
     let exec = TensorWasmExecutor::new(engine);
-    let pool = Arc::new(InstancePool::new(InstancePoolConfig {
-        warm_instances_per_tuple: 2,
-        max_total_warm: 0,
-    }));
+    let pool = Arc::new(InstancePool::new(InstancePoolConfig::new(2, 0)));
     let exec = exec.with_instance_pool(Arc::clone(&pool));
 
     let wasm = noop_wasm();
@@ -103,10 +100,7 @@ async fn pool_reuse_resets_guest_globals_to_initial_state() {
     // pool must therefore return 1 on every call.
     let engine = Arc::new(TensorWasmEngine::new().expect("engine"));
     let exec = TensorWasmExecutor::new(engine);
-    let pool = Arc::new(InstancePool::new(InstancePoolConfig {
-        warm_instances_per_tuple: 1,
-        max_total_warm: 0,
-    }));
+    let pool = Arc::new(InstancePool::new(InstancePoolConfig::new(1, 0)));
     let exec = exec.with_instance_pool(Arc::clone(&pool));
 
     let wasm = counter_wasm();
@@ -139,10 +133,7 @@ async fn pool_isolates_instances_per_tenant() {
     // used by tenant A.
     let engine = Arc::new(TensorWasmEngine::new().expect("engine"));
     let exec = TensorWasmExecutor::new(engine);
-    let pool = Arc::new(InstancePool::new(InstancePoolConfig {
-        warm_instances_per_tuple: 1,
-        max_total_warm: 0,
-    }));
+    let pool = Arc::new(InstancePool::new(InstancePoolConfig::new(1, 0)));
     let exec = exec.with_instance_pool(Arc::clone(&pool));
 
     let wasm = noop_wasm();
@@ -177,10 +168,7 @@ async fn pool_isolates_instances_per_module() {
     // module M.
     let engine = Arc::new(TensorWasmEngine::new().expect("engine"));
     let exec = TensorWasmExecutor::new(engine);
-    let pool = Arc::new(InstancePool::new(InstancePoolConfig {
-        warm_instances_per_tuple: 1,
-        max_total_warm: 0,
-    }));
+    let pool = Arc::new(InstancePool::new(InstancePoolConfig::new(1, 0)));
     let exec = exec.with_instance_pool(Arc::clone(&pool));
 
     let wasm_a = noop_wasm();
@@ -215,10 +203,7 @@ async fn pool_falls_back_to_spawn_on_empty_channel() {
     // rather than blocking. The miss counter records the fall-through.
     let engine = Arc::new(TensorWasmEngine::new().expect("engine"));
     let exec = TensorWasmExecutor::new(engine);
-    let pool = Arc::new(InstancePool::new(InstancePoolConfig {
-        warm_instances_per_tuple: 0,
-        max_total_warm: 0,
-    }));
+    let pool = Arc::new(InstancePool::new(InstancePoolConfig::new(0, 0)));
     let exec = exec.with_instance_pool(Arc::clone(&pool));
 
     let wasm = noop_wasm();
@@ -241,10 +226,7 @@ async fn pool_typed_args_pass_through_to_export() {
     // shape.
     let engine = Arc::new(TensorWasmEngine::new().expect("engine"));
     let exec = TensorWasmExecutor::new(engine);
-    let pool = Arc::new(InstancePool::new(InstancePoolConfig {
-        warm_instances_per_tuple: 1,
-        max_total_warm: 0,
-    }));
+    let pool = Arc::new(InstancePool::new(InstancePoolConfig::new(1, 0)));
     let exec = exec.with_instance_pool(Arc::clone(&pool));
 
     // Use a module that adds two i32 args.
@@ -274,10 +256,7 @@ async fn pool_shutdown_drains_warm_channels() {
     // release the executor slots it held.
     let engine = Arc::new(TensorWasmEngine::new().expect("engine"));
     let exec = TensorWasmExecutor::new(engine);
-    let pool = Arc::new(InstancePool::new(InstancePoolConfig {
-        warm_instances_per_tuple: 3,
-        max_total_warm: 0,
-    }));
+    let pool = Arc::new(InstancePool::new(InstancePoolConfig::new(3, 0)));
     let exec = exec.with_instance_pool(Arc::clone(&pool));
 
     let wasm = noop_wasm();

@@ -90,6 +90,13 @@ fn thirty_two_threads_register_disjoint_ids_concurrently() {
                          no tombstone should exist before any unregister",
                     );
                 }
+                #[cfg(feature = "strict-cap-binding")]
+                Err(RegistryError::CapabilityFromForeignRegistry) => {
+                    panic!(
+                        "unexpected CapabilityFromForeignRegistry for id {id:?} — \
+                         ctx built by this registry",
+                    );
+                }
             }
         }));
     }

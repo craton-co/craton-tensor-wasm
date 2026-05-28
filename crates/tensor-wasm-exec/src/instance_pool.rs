@@ -123,6 +123,17 @@ impl Default for InstancePoolConfig {
     }
 }
 
+impl InstancePoolConfig {
+    /// Construct a pool config. Kept available for foreign-crate callers
+    /// even though [`InstancePoolConfig`] is `#[non_exhaustive]`.
+    pub fn new(warm_instances_per_tuple: usize, max_total_warm: usize) -> Self {
+        Self {
+            warm_instances_per_tuple,
+            max_total_warm,
+        }
+    }
+}
+
 /// Key for the per-tuple warm-pool map. Both halves are load-bearing:
 /// the tenant id enforces tenant isolation (T2 must never observe an
 /// instance previously used by T1), and the module hash enforces module

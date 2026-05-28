@@ -65,14 +65,25 @@ use tensor_wasm_core::types::TenantId;
 /// follow-up will surface this as `tensor_wasm_isolation_downgrade_total`
 /// alongside the other counters in
 /// [`tensor_wasm_core::metrics::TensorWasmMetrics`].
+#[cfg(not(feature = "loom"))]
 static ISOLATION_DOWNGRADE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide count of `ContextIsolated -> StreamIsolated` downgrades
 /// observed since startup. See [`ISOLATION_DOWNGRADE_COUNT`] for the
 /// alert contract: any non-zero reading on an operator that requested
 /// `ContextIsolated` is a deployment-config bug.
+///
+/// Under the `loom` feature `loom::sync::atomic::AtomicU64::new` is not
+/// `const fn`, so the static counter is suppressed and this returns 0.
+/// The loom test harness builds its own atomic per-execution.
+#[cfg(not(feature = "loom"))]
 pub fn isolation_downgrade_count() -> u64 {
     ISOLATION_DOWNGRADE_COUNT.load(Ordering::Relaxed)
+}
+/// Loom-build stub for [`isolation_downgrade_count`]; always returns 0.
+#[cfg(feature = "loom")]
+pub fn isolation_downgrade_count() -> u64 {
+    0
 }
 
 /// How aggressively a tenant's GPU work is separated from other tenants'.

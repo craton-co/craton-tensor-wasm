@@ -92,9 +92,12 @@ async fn invoke_envelope_matches_empty_body_response() {
     let router = router();
     let id = deploy_min_module(&router).await;
 
+    // T33 typed-args validator rejects strings in the args array. Use an
+    // all-numeric body — the test's purpose is envelope-shape stability,
+    // not exercising the type matrix.
     let envelope = json!({
         "export": "main",
-        "args": [1.0, 2.0, "three"],
+        "args": [1.0, 2.0, 3.0],
     });
 
     let envelope_resp = router
