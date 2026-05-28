@@ -55,6 +55,18 @@ fn duration_to_epoch_ticks(d: Duration, tick: Duration) -> u64 {
 /// to a few initialisers) while still bounding the worst case.
 pub const MAX_START_FN_DURATION: Duration = Duration::from_secs(30);
 
+/// Hard upper bound on the byte length of a Wasm module the executor will
+/// accept for compilation. Modules above this size are rejected with
+/// [`ExecError::ModuleTooLarge`] *before* `Module::from_binary` runs —
+/// pathological code-section blow-ups can otherwise force Cranelift to
+/// burn arbitrary CPU on adversarial input. 64 MiB is comfortably above
+/// any legitimate ML kernel module we've seen (single-digit MiB is
+/// typical), while keeping the Cranelift worst case bounded.
+///
+/// This constant is the floor: embedders can tighten via
+/// [`EngineConfig::max_module_bytes`](crate::engine::EngineConfig::max_module_bytes).
+pub const MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Errors raised by the executor.
 #[derive(Debug, Error)]
 pub enum ExecError {
@@ -119,6 +131,32 @@ pub enum ExecError {
         /// Configured engine-wide ceiling.
         limit: usize,
     },
+    /// The submitted Wasm module is larger than the configured
+    /// pre-compile size cap
+    /// ([`crate::engine::EngineConfig::max_module_bytes`], floored at
+    /// [`MAX_MODULE_BYTES`]).
+    ///
+    /// Rejected before `Module::from_binary` runs so a pathological
+    /// code section cannot force Cranelift to burn CPU on adversarial
+    /// input. Mapped to
+    /// [`tensor_wasm_core::error::TensorWasmError::MemoryExhausted`] on
+    /// the conversion boundary (the API layer surfaces it as 503).
+    #[error("wasm module byte length {len} exceeds cap {max}")]
+    ModuleTooLarge {
+        /// Length of the rejected wasm blob, in bytes.
+        len: usize,
+        /// Configured per-executor cap, in bytes.
+        max: usize,
+    },
+    /// `spawn_instance` was called with a deadline configured but the
+    /// engine's epoch ticker is not running. Without the ticker, the
+    /// per-store epoch counter never advances, so neither the per-call
+    /// deadline nor [`MAX_START_FN_DURATION`] can fire — a runaway
+    /// guest would wedge the worker thread until it returned of its
+    /// own accord. Refuse the spawn instead of silently dropping the
+    /// deadline contract.
+    #[error("epoch ticker not running — refusing spawn with deadline; call `engine.spawn_epoch_ticker()` first")]
+    EpochTickerNotRunning,
 }
 
 /// Payload for [`ExecError::Timeout`]. Carries the real elapsed and deadline
@@ -197,6 +235,17 @@ impl From<ExecError> for tensor_wasm_core::error::TensorWasmError {
                 requested: active as u64,
                 limit: limit as u64,
             },
+            ExecError::ModuleTooLarge { len, max } => TensorWasmError::MemoryExhausted {
+                requested: len as u64,
+                limit: max as u64,
+            },
+            ExecError::EpochTickerNotRunning => {
+                // Surface as a compile-class failure: the spawn never
+                // got off the ground, no guest code executed, and the
+                // remedy is operational (start the ticker) rather than
+                // anything the caller can retry.
+                TensorWasmError::WasmCompile("epoch ticker not running".into())
+            }
         }
     }
 }
@@ -535,7 +584,29 @@ impl TensorWasmExecutor {
     /// to 8 bytes) closes a cross-tenant cache-poisoning vector: at 8
     /// bytes, a 65k-module corpus has a ~2⁻³² collision chance per pair,
     /// which an attacker crafting prefix-colliding modules can amplify.
-    fn compile_module_cached(&self, wasm: &[u8]) -> Result<Module, ExecError> {
+    ///
+    /// The actual `Module::from_binary` call runs inside
+    /// [`tokio::task::spawn_blocking`]: Cranelift compile is CPU-bound and
+    /// can exceed 100 ms on multi-MiB modules — running it on a Tokio
+    /// worker thread blocks every other I/O task multiplexed onto that
+    /// worker. Offloading to the blocking pool keeps the reactor responsive.
+    /// The byte-length cap above runs synchronously before the offload so
+    /// an oversized blob fails fast without entering the blocking pool.
+    async fn compile_module_cached(&self, wasm: &[u8]) -> Result<Module, ExecError> {
+        // Pre-compile size cap (exec hardening). Reject pathologically
+        // large blobs *before* hashing or handing them to Cranelift —
+        // a wasm with a malicious code section can otherwise force
+        // arbitrary compile-time CPU. The configured cap is floored at
+        // `MAX_MODULE_BYTES` upstream in `EngineConfig`, but we still
+        // observe the configured value here so a stricter operator
+        // policy wins.
+        let cap = self.engine.config().max_module_bytes;
+        if wasm.len() > cap {
+            return Err(ExecError::ModuleTooLarge {
+                len: wasm.len(),
+                max: cap,
+            });
+        }
         let digest = blake3::hash(wasm);
         // BLAKE3 outputs a fixed 32-byte digest; use it whole as the cache key.
         let key: [u8; 32] = *digest.as_bytes();
@@ -548,13 +619,46 @@ impl TensorWasmExecutor {
         if let Some(m) = self.module_cache.lock().get(&key).cloned() {
             return Ok(m);
         }
-        let module = Module::from_binary(self.engine.inner(), wasm)
+        // Cranelift compile is CPU-bound — offload to the blocking
+        // pool. We clone the wasmtime `Engine` (cheap `Arc`-shaped
+        // internally) and the wasm bytes so the closure is fully
+        // owning. `spawn_blocking` returns a `JoinError` which we
+        // surface as a wasmtime error: a panic inside Cranelift is
+        // not something a caller can usefully distinguish from a
+        // parse failure, and either way the spawn must be aborted.
+        let engine = self.engine.inner().clone();
+        let bytes = wasm.to_vec();
+        let module = tokio::task::spawn_blocking(move || Module::from_binary(&engine, &bytes))
+            .await
+            .map_err(|join_err| {
+                ExecError::Wasmtime(wasmtime::Error::msg(format!(
+                    "wasm compile task failed: {join_err}"
+                )))
+            })?
             .map_err(ExecError::Wasmtime)?;
         self.module_cache.lock().put(key, module.clone());
         Ok(module)
     }
 
     /// Compile + instantiate a Wasm module. Returns the assigned [`InstanceId`].
+    ///
+    /// # Deadline / ticker contract
+    ///
+    /// If a [`SpawnConfig::deadline`] is set — or if the implicit
+    /// [`MAX_START_FN_DURATION`] cap would otherwise apply (which it
+    /// always does, since every spawn runs `Instance::new_async`) —
+    /// the engine's epoch ticker MUST be running. Without it the
+    /// per-store epoch counter never advances, so neither the per-call
+    /// deadline nor the start-function cap can fire, and a runaway
+    /// guest would wedge the worker thread until it returned of its
+    /// own accord. We refuse the spawn with
+    /// [`ExecError::EpochTickerNotRunning`] instead of silently
+    /// dropping the deadline contract; operators must call
+    /// `engine.spawn_epoch_ticker()` (typically inside a Tokio runtime
+    /// at startup) before serving traffic. The engine constructor
+    /// auto-spawns the ticker when invoked from inside a runtime, so
+    /// this only trips for sync-startup setups that forget the
+    /// explicit call.
     #[instrument(skip(self, wasm), fields(tenant = %cfg.tenant_id, instance_id = tracing::field::Empty))]
     pub async fn spawn_instance(
         &self,
@@ -641,22 +745,40 @@ impl TensorWasmExecutor {
             u64::try_from(ticks_u128).unwrap_or(u64::MAX)
         };
         let start_deadline_ticks = epoch_deadline_ticks.min(max_start_ticks);
-        // Warn (once per engine/executor) if the ticker isn't running —
-        // without it, neither the start-function cap above nor any
-        // call-time deadline will actually fire, and a runaway guest
-        // will wedge the worker thread until it returns of its own accord.
-        if !self.engine.is_epoch_ticker_running() {
+        // Refuse the spawn if the ticker is down AND any deadline-class
+        // bound would otherwise apply. Pre-fix this only logged a
+        // one-shot `tracing::error!` and continued, which could wedge
+        // a runaway guest forever: with the epoch counter frozen,
+        // neither the per-call deadline nor the start-function cap
+        // can fire, and `terminate` cannot reach an instance that
+        // never returned from `Instance::new_async`. The honest
+        // alternative is to fail fast so operators can fix the
+        // ticker setup before serving traffic.
+        //
+        // Note: `MAX_START_FN_DURATION` always applies (every spawn
+        // runs `Instance::new_async`), so today this guard effectively
+        // requires the ticker for every spawn — including those with
+        // `deadline: None`. The check still consults `cfg.deadline`
+        // so the intent is documented at the call site: a future
+        // change that makes the start-function cap opt-in would
+        // narrow the requirement to only deadline-carrying spawns.
+        let deadline_class_applies =
+            cfg.deadline.is_some() || MAX_START_FN_DURATION > Duration::ZERO;
+        if deadline_class_applies && !self.engine.is_epoch_ticker_running() {
+            // One-shot operator log so the failure mode is visible
+            // even when the caller swallows the typed error.
             let flag = self
                 .ticker_warned
                 .get_or_init(|| AtomicBool::new(false));
             if !flag.swap(true, Ordering::AcqRel) {
                 tracing::error!(
                     target: "tensor_wasm_exec::executor",
-                    "epoch ticker not running — deadlines will not fire; call `engine.spawn_epoch_ticker(Handle::current())` before serving traffic",
+                    "epoch ticker not running — refusing spawn; call `engine.spawn_epoch_ticker()` before serving traffic",
                 );
             }
+            return Err(ExecError::EpochTickerNotRunning);
         }
-        let module = self.compile_module_cached(wasm)?;
+        let module = self.compile_module_cached(wasm).await?;
 
         // Pre-instantiation memory cap (closes mem-H5 / exec-S-2 / exec-S-10).
         // Wasmtime's `ResourceLimiter::memory_growing` fires only on
