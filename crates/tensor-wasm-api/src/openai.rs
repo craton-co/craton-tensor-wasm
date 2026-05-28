@@ -58,10 +58,14 @@
 //! file owns only the request type definitions, the error envelope, and
 //! the two handlers.
 
+use axum::extract::Extension;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{extract::rejection::JsonRejection, Json};
 use serde::{Deserialize, Serialize};
+use tensor_wasm_core::types::TenantId;
+
+use crate::rate_limit::AuthContext;
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -261,10 +265,28 @@ impl IntoResponse for OpenAiError {
 /// every other behaviour (model lookup, tenant resolution, streaming)
 /// lands in v0.4. The scaffold's only job is to lock the URL surface
 /// and the error envelope.
-#[tracing::instrument(name = "http.openai.completions", skip(payload))]
+#[tracing::instrument(name = "http.openai.completions", skip(payload, auth))]
 pub async fn completions_handler(
+    tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<AuthContext>>,
     payload: Result<Json<CompletionsRequest>, JsonRejection>,
 ) -> Response {
+    // T2 security gate: the bearer token must be scoped to the resolved
+    // tenant BEFORE any body parsing or downstream work. The handler still
+    // returns 501 once the gate clears — the gate exists so the v0.4
+    // wiring step inherits the tenant-scope contract from day one (it would
+    // otherwise be retrofitted onto a route whose locked surface was never
+    // tenant-checked). Absent `AuthContext` only occurs in test routers
+    // that bypass `bearer_auth`; we degrade to dev-mode wildcard there to
+    // match the convention used by the native routes (see `invoke_function`
+    // in `routes.rs`).
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        if let Err(err) = ctx.authorize_tenant(tenant) {
+            return err.into_response();
+        }
+    }
+
     let Json(_req) = match payload {
         Ok(j) => j,
         Err(rej) => {
@@ -292,10 +314,20 @@ pub async fn completions_handler(
 /// scaffold only validates shape; the v0.4 wiring step lands model
 /// resolution, tenant inference from the bearer token's
 /// [`TokenScope`](crate::token_scope::TokenScope), and SSE streaming.
-#[tracing::instrument(name = "http.openai.chat_completions", skip(payload))]
+#[tracing::instrument(name = "http.openai.chat_completions", skip(payload, auth))]
 pub async fn chat_completions_handler(
+    tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<AuthContext>>,
     payload: Result<Json<ChatCompletionsRequest>, JsonRejection>,
 ) -> Response {
+    // T2 security gate: see `completions_handler` above for the rationale.
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        if let Err(err) = ctx.authorize_tenant(tenant) {
+            return err.into_response();
+        }
+    }
+
     let Json(_req) = match payload {
         Ok(j) => j,
         Err(rej) => {
