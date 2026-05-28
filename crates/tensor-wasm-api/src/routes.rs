@@ -541,30 +541,63 @@ impl From<JsonRejection> for ApiError {
 
 impl From<ExecError> for ApiError {
     fn from(err: ExecError) -> Self {
-        // SECURITY (api S-22): pre-W4.x this impl used `err.to_string()`
-        // verbatim as the wire `message`. For `ExecError::Wasmtime(_)` that
-        // surfaces the full wasmtime error chain (including host pointer
-        // addresses, host file paths, and internal stack-frame names) to
-        // untrusted callers. We now branch per-variant so structured
-        // variants (NotFound, MissingExport, Timeout) keep their safe,
-        // already-stable messages while the wasmtime variant is replaced
-        // with an opaque string and the full error is logged server-side.
+        // SECURITY (api S-22, api T3): pre-W4.x this impl used
+        // `err.to_string()` verbatim as the wire `message`. That leaked
+        // server-internal state to untrusted callers in two ways:
+        //
+        //   * `ExecError::Wasmtime(_)` surfaced the full wasmtime error
+        //     chain (host pointer addresses, host file paths, internal
+        //     stack-frame names).
+        //   * The structured variants (`NotFound`, `MissingExport`,
+        //     `Timeout`, `ModuleMemoryTooLarge`, `ModuleTooLarge`,
+        //     `CapacityExhausted`, `EpochTickerNotRunning`) embedded
+        //     internal instance IDs, deadline figures, declared memory
+        //     sizes, capacity counters, and export names.
+        //
+        // We now branch per-variant and emit a fixed, stable wire
+        // message for every variant. The original (verbose) error is
+        // logged server-side via `tracing::warn!` / `tracing::error!`
+        // with structured fields so operators retain forensics without
+        // leaking the same state into client responses.
         match &err {
-            ExecError::NotFound(_) => ApiError {
-                status: StatusCode::NOT_FOUND,
-                kind: "instance_not_found".to_string(),
-                message: err.to_string(),
-            },
-            ExecError::MissingExport(_) => ApiError {
-                status: StatusCode::BAD_REQUEST,
-                kind: "missing_export".to_string(),
-                message: err.to_string(),
-            },
-            ExecError::Timeout(_) => ApiError {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                kind: "invoke_timeout".to_string(),
-                message: err.to_string(),
-            },
+            ExecError::NotFound(id) => {
+                tracing::warn!(
+                    target: "tensor_wasm_api::routes",
+                    instance_id = %id,
+                    "exec error: instance not found",
+                );
+                ApiError {
+                    status: StatusCode::NOT_FOUND,
+                    kind: "instance_not_found".to_string(),
+                    message: "function not found".to_string(),
+                }
+            }
+            ExecError::MissingExport(name) => {
+                tracing::warn!(
+                    target: "tensor_wasm_api::routes",
+                    export = %name,
+                    "exec error: requested export missing from module",
+                );
+                ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    kind: "missing_export".to_string(),
+                    message: "requested export not found in module".to_string(),
+                }
+            }
+            ExecError::Timeout(ctx) => {
+                tracing::warn!(
+                    target: "tensor_wasm_api::routes",
+                    instance_id = %ctx.id,
+                    elapsed_ms = ctx.elapsed_ms,
+                    deadline_ms = ctx.deadline_ms,
+                    "exec error: invocation deadline exceeded",
+                );
+                ApiError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    kind: "invoke_timeout".to_string(),
+                    message: "invocation deadline exceeded".to_string(),
+                }
+            }
             // ExecError::Wasmtime collapses both runtime traps and compile
             // failures; the executor distinguishes them only when converting
             // to TensorWasmError. For the API surface we keep a single 500
@@ -585,35 +618,74 @@ impl From<ExecError> for ApiError {
             // Per mem H5 + exec S-2: module's declared linear memory exceeds
             // the engine's per-tenant cap. Surface as 413 so clients can
             // distinguish quota rejection from a generic compile failure.
-            ExecError::ModuleMemoryTooLarge { .. } => ApiError {
-                status: StatusCode::PAYLOAD_TOO_LARGE,
-                kind: "module_memory_too_large".to_string(),
-                message: err.to_string(),
-            },
+            // The requested / limit byte figures are operator-only state.
+            ExecError::ModuleMemoryTooLarge {
+                requested_bytes,
+                limit_bytes,
+            } => {
+                tracing::warn!(
+                    target: "tensor_wasm_api::routes",
+                    requested_bytes = *requested_bytes,
+                    limit_bytes = *limit_bytes,
+                    "exec error: module declares memory above per-instance cap",
+                );
+                ApiError {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    kind: "module_memory_too_large".to_string(),
+                    message: "module declares memory above per-instance cap"
+                        .to_string(),
+                }
+            }
             // Per exec S-10: the engine-wide live-instance cap is
             // saturated. 503 is the right code (the request is well-
             // formed and would succeed once load drops) so clients with
-            // retry-with-backoff handling recover cleanly.
-            ExecError::CapacityExhausted { .. } => ApiError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                kind: "capacity_exhausted".to_string(),
-                message: err.to_string(),
-            },
+            // retry-with-backoff handling recover cleanly. The active /
+            // limit counters are server-internal capacity state.
+            ExecError::CapacityExhausted { active, limit } => {
+                tracing::warn!(
+                    target: "tensor_wasm_api::routes",
+                    active = *active,
+                    limit = *limit,
+                    "exec error: engine instance capacity exhausted",
+                );
+                ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    kind: "capacity_exhausted".to_string(),
+                    message: "engine instance capacity exhausted; retry later"
+                        .to_string(),
+                }
+            }
             // Per B3.2: adversarial Wasm bytes that exceed the pre-compile
-            // size cap. 413 mirrors the body-too-large family.
-            ExecError::ModuleTooLarge { .. } => ApiError {
-                status: StatusCode::PAYLOAD_TOO_LARGE,
-                kind: "module_too_large".to_string(),
-                message: err.to_string(),
-            },
+            // size cap. 413 mirrors the body-too-large family. The
+            // observed length and configured cap are operator-only state.
+            ExecError::ModuleTooLarge { len, max } => {
+                tracing::warn!(
+                    target: "tensor_wasm_api::routes",
+                    len = *len,
+                    max = *max,
+                    "exec error: module bytes above per-tenant cap",
+                );
+                ApiError {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    kind: "module_too_large".to_string(),
+                    message: "module bytes above per-tenant cap".to_string(),
+                }
+            }
             // Per B3.2: spawn refused because the epoch ticker is down and
             // a deadline-class bound would otherwise apply. 500 — the
-            // executor is mis-configured.
-            ExecError::EpochTickerNotRunning => ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                kind: "epoch_ticker_not_running".to_string(),
-                message: err.to_string(),
-            },
+            // executor is mis-configured. The remediation hint embedded
+            // in the underlying error is operator-only.
+            ExecError::EpochTickerNotRunning => {
+                tracing::error!(
+                    target: "tensor_wasm_api::routes",
+                    "exec error: engine deadline ticker not running",
+                );
+                ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    kind: "epoch_ticker_not_running".to_string(),
+                    message: "engine deadline ticker not running".to_string(),
+                }
+            }
         }
     }
 }
@@ -1572,5 +1644,136 @@ mod tests {
         let api: ApiError = err.into();
         assert_eq!(api.status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(api.kind, "invoke_timeout");
+        // SECURITY (api T3): message must NOT leak the instance id or
+        // the elapsed / deadline figures — those are server-internal.
+        assert_eq!(api.message, "invocation deadline exceeded");
+        assert!(
+            !api.message.contains("I#7"),
+            "leaked instance id: {}",
+            api.message,
+        );
+        assert!(
+            !api.message.contains("1000") && !api.message.contains("500"),
+            "leaked timing figures: {}",
+            api.message,
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // SECURITY (api T3): `From<ExecError> for ApiError` previously used
+    // `err.to_string()` verbatim for several variants, leaking internal
+    // instance IDs, deadlines, quotas, capacity counters, and export
+    // names to untrusted callers. The tests below pin the per-variant
+    // wire `message` to a fixed, stable string and assert that none of
+    // the structured fields appear in the response body.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn exec_error_not_found_maps_to_stable_404_message() {
+        use tensor_wasm_core::types::InstanceId;
+        let err = ExecError::NotFound(InstanceId(42));
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::NOT_FOUND);
+        assert_eq!(api.kind, "instance_not_found");
+        assert_eq!(api.message, "function not found");
+        assert!(
+            !api.message.contains("42") && !api.message.contains("I#"),
+            "leaked instance id: {}",
+            api.message,
+        );
+    }
+
+    #[test]
+    fn exec_error_missing_export_maps_to_stable_400_message() {
+        let err = ExecError::MissingExport("super_secret_internal_symbol".to_string());
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::BAD_REQUEST);
+        assert_eq!(api.kind, "missing_export");
+        assert_eq!(api.message, "requested export not found in module");
+        // The export name is attacker-controlled but echoing it back
+        // expands the attack surface (XSS-via-error, info-leak about
+        // which symbols the module exports). The wire message must
+        // be content-free.
+        assert!(
+            !api.message.contains("super_secret_internal_symbol"),
+            "leaked export name: {}",
+            api.message,
+        );
+    }
+
+    #[test]
+    fn exec_error_module_memory_too_large_maps_to_stable_413_message() {
+        let err = ExecError::ModuleMemoryTooLarge {
+            requested_bytes: 4_294_967_296,
+            limit_bytes: 67_108_864,
+        };
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(api.kind, "module_memory_too_large");
+        assert_eq!(
+            api.message,
+            "module declares memory above per-instance cap",
+        );
+        assert!(
+            !api.message.contains("4294967296")
+                && !api.message.contains("67108864"),
+            "leaked byte figures: {}",
+            api.message,
+        );
+    }
+
+    #[test]
+    fn exec_error_capacity_exhausted_maps_to_stable_503_message() {
+        let err = ExecError::CapacityExhausted {
+            active: 257,
+            limit: 256,
+        };
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(api.kind, "capacity_exhausted");
+        assert_eq!(
+            api.message,
+            "engine instance capacity exhausted; retry later",
+        );
+        assert!(
+            !api.message.contains("257") && !api.message.contains("256"),
+            "leaked capacity figures: {}",
+            api.message,
+        );
+    }
+
+    #[test]
+    fn exec_error_module_too_large_maps_to_stable_413_message() {
+        let err = ExecError::ModuleTooLarge {
+            len: 16_777_217,
+            max: 16_777_216,
+        };
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(api.kind, "module_too_large");
+        assert_eq!(api.message, "module bytes above per-tenant cap");
+        assert!(
+            !api.message.contains("16777217")
+                && !api.message.contains("16777216"),
+            "leaked size figures: {}",
+            api.message,
+        );
+    }
+
+    #[test]
+    fn exec_error_epoch_ticker_not_running_maps_to_stable_500_message() {
+        let err = ExecError::EpochTickerNotRunning;
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(api.kind, "epoch_ticker_not_running");
+        assert_eq!(api.message, "engine deadline ticker not running");
+        // The underlying Display includes a remediation hint
+        // ("call `engine.spawn_epoch_ticker()` first"); that hint is
+        // operator-only and must not appear on the wire.
+        assert!(
+            !api.message.contains("spawn_epoch_ticker"),
+            "leaked operator hint: {}",
+            api.message,
+        );
     }
 }
