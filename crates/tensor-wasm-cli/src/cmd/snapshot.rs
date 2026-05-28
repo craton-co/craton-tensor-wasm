@@ -341,7 +341,7 @@ async fn save(
         }
         writer
             .write_all(&chunk)
-            .with_context(|| format!("writing snapshot chunk to tempfile"))?;
+            .with_context(|| "writing snapshot chunk to tempfile".to_string())?;
     }
     // Critical: flush the BufWriter before unwrapping so any buffered tail
     // bytes hit the tempfile. We then call `into_inner()` to recover the

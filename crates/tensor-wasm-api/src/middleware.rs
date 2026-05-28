@@ -854,6 +854,7 @@ pub async fn bearer_auth(mut req: Request, next: Next) -> Response {
 ///   class independently — a spike in `invalid_tenant` typically
 ///   indicates a client bug or a probing attacker, whereas a spike in
 ///   `missing_tenant` indicates a misconfigured client.
+#[allow(clippy::result_large_err)]
 pub fn extract_tenant(headers: &HeaderMap, cfg: TenantConfig) -> Result<TenantId, Response> {
     // Fix 1: refuse requests carrying more than one X-TensorWasm-Tenant
     // header. The single-`get` path would otherwise pick the first

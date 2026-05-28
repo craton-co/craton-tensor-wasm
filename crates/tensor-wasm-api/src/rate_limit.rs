@@ -579,8 +579,12 @@ impl RateLimiter {
             .as_deref_mut()
             .map(|s| refill_and_decide(s, token_burst, token_qps, now));
 
-        let per_tenant_admit = per_tenant_decision.as_ref().is_none_or(|d| d.admittable);
-        let token_admit = token_decision.as_ref().is_none_or(|d| d.admittable);
+        // `is_none_or` is MSRV 1.82; workspace MSRV is 1.78, so keep the
+        // map_or formulation here.
+        #[allow(clippy::unnecessary_map_or)]
+        let per_tenant_admit = per_tenant_decision.as_ref().map_or(true, |d| d.admittable);
+        #[allow(clippy::unnecessary_map_or)]
+        let token_admit = token_decision.as_ref().map_or(true, |d| d.admittable);
 
         if per_tenant_admit && token_admit {
             if let Some(state) = per_tenant_guard.as_deref_mut() {

@@ -179,6 +179,7 @@ pub fn build_router_with_trusted_proxies(
 ///
 /// All other parameters behave identically to
 /// [`build_router_with_trusted_proxies`].
+#[allow(clippy::too_many_arguments)]
 pub fn build_router_with_kernel_publish_tokens(
     state: Arc<AppState>,
     auth: AuthConfig,

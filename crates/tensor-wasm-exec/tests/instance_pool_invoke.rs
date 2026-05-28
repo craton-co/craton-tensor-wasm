@@ -18,8 +18,9 @@ use tensor_wasm_exec::instance_pool::{InstancePool, InstancePoolConfig};
 
 /// A module that exports a `tick` function returning the post-increment
 /// value of a mutable global `counter`. Each `tick` invocation against a
-/// SHARED instance returns the next integer; a fresh instance starts at
-/// 1. We use this to distinguish "same instance reused" (counter keeps
+/// SHARED instance returns the next integer; a fresh instance starts at 1.
+///
+/// We use this to distinguish "same instance reused" (counter keeps
 /// climbing) from "fresh instance reset" (counter returns to 1).
 fn counter_wasm() -> Vec<u8> {
     wat::parse_str(

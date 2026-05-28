@@ -442,7 +442,7 @@ pub async fn bounded_bytes(
         // Use `checked_add` so a pathological server claiming a chunk of
         // `usize::MAX` bytes can't overflow `buf.len() + chunk.len()` past
         // the cap check.
-        let new_total = buf.len().checked_add(chunk.len()).unwrap_or(usize::MAX);
+        let new_total = buf.len().saturating_add(chunk.len());
         if new_total > limit {
             tracing::warn!(
                 running_total = new_total as u64,

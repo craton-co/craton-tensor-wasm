@@ -155,7 +155,7 @@ fn two_concatenated_zstd_frames_as_v2_are_rejected() {
 
     let classified_as_v3 = glued.len() >= SIGNATURE_TRAILER_LEN && {
         let trailer_start = glued.len() - SIGNATURE_TRAILER_LEN;
-        &glued[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN] == &V3_TRAILER_MAGIC
+        glued[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN] == V3_TRAILER_MAGIC
     };
 
     let err = SnapshotReader::new()

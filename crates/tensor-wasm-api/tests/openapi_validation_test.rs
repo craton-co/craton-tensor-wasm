@@ -325,7 +325,7 @@ fn parse_schema_required_and_strictness(yaml: &str, schema_name: &str) -> (BTree
         // Inside the target schema. Inspect lines at indent 6 only —
         // properties' nested fields live at indent 8+ and are not the
         // schema's direct keys.
-        let indent = leading_space_count(&line);
+        let indent = leading_space_count(line);
         if indent != SCHEMA_CHILD_INDENT {
             continue;
         }

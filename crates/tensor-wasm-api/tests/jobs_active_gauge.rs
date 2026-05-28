@@ -121,7 +121,10 @@ async fn poll_until_terminal(router: &axum::Router, job_id: &str) -> Value {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn invoke_async_increments_jobs_active_then_decrements_on_completion() {
+    // _serial held across await intentionally — this is a test-only mutex
+    // that serialises the global metrics registry across these tests.
     let _serial = test_lock();
     let (router, state) = router_with_state();
 
@@ -188,6 +191,7 @@ async fn invoke_async_increments_jobs_active_then_decrements_on_completion() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn invoke_async_failure_path_also_decrements_jobs_active() {
     let _serial = test_lock();
     // A module with no `_start` and no `main` resolves as Failed. The
@@ -215,6 +219,7 @@ async fn invoke_async_failure_path_also_decrements_jobs_active() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn invoke_async_panic_path_drop_guard_decrements_jobs_active() {
     let _serial = test_lock();
     // Panic-safety contract: if the spawned task unwinds before reaching

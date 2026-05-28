@@ -737,7 +737,11 @@ tensor_wasm_gpu_memory_used_bytes 1073741824
         let s = &m["foo"][0];
         assert_eq!(s.labels.get("a").map(String::as_str), Some("1"));
         assert_eq!(s.labels.get("b").map(String::as_str), Some("two"));
-        assert!((s.value - 3.14).abs() < 1e-9);
+        // PI-shaped sample value from the fixture; arbitrary numeric literal,
+        // not the constant — using #[allow] keeps it readable.
+        #[allow(clippy::approx_constant)]
+        let expected = 3.14_f64;
+        assert!((s.value - expected).abs() < 1e-9);
     }
 
     #[test]
