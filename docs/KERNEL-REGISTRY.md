@@ -106,6 +106,66 @@ the resolver:
 The registry is layered _under_ the JIT cache: a registry hit looks
 identical to a normal cache hit from the caller's perspective.
 
+## Resolution flow
+
+The JIT cache is a three-tier structure. `KernelCache::get_with_registry_fallback`
+walks the tiers in order on every dispatch:
+
+```text
+                 ┌────────────────────────────────────────────────────┐
+   dispatch ──▶  │  KernelCache::get_with_registry_fallback(key, res) │
+                 └────────────────┬───────────────────────────────────┘
+                                  │
+                                  ▼
+                ┌─────────────────────────────────────┐
+                │  L1: in-mem DashMap<CacheKey, …>    │
+                │  hit?  ── yes ──▶ return CachedKernel
+                └────────────────┬────────────────────┘
+                                 │ miss
+                                 ▼
+                ┌─────────────────────────────────────┐
+                │  L2: on-disk DiskCache (V2 .ptxbin) │
+                │  HMAC-verify, promote into L1       │
+                │  hit?  ── yes ──▶ return CachedKernel
+                └────────────────┬────────────────────┘
+                                 │ miss
+                                 ▼
+                ┌─────────────────────────────────────────────────┐
+                │  L3: KernelRegistry (Option<Arc<dyn>>)          │
+                │  step 1: resolver.resolve(blueprint_fp, sm)     │
+                │           → Option<(name, version)>             │
+                │  step 2: registry.get(&name, &version)          │
+                │           → Arc<(KernelManifest, ptx_text)>     │
+                │  step 3: promote into L1 via cache.put          │
+                │  hit?  ── yes ──▶ return CachedKernel
+                └────────────────┬────────────────────────────────┘
+                                 │ miss
+                                 ▼
+                          return None
+                  (caller re-emits via ptx_emit + put)
+```
+
+Each tier promotes hits into the tier above it: an L2 hit pre-populates
+L1, and an L3 hit pre-populates both L1 and the in-memory promotion
+path (L2 writeback is left to the next L1 `put` so the registry path
+does not double-pay the HMAC write on a synchronous dispatch).
+
+### v0.3.8 status
+
+`tensor-wasm-jit` v0.3.8 ships the **client-side** cache plumbing:
+
+- `KernelCacheConfig::with_registry` attaches an `Arc<dyn KernelRegistry>`.
+- `BlueprintResolver` is the bridge trait — embedders provide the
+  `(blueprint, sm) → (name, version)` mapping policy. An
+  `InMemoryBlueprintResolver` wraps a `HashMap` for tests.
+- `KernelCache::get_with_registry_fallback(key, resolver)` walks the
+  three tiers above.
+
+v0.4 ships the **server-side** `/kernels` endpoints (B7.5 is doing
+this in parallel): the on-disk store, the `POST /kernels` publish
+route, and the `GET /kernels/{name}/{version}` resolver-friendly fetch
+that the v0.4 `BlueprintResolver` implementation will call.
+
 ## Security notes
 
 ### HMAC key rotation

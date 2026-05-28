@@ -91,6 +91,77 @@ impl KernelManifest {
             publisher,
         }
     }
+
+    /// First 8 bytes of `digest` interpreted as a little-endian `u64`.
+    /// Used as the synthetic `fingerprint` field on the `CachedKernel`
+    /// that the registry path promotes into L1.
+    pub fn digest_as_u64(&self) -> u64 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&self.digest[..8]);
+        u64::from_le_bytes(buf)
+    }
+}
+
+/// Resolves a JIT cache key to a (name, version) tuple that the
+/// registry can look up. The cache is keyed by (tenant, blueprint
+/// fingerprint, sm_version, emit_config_hash); the registry is keyed
+/// by (name, version). This trait is the bridge — embedders provide
+/// the mapping policy (e.g. a YAML manifest baked into the deploy,
+/// or a tenant-level metadata table).
+pub trait BlueprintResolver: Send + Sync {
+    /// Resolve a (blueprint fingerprint, sm_version) pair to a
+    /// `(name, version)` tuple that [`KernelRegistry::get`] understands.
+    /// Returns `None` if the embedder has no mapping for this
+    /// blueprint — the caller then proceeds with fresh PTX emission.
+    fn resolve(&self, blueprint_fp: u64, sm_version: u32) -> Option<(String, String)>;
+}
+
+/// In-memory [`BlueprintResolver`] backed by a `HashMap`. Test-only
+/// convenience for the cache integration tests in v0.3.8; production
+/// embedders supply their own implementation that consults a
+/// deployment-baked manifest or a tenant-level metadata table.
+pub struct InMemoryBlueprintResolver {
+    map: HashMap<(u64, u32), (String, String)>,
+}
+
+impl InMemoryBlueprintResolver {
+    /// Construct an empty resolver. Use [`Self::insert`] to populate
+    /// the (blueprint, sm) → (name, version) mapping.
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+
+    /// Build a resolver pre-populated from a map of
+    /// `(blueprint_fp, sm_version)` → `(name, version)` entries.
+    pub fn from_map(map: HashMap<(u64, u32), (String, String)>) -> Self {
+        Self { map }
+    }
+
+    /// Insert a single `(blueprint_fp, sm_version)` → `(name, version)`
+    /// mapping. Overwrites any prior entry for the same key.
+    pub fn insert(
+        &mut self,
+        blueprint_fp: u64,
+        sm_version: u32,
+        name: String,
+        version: String,
+    ) {
+        self.map.insert((blueprint_fp, sm_version), (name, version));
+    }
+}
+
+impl Default for InMemoryBlueprintResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlueprintResolver for InMemoryBlueprintResolver {
+    fn resolve(&self, blueprint_fp: u64, sm_version: u32) -> Option<(String, String)> {
+        self.map.get(&(blueprint_fp, sm_version)).cloned()
+    }
 }
 
 /// Failure modes for registry operations.

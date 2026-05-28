@@ -20,6 +20,15 @@ anyhow.workspace = true
 axum.workspace = true
 tensor-wasm-core = { workspace = true }
 tensor-wasm-exec = { workspace = true }
+# tensor-wasm-jit: pulled in only when the `kernel-registry-api` feature
+# is enabled. The api crate uses it solely to expose the `/kernels` HTTP
+# routes (B6.4) — manifest verification, in-memory storage, and the
+# trait surface all live in `tensor-wasm-jit::registry`. The dep is
+# optional so the default build keeps the lean dependency graph the
+# B6.3 scaffold (jit/Cargo.toml) describes; only consumers that flip
+# `--features kernel-registry-api` pull in `hmac`/`sha2`/`serde_json`
+# transitively.
+tensor-wasm-jit = { workspace = true, features = ["kernel-registry"], optional = true }
 base64 = "0.22"
 dashmap.workspace = true
 # futures: needed by the streaming `/invoke-stream` handler to build an

@@ -19,6 +19,8 @@ use tracing::{debug, instrument};
 
 #[cfg(feature = "signed-snapshots")]
 use crate::format::{SIGNATURE_KIND_HMAC_SHA256, SNAPSHOT_VERSION_V3};
+#[cfg(feature = "artifact-backing")]
+use crate::format::SNAPSHOT_VERSION_V2;
 #[cfg(feature = "signed-snapshots")]
 use zeroize::Zeroizing;
 
@@ -387,20 +389,22 @@ impl SnapshotWriter {
         self
     }
 
-    /// Encode and compress `state` into a snapshot blob.
+    /// Validate `state`'s blob sizes against the `limits` caps and build the
+    /// metadata struct that any envelope (legacy v2/v3 or the v0.4 unified
+    /// artifact store) needs to carry. Shared by [`SnapshotWriter::capture`]
+    /// and (under the `artifact-backing` feature) by
+    /// [`SnapshotWriter::capture_to_artifact_store`] so the two write paths
+    /// cannot drift on which input is "too large" or on which metadata
+    /// fields are populated.
     ///
-    /// The returned bytes are self-describing: the magic and version are
-    /// embedded in the bincode payload, so a caller only needs to persist the
-    /// `Vec<u8>` as-is. Returns [`TensorWasmError::Serialization`] if bincode encoding
-    /// fails, the zstd encoder reports a system error, or any input blob exceeds
-    /// the caps in [`limits`]. Capture is the first line of defence — oversized
-    /// inputs are rejected here so the writer never produces bytes that the
-    /// reader would have to reject.
-    #[instrument(skip(self, state), fields(
-        tenant = %state.tenant_id,
-        instance = %state.instance_id,
-    ))]
-    pub fn capture(&self, state: InstanceState<'_>) -> Result<Vec<u8>> {
+    /// Returns `(metadata, crc32)`. Kept private because the two consumers
+    /// have different needs from here: `capture` borrows the byte slices
+    /// directly into a `SnapshotRef` to avoid a host-side copy, while
+    /// `capture_to_artifact_store` materialises an owned [`Snapshot`] so it
+    /// can hand the bincode-encoded bytes to the artifact store. Neither
+    /// shape is more correct than the other — they just have different
+    /// ownership constraints — so the shared work stops at the metadata.
+    fn build_metadata(&self, state: &InstanceState<'_>) -> Result<(SnapshotMetadata, u32)> {
         check_blob_size(
             "wasm_memory",
             state.wasm_memory.len(),
@@ -425,6 +429,74 @@ impl SnapshotWriter {
             .unwrap_or(0);
 
         let crc32 = payload_crc32(state.wasm_memory, state.gpu_memory, state.registers);
+        let metadata = SnapshotMetadata {
+            tenant_id: state.tenant_id,
+            instance_id: state.instance_id,
+            created_unix_ms,
+            total_uncompressed_bytes,
+            // Replay-protection fields are sketched in the format today
+            // but not yet driven by the writer. Both default values
+            // ("no sequence", "no nonce") preserve the v0.3.x semantics:
+            // operators that have not opted into the v0.4 freshness
+            // check continue to see snapshots they captured before the
+            // field existed as logically-equivalent (0, None) records.
+            sequence_no: 0,
+            nonce: None,
+        };
+        Ok((metadata, crc32))
+    }
+
+    /// Build an owned [`Snapshot`] from `state` for the artifact-store write
+    /// path. Mirrors the same size checks and metadata population as
+    /// [`SnapshotWriter::capture`] (via [`SnapshotWriter::build_metadata`]),
+    /// but materialises the three byte blobs into owned `Vec<u8>` so the
+    /// resulting struct can be bincode-encoded and handed to
+    /// [`tensor_wasm_artifacts::DiskArtifactStore::put`], which takes a
+    /// `&[u8]` payload.
+    ///
+    /// Only used by [`SnapshotWriter::capture_to_artifact_store`]. The
+    /// legacy [`SnapshotWriter::capture`] continues to borrow the caller's
+    /// slices via the internal `SnapshotRef` to avoid a host-side copy on
+    /// the v2/v3 path — this helper is for the v0.4 convergence path where
+    /// owning the bytes is unavoidable.
+    #[cfg(feature = "artifact-backing")]
+    fn build_snapshot(&self, state: InstanceState<'_>) -> Result<Snapshot> {
+        let (metadata, crc32) = self.build_metadata(&state)?;
+        Ok(Snapshot {
+            magic: SNAPSHOT_MAGIC,
+            // Artifact-backed snapshots reuse the v2 inner-version
+            // discriminant: the outer envelope is the artifact store's
+            // own (magic + content-hash + HMAC) frame, so the inline v3
+            // HMAC trailer is redundant — we do not bump to v3 just
+            // because the writer happens to have an HMAC key configured
+            // for the legacy path. v0.4 may collapse this field
+            // entirely once the artifact-store envelope is the only
+            // shape on the wire.
+            version: SNAPSHOT_VERSION_V2,
+            wasm_memory: state.wasm_memory.to_vec(),
+            gpu_memory: state.gpu_memory.to_vec(),
+            registers: state.registers.to_vec(),
+            metadata,
+            crc32,
+        })
+    }
+
+    /// Encode and compress `state` into a snapshot blob.
+    ///
+    /// The returned bytes are self-describing: the magic and version are
+    /// embedded in the bincode payload, so a caller only needs to persist the
+    /// `Vec<u8>` as-is. Returns [`TensorWasmError::Serialization`] if bincode encoding
+    /// fails, the zstd encoder reports a system error, or any input blob exceeds
+    /// the caps in [`limits`]. Capture is the first line of defence — oversized
+    /// inputs are rejected here so the writer never produces bytes that the
+    /// reader would have to reject.
+    #[instrument(skip(self, state), fields(
+        tenant = %state.tenant_id,
+        instance = %state.instance_id,
+    ))]
+    pub fn capture(&self, state: InstanceState<'_>) -> Result<Vec<u8>> {
+        let (metadata, crc32) = self.build_metadata(&state)?;
+        let total_uncompressed_bytes = metadata.total_uncompressed_bytes;
 
         // Pick the on-wire version. Without an HMAC key configured we emit the
         // legacy unsigned v2 envelope; with a key we bump to v3 so the reader
@@ -450,20 +522,7 @@ impl SnapshotWriter {
             wasm_memory: state.wasm_memory,
             gpu_memory: state.gpu_memory,
             registers: state.registers,
-            metadata: SnapshotMetadata {
-                tenant_id: state.tenant_id,
-                instance_id: state.instance_id,
-                created_unix_ms,
-                total_uncompressed_bytes,
-                // Replay-protection fields are sketched in the format today
-                // but not yet driven by the writer. Both default values
-                // ("no sequence", "no nonce") preserve the v0.3.x semantics:
-                // operators that have not opted into the v0.4 freshness
-                // check continue to see snapshots they captured before the
-                // field existed as logically-equivalent (0, None) records.
-                sequence_no: 0,
-                nonce: None,
-            },
+            metadata,
             crc32,
         };
 

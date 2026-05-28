@@ -37,6 +37,15 @@ subtle = { version = "2", optional = true }
 # the field itself only exists under that feature — keeps the no-feature
 # build dep-surface identical to before.
 zeroize = { workspace = true, optional = true }
+# Opt-in convergence path onto the unified content-addressed artifact store
+# (see `docs/ARTIFACT-STORE.md`). Activating the `artifact-backing` feature
+# enables `SnapshotWriter::capture_to_artifact_store` and
+# `SnapshotReader::restore_from_artifact_store`, which wrap the bincode-
+# encoded `Snapshot` in `DiskArtifactStore::put` / `get` instead of the
+# inline v2/v3 envelope. The default capture / restore methods continue
+# to emit and parse the legacy envelope byte-for-byte; this feature is
+# purely additive for v0.3.8.
+tensor-wasm-artifacts = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -57,8 +66,17 @@ cuda = ["dep:cust"]
 # `SnapshotReader::with_hmac_sha256_key` become available; without it the
 # writer/reader continue to handle only the unsigned v2 wire format.
 signed-snapshots = ["dep:hmac", "dep:sha2", "dep:subtle", "dep:zeroize"]
+# Opt-in artifact-store backing for snapshots. When enabled, exposes
+# `SnapshotWriter::capture_to_artifact_store` and
+# `SnapshotReader::restore_from_artifact_store` for routing snapshots
+# through the unified `tensor-wasm-artifacts::DiskArtifactStore` envelope
+# (BLAKE3 content-hash + HMAC-SHA256 trailer + key-fingerprinted
+# filenames). The legacy inline v2/v3 envelope produced by `capture` and
+# parsed by `restore` is unaffected — v0.4 will flip the default
+# capture/restore path; v0.3.8 only ships the opt-in.
+artifact-backing = ["dep:tensor-wasm-artifacts"]
 
 [package.metadata.docs.rs]
 all-features = false
-features = ["signed-snapshots"]
+features = ["signed-snapshots", "artifact-backing"]
 rustdoc-args = ["--cfg", "docsrs"]

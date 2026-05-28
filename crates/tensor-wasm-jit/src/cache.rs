@@ -37,6 +37,8 @@ use zeroize::Zeroizing;
 
 use crate::ir::TensorWasmKernelBlueprint;
 use crate::ptx_emit::EmittedPtx;
+#[cfg(feature = "kernel-registry")]
+use crate::registry::{BlueprintResolver, KernelRegistry};
 
 /// Cache key.
 ///
@@ -161,7 +163,7 @@ pub const DEFAULT_CAPACITY: usize = 256;
 /// historical defaults — capacity [`DEFAULT_CAPACITY`], verify-on-get
 /// `true`) and refine with the `with_*` builders, then hand the config
 /// to [`KernelCache::with_config`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct KernelCacheConfig {
     /// Soft maximum L1 entry count. Clamped to `>= 1` inside the cache.
     pub capacity: usize,
@@ -180,6 +182,16 @@ pub struct KernelCacheConfig {
     /// multi-MB PTX where the recompute dominates can opt out, but the
     /// safe default is verify-on-get.
     pub verify_on_get: bool,
+
+    #[cfg(feature = "kernel-registry")]
+    /// Optional registry consulted on L1+L2 miss. v0.4 path: caller resolves
+    /// (tenant, blueprint, sm_version) → (name, version) via an external
+    /// lookup, then `KernelCache::get_with_registry_fallback` consults the
+    /// registry by that pair. v0.3.8 ships a `resolve_by_blueprint_hint`
+    /// trait method on the cache config for the resolver step; the
+    /// in-memory test impl resolves blueprint fingerprint → name@version
+    /// directly via a `HashMap`.
+    pub registry: Option<Arc<dyn KernelRegistry>>,
 }
 
 impl Default for KernelCacheConfig {
@@ -187,6 +199,8 @@ impl Default for KernelCacheConfig {
         Self {
             capacity: DEFAULT_CAPACITY,
             verify_on_get: true,
+            #[cfg(feature = "kernel-registry")]
+            registry: None,
         }
     }
 }
@@ -207,6 +221,38 @@ impl KernelCacheConfig {
     pub fn with_verify_on_get(mut self, on: bool) -> Self {
         self.verify_on_get = on;
         self
+    }
+
+    /// Attach a [`KernelRegistry`] as the L3 fallback consulted by
+    /// [`KernelCache::get_with_registry_fallback`] on an L1+L2 miss.
+    /// Default is `None` (registry path disabled). See the field-level
+    /// docs on [`Self::registry`] for the resolution contract.
+    #[cfg(feature = "kernel-registry")]
+    #[must_use]
+    pub fn with_registry(mut self, reg: Arc<dyn KernelRegistry>) -> Self {
+        self.registry = Some(reg);
+        self
+    }
+}
+
+// Manual `Debug` impl: `Arc<dyn KernelRegistry>` does not implement
+// `Debug` (the trait deliberately does not require it so embedder
+// backends like `InMemoryRegistry` — whose interior `Mutex<HashMap>`
+// is awkward to debug-format — stay easy to write). Render the
+// registry field as a presence-only marker so `{:?}` on a cache
+// config still surfaces whether the L3 path is wired without forcing
+// every registry impl to derive `Debug`.
+impl std::fmt::Debug for KernelCacheConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("KernelCacheConfig");
+        d.field("capacity", &self.capacity);
+        d.field("verify_on_get", &self.verify_on_get);
+        #[cfg(feature = "kernel-registry")]
+        d.field(
+            "registry",
+            &self.registry.as_ref().map(|_| "<dyn KernelRegistry>"),
+        );
+        d.finish()
     }
 }
 
@@ -563,6 +609,42 @@ impl KernelCache {
             blueprint.fingerprint(),
             sm_version,
         ))
+    }
+
+    /// L1 → L2 → L3(registry) resolution path. v0.3.8 scaffold: invokes the
+    /// registered resolver + registry on every miss; v0.4 may add a
+    /// resolver-level cache to amortise the (blueprint → name@version)
+    /// translation.
+    #[cfg(feature = "kernel-registry")]
+    pub fn get_with_registry_fallback(
+        &self,
+        key: &CacheKey,
+        resolver: &dyn BlueprintResolver,
+    ) -> Option<Arc<CachedKernel>> {
+        // L1 + L2
+        if let Some(hit) = self.get(key) {
+            return Some(Arc::new(hit));
+        }
+        // L3
+        let registry = self.config.registry.as_ref()?;
+        let (name, version) = resolver.resolve(key.blueprint, key.sm_version)?;
+        let entry = registry.get(&name, &version).ok()?;
+        // Promote into L1 via the standard put path (which re-checks
+        // integrity) so subsequent calls hit fast.
+        let (manifest, ptx_text) = (&entry.0, &entry.1);
+        let emitted = crate::ptx_emit::EmittedPtx {
+            text: ptx_text.clone(),
+            launch_geometry: (0, 0), // v0.4: extend KernelManifest to carry geometry
+        };
+        let cached = CachedKernel::new(
+            manifest.digest_as_u64(), // see Step 4 — add helper
+            Arc::new(emitted),
+            CompiledHandle::default(),
+        );
+        // Best-effort L1 promote; ignore put errors (the entry was valid
+        // from the registry, the put rejection would be the wrong path).
+        let _ = self.put(*key, cached.clone());
+        Some(Arc::new(cached))
     }
 
     /// Number of entries currently held.
