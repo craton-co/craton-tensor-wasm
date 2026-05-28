@@ -219,13 +219,13 @@ fn ptx_fixture_exists() {
     assert!(contents.contains(".entry vector_add"));
 }
 
-// FIXME(post-S22): tokio Semaphore::acquire on a 0-permit semaphore parks
-// the task forever rather than returning `Closed`/error. The intended
-// `QuotaExceeded` path requires either pre-checking `available_permits()`
-// before acquire, or using `try_acquire()`. Ignored until the back-pressure
-// implementation is updated.
+// Regression: a cap-0 back-pressure semaphore used to park the wasm
+// fiber forever on `tokio::sync::Semaphore::acquire` because no permit
+// ever returns. `BackPressure::acquire_borrowed` now probes via
+// `try_acquire` first and synthesises `QuotaExceeded` when the cap is
+// the cap-0 sentinel, so the guest observes the saturation error
+// rather than hanging.
 #[tokio::test]
-#[ignore = "back-pressure cap=0 hangs on tokio Semaphore::acquire; tracked"]
 async fn launch_over_back_pressure_cap_returns_quota_exceeded() {
     // With a cap of zero, the very first launch must fail with
     // QuotaExceeded — confirming `launch_impl` actually consults the

@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, SemaphorePermit, Semaphore};
 
+use crate::abi::AbiError;
+
 /// Default maximum number of concurrent GPU operations across the process.
 /// Mirrors the plan's choice of "a few times the number of SMs" — tuned
 /// at startup to match the deployed hardware in S17.
@@ -82,7 +84,37 @@ impl BackPressure {
     /// only within the current async scope (no `tokio::spawn`). The
     /// production `launch_impl_async` host-function path runs inside a
     /// wasmtime async fiber that never spawns, so it uses this variant.
-    pub async fn acquire_borrowed(&self) -> BorrowedDispatchPermit<'_> {
+    ///
+    /// # Cap-0 / saturated semantics
+    ///
+    /// A cap of `0` is a "no permits, ever" sentinel: the semaphore was
+    /// constructed with zero permits and none will ever be released
+    /// because nothing can acquire to release. Awaiting `Semaphore::acquire`
+    /// in that state parks the caller forever — a footgun, because guests
+    /// observing back-pressure should see `QuotaExceeded` rather than
+    /// hang. We therefore probe with `try_acquire` first: if it fails
+    /// AND the configured cap is `0`, we return [`AbiError::QuotaExceeded`]
+    /// rather than awaiting. For caps > 0 we fall through to the standard
+    /// async acquire (permits will eventually return as in-flight
+    /// dispatches drop their permits).
+    pub async fn acquire_borrowed(&self) -> Result<BorrowedDispatchPermit<'_>, AbiError> {
+        // Fast path / saturated-cap-0 guard: try a synchronous acquire
+        // first. On success we skip the async machinery entirely; on
+        // failure we check whether the cap is the cap-0 sentinel and, if
+        // so, surface `QuotaExceeded` instead of parking forever.
+        if let Ok(permit) = self.inner.semaphore.try_acquire() {
+            self.inner.active.fetch_add(1, Ordering::Relaxed);
+            return Ok(BorrowedDispatchPermit {
+                permit: Some(permit),
+                counter: &self.inner,
+            });
+        }
+        if self.inner.max_concurrent == 0 {
+            // Cap-0 semaphores never release a permit; awaiting would
+            // park the wasm fiber indefinitely. Return the saturated-
+            // back-pressure signal instead.
+            return Err(AbiError::QuotaExceeded);
+        }
         let permit = self
             .inner
             .semaphore
@@ -90,10 +122,10 @@ impl BackPressure {
             .await
             .expect("semaphore closed unexpectedly");
         self.inner.active.fetch_add(1, Ordering::Relaxed);
-        BorrowedDispatchPermit {
+        Ok(BorrowedDispatchPermit {
             permit: Some(permit),
             counter: &self.inner,
-        }
+        })
     }
 
     /// Try to acquire a permit without awaiting. Returns `None` under load.
@@ -350,12 +382,29 @@ mod tests {
         // does for the owned `DispatchPermit`.
         let bp = BackPressure::with_cap(2);
         assert_eq!(bp.active(), 0);
-        let a = bp.acquire_borrowed().await;
+        let a = bp.acquire_borrowed().await.expect("permit");
         assert_eq!(bp.active(), 1);
-        let b = bp.acquire_borrowed().await;
+        let b = bp.acquire_borrowed().await.expect("permit");
         assert_eq!(bp.active(), 2);
         drop(a);
         drop(b);
+        assert_eq!(bp.active(), 0);
+    }
+
+    #[tokio::test]
+    async fn acquire_borrowed_cap_zero_returns_quota_exceeded() {
+        // Regression: a cap-0 BackPressure used to hang on
+        // `Semaphore::acquire` because no permit will ever be released.
+        // The fix is to detect the saturated-cap-0 case and return
+        // `QuotaExceeded` synchronously instead of parking forever.
+        let bp = BackPressure::with_cap(0);
+        let err = bp.acquire_borrowed().await.expect_err("cap=0 must error");
+        assert_eq!(err, AbiError::QuotaExceeded);
+        // Repeated calls keep returning the same error rather than
+        // parking — the contract is "saturated forever".
+        let err2 = bp.acquire_borrowed().await.expect_err("cap=0 must error");
+        assert_eq!(err2, AbiError::QuotaExceeded);
+        // No permit was ever issued; the live-counter stayed at zero.
         assert_eq!(bp.active(), 0);
     }
 

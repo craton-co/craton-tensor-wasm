@@ -147,6 +147,26 @@ pub enum LoweredArg {
     /// CUDA Unified Memory it is also a valid device address. The
     /// `guest_offset` field is preserved for log lines / tests so a
     /// pointer arg round-trips losslessly through parsing.
+    ///
+    /// `#[non_exhaustive]` blocks external struct-literal construction
+    /// — out-of-crate callers cannot stamp a `LoweredArg::Ptr { ... }`
+    /// expression with an arbitrary `host_ptr`. The launch path itself,
+    /// which lives inside this crate, retains full construction rights;
+    /// integration tests author pointer args via
+    /// [`LoweredArg::ptr_for_encoding`] (null placeholder pointer the
+    /// parser overwrites with the resolved one). This is defence-in-
+    /// depth on top of the comment that the field is "treat as opaque":
+    /// a guest-driven `memory.grow` between launch and any embedder
+    /// readback can dangle the host pointer, so the only safe consumer
+    /// is the launch path. Embedders observing the parsed argv take a
+    /// pointer-free [`LoweredArgSnapshot`] via
+    /// [`crate::host::WasiCudaContext::last_lowered_args`].
+    ///
+    /// Pattern-matching still works for external consumers using the
+    /// `..` rest pattern (`LoweredArg::Ptr { guest_offset, len, .. }`);
+    /// the rest pattern intentionally hides `host_ptr` at the public
+    /// boundary.
+    #[non_exhaustive]
     Ptr {
         /// Host-side raw pointer into the caller's linear memory.
         ///
@@ -155,14 +175,6 @@ pub enum LoweredArg {
         /// move on a `memory.grow`). The CUDA launch site captures the
         /// pointer into a parameter slot and immediately hands it to
         /// `cuLaunchKernel`, before any guest code can run.
-        ///
-        /// Crate-private: the raw pointer is intentionally not part of
-        /// this crate's public API. A guest-driven `memory.grow` between
-        /// launch and any embedder readback can dangle this pointer, so
-        /// the only safe consumer is the launch path itself. Embedders
-        /// that need to observe the parsed argv take a pointer-free
-        /// [`LoweredArgSnapshot`] via
-        /// [`crate::host::WasiCudaContext::last_lowered_args`].
         host_ptr: *const u8,
         /// Byte length the kernel will access.
         len: u32,
@@ -252,11 +264,12 @@ impl LoweredArg {
     ///
     /// Out-of-crate callers (integration tests and embedders that want
     /// to round-trip argv through [`encode_argv`]) cannot construct
-    /// `LoweredArg::Ptr` directly because `host_ptr` is crate-private.
-    /// `encode_argv` reads only `guest_offset` and `len`, so a null
-    /// placeholder is sufficient for the wire-format encoding path.
-    /// This constructor exists solely for that use case; the launch
-    /// path itself populates `host_ptr` via [`parse_argv`].
+    /// `LoweredArg::Ptr` via struct-literal syntax because the variant
+    /// is `#[non_exhaustive]`; this constructor is the supported entry
+    /// point. `encode_argv` reads only `guest_offset` and `len`, so a
+    /// null placeholder is sufficient for the wire-format encoding
+    /// path; the launch path itself populates `host_ptr` via
+    /// [`parse_argv`].
     pub fn ptr_for_encoding(guest_offset: u32, len: u32) -> Self {
         LoweredArg::Ptr {
             host_ptr: std::ptr::null(),
@@ -380,26 +393,42 @@ pub fn parse_argv(buf: &[u8], mem: &[u8]) -> Result<Vec<LoweredArg>, AbiError> {
 /// parsed [`Vec<LoweredArg>`] directly. The struct is still defined
 /// non-conditionally so the type checker can prove the no-CUDA build
 /// keeps the lowering free of CUDA-specific types.
+///
+/// # Layout (post v0.3.4)
+///
+/// A single contiguous `Vec<u8>` (`backing`) holds every scalar value
+/// in declaration order, aligned per its native type. `slots` is the
+/// pointer table CUDA reads through — each `*mut c_void` points to the
+/// start of one slot inside `backing`. A 16-arg kernel costs one
+/// `Vec<u8>` allocation plus one `Vec<*mut c_void>` allocation rather
+/// than 16 small `Box<[u8]>` allocations.
+///
+/// The single-buffer layout is sound because `cuLaunchKernel` reads
+/// each parameter through `kernelParams[i]` independently; the driver
+/// has no per-slot alignment requirement that depends on slots being
+/// distinct allocations. We still align each slot to
+/// `std::mem::align_of::<T>()` so a misaligned `f64` cannot read garbage
+/// on architectures that fault on unaligned loads.
 pub struct KernelParamStorage {
-    /// Per-arg value storage: each `Box<[u8]>` holds the raw bytes
-    /// `cuLaunchKernel` reads through the corresponding pointer slot.
-    /// Allocated as a `Box<[u8]>` (rather than `Vec<u8>`) so the
-    /// backing memory cannot be moved by a push — the pointer in
-    /// `slots` would otherwise dangle.
-    _values: Vec<Box<[u8]>>,
+    /// Contiguous backing buffer holding every scalar slot's value
+    /// bytes (or, for `Ptr` args, the `usize`-encoded resolved host
+    /// pointer — CUDA's argv is "address-of pointer", not "pointer").
+    /// Stored in a `Box<[u8]>` rather than a `Vec<u8>` so the buffer
+    /// cannot be reallocated after `slots` is populated — any reallocation
+    /// would dangle every pointer inside `slots`. We freeze the `Vec`
+    /// into a `Box<[u8]>` once we're done writing to it.
+    backing: Box<[u8]>,
     /// Pointer slots in the order CUDA reads them. Each entry points
-    /// into the matching `_values[i]` slice — for scalar args that
-    /// slice holds the value bytes; for `Ptr` args it holds the
-    /// little-endian bytes of the resolved host pointer (CUDA's argv
-    /// is "address-of pointer", not "pointer").
+    /// into `backing` at the slot's recorded offset.
     slots: Vec<*mut std::ffi::c_void>,
 }
 
-// SAFETY: the pointers inside `slots` reference either heap memory
-// owned by `_values` or live wasm linear-memory bytes whose lifetime
-// the launch site enforces externally (the `Vec<LoweredArg>` it
-// originated from is held in the same stack frame). Like
-// `LoweredArg`, we never share these across threads.
+// SAFETY: the pointers inside `slots` reference either bytes inside
+// `backing` (which the struct owns and never reallocates after
+// construction) or live wasm linear-memory bytes whose lifetime the
+// launch site enforces externally (the `Vec<LoweredArg>` it originated
+// from is held in the same stack frame). Like `LoweredArg`, we never
+// share these across threads.
 unsafe impl Send for KernelParamStorage {}
 
 impl KernelParamStorage {
@@ -418,6 +447,22 @@ impl KernelParamStorage {
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
+
+    /// Borrow the contiguous backing buffer that holds every slot's
+    /// value bytes. Exposed (crate-public) for the regression test that
+    /// asserts all slot pointers land inside one allocation; not part
+    /// of the launch-time hot path.
+    #[doc(hidden)]
+    pub fn backing(&self) -> &[u8] {
+        &self.backing
+    }
+
+    /// Borrow the pointer table as a slice. Exposed for tests; the
+    /// launch path uses [`KernelParamStorage::as_ptr`].
+    #[doc(hidden)]
+    pub fn slot_ptrs(&self) -> &[*mut std::ffi::c_void] {
+        &self.slots
+    }
 }
 
 /// Build a [`KernelParamStorage`] from a previously-parsed `Vec<LoweredArg>`.
@@ -426,43 +471,123 @@ impl KernelParamStorage {
 /// `cuLaunchKernel`; on no-CUDA builds it is only useful as a sanity
 /// check that the layout compiles cleanly across both feature
 /// configurations.
+///
+/// # Allocation profile
+///
+/// One `Vec<u8>` (sized to fit every aligned slot) plus one
+/// `Vec<*mut c_void>` of `args.len()` pointer slots. A 16-arg kernel
+/// therefore costs two allocations total, down from 17 on the
+/// pre-v0.3.4 layout that boxed each scalar separately.
 pub fn build_kernel_param_storage(args: &[LoweredArg]) -> KernelParamStorage {
-    let mut values: Vec<Box<[u8]>> = Vec::with_capacity(args.len());
-    let mut slots: Vec<*mut std::ffi::c_void> = Vec::with_capacity(args.len());
-
-    // Inline boxing per arg. Splitting this into a closure that captures
-    // `&mut values, &mut slots` is tempting but the closure binding
-    // would hold the mut-borrows until end-of-fn, preventing the
-    // subsequent move into `KernelParamStorage`. Manual repetition is
-    // the cheapest workaround.
+    // Pass 1: compute the offset of each slot inside `backing`,
+    // padding for the slot's native alignment. We keep the offsets in a
+    // `Vec<usize>` rather than dropping straight into `slots: Vec<*mut
+    // c_void>` because `backing` may move while we are still pushing
+    // bytes into it; the offsets stay valid across that move, and we
+    // resolve them to pointers exactly once at the end (after `backing`
+    // is frozen into a `Box<[u8]>`).
     //
     // Note on CUDA semantics for `Ptr`: CUDA expects the *address of*
     // the device pointer in each argv slot. We stash the pointer's
-    // bytes in a little box and point the slot at *that*. Under CUDA
-    // Unified Memory `host_ptr` doubles as a device address; for
+    // `usize` bytes in `backing` and point the slot at *that*. Under
+    // CUDA Unified Memory `host_ptr` doubles as a device address; for
     // non-UVM allocations the guest would have to call `cuMemAlloc`
     // separately (out of scope for v0.2 — see `docs/RISKS.md`).
-    for a in args {
-        let bytes: Box<[u8]> = match a {
-            LoweredArg::I32(v) => Vec::from(v.to_ne_bytes()).into_boxed_slice(),
-            LoweredArg::I64(v) => Vec::from(v.to_ne_bytes()).into_boxed_slice(),
-            LoweredArg::F32(v) => Vec::from(v.to_ne_bytes()).into_boxed_slice(),
-            LoweredArg::F64(v) => Vec::from(v.to_ne_bytes()).into_boxed_slice(),
-            LoweredArg::U32(v) => Vec::from(v.to_ne_bytes()).into_boxed_slice(),
-            LoweredArg::U64(v) => Vec::from(v.to_ne_bytes()).into_boxed_slice(),
-            LoweredArg::Ptr { host_ptr, .. } => {
-                Vec::from((*host_ptr as usize).to_ne_bytes()).into_boxed_slice()
-            }
-        };
-        let mut boxed = bytes;
-        slots.push(boxed.as_mut_ptr() as *mut std::ffi::c_void);
-        values.push(boxed);
+    let mut backing: Vec<u8> = Vec::new();
+    let mut offsets: Vec<usize> = Vec::with_capacity(args.len());
+
+    /// Pad `backing.len()` up to the next multiple of `align`, then
+    /// record the resulting offset as a new slot, then extend `backing`
+    /// with `bytes`. Returns the slot's start offset.
+    fn push_slot(backing: &mut Vec<u8>, offsets: &mut Vec<usize>, align: usize, bytes: &[u8]) {
+        let unpadded = backing.len();
+        // Round up to the next multiple of `align`. `align` is always a
+        // power of two for the types we handle (`align_of::<T>()`), so
+        // the bit-trick is safe.
+        let padding = unpadded.wrapping_neg() & (align - 1);
+        backing.resize(unpadded + padding, 0);
+        let offset = backing.len();
+        backing.extend_from_slice(bytes);
+        offsets.push(offset);
     }
 
-    KernelParamStorage {
-        _values: values,
-        slots,
+    for a in args {
+        match a {
+            LoweredArg::I32(v) => push_slot(
+                &mut backing,
+                &mut offsets,
+                std::mem::align_of::<i32>(),
+                &v.to_ne_bytes(),
+            ),
+            LoweredArg::I64(v) => push_slot(
+                &mut backing,
+                &mut offsets,
+                std::mem::align_of::<i64>(),
+                &v.to_ne_bytes(),
+            ),
+            LoweredArg::F32(v) => push_slot(
+                &mut backing,
+                &mut offsets,
+                std::mem::align_of::<f32>(),
+                &v.to_ne_bytes(),
+            ),
+            LoweredArg::F64(v) => push_slot(
+                &mut backing,
+                &mut offsets,
+                std::mem::align_of::<f64>(),
+                &v.to_ne_bytes(),
+            ),
+            LoweredArg::U32(v) => push_slot(
+                &mut backing,
+                &mut offsets,
+                std::mem::align_of::<u32>(),
+                &v.to_ne_bytes(),
+            ),
+            LoweredArg::U64(v) => push_slot(
+                &mut backing,
+                &mut offsets,
+                std::mem::align_of::<u64>(),
+                &v.to_ne_bytes(),
+            ),
+            LoweredArg::Ptr { host_ptr, .. } => {
+                // CUDA expects the address-of-pointer; we store the
+                // resolved host pointer's `usize` bytes in `backing` so
+                // the slot can point at *that*.
+                let as_usize = *host_ptr as usize;
+                push_slot(
+                    &mut backing,
+                    &mut offsets,
+                    std::mem::align_of::<usize>(),
+                    &as_usize.to_ne_bytes(),
+                );
+            }
+        }
     }
+
+    // Freeze the backing buffer. `into_boxed_slice` drops the unused
+    // tail capacity but does not move the bytes — the slice keeps the
+    // same data pointer, so the offsets we computed above remain
+    // correct. From here on, `backing` is read-only and its data
+    // pointer is stable for the lifetime of the `KernelParamStorage`.
+    let backing: Box<[u8]> = backing.into_boxed_slice();
+
+    // Pass 2: resolve each offset to a raw pointer into `backing`. We
+    // do this after freezing the buffer so the pointers are guaranteed
+    // not to dangle.
+    let base = backing.as_ptr() as *mut u8;
+    let slots: Vec<*mut std::ffi::c_void> = offsets
+        .iter()
+        .map(|&off| {
+            // SAFETY: every offset was produced by `push_slot` and is
+            // at most `backing.len()`. The resulting pointer is
+            // in-bounds for the `Box<[u8]>` (and one-past-end for a
+            // hypothetical zero-byte slot, which the type system would
+            // not let us reach but the alignment doesn't preclude).
+            unsafe { base.add(off) as *mut std::ffi::c_void }
+        })
+        .collect();
+
+    KernelParamStorage { backing, slots }
 }
 
 /// Helper for tests and host-stub paths: encode a sequence of

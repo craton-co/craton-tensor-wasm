@@ -801,7 +801,7 @@ Representative test
 let expected = vec![
     LoweredArg::I32(-13),
     LoweredArg::U32(0x1234_5678),
-    LoweredArg::Ptr { host_ptr: std::ptr::null(), len: 64, guest_offset: 256 },
+    LoweredArg::ptr_for_encoding(/* guest_offset */ 256, /* len */ 64),
 ];
 let argv = encode_argv(&expected);
 let wat = build_launch_wat(&argv, /*offset=*/1024, kid);
