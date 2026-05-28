@@ -235,11 +235,17 @@ impl std::fmt::Debug for Snapshot {
 }
 
 /// Borrowing mirror of [`Snapshot`] used only on the write path so capture does
-/// not have to clone the caller's byte slices.
+/// not have to clone the caller's byte slices. Drives both the legacy v2/v3
+/// envelope ([`SnapshotWriter::capture`]) and the artifact-store envelope
+/// ([`SnapshotWriter::capture_to_artifact_store`]) — the only difference
+/// between the two callers is which `version` field they fill in.
 ///
 /// Field order, types (post-`serde_bytes` adaptation), and bincode encoding are
 /// identical to [`Snapshot`], so a blob produced from `SnapshotRef` round-trips
-/// through [`crate::reader::SnapshotReader::restore`] into the owned form.
+/// through [`crate::reader::SnapshotReader::restore`] (or, under the
+/// `artifact-backing` feature, through
+/// [`crate::reader::SnapshotReader::restore_from_artifact_store`]) into the
+/// owned form.
 #[derive(Debug, Serialize)]
 struct SnapshotRef<'a> {
     magic: u32,
@@ -413,13 +419,15 @@ impl SnapshotWriter {
     /// cannot drift on which input is "too large" or on which metadata
     /// fields are populated.
     ///
-    /// Returns `(metadata, crc32)`. Kept private because the two consumers
-    /// have different needs from here: `capture` borrows the byte slices
-    /// directly into a `SnapshotRef` to avoid a host-side copy, while
-    /// `capture_to_artifact_store` materialises an owned [`Snapshot`] so it
-    /// can hand the bincode-encoded bytes to the artifact store. Neither
-    /// shape is more correct than the other — they just have different
-    /// ownership constraints — so the shared work stops at the metadata.
+    /// Returns `(metadata, crc32)`. Kept private because both consumers
+    /// borrow the byte slices into a `SnapshotRef` to avoid a host-side
+    /// copy of the (potentially multi-GiB) memory blobs: `capture`
+    /// streams the `SnapshotRef` straight through bincode into the zstd
+    /// encoder, while `capture_to_artifact_store` bincode-encodes a
+    /// `SnapshotRef` into a `Vec<u8>` and hands the encoded bytes to
+    /// the artifact store. The shared work stops at the metadata so the
+    /// two paths can pick their own `SnapshotRef` `version` field
+    /// (legacy v2/v3 on `capture`, fixed v2 on `capture_to_artifact_store`).
     fn build_metadata(&self, state: &InstanceState<'_>) -> Result<(SnapshotMetadata, u32)> {
         check_blob_size(
             "wasm_memory",
@@ -482,39 +490,49 @@ impl SnapshotWriter {
         Ok((metadata, crc32))
     }
 
-    /// Build an owned [`Snapshot`] from `state` for the artifact-store write
-    /// path. Mirrors the same size checks and metadata population as
-    /// [`SnapshotWriter::capture`] (via [`SnapshotWriter::build_metadata`]),
-    /// but materialises the three byte blobs into owned `Vec<u8>` so the
-    /// resulting struct can be bincode-encoded and handed to
-    /// [`tensor_wasm_artifacts::DiskArtifactStore::put`], which takes a
-    /// `&[u8]` payload.
+    /// Build a borrowing [`SnapshotRef`] view over `state` for the
+    /// artifact-store write path. Mirrors the same size checks and metadata
+    /// population as [`SnapshotWriter::capture`] (via
+    /// [`SnapshotWriter::build_metadata`]) but produces a `SnapshotRef`
+    /// instead of an owned [`Snapshot`] so the three potentially-GiB byte
+    /// blobs are not host-side copied just to be handed to bincode.
     ///
-    /// Only used by [`SnapshotWriter::capture_to_artifact_store`]. The
-    /// legacy [`SnapshotWriter::capture`] continues to borrow the caller's
-    /// slices via the internal `SnapshotRef` to avoid a host-side copy on
-    /// the v2/v3 path — this helper is for the v0.4 convergence path where
-    /// owning the bytes is unavoidable.
+    /// PERF (audit T21): pre-T21 this returned an owned `Snapshot` built
+    /// from three `.to_vec()` calls. On a multi-GiB GPU capture that meant
+    /// three full-payload copies before bincode even ran. The borrowing
+    /// `SnapshotRef` serialises to byte-identical bincode (same field
+    /// order, same `serde_bytes` adapter on the three byte fields) so the
+    /// wire format and the reader path are unchanged.
+    ///
+    /// Returns the (`SnapshotRef`, `total_uncompressed_bytes`) pair so the
+    /// caller can log the uncompressed size without redoing the sum.
     #[cfg(feature = "artifact-backing")]
-    fn build_snapshot(&self, state: InstanceState<'_>) -> Result<Snapshot> {
+    fn build_snapshot_ref<'a>(
+        &self,
+        state: InstanceState<'a>,
+    ) -> Result<(SnapshotRef<'a>, u64)> {
         let (metadata, crc32) = self.build_metadata(&state)?;
-        Ok(Snapshot {
-            magic: SNAPSHOT_MAGIC,
-            // Artifact-backed snapshots reuse the v2 inner-version
-            // discriminant: the outer envelope is the artifact store's
-            // own (magic + content-hash + HMAC) frame, so the inline v3
-            // HMAC trailer is redundant — we do not bump to v3 just
-            // because the writer happens to have an HMAC key configured
-            // for the legacy path. v0.4 may collapse this field
-            // entirely once the artifact-store envelope is the only
-            // shape on the wire.
-            version: SNAPSHOT_VERSION_V2,
-            wasm_memory: state.wasm_memory.to_vec(),
-            gpu_memory: state.gpu_memory.to_vec(),
-            registers: state.registers.to_vec(),
-            metadata,
-            crc32,
-        })
+        let total_uncompressed_bytes = metadata.total_uncompressed_bytes;
+        Ok((
+            SnapshotRef {
+                magic: SNAPSHOT_MAGIC,
+                // Artifact-backed snapshots reuse the v2 inner-version
+                // discriminant: the outer envelope is the artifact store's
+                // own (magic + content-hash + HMAC) frame, so the inline v3
+                // HMAC trailer is redundant — we do not bump to v3 just
+                // because the writer happens to have an HMAC key configured
+                // for the legacy path. v0.4 may collapse this field
+                // entirely once the artifact-store envelope is the only
+                // shape on the wire.
+                version: SNAPSHOT_VERSION_V2,
+                wasm_memory: state.wasm_memory,
+                gpu_memory: state.gpu_memory,
+                registers: state.registers,
+                metadata,
+                crc32,
+            },
+            total_uncompressed_bytes,
+        ))
     }
 
     /// Encode and compress `state` into a snapshot blob.
@@ -568,7 +586,24 @@ impl SnapshotWriter {
         // redundant pass over the buffer. `bincode::config::legacy()` keeps the
         // wire format byte-identical to bincode 1.x's default fixint+LE config.
         let cfg = bincode::config::legacy();
-        let mut compressed: Vec<u8> = Vec::with_capacity(8 * 1024);
+        // PERF (audit T21): pre-size `compressed` using a 4:1 ratio heuristic
+        // over the input's total uncompressed size. The old constant 8 KiB
+        // capacity forced ~10+ reallocations on every multi-MiB GPU capture
+        // because the streaming zstd encoder writes in increments of a few
+        // tens of KiB. 4:1 is a reasonable expected ratio for fp16/fp32
+        // tensor memory (which dominates GPU snapshots) — overshooting wastes
+        // a one-off allocation we'd grow into anyway, while undershooting
+        // costs amortised O(N log N) reallocations. The clamp avoids
+        // pathological behaviour: the 8 KiB floor keeps tiny captures from
+        // allocating a zero-byte Vec, and the `MAX_INPUT_BYTES / 4` ceiling
+        // (256 MiB at today's 1 GiB MAX_INPUT_BYTES) protects against a
+        // hostile-but-passing-size_check input pushing the writer's
+        // peak-resident footprint past the reader's hard cap. The output
+        // bytes are unchanged — this is purely about reducing reallocation
+        // count on the write path.
+        let estimated_compressed = (total_uncompressed_bytes as usize / 4)
+            .clamp(8 * 1024, limits::MAX_INPUT_BYTES / 4);
+        let mut compressed: Vec<u8> = Vec::with_capacity(estimated_compressed);
         let mut encoder = zstd::stream::write::Encoder::new(&mut compressed, self.zstd_level)
             .map_err(|e| TensorWasmError::Serialization(format!("zstd init: {e}").into()))?;
         bincode::serde::encode_into_std_write(&snapshot_ref, &mut encoder, cfg)
@@ -684,14 +719,23 @@ impl SnapshotWriter {
     ) -> Result<tensor_wasm_artifacts::ContentHash> {
         // Build the bincode-encoded Snapshot (NOT zstd-wrapped) — the
         // artifact store handles compression itself. The size caps from
-        // `build_snapshot`'s `build_metadata` call still apply, so an
+        // `build_snapshot_ref`'s `build_metadata` call still apply, so an
         // oversized capture is rejected here before bincode runs.
-        let snapshot = self.build_snapshot(state)?;
-        let bytes = bincode::serde::encode_to_vec(&snapshot, bincode::config::legacy())
+        //
+        // PERF (audit T21): encode from a borrowing `SnapshotRef` rather
+        // than an owned `Snapshot`. The pre-T21 path called `.to_vec()`
+        // on each of `wasm_memory`, `gpu_memory`, and `registers` —
+        // three full-payload copies before bincode even ran. The
+        // borrowing view serialises to byte-identical bincode (same
+        // field order, same `serde_bytes` adapter) so the artifact
+        // store sees the same payload and the reader's existing
+        // `decode_from_slice::<Snapshot>` path keeps working without
+        // change.
+        let (snapshot_ref, total_uncompressed_bytes) = self.build_snapshot_ref(state)?;
+        let bytes = bincode::serde::encode_to_vec(&snapshot_ref, bincode::config::legacy())
             .map_err(|e| {
                 TensorWasmError::Serialization(format!("bincode encode: {e}").into())
             })?;
-        let total_uncompressed_bytes = snapshot.metadata.total_uncompressed_bytes;
         let hash = store.put(&bytes).map_err(|e| {
             // `ArtifactError` is not part of the `TensorWasmError` enum
             // (it lives in a leaf crate that does not depend on
