@@ -152,10 +152,11 @@ fn bench_rejects_zero_iterations() {
 #[test]
 fn run_executes_inline_wat_fixture() {
     // Build a trivial Wasm fixture with an `add` export the CLI can call.
-    // Note: TensorWasmExecutor::call_export currently runs `() -> ()` signatures —
+    // Note: this `run` invocation passes `&[]` through `call_export_with_args`
+    // (the legacy `call_export` no-args shim is `#[deprecated]` since 0.3.7),
     // so the `add` function in this fixture must take no params and return
     // nothing. We still pass --args to exercise JSON validation; the
-    // executor ignores the values.
+    // executor ignores the values for this empty-arg fast path.
     let wat = r#"
         (module
             (func (export "add"))

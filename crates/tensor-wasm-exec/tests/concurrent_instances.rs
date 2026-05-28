@@ -36,7 +36,7 @@ async fn one_hundred_concurrent_instances() {
                 )
                 .await
                 .expect("spawn");
-            exec.call_export(id, "noop").await.expect("call");
+            exec.call_export_with_args(id, "noop", &[]).await.expect("call");
             exec.terminate(id).await.expect("terminate");
         }));
     }

@@ -342,6 +342,31 @@ checkout` the day v0.2 ships.
 
 ## [Unreleased]
 
+### Deprecated
+- `TensorWasmExecutor::call_export(id, export) -> Result<(), ExecError>` —
+  superseded by `call_export_with_args(id, export, &[])` which returns the
+  export's result list as `serde_json::Value`. The legacy method is now a
+  `#[deprecated(since = "0.3.7")]` thin wrapper; **slated for removal in
+  v0.4.** External callers see the migration warning at compile time;
+  in-tree call sites (CLI `run`/`bench`, HTTP `/invoke`, every
+  `tensor-wasm-exec/tests/*.rs` integration test) migrated in this
+  release. Migration recipe: replace `.call_export(id, name)` with
+  `.call_export_with_args(id, name, &[])` — the empty-slice fast path
+  takes the same `func.typed::<(), ()>()` branch the legacy method used,
+  so runtime cost is identical. See
+  `docs/MIGRATING-FROM-WASMTIME-WASMER.md` § "Typed exports".
+- `TensorWasmExecutor::call_export_then_terminate` — same disposition;
+  swap to `call_export_with_args_then_terminate(..., &[])`. The
+  `AutoTerminateGuard` drop semantics are unchanged.
+
+  *Note on enforcement:* `deny.toml` is dep-level (cargo-deny does not
+  support symbol-level bans on Rust APIs), so the deprecation lint is
+  the only mechanism preventing fresh in-tree call sites until v0.4
+  physically removes the methods. Reviewers should reject any new
+  `.call_export(` invocation that is not explicitly tagged
+  `#[allow(deprecated)]` in a named `legacy_call_export_*` back-compat
+  test.
+
 ### Added
 - `tensor-wasm-snapshot`: optional HMAC-SHA256 signing (`signed-snapshots` feature, default on). New v3 wire format = v2 + 33 trailing bytes (kind + 32-byte signature). Writer/reader opt-in via `with_hmac_sha256_key`; reader can `require_signature()` to reject v2.
 - `tensor-wasm-cli`: `--hmac-key-file` on `snapshot save`/`restore`; `--require-signature` on `restore`.

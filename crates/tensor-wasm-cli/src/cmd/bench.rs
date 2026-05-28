@@ -51,7 +51,7 @@ pub async fn run(args: BenchArgs) -> Result<()> {
             .await
             .with_context(|| format!("spawning instance on iter {i}"))?;
         executor
-            .call_export(id, &args.export)
+            .call_export_with_args(id, &args.export, &[])
             .await
             .with_context(|| format!("calling `{}` on iter {i}", args.export))?;
         executor

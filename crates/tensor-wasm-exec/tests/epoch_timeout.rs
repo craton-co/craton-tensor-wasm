@@ -52,7 +52,7 @@ async fn infinite_loop_terminates_within_2x_deadline() {
         .expect("spawn");
 
     let start = Instant::now();
-    let res = exec.call_export(id, "spin").await;
+    let res = exec.call_export_with_args(id, "spin", &[]).await;
     let elapsed = start.elapsed();
 
     // The call MUST return an error (any of Wasmtime / Timeout flavour) within 2× deadline.

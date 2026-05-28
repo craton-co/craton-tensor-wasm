@@ -60,7 +60,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
         .await
         .context("spawning instance")?;
 
-    let call_result = executor.call_export(id, &args.export).await;
+    let call_result = executor
+        .call_export_with_args(id, &args.export, &[])
+        .await
+        .map(|_| ());
     let _ = executor.terminate(id).await;
     call_result.with_context(|| format!("calling export `{}`", args.export))?;
 

@@ -30,7 +30,7 @@ async fn four_concurrent_calls_on_one_instance() {
     for _ in 0..4 {
         let exec = exec.clone();
         handles.push(tokio::spawn(async move {
-            exec.call_export(id, "noop").await
+            exec.call_export_with_args(id, "noop", &[]).await
         }));
     }
 

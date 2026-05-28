@@ -66,7 +66,7 @@ async fn table_grow_past_limit_is_rejected_without_host_crash() {
     // for the table backing store on this single call, blowing through
     // every reasonable host budget. With the cap, `table.grow` is denied
     // in-band, the guest drops the -1, and the call returns Ok.
-    exec.call_export(id, "grow_table_huge")
+    exec.call_export_with_args(id, "grow_table_huge", &[])
         .await
         .expect("call returns; table-grow rejection is in-band");
 
@@ -102,6 +102,8 @@ async fn table_grow_under_limit_succeeds() {
         .spawn_instance(SpawnConfig::for_tenant(TenantId(1)), &small_table_wasm())
         .await
         .expect("spawn");
-    exec.call_export(id, "grow_table_small").await.expect("call");
+    exec.call_export_with_args(id, "grow_table_small", &[])
+        .await
+        .expect("call");
     exec.terminate(id).await.expect("terminate");
 }

@@ -34,7 +34,7 @@ async fn trapping_guest_does_not_poison_registry() {
         .await
         .expect("spawn");
 
-    let res = exec.call_export(id, "boom").await;
+    let res = exec.call_export_with_args(id, "boom", &[]).await;
     assert!(res.is_err(), "unreachable trap must surface as Err");
 
     // The instance is still in the registry — the trap doesn't auto-terminate.
@@ -47,7 +47,7 @@ async fn trapping_guest_does_not_poison_registry() {
         .spawn_instance(SpawnConfig::for_tenant(TenantId(2)), &trapping_wasm())
         .await
         .expect("spawn after trap");
-    exec.call_export(id2, "noop")
+    exec.call_export_with_args(id2, "noop", &[])
         .await
         .expect("noop after trap");
     exec.terminate(id2).await.expect("terminate second");

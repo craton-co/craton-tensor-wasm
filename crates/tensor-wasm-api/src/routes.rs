@@ -635,14 +635,23 @@ async fn run_invoke(
     // a missing `_start` falls through to `main`. If neither exists the
     // `MissingExport` from the second attempt is returned (mapped to 400).
     //
-    // api S-20 / exec orphan-instance: use `call_export_then_terminate` so
-    // the instance is cleaned up even if our future is dropped mid-await
+    // api S-20 / exec orphan-instance: use `call_export_with_args_then_terminate`
+    // so the instance is cleaned up even if our future is dropped mid-await
     // (e.g. by tower's `TimeoutLayer`). The previous `call_export` +
     // explicit `terminate` flow leaked the registry entry into
     // `instances` on outer cancellation, holding the wasmtime `Store`
     // and counting against `max_instances` until process restart.
-    let call_result = match executor.call_export_then_terminate(instance_id, "_start").await {
-        Ok(()) => Ok(()),
+    //
+    // The legacy `call_export_then_terminate` (no-args) is `#[deprecated]`
+    // since 0.3.7; we call the typed variant with an empty `&[]` slice
+    // here for parity with the legacy `() -> ()` semantics and discard
+    // the JSON result (this code path historically returned a fixed
+    // `"result": "ok"` string).
+    let call_result = match executor
+        .call_export_with_args_then_terminate(instance_id, "_start", &[])
+        .await
+    {
+        Ok(_) => Ok(()),
         Err(ExecError::MissingExport(_)) => {
             // `_start` was missing AND the instance was already terminated
             // by the first guard. Re-spawn to try `main` — slightly more
@@ -651,7 +660,10 @@ async fn run_invoke(
             // terminate invariant intact.
             let cfg = SpawnConfig::for_tenant(tenant).with_deadline(INVOKE_DEFAULT_DEADLINE);
             let retry_id = executor.spawn_instance(cfg, wasm_bytes).await?;
-            executor.call_export_then_terminate(retry_id, "main").await
+            executor
+                .call_export_with_args_then_terminate(retry_id, "main", &[])
+                .await
+                .map(|_| ())
         }
         Err(other) => Err(other),
     };

@@ -256,7 +256,7 @@ async fn run_once(wasm: &[u8]) -> anyhow::Result<()> {
     let id = executor
         .spawn_instance(SpawnConfig::for_tenant(TenantId(1)), wasm)
         .await?;
-    let call = executor.call_export(id, "_start").await;
+    let call = executor.call_export_with_args(id, "_start", &[]).await;
     let _ = executor.terminate(id).await;
     call?;
     Ok(())
@@ -296,7 +296,10 @@ Confirm you actually want to switch ([§1.1](#11-the-library-user)).
 Then: replace `wasmtime::Engine` with `TensorWasmEngine`; replace
 `Linker` + `Module::new` + `Store` + `instantiate` with
 `TensorWasmExecutor::spawn_instance`; replace `get_typed_func` +
-`func.call` with `executor.call_export(id, "<export>")`; drop any
+`func.call` with `executor.call_export_with_args(id, "<export>", &[])`
+(the legacy `call_export(id, "<export>")` no-args shim is
+`#[deprecated]` since 0.3.7, removal target v0.4 — see
+[§ Typed exports](#typed-exports-v036--v037)); drop any
 custom host imports beyond WASI P2 + `wasi:cuda` (import table is
 fixed in v0.1.0); replace `Module::serialize`/`deserialize`
 warm-cache with the snapshot subsystem
@@ -632,6 +635,70 @@ need a code change; the import table is fixed in v0.1.0.
   return `AbiError::NotAvailable` (code `-1`) and the rest of the
   runtime is unaffected. Default developer-laptop configuration;
   see the [5-minute quickstart](../README.md#5-minute-quickstart).
+
+## 13.bis Inter-version migration
+
+### Typed exports (v0.3.6 → v0.3.7)
+
+v0.3.6 shipped `TensorWasmExecutor::call_export(id, export)` as the only
+guest-invocation entry point: it ran the export as a `() -> ()` typed
+call, discarded any return value, and surfaced success / error via
+`Result<(), ExecError>`. The signature could not pass arguments and
+could not surface multi-value results.
+
+B6.2 (v0.3.7) lands `call_export_with_args` as the primary entry point:
+
+```rust
+pub async fn call_export_with_args(
+    &self,
+    id: InstanceId,
+    export: &str,
+    args: &[WasmArg],
+) -> Result<serde_json::Value, ExecError>
+```
+
+`WasmArg` is a small `Copy` enum mirroring the four core wasm value
+types (`i32`, `i64`, `f32`, `f64`). The return value is the export's
+result list serialised as a JSON array — empty for the historical
+`() -> ()` shape, populated for richer signatures. The deadline,
+admission-control, drop-guard, and span instrumentation contracts are
+unchanged.
+
+`call_export` and its sibling `call_export_then_terminate` are now thin
+back-compat wrappers — both **`#[deprecated]` since 0.3.7**, both
+slated for removal in **v0.4**. Compiling against them today emits a
+`deprecated` warning pointing back at this section.
+
+#### Migration
+
+For every external `call_export(id, "name")` call site:
+
+```diff
+- exec.call_export(id, "name").await?;
++ exec.call_export_with_args(id, "name", &[]).await?;
+```
+
+The empty-slice fast path inside `call_export_with_args` takes the
+same `func.typed::<(), ()>()` branch the legacy method used, so the
+runtime cost is identical (no extra `Val` allocations on the hot
+path). The discarded return value is the only behavioural diff — the
+wrapper above maps it to `()` for callers that don't need it.
+
+For `call_export_then_terminate(id, "name")`:
+
+```diff
+- exec.call_export_then_terminate(id, "name").await?;
++ exec.call_export_with_args_then_terminate(id, "name", &[]).await?;
+```
+
+Same `AutoTerminateGuard` lifecycle (success, error, *and* Future-drop
+all clean up the registry entry); the discarded `serde_json::Value`
+return is again the only diff.
+
+In-tree callers (CLI `run` / `bench`, HTTP `/invoke`, every
+`tensor-wasm-exec/tests/*.rs` integration test) migrated in B6.2 +
+B6.2-follow-up. External embedders should plan the same swap before
+the v0.4 bump.
 
 ## 13. Where to go next
 

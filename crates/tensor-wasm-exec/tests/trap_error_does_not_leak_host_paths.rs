@@ -63,7 +63,7 @@ async fn trap_error_does_not_leak_host_paths_or_pointers() {
         .expect("spawn trapping module");
 
     let exec_err = exec
-        .call_export(id, "go")
+        .call_export_with_args(id, "go", &[])
         .await
         .expect_err("unreachable must trap");
 
