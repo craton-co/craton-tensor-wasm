@@ -4,6 +4,7 @@
 //! Axum router builder and listener.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,8 +16,8 @@ use crate::audit::{audit_log_middleware, AuditConfig, TrustedProxies};
 use crate::http_metrics::{http_metrics_middleware, HttpMetricsLayerConfig, RouteAllowList};
 use crate::middleware::{
     bearer_auth, body_limit_layer, concurrency_limit_layer, cors_layer, host_validate,
-    tenant_scope, INVOKE_CONCURRENCY_LIMIT, PROBE_CONCURRENCY_LIMIT, READ_CONCURRENCY_LIMIT,
-    WRITE_CONCURRENCY_LIMIT,
+    tenant_scope, ENV_API_TOKENS, ENV_TRUSTED_HOSTS, INVOKE_CONCURRENCY_LIMIT,
+    PROBE_CONCURRENCY_LIMIT, READ_CONCURRENCY_LIMIT, WRITE_CONCURRENCY_LIMIT,
     timeout_layer, trace_layer_with_propagation, AuthConfig, CorsConfig, KernelPublishTokens,
     TenantConfig, TrustedHosts, MAX_REQUEST_BODY_BYTES,
 };
@@ -197,6 +198,76 @@ pub fn build_router_with_kernel_publish_tokens(
     )
 }
 
+/// Process-wide latch for the T16 "tokens set but trusted_hosts unset"
+/// startup warning. The warning fires at most once per process even if
+/// the router builders are invoked multiple times (tests routinely
+/// rebuild the router for each case; production starts the gateway once).
+static T16_HOST_WARN_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// One-shot startup safety check: when the gateway is in production mode
+/// (`TENSOR_WASM_API_TOKENS` set to a non-empty value) but the operator
+/// has not configured a `Host` allowlist (`TENSOR_WASM_API_TRUSTED_HOSTS`
+/// unset or empty), emit a single `tracing::warn!` that points at the
+/// virtual-host-confusion / cache-poisoning risk. The runtime
+/// `host_validate` middleware itself stays a no-op when no allowlist is
+/// configured — this only adds operator-facing visibility so a
+/// production deployment behind a misconfigured ingress that forwards
+/// arbitrary `Host` headers is no longer silent.
+///
+/// Closes the T16 audit finding. The atomic latch makes the warning
+/// idempotent across repeated `build_router*` calls in the same process
+/// (the integration test suite alone rebuilds the router dozens of
+/// times); operators see exactly one log line per process.
+fn maybe_warn_host_validation_disabled() {
+    let tokens_set = std::env::var(ENV_API_TOKENS)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if !tokens_set {
+        return;
+    }
+    let trusted_hosts_set = std::env::var(ENV_TRUSTED_HOSTS)
+        .map(|v| !TrustedHosts::from_raw(&v).is_empty())
+        .unwrap_or(false);
+    if trusted_hosts_set {
+        return;
+    }
+    // CAS so we only emit once per process. `Acquire`/`Release` is
+    // overkill for a log latch but matches the pattern used by the
+    // `install_w3c_propagator` `Once` elsewhere in this module.
+    if T16_HOST_WARN_FIRED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        tracing::warn!(
+            target: "tensor_wasm_api::server",
+            "TENSOR_WASM_API_TOKENS is set (production-mode) but \
+             TENSOR_WASM_API_TRUSTED_HOSTS is unset — Host header \
+             validation is disabled. This is OK behind an ingress that \
+             strips/validates Host, otherwise enable trusted hosts to \
+             avoid virtual-host confusion. Set \
+             TENSOR_WASM_API_TRUSTED_HOSTS=host1.example.com,host2.example.com \
+             to enable.",
+        );
+    }
+}
+
+/// Reset the T16 startup-warning latch.
+///
+/// Used by the integration test in
+/// `tests/host_validate_startup_warn.rs` so each scenario starts from a
+/// clean "not yet warned" state. Production code MUST NOT call this:
+/// the warning is fire-once for the life of the process by design, and
+/// resetting it lets the misconfiguration warning fire repeatedly on
+/// every router rebuild. The function is hidden from rustdoc and prefixed
+/// with `__` to discourage external callers; it is `pub` only so the
+/// integration test binary (which lives outside the crate root) can
+/// reach it without depending on `#[cfg(test)]` visibility, which does
+/// not extend to integration tests.
+#[doc(hidden)]
+pub fn __reset_host_validation_warn_for_test() {
+    T16_HOST_WARN_FIRED.store(false, Ordering::Release);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_router_full(
     state: Arc<AppState>,
@@ -214,6 +285,11 @@ fn build_router_full(
     // without poking holes in attribute placement.
     #[cfg(not(feature = "kernel-registry-api"))]
     let _ = kernel_publish_tokens;
+    // T16: one-shot warning when production-mode tokens are configured
+    // but the Host allowlist is not. The runtime middleware behaviour is
+    // unchanged (pass-through with no allowlist); only the operator-
+    // facing visibility is new.
+    maybe_warn_host_validation_disabled();
     // Wire the W3C Trace Context propagator globally. Idempotent across
     // calls; safe to invoke on every router rebuild (tests do that
     // routinely). Without this, the tower `trace_layer_with_propagation`
