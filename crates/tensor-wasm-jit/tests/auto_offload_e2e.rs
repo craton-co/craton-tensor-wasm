@@ -152,8 +152,8 @@ fn round_trip_through_wasmparser_validator() {
             },
             ..RewriteOptions::default()
         };
-        let out = rewrite_wasm(&wasm, &opts, &cache)
-            .unwrap_or_else(|e| panic!("rewrite #{i}: {e}"));
+        let out =
+            rewrite_wasm(&wasm, &opts, &cache).unwrap_or_else(|e| panic!("rewrite #{i}: {e}"));
         wasmparser::Validator::new()
             .validate_all(&out.rewritten_wasm)
             .unwrap_or_else(|e| panic!("validate #{i}: {e}"));

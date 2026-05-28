@@ -84,20 +84,14 @@ fn cuda_oxide_allocate_returns_not_yet_wired() {
 /// `cudarc_apply_advice_is_exported` in `cudarc_smoke.rs`.
 #[test]
 fn cuda_oxide_apply_advice_is_exported() {
-    let _f: fn(
-        &CudaOxideUnifiedBuffer,
-        CudaOxideAdvice,
-    ) -> Result<(), UnifiedError> = apply_advice;
+    let _f: fn(&CudaOxideUnifiedBuffer, CudaOxideAdvice) -> Result<(), UnifiedError> = apply_advice;
 }
 
 /// `prefetch_async` is exported as a free function with the expected
 /// signature. Same type-level export rationale as `apply_advice` above.
 #[test]
 fn cuda_oxide_prefetch_async_is_exported() {
-    let _f: fn(
-        &CudaOxideUnifiedBuffer,
-        DeviceId,
-    ) -> Result<(), UnifiedError> = prefetch_async;
+    let _f: fn(&CudaOxideUnifiedBuffer, DeviceId) -> Result<(), UnifiedError> = prefetch_async;
 }
 
 /// Under the host-backend feature, zero-byte allocations are rejected

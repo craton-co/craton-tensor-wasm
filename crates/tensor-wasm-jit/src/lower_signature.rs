@@ -113,11 +113,9 @@ fn lower_abi_param(
             purpose: p.purpose.to_string(),
         });
     }
-    cranelift_type_to_lowered(p.value_type).ok_or_else(|| {
-        SignatureLoweringError::UnsupportedType {
-            position: format!("{kind} {idx}"),
-            ty: p.value_type.to_string(),
-        }
+    cranelift_type_to_lowered(p.value_type).ok_or_else(|| SignatureLoweringError::UnsupportedType {
+        position: format!("{kind} {idx}"),
+        ty: p.value_type.to_string(),
     })
 }
 

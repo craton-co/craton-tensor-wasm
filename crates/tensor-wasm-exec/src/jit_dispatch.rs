@@ -200,104 +200,110 @@ where
     T: JitArenaProvider + TenantContext + 'static,
 {
     // alloc(size: i32) -> i32
-    linker.func_wrap(host_module, alloc_fn, move |mut caller: Caller<'_, T>, size: i32| -> i32 {
-        if size <= 0 {
-            return -1;
-        }
-        let size_u = size as u32;
-        let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-            Some(m) => m,
-            None => {
+    linker.func_wrap(
+        host_module,
+        alloc_fn,
+        move |mut caller: Caller<'_, T>, size: i32| -> i32 {
+            if size <= 0 {
+                return -1;
+            }
+            let size_u = size as u32;
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => {
+                    tracing::warn!(
+                        target: "tensor_wasm_exec::jit_dispatch",
+                        "alloc: caller has no exported `memory`"
+                    );
+                    return -1;
+                }
+            };
+            // Capture the bump cursor (Copy) from the per-store arena. We
+            // release the &mut borrow before touching `memory` so wasmtime's
+            // borrow rules around `caller` are satisfied.
+            let cursor_opt = caller.data_mut().jit_arena_mut().bump_cursor;
+            let mem_len = memory.data(&caller).len() as u64;
+            let cursor = match cursor_opt {
+                Some(c) => c,
+                None => {
+                    // Lazily seed the arena: park it at the top of memory. If
+                    // memory is smaller than the arena, grow by one page.
+                    if mem_len < SCRATCH_ARENA_BYTES as u64 {
+                        let pages_needed = (SCRATCH_ARENA_BYTES as u64)
+                            .div_ceil(65536)
+                            .saturating_sub(mem_len / 65536);
+                        if pages_needed > 0 && memory.grow(&mut caller, pages_needed).is_err() {
+                            return -1;
+                        }
+                    }
+                    let new_len = memory.data(&caller).len() as u64;
+                    let top = u32::try_from(new_len).unwrap_or(u32::MAX);
+                    // The arena occupies the upper SCRATCH_ARENA_BYTES of
+                    // memory only. Anything below `arena_floor` belongs to the
+                    // guest (static data, stack, heap, …) and must never be
+                    // overwritten.
+                    let floor = top.saturating_sub(SCRATCH_ARENA_BYTES);
+                    let arena = caller.data_mut().jit_arena_mut();
+                    arena.arena_floor = floor;
+                    arena.bump_cursor = Some(top);
+                    top
+                }
+            };
+            // Drop down by `size` bytes (8-byte align) for the new allocation.
+            let aligned_size = (size_u + 7) & !7;
+            let Some(ptr) = cursor.checked_sub(aligned_size) else {
                 tracing::warn!(
                     target: "tensor_wasm_exec::jit_dispatch",
-                    "alloc: caller has no exported `memory`"
+                    requested = size,
+                    "alloc: scratch arena exhausted (cursor underflow)"
+                );
+                return -1;
+            };
+            let st = caller.data_mut().jit_arena_mut();
+            if ptr < st.arena_floor {
+                tracing::warn!(
+                    target: "tensor_wasm_exec::jit_dispatch",
+                    requested = size,
+                    arena_floor = st.arena_floor,
+                    cursor = cursor,
+                    "alloc: scratch arena exhausted (would collide with guest data)"
                 );
                 return -1;
             }
-        };
-        // Capture the bump cursor (Copy) from the per-store arena. We
-        // release the &mut borrow before touching `memory` so wasmtime's
-        // borrow rules around `caller` are satisfied.
-        let cursor_opt = caller.data_mut().jit_arena_mut().bump_cursor;
-        let mem_len = memory.data(&caller).len() as u64;
-        let cursor = match cursor_opt {
-            Some(c) => c,
-            None => {
-                // Lazily seed the arena: park it at the top of memory. If
-                // memory is smaller than the arena, grow by one page.
-                if mem_len < SCRATCH_ARENA_BYTES as u64 {
-                    let pages_needed = (SCRATCH_ARENA_BYTES as u64)
-                        .div_ceil(65536)
-                        .saturating_sub(mem_len / 65536);
-                    if pages_needed > 0
-                        && memory.grow(&mut caller, pages_needed).is_err()
-                    {
-                        return -1;
-                    }
-                }
-                let new_len = memory.data(&caller).len() as u64;
-                let top = u32::try_from(new_len).unwrap_or(u32::MAX);
-                // The arena occupies the upper SCRATCH_ARENA_BYTES of
-                // memory only. Anything below `arena_floor` belongs to the
-                // guest (static data, stack, heap, …) and must never be
-                // overwritten.
-                let floor = top.saturating_sub(SCRATCH_ARENA_BYTES);
-                let arena = caller.data_mut().jit_arena_mut();
-                arena.arena_floor = floor;
-                arena.bump_cursor = Some(top);
-                top
-            }
-        };
-        // Drop down by `size` bytes (8-byte align) for the new allocation.
-        let aligned_size = (size_u + 7) & !7;
-        let Some(ptr) = cursor.checked_sub(aligned_size) else {
-            tracing::warn!(
-                target: "tensor_wasm_exec::jit_dispatch",
-                requested = size,
-                "alloc: scratch arena exhausted (cursor underflow)"
-            );
-            return -1;
-        };
-        let st = caller.data_mut().jit_arena_mut();
-        if ptr < st.arena_floor {
-            tracing::warn!(
-                target: "tensor_wasm_exec::jit_dispatch",
-                requested = size,
-                arena_floor = st.arena_floor,
-                cursor = cursor,
-                "alloc: scratch arena exhausted (would collide with guest data)"
-            );
-            return -1;
-        }
-        st.bump_cursor = Some(ptr);
-        st.live.push((ptr, aligned_size));
-        ptr as i32
-    })?;
+            st.bump_cursor = Some(ptr);
+            st.live.push((ptr, aligned_size));
+            ptr as i32
+        },
+    )?;
 
     // free(ptr: i32, size: i32)
-    linker.func_wrap(host_module, free_fn, move |mut caller: Caller<'_, T>, ptr: i32, size: i32| {
-        if ptr <= 0 || size <= 0 {
-            return;
-        }
-        let st = caller.data_mut().jit_arena_mut();
-        // LIFO: pop iff the top matches; otherwise treat as a leak and
-        // move on. Mismatched frees mean the guest violated the arena
-        // contract — log once and proceed.
-        match st.live.last().copied() {
-            Some((top_ptr, top_size)) if top_ptr == ptr as u32 => {
-                st.live.pop();
-                st.bump_cursor = Some(top_ptr + top_size);
+    linker.func_wrap(
+        host_module,
+        free_fn,
+        move |mut caller: Caller<'_, T>, ptr: i32, size: i32| {
+            if ptr <= 0 || size <= 0 {
+                return;
             }
-            _ => {
-                tracing::warn!(
-                    target: "tensor_wasm_exec::jit_dispatch",
-                    ptr = ptr,
-                    size = size,
-                    "free: out-of-order free; slot leaked until arena reset"
-                );
+            let st = caller.data_mut().jit_arena_mut();
+            // LIFO: pop iff the top matches; otherwise treat as a leak and
+            // move on. Mismatched frees mean the guest violated the arena
+            // contract — log once and proceed.
+            match st.live.last().copied() {
+                Some((top_ptr, top_size)) if top_ptr == ptr as u32 => {
+                    st.live.pop();
+                    st.bump_cursor = Some(top_ptr + top_size);
+                }
+                _ => {
+                    tracing::warn!(
+                        target: "tensor_wasm_exec::jit_dispatch",
+                        ptr = ptr,
+                        size = size,
+                        "free: out-of-order free; slot leaked until arena reset"
+                    );
+                }
             }
-        }
-    })?;
+        },
+    )?;
 
     // dispatch(fp_lo, fp_hi, scratch_ptr, args_len, results_len) -> i32
     let cache_disp = cache;
@@ -418,9 +424,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tensor_wasm_jit::cache::{CachedKernel, CompiledHandle, KernelCache};
     use tensor_wasm_jit::ptx_emit::EmittedPtx;
-    use std::sync::Arc;
     use wasmtime::{Config, Engine, Module, Store};
 
     /// Minimal store payload for the in-module tests: just wraps an
@@ -752,18 +758,9 @@ mod tests {
                         .expect("memory");
                     let mem = memory.data_mut(&mut caller);
                     let sp = scratch_ptr as usize;
-                    let a = i32::from_le_bytes([
-                        mem[sp],
-                        mem[sp + 1],
-                        mem[sp + 2],
-                        mem[sp + 3],
-                    ]);
-                    let b = i32::from_le_bytes([
-                        mem[sp + 4],
-                        mem[sp + 5],
-                        mem[sp + 6],
-                        mem[sp + 7],
-                    ]);
+                    let a = i32::from_le_bytes([mem[sp], mem[sp + 1], mem[sp + 2], mem[sp + 3]]);
+                    let b =
+                        i32::from_le_bytes([mem[sp + 4], mem[sp + 5], mem[sp + 6], mem[sp + 7]]);
                     let sum = a.wrapping_add(b).to_le_bytes();
                     let r = sp + args_len as usize;
                     mem[r..r + 4].copy_from_slice(&sum);
@@ -774,7 +771,9 @@ mod tests {
 
         let mut store = Store::new(&engine, TestState::default());
         let module = Module::new(&engine, &outcome.rewritten_wasm).expect("module");
-        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
         let add = instance
             .get_typed_func::<(i32, i32), i32>(&mut store, "add")
             .expect("typed");

@@ -105,8 +105,16 @@ fn calling_twice_returns_stable_outcome() {
     //   Ok(true)     | Ok(false)
     //   Ok(false)    | Ok(false)
     //   Err(kind)    | Err(same kind)
-    let first = init_with_otlp(LogLevel::Info, false, "TENSOR_WASM_TEST_OTLP_NO_LEAK_ENDPOINT");
-    let second = init_with_otlp(LogLevel::Info, false, "TENSOR_WASM_TEST_OTLP_NO_LEAK_ENDPOINT");
+    let first = init_with_otlp(
+        LogLevel::Info,
+        false,
+        "TENSOR_WASM_TEST_OTLP_NO_LEAK_ENDPOINT",
+    );
+    let second = init_with_otlp(
+        LogLevel::Info,
+        false,
+        "TENSOR_WASM_TEST_OTLP_NO_LEAK_ENDPOINT",
+    );
 
     let k1 = classify(&first);
     let k2 = classify(&second);

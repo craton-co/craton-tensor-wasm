@@ -9,9 +9,7 @@
 //! that isn't a well-formed PTX identifier before any output is written.
 
 use tensor_wasm_jit::ir::{GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
-use tensor_wasm_jit::ptx_emit::{
-    emit, is_valid_ptx_identifier, EmitError, MAX_PTX_IDENTIFIER_LEN,
-};
+use tensor_wasm_jit::ptx_emit::{emit, is_valid_ptx_identifier, EmitError, MAX_PTX_IDENTIFIER_LEN};
 
 #[test]
 fn validator_accepts_canonical_identifiers() {

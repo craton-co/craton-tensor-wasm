@@ -276,7 +276,10 @@ async fn span_attributes_bound_oversized_traceparent_header() {
     // prove the attack does not land in a span, so we record the
     // status only for debugging context and proceed to inspect the
     // captured spans regardless.
-    let resp = router.oneshot(req).await.expect("router::oneshot infallible");
+    let resp = router
+        .oneshot(req)
+        .await
+        .expect("router::oneshot infallible");
     let _ = resp.status();
 
     let snap = snapshot(&captured);

@@ -53,8 +53,7 @@ fn arb_lowered_arg() -> impl Strategy<Value = LoweredArg> {
         // Ptr offset + len must fit in `FAKE_MEM_BYTES`. We cap each at
         // 1024 so even the worst-case `[1023, 1023+1023)` window lands
         // inside `[0, 4096)` and the parser's bounds-check passes.
-        (0u32..1024, 0u32..1024)
-            .prop_map(|(off, len)| LoweredArg::ptr_for_encoding(off, len)),
+        (0u32..1024, 0u32..1024).prop_map(|(off, len)| LoweredArg::ptr_for_encoding(off, len)),
     ]
 }
 

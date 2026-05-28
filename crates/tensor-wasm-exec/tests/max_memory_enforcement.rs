@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use tensor_wasm_core::types::TenantId;
-use tensor_wasm_exec::engine::{TensorWasmEngine, EngineConfig, MemoryBackend};
-use tensor_wasm_exec::executor::{TensorWasmExecutor, SpawnConfig};
+use tensor_wasm_exec::engine::{EngineConfig, MemoryBackend, TensorWasmEngine};
+use tensor_wasm_exec::executor::{SpawnConfig, TensorWasmExecutor};
 
 /// A wasm module exporting `grow_by_two_mb`, which calls `memory.grow(32)`
 /// (32 pages × 64 KiB = 2 MiB) and drops the result. Wasmtime returns the

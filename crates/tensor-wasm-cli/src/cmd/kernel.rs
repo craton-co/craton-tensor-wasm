@@ -141,7 +141,12 @@ pub async fn run(action: KernelAction, ctx: &HttpContext) -> Result<()> {
             key_file,
             publisher,
             server,
-        } => publish(&server, &name, &version, &ptx_file, sm, &key_file, &publisher, ctx).await,
+        } => {
+            publish(
+                &server, &name, &version, &ptx_file, sm, &key_file, &publisher, ctx,
+            )
+            .await
+        }
         KernelAction::List { server } => list(&server, ctx).await,
         KernelAction::Verify {
             selector,

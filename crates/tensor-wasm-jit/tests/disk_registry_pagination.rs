@@ -23,9 +23,7 @@
 
 use std::collections::HashSet;
 
-use tensor_wasm_jit::registry::{
-    sign_manifest, DiskRegistry, KernelManifest,
-};
+use tensor_wasm_jit::registry::{sign_manifest, DiskRegistry, KernelManifest};
 
 /// Helper: build a v2-signed manifest matching `ptx_text` under `key`.
 fn signed_manifest(
@@ -94,5 +92,9 @@ fn pagination_returns_three_pages_summing_to_250() {
     // Default list() is a wrapper for list_paginated(0, 100) — verify.
     use tensor_wasm_jit::registry::KernelRegistry;
     let default = KernelRegistry::list(&reg);
-    assert_eq!(default.len(), 100, "default list returns 100 (default limit)");
+    assert_eq!(
+        default.len(),
+        100,
+        "default list returns 100 (default limit)"
+    );
 }

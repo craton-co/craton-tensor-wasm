@@ -328,10 +328,8 @@ fn multi_block_brif_diamond_lowers_three_blocks() {
     sig.params.push(AbiParam::new(types::I32));
     sig.params.push(AbiParam::new(types::I32));
     sig.returns.push(AbiParam::new(types::I32));
-    let mut func = Function::with_name_signature(
-        UserFuncName::testcase("brif_diamond".as_bytes()),
-        sig,
-    );
+    let mut func =
+        Function::with_name_signature(UserFuncName::testcase("brif_diamond".as_bytes()), sig);
 
     let entry = func.dfg.make_block();
     let cond = func.dfg.append_block_param(entry, types::I32);
@@ -449,8 +447,7 @@ fn atomic_load_surfaces_as_unsupported_opcode() {
     // block well-formed without depending on iconst, which is itself
     // unsupported).
     sig.params.push(AbiParam::new(PTR_TY));
-    let mut func =
-        Function::with_name_signature(UserFuncName::testcase("atomic".as_bytes()), sig);
+    let mut func = Function::with_name_signature(UserFuncName::testcase("atomic".as_bytes()), sig);
     let block = func.dfg.make_block();
     let ptr = func.dfg.append_block_param(block, PTR_TY);
     func.layout.append_block(block);
@@ -493,8 +490,6 @@ fn atomic_load_surfaces_as_unsupported_opcode() {
                 "expected 'atomic' in the rejection reason, got {reason:?}",
             );
         }
-        other => panic!(
-            "expected UnsupportedOpcode or Rejected for atomic_load, got {other:?}",
-        ),
+        other => panic!("expected UnsupportedOpcode or Rejected for atomic_load, got {other:?}",),
     }
 }

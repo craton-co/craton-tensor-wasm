@@ -72,7 +72,8 @@ fn two_concatenated_zstd_frames_under_valid_hmac_are_rejected() {
     // Glue the two frames and compute HMAC over the resulting prefix so the
     // HMAC gate accepts. Without this, the test would short-circuit on
     // "HMAC mismatch" and we would not reach the single-frame guard.
-    let mut concatenated_prefix: Vec<u8> = Vec::with_capacity(first_frame.len() + second_frame.len());
+    let mut concatenated_prefix: Vec<u8> =
+        Vec::with_capacity(first_frame.len() + second_frame.len());
     concatenated_prefix.extend_from_slice(first_frame);
     concatenated_prefix.extend_from_slice(&second_frame);
 

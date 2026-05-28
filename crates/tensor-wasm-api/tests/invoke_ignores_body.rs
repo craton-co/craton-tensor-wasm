@@ -22,11 +22,11 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig};
 use tower::ServiceExt;
 
 async fn body_bytes(body: Body) -> Vec<u8> {

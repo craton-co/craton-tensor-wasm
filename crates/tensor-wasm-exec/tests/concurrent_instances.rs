@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::TensorWasmEngine;
-use tensor_wasm_exec::executor::{TensorWasmExecutor, SpawnConfig};
+use tensor_wasm_exec::executor::{SpawnConfig, TensorWasmExecutor};
 
 fn noop_wasm() -> Vec<u8> {
     wat::parse_str(r#"(module (func (export "noop")))"#).unwrap()
@@ -36,7 +36,9 @@ async fn one_hundred_concurrent_instances() {
                 )
                 .await
                 .expect("spawn");
-            exec.call_export_with_args(id, "noop", &[]).await.expect("call");
+            exec.call_export_with_args(id, "noop", &[])
+                .await
+                .expect("call");
             exec.terminate(id).await.expect("terminate");
         }));
     }

@@ -138,13 +138,48 @@ pub fn lower_arith_inst(
     value_map.insert(result_value, result);
 
     Some(match kind {
-        ArithKind::AddI => LoweredOp::AddI { ty, lhs, rhs, result },
-        ArithKind::SubI => LoweredOp::SubI { ty, lhs, rhs, result },
-        ArithKind::MulI => LoweredOp::MulI { ty, lhs, rhs, result },
-        ArithKind::DivS => LoweredOp::DivS { ty, lhs, rhs, result },
-        ArithKind::DivU => LoweredOp::DivU { ty, lhs, rhs, result },
-        ArithKind::RemS => LoweredOp::RemS { ty, lhs, rhs, result },
-        ArithKind::RemU => LoweredOp::RemU { ty, lhs, rhs, result },
+        ArithKind::AddI => LoweredOp::AddI {
+            ty,
+            lhs,
+            rhs,
+            result,
+        },
+        ArithKind::SubI => LoweredOp::SubI {
+            ty,
+            lhs,
+            rhs,
+            result,
+        },
+        ArithKind::MulI => LoweredOp::MulI {
+            ty,
+            lhs,
+            rhs,
+            result,
+        },
+        ArithKind::DivS => LoweredOp::DivS {
+            ty,
+            lhs,
+            rhs,
+            result,
+        },
+        ArithKind::DivU => LoweredOp::DivU {
+            ty,
+            lhs,
+            rhs,
+            result,
+        },
+        ArithKind::RemS => LoweredOp::RemS {
+            ty,
+            lhs,
+            rhs,
+            result,
+        },
+        ArithKind::RemU => LoweredOp::RemU {
+            ty,
+            lhs,
+            rhs,
+            result,
+        },
     })
 }
 
@@ -185,7 +220,7 @@ fn cranelift_int_type_to_lowered(ty: ir::Type) -> Option<LoweredType> {
 mod tests {
     use super::*;
     use cranelift_codegen::cursor::{Cursor, FuncCursor};
-    use cranelift_codegen::ir::types::{I8, I16, I32, I64, I128};
+    use cranelift_codegen::ir::types::{I128, I16, I32, I64, I8};
     use cranelift_codegen::ir::{Function, InstBuilder};
 
     /// Build a one-block, one-instruction Cranelift function with a binary
@@ -193,10 +228,7 @@ mod tests {
     ///
     /// Returns `(func, inst, lhs_val, rhs_val)` so callers can pre-populate
     /// the value-map with the block-param operands.
-    fn fixture_with_binary_op(
-        opcode: Opcode,
-        ty: ir::Type,
-    ) -> (Function, Inst, Value, Value) {
+    fn fixture_with_binary_op(opcode: Opcode, ty: ir::Type) -> (Function, Inst, Value, Value) {
         let mut func = Function::new();
         let block = func.dfg.make_block();
         let lhs = func.dfg.append_block_param(block, ty);
@@ -233,7 +265,12 @@ mod tests {
         let (mut map, mut next_id) = seed_map(lhs, rhs);
         let op = lower_arith_inst(inst, &func, &mut map, &mut next_id).expect("iadd lowered");
         match op {
-            LoweredOp::AddI { ty, lhs, rhs, result } => {
+            LoweredOp::AddI {
+                ty,
+                lhs,
+                rhs,
+                result,
+            } => {
                 assert_eq!(ty, LoweredType::I32);
                 assert_eq!(lhs, 0);
                 assert_eq!(rhs, 1);
@@ -373,8 +410,15 @@ mod tests {
         let before_next = next_id;
         let before_len = map.len();
         assert!(lower_arith_inst(inst, &func, &mut map, &mut next_id).is_none());
-        assert_eq!(next_id, before_next, "next_id untouched on unsupported type");
-        assert_eq!(map.len(), before_len, "value_map untouched on unsupported type");
+        assert_eq!(
+            next_id, before_next,
+            "next_id untouched on unsupported type"
+        );
+        assert_eq!(
+            map.len(),
+            before_len,
+            "value_map untouched on unsupported type"
+        );
     }
 
     /// If an operand is missing from `value_map`, the lowering must

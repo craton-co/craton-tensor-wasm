@@ -131,10 +131,8 @@ async fn deploy_trivial_function(router: &axum::Router, bearer: &str, peer: Sock
 /// header must NOT reach the audit record.
 #[tokio::test]
 async fn xfcc_from_untrusted_peer_is_dropped() {
-    let (router, sink) = router_with_proxies(
-        &[("scoped", TokenScope::all())],
-        TrustedProxies::empty(),
-    );
+    let (router, sink) =
+        router_with_proxies(&[("scoped", TokenScope::all())], TrustedProxies::empty());
 
     let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
     // Use POST /functions so the audit middleware emits a record we can
@@ -174,10 +172,7 @@ async fn xfcc_from_untrusted_peer_is_dropped() {
 #[tokio::test]
 async fn xfcc_from_trusted_peer_is_parsed() {
     let trusted = TrustedProxies::parse("127.0.0.1/32");
-    let (router, sink) = router_with_proxies(
-        &[("scoped", TokenScope::all())],
-        trusted,
-    );
+    let (router, sink) = router_with_proxies(&[("scoped", TokenScope::all())], trusted);
 
     let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
     let wasm_bytes = wat::parse_str(r#"(module (func (export "_start")))"#).unwrap();
@@ -210,8 +205,7 @@ async fn xfcc_from_trusted_peer_is_parsed() {
     // Serialised form carries the value too.
     let v: Value = serde_json::to_value(rec).expect("serialises");
     assert_eq!(
-        v["client_cert_subject"],
-        "CN=client-prod,O=Acme",
+        v["client_cert_subject"], "CN=client-prod,O=Acme",
         "wire shape carries the parsed Subject: {v}",
     );
 }
@@ -221,10 +215,7 @@ async fn xfcc_from_trusted_peer_is_parsed() {
 #[tokio::test]
 async fn xfcc_cidr_range_membership() {
     let trusted = TrustedProxies::parse("10.0.0.0/8");
-    let (router, sink) = router_with_proxies(
-        &[("scoped", TokenScope::all())],
-        trusted,
-    );
+    let (router, sink) = router_with_proxies(&[("scoped", TokenScope::all())], trusted);
 
     // First request: peer inside the CIDR → XFCC should pass through.
     let inside: SocketAddr = "10.5.3.7:12345".parse().unwrap();

@@ -62,10 +62,7 @@ fn cranelift_type_to_lowered(ty: ir::Type) -> Option<LoweredType> {
 /// every operand is registered before its consumer; per-family helpers
 /// surface a `None` instead of panicking so the driver can decide whether
 /// to abort or defer.
-fn lookup_value(
-    value_map: &HashMap<Value, LoweredValueId>,
-    v: Value,
-) -> Option<LoweredValueId> {
+fn lookup_value(value_map: &HashMap<Value, LoweredValueId>, v: Value) -> Option<LoweredValueId> {
     value_map.get(&v).copied()
 }
 

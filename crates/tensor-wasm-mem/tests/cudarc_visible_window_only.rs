@@ -69,8 +69,7 @@ fn cudarc_allocate_does_not_zero_beyond_visible_window() {
 
     // `reset` takes `&mut self` (audit T4); keep the pool mutable so we can
     // recycle it across the two carves.
-    let mut pool = UnifiedMemoryPool::new(SLAB_SIZE)
-        .expect("alloc 4 MiB cudarc-backed pool slab");
+    let mut pool = UnifiedMemoryPool::new(SLAB_SIZE).expect("alloc 4 MiB cudarc-backed pool slab");
 
     // Tenant A: write a sentinel at the last byte of the allocation. The
     // pre-T14 cudarc backing zeroed the entire slab at allocation time;
@@ -126,7 +125,15 @@ fn cudarc_allocate_does_not_zero_beyond_visible_window() {
     );
     // Spot-check a few more offsets to defend against a regression that
     // zeroes only the boundary cachelines.
-    for &probe in &[0usize, 1, 4095, 4096, 65_536, ALLOC_SIZE / 4, ALLOC_SIZE - 64] {
+    for &probe in &[
+        0usize,
+        1,
+        4095,
+        4096,
+        65_536,
+        ALLOC_SIZE / 4,
+        ALLOC_SIZE - 64,
+    ] {
         assert_eq!(
             slice[probe], 0,
             "tenant B observed non-zero byte at offset {probe} — pool zero-fill regression",

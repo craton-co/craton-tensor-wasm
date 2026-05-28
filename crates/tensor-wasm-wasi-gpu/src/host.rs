@@ -232,20 +232,14 @@ impl WasiCudaContext {
         // Recover from a poisoned mutex rather than panicking — a
         // previous panic during a launch should not brick the
         // deadline-update path.
-        let mut guard = self
-            .bp_deadline
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.bp_deadline.lock().unwrap_or_else(|e| e.into_inner());
         *guard = deadline;
     }
 
     /// Read the currently-installed back-pressure deadline. Returns
     /// `None` when no deadline is configured.
     pub fn bp_deadline(&self) -> Option<Instant> {
-        *self
-            .bp_deadline
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        *self.bp_deadline.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Build a deadline-aware [`BackPressure`] clone suitable for the
@@ -307,10 +301,7 @@ impl WasiCudaContext {
         // have poisoned this mutex. The error payload is still valid and
         // we'd rather overwrite it with the current call's message than
         // brick the rest of the instance — recover the inner String slot.
-        *self
-            .last_error
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(msg);
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
     }
 
     /// Test-only accessor for the truncating `record_error` path.
@@ -418,7 +409,12 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
          entry_ptr: i32,
          entry_len: i32|
          -> i64 {
-            if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
+            if !caller
+                .data()
+                .wasi_cuda()
+                .wasi_cuda_enabled
+                .load(Ordering::Acquire)
+            {
                 // wasi-gpu 1.5: do NOT record_error on the disabled-capability
                 // path. Matching the FN_LAST_ERROR_* gate, a recorded
                 // message would (a) burn allocations + mutex traffic for a
@@ -452,7 +448,12 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
         ): (i64, i32, i32, i32, i32, i32, i32, i32, i32, i32)|
          -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
             Box::new(async move {
-                if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
+                if !caller
+                    .data()
+                    .wasi_cuda()
+                    .wasi_cuda_enabled
+                    .load(Ordering::Acquire)
+                {
                     // wasi-gpu 1.5: see the load_ptx branch above for why
                     // we skip record_error here.
                     return AbiError::NotAvailable.code();
@@ -477,7 +478,12 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
     )?;
 
     linker.func_wrap(MODULE, FN_SYNC, |caller: Caller<'_, T>| -> i32 {
-        if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
+        if !caller
+            .data()
+            .wasi_cuda()
+            .wasi_cuda_enabled
+            .load(Ordering::Acquire)
+        {
             // wasi-gpu 1.5: see the load_ptx branch above for the rationale.
             return AbiError::NotAvailable.code();
         }
@@ -494,7 +500,12 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
     // backwards-compat but is now an unimported name from the guest's POV.
 
     linker.func_wrap(MODULE, FN_LAST_ERROR_LEN, |caller: Caller<'_, T>| -> i32 {
-        if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
+        if !caller
+            .data()
+            .wasi_cuda()
+            .wasi_cuda_enabled
+            .load(Ordering::Acquire)
+        {
             // Note: we do NOT call `record_error` here — the guest could
             // read that recorded message back via this same surface,
             // turning the gate into a leak channel. Returning the
@@ -516,7 +527,12 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
         MODULE,
         FN_LAST_ERROR_COPY,
         |mut caller: Caller<'_, T>, dst_ptr: i32, dst_len: i32| -> i32 {
-            if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
+            if !caller
+                .data()
+                .wasi_cuda()
+                .wasi_cuda_enabled
+                .load(Ordering::Acquire)
+            {
                 // See the matching note on FN_LAST_ERROR_LEN: keep the
                 // failure shape distinct from "no error" without recording
                 // anything the guest could subsequently observe.
@@ -803,10 +819,9 @@ fn validate_launch_args<T: HasWasiCuda>(
         return Err(AbiError::InvalidDimensions);
     }
     if shared_mem < 0 {
-        caller
-            .data()
-            .wasi_cuda()
-            .record_error(format!("launch: shared_mem must be >= 0 (got {shared_mem})"));
+        caller.data().wasi_cuda().record_error(format!(
+            "launch: shared_mem must be >= 0 (got {shared_mem})"
+        ));
         return Err(AbiError::InvalidDimensions);
     }
     // Per-axis block-dim ceilings (CUDA hardware: 1024 for x and y, 64 for z
@@ -1322,10 +1337,7 @@ mod tests {
         );
         let bytes = wat::parse_str(&wat).unwrap();
         let module = wasmtime::Module::new(&engine, &bytes).expect("compile");
-        let mut store = wasmtime::Store::new(
-            &engine,
-            Dummy(WasiCudaContext::new(InstanceId(101))),
-        );
+        let mut store = wasmtime::Store::new(&engine, Dummy(WasiCudaContext::new(InstanceId(101))));
         let result = linker.instantiate_async(&mut store, &module).await;
         assert!(
             result.is_err(),

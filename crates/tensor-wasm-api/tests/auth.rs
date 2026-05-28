@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig};
 use http_body_util::BodyExt;
 use serde_json::Value;
+use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig};
 use tower::ServiceExt;
 
 async fn body_json(body: Body) -> Value {
@@ -23,11 +23,7 @@ async fn body_json(body: Body) -> Value {
 
 fn router_with_tokens(tokens: &[&str]) -> axum::Router {
     let auth = AuthConfig::from_tokens(tokens.iter().copied());
-    build_router_with_config(
-        Arc::new(AppState::default()),
-        auth,
-        TenantConfig::default(),
-    )
+    build_router_with_config(Arc::new(AppState::default()), auth, TenantConfig::default())
 }
 
 /// `/metrics` is declared `security: []` in `openapi/tensor-wasm-api.yaml`

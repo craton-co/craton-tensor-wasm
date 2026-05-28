@@ -58,11 +58,7 @@ async fn body_json(body: Body) -> Value {
 /// asserting the fix the regression is actually about.
 fn router_with_wildcard_token(token: &str) -> axum::Router {
     let auth = AuthConfig::from_scopes([(token, TokenScope::all())]);
-    build_router_with_config(
-        Arc::new(AppState::default()),
-        auth,
-        TenantConfig::default(),
-    )
+    build_router_with_config(Arc::new(AppState::default()), auth, TenantConfig::default())
 }
 
 /// Deploy a trivial `_start`-only module and return the assigned id.
@@ -114,12 +110,7 @@ async fn dispatch_async(
         .expect("job_id")
 }
 
-fn poll_job(
-    _router: &axum::Router,
-    job_id: &str,
-    bearer: &str,
-    tenant: u64,
-) -> Request<Body> {
+fn poll_job(_router: &axum::Router, job_id: &str, bearer: &str, tenant: u64) -> Request<Body> {
     Request::builder()
         .method(Method::GET)
         .uri(format!("/jobs/{job_id}"))
@@ -144,11 +135,7 @@ async fn wait_for_completion(
         loop {
             let req = poll_job(router, job_id, bearer, tenant);
             let resp = router.clone().oneshot(req).await.expect("poll");
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "owner poll must succeed",
-            );
+            assert_eq!(resp.status(), StatusCode::OK, "owner poll must succeed",);
             let body = body_json(resp.into_body()).await;
             match body.get("status").and_then(Value::as_str) {
                 Some("completed") | Some("failed") => return body,
@@ -193,7 +180,11 @@ async fn get_job_rejects_cross_tenant_read_with_tenant_scope_denied() {
     // be the canonical error envelope and must NOT contain the
     // job's `result` payload.
     let req = poll_job(&router, &job_id, TOKEN, TENANT_B);
-    let resp = router.clone().oneshot(req).await.expect("cross-tenant poll");
+    let resp = router
+        .clone()
+        .oneshot(req)
+        .await
+        .expect("cross-tenant poll");
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
@@ -292,11 +283,8 @@ async fn token_scope_layer_runs_before_resource_check() {
         TokenScope::from_tenants([TenantId(TENANT_OWNER)]),
     );
     let auth = AuthConfig::from_scopes(scopes);
-    let router = build_router_with_config(
-        Arc::new(AppState::default()),
-        auth,
-        TenantConfig::default(),
-    );
+    let router =
+        build_router_with_config(Arc::new(AppState::default()), auth, TenantConfig::default());
 
     let function_id = deploy_trivial(&router, TOKEN_OWNER, TENANT_OWNER).await;
     let job_id = dispatch_async(&router, &function_id, TOKEN_OWNER, TENANT_OWNER).await;

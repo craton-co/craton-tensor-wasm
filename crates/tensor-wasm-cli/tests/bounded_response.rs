@@ -23,9 +23,7 @@ use axum::routing::get;
 use axum::Router;
 use tokio::net::TcpListener;
 
-use tensor_wasm_cli::cmd::{
-    bounded_bytes, bounded_text, ApiClientError, MAX_RESPONSE_BODY_BYTES,
-};
+use tensor_wasm_cli::cmd::{bounded_bytes, bounded_text, ApiClientError, MAX_RESPONSE_BODY_BYTES};
 
 /// Bind a fresh axum server on `127.0.0.1:0`, return its bound address and
 /// the join handle of the background task that drives it. The handle is
@@ -56,7 +54,9 @@ async fn oversized_content_length() -> Response<Body> {
     use axum::body::Bytes;
     use futures::stream;
     let oversize = (MAX_RESPONSE_BODY_BYTES as u64) + 1;
-    let s = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(b"tiny"))]);
+    let s = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+        b"tiny",
+    ))]);
     Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -193,6 +193,8 @@ async fn bounded_text_passes_small_response() {
         .send()
         .await
         .expect("GET succeeds");
-    let text = bounded_text(resp).await.expect("small response should pass");
+    let text = bounded_text(resp)
+        .await
+        .expect("small response should pass");
     assert_eq!(text, "ok");
 }

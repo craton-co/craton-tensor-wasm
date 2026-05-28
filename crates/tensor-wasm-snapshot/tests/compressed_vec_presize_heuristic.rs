@@ -97,9 +97,7 @@ fn small_snapshot_still_round_trips_under_floor_clamp() {
             registers: &[],
         })
         .expect("capture empty");
-    let restored = SnapshotReader::new()
-        .restore(&blob)
-        .expect("restore empty");
+    let restored = SnapshotReader::new().restore(&blob).expect("restore empty");
     assert!(restored.wasm_memory.is_empty());
     assert_eq!(restored.metadata.total_uncompressed_bytes, 0);
 }

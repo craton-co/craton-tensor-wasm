@@ -654,9 +654,7 @@ impl TenantContext {
     /// between `cuMemAllocManaged` (unified-memory path) and
     /// `cuMemAllocFromPoolAsync` (driver-enforced cap path).
     #[cfg(feature = "gpu-mem-pool")]
-    pub fn mem_pool(
-        &self,
-    ) -> Option<&Arc<tensor_wasm_mem::cuda_mem_pool::TenantMemPool>> {
+    pub fn mem_pool(&self) -> Option<&Arc<tensor_wasm_mem::cuda_mem_pool::TenantMemPool>> {
         self.mem_pool.as_ref()
     }
 

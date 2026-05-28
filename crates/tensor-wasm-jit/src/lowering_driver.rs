@@ -90,15 +90,14 @@ pub fn lower_function(func: &cl::Function) -> Result<LoweredFunction, LoweringEr
     // `UnsupportedType` at a sentinel location — the message carries the
     // signature error's `Display` text, which itself names the offending
     // position and type.
-    let signature = lower_signature(&func.signature).map_err(|err| {
-        LoweringError::UnsupportedType {
+    let signature =
+        lower_signature(&func.signature).map_err(|err| LoweringError::UnsupportedType {
             ty: err.to_string(),
             location: InstLocation {
                 block: 0,
                 inst_index: 0,
             },
-        }
-    })?;
+        })?;
 
     // ---- 2. Reject-list integration (W2.1 placeholder) ---------------
     //
@@ -160,12 +159,13 @@ pub fn lower_function(func: &cl::Function) -> Result<LoweredFunction, LoweringEr
             .expect("block params seeded above");
         for (id, cl_value) in params {
             let cl_ty = func.dfg.value_type(*cl_value);
-            let lty = crate::lower_signature::cranelift_type_to_lowered(cl_ty).ok_or_else(
-                || LoweringError::UnsupportedType {
-                    ty: cl_ty.to_string(),
-                    location: InstLocation::new(cl_block, 0),
-                },
-            )?;
+            let lty =
+                crate::lower_signature::cranelift_type_to_lowered(cl_ty).ok_or_else(|| {
+                    LoweringError::UnsupportedType {
+                        ty: cl_ty.to_string(),
+                        location: InstLocation::new(cl_block, 0),
+                    }
+                })?;
             lblock.params.push((*id, lty));
         }
 
@@ -455,10 +455,9 @@ fn memory_attempt(
 
     match result {
         Ok(some_ops) => Ok(some_ops),
-        Err(MemLowerError::UnmappedValue(v)) => Err(LoweringError::UndefinedValue {
-            value: v,
-            location,
-        }),
+        Err(MemLowerError::UnmappedValue(v)) => {
+            Err(LoweringError::UndefinedValue { value: v, location })
+        }
         Err(MemLowerError::UnsupportedType(ty)) => {
             Err(LoweringError::UnsupportedType { ty, location })
         }
@@ -575,10 +574,8 @@ mod tests {
     fn errors_on_unsupported_opcode_iconst() {
         let mut sig = Signature::new(CallConv::SystemV);
         sig.returns.push(AbiParam::new(types::I32));
-        let mut func = Function::with_name_signature(
-            UserFuncName::testcase("iconst_fn".as_bytes()),
-            sig,
-        );
+        let mut func =
+            Function::with_name_signature(UserFuncName::testcase("iconst_fn".as_bytes()), sig);
         let block = func.dfg.make_block();
         func.layout.append_block(block);
 
@@ -607,10 +604,8 @@ mod tests {
         let mut sig = Signature::new(CallConv::SystemV);
         sig.params.push(AbiParam::new(types::I32));
         sig.returns.push(AbiParam::new(types::I32));
-        let mut func = Function::with_name_signature(
-            UserFuncName::testcase("two_block".as_bytes()),
-            sig,
-        );
+        let mut func =
+            Function::with_name_signature(UserFuncName::testcase("two_block".as_bytes()), sig);
 
         // Two blocks. Entry takes one i32 param; the second block also
         // takes one i32 param (which we'll forward via the jump's block

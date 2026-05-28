@@ -21,7 +21,11 @@ fn sole_artifact_file(dir: &std::path::Path) -> std::path::PathBuf {
             hits.push(entry.path());
         }
     }
-    assert_eq!(hits.len(), 1, "expected exactly one artifact file, found {hits:?}");
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly one artifact file, found {hits:?}"
+    );
     hits.into_iter().next().unwrap()
 }
 

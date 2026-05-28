@@ -34,7 +34,9 @@ fn default_capture_emits_artifact_envelope_magic() {
     // envelope shape, not throughput. Any input that exercises the
     // bincode+zstd pipeline is sufficient.
     let wasm: Vec<u8> = (0u32..512).map(|i| (i % 251) as u8).collect();
-    let gpu: Vec<u8> = (0u32..256).map(|i| ((i.wrapping_mul(13)) % 253) as u8).collect();
+    let gpu: Vec<u8> = (0u32..256)
+        .map(|i| ((i.wrapping_mul(13)) % 253) as u8)
+        .collect();
     let regs: Vec<u8> = (0u32..32).map(|i| ((i ^ 0x40) & 0xFF) as u8).collect();
 
     // Default path: feature is enabled by the cargo defaults, writer has
@@ -81,7 +83,9 @@ fn default_capture_emits_artifact_envelope_magic() {
 #[test]
 fn default_capture_round_trips_through_default_reader() {
     let wasm: Vec<u8> = (0u32..2048).map(|i| (i % 251) as u8).collect();
-    let gpu: Vec<u8> = (0u32..1024).map(|i| ((i.wrapping_mul(17)) % 253) as u8).collect();
+    let gpu: Vec<u8> = (0u32..1024)
+        .map(|i| ((i.wrapping_mul(17)) % 253) as u8)
+        .collect();
     let regs: Vec<u8> = (0u32..128).map(|i| ((i ^ 0xA5) & 0xFF) as u8).collect();
 
     let bytes = SnapshotWriter::new()

@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{OwnedSemaphorePermit, SemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
 use crate::abi::AbiError;
 
@@ -533,8 +533,7 @@ impl std::future::Future for DispatchFuture {
     type Output = ();
     fn poll(
         self: std::pin::Pin<&mut Self>,
-        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
-        cx: &mut std::task::Context<'_>,
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         // Enter the dispatch span for the duration of this poll so the
         // trace stays attached to the originating `wasi_cuda.launch`
@@ -790,8 +789,14 @@ mod tests {
     fn backpressure_error_converts_to_abi_error() {
         // All variants collapse to QuotaExceeded for back-compat
         // with the existing host-function return path.
-        assert_eq!(AbiError::from(BackPressureError::Saturated), AbiError::QuotaExceeded);
-        assert_eq!(AbiError::from(BackPressureError::DeadlineNear), AbiError::QuotaExceeded);
+        assert_eq!(
+            AbiError::from(BackPressureError::Saturated),
+            AbiError::QuotaExceeded
+        );
+        assert_eq!(
+            AbiError::from(BackPressureError::DeadlineNear),
+            AbiError::QuotaExceeded
+        );
         assert_eq!(
             AbiError::from(BackPressureError::DeadlineElapsed),
             AbiError::QuotaExceeded

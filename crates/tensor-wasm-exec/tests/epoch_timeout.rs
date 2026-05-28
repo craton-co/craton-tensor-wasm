@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tensor_wasm_core::types::TenantId;
-use tensor_wasm_exec::engine::{TensorWasmEngine, EngineConfig};
-use tensor_wasm_exec::executor::{TensorWasmExecutor, SpawnConfig};
+use tensor_wasm_exec::engine::{EngineConfig, TensorWasmEngine};
+use tensor_wasm_exec::executor::{SpawnConfig, TensorWasmExecutor};
 
 fn infinite_loop_wasm() -> Vec<u8> {
     wat::parse_str(

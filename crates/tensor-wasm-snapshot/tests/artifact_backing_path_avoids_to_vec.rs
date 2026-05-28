@@ -42,9 +42,7 @@ const TEST_KEY: [u8; 32] = [0xA9; 32];
 const ONE_MIB: usize = 1024 * 1024;
 
 fn large_state() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let wasm: Vec<u8> = (0u32..(ONE_MIB as u32))
-        .map(|i| (i % 251) as u8)
-        .collect();
+    let wasm: Vec<u8> = (0u32..(ONE_MIB as u32)).map(|i| (i % 251) as u8).collect();
     let gpu: Vec<u8> = (0u32..(ONE_MIB as u32))
         .map(|i| ((i.wrapping_mul(17)) % 253) as u8)
         .collect();

@@ -55,9 +55,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tensor_wasm_artifacts::{
-    ArtifactError, ArtifactStore, ContentHash, DiskArtifactStore,
-};
+use tensor_wasm_artifacts::{ArtifactError, ArtifactStore, ContentHash, DiskArtifactStore};
 
 /// Signed kernel manifest. Cargo for vetted PTX.
 ///
@@ -230,13 +228,7 @@ impl InMemoryBlueprintResolver {
 
     /// Insert a single `(blueprint_fp, sm_version)` → `(name, version)`
     /// mapping. Overwrites any prior entry for the same key.
-    pub fn insert(
-        &mut self,
-        blueprint_fp: u64,
-        sm_version: u32,
-        name: String,
-        version: String,
-    ) {
+    pub fn insert(&mut self, blueprint_fp: u64, sm_version: u32, name: String, version: String) {
         self.map.insert((blueprint_fp, sm_version), (name, version));
     }
 }
@@ -307,11 +299,7 @@ pub trait KernelRegistry: Send + Sync {
         version: &str,
     ) -> Result<Arc<(KernelManifest, String)>, RegistryError>;
     /// Verify and persist a signed manifest + PTX text.
-    fn publish(
-        &self,
-        manifest: KernelManifest,
-        ptx_text: String,
-    ) -> Result<(), RegistryError>;
+    fn publish(&self, manifest: KernelManifest, ptx_text: String) -> Result<(), RegistryError>;
     /// Enumerate all registered manifests (PTX text omitted).
     fn list(&self) -> Vec<KernelManifest>;
     /// Page-aware listing. Default implementation slices the result of
@@ -324,11 +312,7 @@ pub trait KernelRegistry: Send + Sync {
     /// the HTTP route's contract is the same regardless of backend.
     fn list_paginated(&self, offset: usize, limit: usize) -> Vec<KernelManifest> {
         let limit = limit.min(DISK_REGISTRY_MAX_LIMIT);
-        self.list()
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect()
+        self.list().into_iter().skip(offset).take(limit).collect()
     }
 }
 
@@ -364,11 +348,7 @@ impl InMemoryRegistry {
     /// deliberate: a digest mismatch is the cheapest tell that the
     /// PTX/manifest pair was corrupted in transit, so we surface that
     /// before doing the constant-time HMAC compare.
-    pub fn publish(
-        &self,
-        manifest: KernelManifest,
-        ptx_text: String,
-    ) -> Result<(), RegistryError> {
+    pub fn publish(&self, manifest: KernelManifest, ptx_text: String) -> Result<(), RegistryError> {
         // Verify digest matches PTX.
         let actual = blake3::hash(ptx_text.as_bytes());
         if actual.as_bytes() != &manifest.digest {
@@ -434,20 +414,12 @@ impl KernelRegistry for InMemoryRegistry {
             .ok_or(RegistryError::NotFound(key))
     }
 
-    fn publish(
-        &self,
-        manifest: KernelManifest,
-        ptx_text: String,
-    ) -> Result<(), RegistryError> {
+    fn publish(&self, manifest: KernelManifest, ptx_text: String) -> Result<(), RegistryError> {
         InMemoryRegistry::publish(self, manifest, ptx_text)
     }
 
     fn list(&self) -> Vec<KernelManifest> {
-        self.entries
-            .lock()
-            .values()
-            .map(|e| e.0.clone())
-            .collect()
+        self.entries.lock().values().map(|e| e.0.clone()).collect()
     }
 }
 
@@ -596,8 +568,7 @@ impl DiskRegistry {
     /// enable one.
     pub fn open(dir: PathBuf, hmac_key: [u8; 32]) -> Result<Self, RegistryError> {
         let artifact_store = DiskArtifactStore::new(dir, hmac_key);
-        let keymap: Arc<DashMap<(String, String, u32), ContentHash>> =
-            Arc::new(DashMap::new());
+        let keymap: Arc<DashMap<(String, String, u32), ContentHash>> = Arc::new(DashMap::new());
 
         // Restart-recovery: walk every blob in the store, decode it,
         // re-verify the manifest signature under the same hmac_key,
@@ -696,17 +667,11 @@ impl DiskRegistry {
     ///    the artifact store. The store computes the BLAKE3
     ///    content-address and HMAC-signs the envelope; the returned
     ///    [`ContentHash`] is recorded in the keymap.
-    pub fn publish(
-        &self,
-        manifest: KernelManifest,
-        ptx_text: String,
-    ) -> Result<(), RegistryError> {
+    pub fn publish(&self, manifest: KernelManifest, ptx_text: String) -> Result<(), RegistryError> {
         // Step 1: publisher allowlist (operator-side authorization).
         if let Some(allow) = &self.publisher_allowlist {
             if !allow.contains(&manifest.publisher) {
-                return Err(RegistryError::PublisherNotAllowed(
-                    manifest.name.clone(),
-                ));
+                return Err(RegistryError::PublisherNotAllowed(manifest.name.clone()));
             }
         }
         // Step 2: digest match.
@@ -841,24 +806,19 @@ impl KernelRegistry for DiskRegistry {
         let (_triple, hash) = match hit {
             Some(p) => p,
             None => {
-                return Err(RegistryError::NotFound(format!(
-                    "{name}@{version}"
-                )));
+                return Err(RegistryError::NotFound(format!("{name}@{version}")));
             }
         };
-        let raw = self
-            .artifact_store
-            .get(&hash)
-            .map_err(|e| match e {
-                ArtifactError::NotFound(_) => {
-                    // Keymap and disk disagree — could happen if the
-                    // operator manually deleted a blob. Treat as a
-                    // miss; the keymap entry is now a tombstone but
-                    // we don't proactively clean it up here.
-                    RegistryError::NotFound(format!("{name}@{version}"))
-                }
-                other => RegistryError::Storage(other.to_string()),
-            })?;
+        let raw = self.artifact_store.get(&hash).map_err(|e| match e {
+            ArtifactError::NotFound(_) => {
+                // Keymap and disk disagree — could happen if the
+                // operator manually deleted a blob. Treat as a
+                // miss; the keymap entry is now a tombstone but
+                // we don't proactively clean it up here.
+                RegistryError::NotFound(format!("{name}@{version}"))
+            }
+            other => RegistryError::Storage(other.to_string()),
+        })?;
         let (manifest, ptx_text) = decode_manifest_blob(&raw)?;
         // Defence in depth: re-verify the manifest signature on resolve.
         // The artifact store already authenticated the bytes, but the
@@ -870,11 +830,7 @@ impl KernelRegistry for DiskRegistry {
         Ok(Arc::new((manifest, ptx_text)))
     }
 
-    fn publish(
-        &self,
-        manifest: KernelManifest,
-        ptx_text: String,
-    ) -> Result<(), RegistryError> {
+    fn publish(&self, manifest: KernelManifest, ptx_text: String) -> Result<(), RegistryError> {
         DiskRegistry::publish(self, manifest, ptx_text)
     }
 
@@ -899,7 +855,12 @@ mod tests {
     /// (the `#[non_exhaustive]` attribute only restricts foreign crates),
     /// but the helper here mirrors the public `KernelManifest::new`
     /// flow so the unit and integration tests stay in lock-step.
-    fn signed_manifest(name: &str, version: &str, ptx_text: &str, key: &[u8; 32]) -> KernelManifest {
+    fn signed_manifest(
+        name: &str,
+        version: &str,
+        ptx_text: &str,
+        key: &[u8; 32],
+    ) -> KernelManifest {
         let digest = *blake3::hash(ptx_text.as_bytes()).as_bytes();
         let mut m = KernelManifest::new(
             name.to_string(),
@@ -994,7 +955,8 @@ mod tests {
         let reg = InMemoryRegistry::new(key);
         let ptx = "// fake ptx\n".to_string();
         let m = signed_manifest("matmul.f32", "1.0.0", &ptx, &key);
-        reg.verify_signature(&m).expect("freshly signed manifest must verify");
+        reg.verify_signature(&m)
+            .expect("freshly signed manifest must verify");
     }
 
     /// Tamper-publisher: rewriting `publisher` after signing MUST
@@ -1076,7 +1038,10 @@ mod tests {
         let key = [0u8; 32];
         let sig_a = sign_manifest(&a, &key);
         let sig_b = sign_manifest(&b, &key);
-        assert_ne!(sig_a, sig_b, "v2 signatures MUST differ across NUL-collision pair");
+        assert_ne!(
+            sig_a, sig_b,
+            "v2 signatures MUST differ across NUL-collision pair"
+        );
     }
 
     /// Cross-version: a manifest "signed" by the legacy v0.3.7

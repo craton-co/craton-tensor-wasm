@@ -42,7 +42,9 @@ fn artifact_backing_tamper_rejected() {
     // and flipping a byte there would also fail verification but for a
     // less interesting reason).
     let wasm: Vec<u8> = (0u32..4096).map(|i| (i % 251) as u8).collect();
-    let gpu: Vec<u8> = (0u32..2048).map(|i| ((i.wrapping_mul(11)) % 253) as u8).collect();
+    let gpu: Vec<u8> = (0u32..2048)
+        .map(|i| ((i.wrapping_mul(11)) % 253) as u8)
+        .collect();
     let regs: Vec<u8> = vec![0xCD; 256];
 
     let hash = SnapshotWriter::new()
@@ -63,11 +65,7 @@ fn artifact_backing_tamper_rejected() {
     let entries: Vec<_> = fs::read_dir(dir.path())
         .expect("read_dir")
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .ends_with(".bin")
-        })
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".bin"))
         .collect();
     assert_eq!(
         entries.len(),

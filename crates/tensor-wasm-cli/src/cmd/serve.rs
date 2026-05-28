@@ -21,8 +21,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Args;
 use tensor_wasm_api::{
-    build_router_with_full_config, AppState, AuthConfig, RateLimitConfig, RateLimiter,
-    TenantConfig,
+    build_router_with_full_config, AppState, AuthConfig, RateLimitConfig, RateLimiter, TenantConfig,
 };
 
 /// Default bind address used when `--addr` is omitted. Matches the loopback
@@ -376,8 +375,7 @@ mod tests {
 
     #[test]
     fn collects_repeated_tokens() {
-        let p =
-            Probe::try_parse_from(["serve", "--token", "a", "--token", "b"]).expect("parses");
+        let p = Probe::try_parse_from(["serve", "--token", "a", "--token", "b"]).expect("parses");
         assert_eq!(p.args.tokens, vec!["a".to_string(), "b".to_string()]);
     }
 

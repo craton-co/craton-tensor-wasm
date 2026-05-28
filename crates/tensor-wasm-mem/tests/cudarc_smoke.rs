@@ -35,10 +35,8 @@ fn cudarc_buffer_type_has_nonzero_size() {
 /// (i.e. the symbol is exported, not just `pub(crate)`).
 #[test]
 fn cudarc_apply_advice_is_exported() {
-    let _f: fn(
-        &CudarcUnifiedBuffer,
-        Advice,
-    ) -> Result<(), tensor_wasm_mem::unified::UnifiedError> = apply_advice;
+    let _f: fn(&CudarcUnifiedBuffer, Advice) -> Result<(), tensor_wasm_mem::unified::UnifiedError> =
+        apply_advice;
 }
 
 /// Zero-byte allocations are rejected without touching the driver. This

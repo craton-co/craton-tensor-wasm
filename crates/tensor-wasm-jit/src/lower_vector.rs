@@ -256,10 +256,8 @@ mod tests {
     /// reads from `dfg` only, so the layout is irrelevant for these unit
     /// tests.
     fn skeleton(param_tys: &[ir::Type]) -> (Function, Vec<Value>) {
-        let mut func = Function::with_name_signature(
-            UserFuncName::user(0, 0),
-            Signature::new(CallConv::Fast),
-        );
+        let mut func =
+            Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
         let block = func.dfg.make_block();
         let mut values = Vec::with_capacity(param_tys.len());
         for &ty in param_tys {
@@ -278,9 +276,10 @@ mod tests {
         rhs: Value,
         ctrl_ty: ir::Type,
     ) -> (ir::Inst, Value) {
-        let inst = func
-            .dfg
-            .make_inst(InstructionData::Binary { opcode, args: [lhs, rhs] });
+        let inst = func.dfg.make_inst(InstructionData::Binary {
+            opcode,
+            args: [lhs, rhs],
+        });
         func.dfg.make_inst_results(inst, ctrl_ty);
         let result = func.dfg.first_result(inst);
         (inst, result)
@@ -293,9 +292,7 @@ mod tests {
         arg: Value,
         ctrl_ty: ir::Type,
     ) -> (ir::Inst, Value) {
-        let inst = func
-            .dfg
-            .make_inst(InstructionData::Unary { opcode, arg });
+        let inst = func.dfg.make_inst(InstructionData::Unary { opcode, arg });
         func.dfg.make_inst_results(inst, ctrl_ty);
         let result = func.dfg.first_result(inst);
         (inst, result)
@@ -335,7 +332,12 @@ mod tests {
         let (map, mut next) = seed_map(&params);
         let op = lower_vector_inst(inst, &func, &map, &mut next).expect("must lower");
         match op {
-            LoweredOp::VMin { lane_ty, lhs, rhs, result } => {
+            LoweredOp::VMin {
+                lane_ty,
+                lhs,
+                rhs,
+                result,
+            } => {
                 assert_eq!(lane_ty, LoweredType::F32);
                 assert_eq!(lhs, 0);
                 assert_eq!(rhs, 1);
@@ -354,7 +356,10 @@ mod tests {
         let op = lower_vector_inst(inst, &func, &map, &mut next).expect("must lower");
         assert!(matches!(
             op,
-            LoweredOp::VMax { lane_ty: LoweredType::F64, .. }
+            LoweredOp::VMax {
+                lane_ty: LoweredType::F64,
+                ..
+            }
         ));
     }
 
@@ -366,7 +371,10 @@ mod tests {
         let op = lower_vector_inst(inst, &func, &map, &mut next).expect("must lower");
         assert!(matches!(
             op,
-            LoweredOp::VMin { lane_ty: LoweredType::I32, .. }
+            LoweredOp::VMin {
+                lane_ty: LoweredType::I32,
+                ..
+            }
         ));
     }
 
@@ -378,7 +386,10 @@ mod tests {
         let op = lower_vector_inst(inst, &func, &map, &mut next).expect("must lower");
         assert!(matches!(
             op,
-            LoweredOp::VMax { lane_ty: LoweredType::I16, .. }
+            LoweredOp::VMax {
+                lane_ty: LoweredType::I16,
+                ..
+            }
         ));
     }
 
@@ -390,7 +401,10 @@ mod tests {
         let op = lower_vector_inst(inst, &func, &map, &mut next).expect("must lower");
         assert!(matches!(
             op,
-            LoweredOp::VMax { lane_ty: LoweredType::I8, .. }
+            LoweredOp::VMax {
+                lane_ty: LoweredType::I8,
+                ..
+            }
         ));
     }
 
@@ -402,7 +416,10 @@ mod tests {
         let op = lower_vector_inst(inst, &func, &map, &mut next).expect("must lower");
         assert!(matches!(
             op,
-            LoweredOp::VMin { lane_ty: LoweredType::I64, .. }
+            LoweredOp::VMin {
+                lane_ty: LoweredType::I64,
+                ..
+            }
         ));
     }
 
@@ -435,7 +452,11 @@ mod tests {
         let (map, mut next) = seed_map(&params);
         let op = lower_vector_inst(inst, &func, &map, &mut next).expect("must lower");
         match op {
-            LoweredOp::VSplat { lane_ty, src, result } => {
+            LoweredOp::VSplat {
+                lane_ty,
+                src,
+                result,
+            } => {
                 assert_eq!(lane_ty, LoweredType::F32);
                 assert_eq!(src, 0);
                 assert_eq!(result, 1);
@@ -452,7 +473,10 @@ mod tests {
         let op = lower_vector_inst(inst, &func, &map, &mut next).expect("must lower");
         assert!(matches!(
             op,
-            LoweredOp::VSplat { lane_ty: LoweredType::I32, .. }
+            LoweredOp::VSplat {
+                lane_ty: LoweredType::I32,
+                ..
+            }
         ));
     }
 
@@ -496,7 +520,13 @@ mod tests {
         let (map, mut next) = seed_map(&params);
         let op = lower_vector_inst(inst, &func, &map, &mut next).expect("must lower");
         match op {
-            LoweredOp::VSelect { lane_ty, cond, then_v, else_v, result } => {
+            LoweredOp::VSelect {
+                lane_ty,
+                cond,
+                then_v,
+                else_v,
+                result,
+            } => {
                 assert_eq!(lane_ty, LoweredType::I32);
                 assert_eq!(cond, 0);
                 assert_eq!(then_v, 1);

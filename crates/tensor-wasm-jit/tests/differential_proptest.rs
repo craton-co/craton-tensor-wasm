@@ -106,8 +106,7 @@ fn vector_add_blueprint(lanes: u32) -> TensorWasmKernelBlueprint {
 /// reference via [`matmul_reference`] directly. The blueprint exists
 /// here so the oracle's `BlueprintKind::classify` path is exercised.
 fn matmul_blueprint(m: u32, n: u32, k: u32) -> TensorWasmKernelBlueprint {
-    TensorWasmKernelBlueprint::new("matmul")
-        .push(TensorWasmOp::MatMul { m, n, k })
+    TensorWasmKernelBlueprint::new("matmul").push(TensorWasmOp::MatMul { m, n, k })
 }
 
 /// Conv2d blueprint expressed as a `Barrier` + `VecFma` sequence —
@@ -116,11 +115,21 @@ fn matmul_blueprint(m: u32, n: u32, k: u32) -> TensorWasmKernelBlueprint {
 fn conv2d_blueprint(window_lanes: u32) -> TensorWasmKernelBlueprint {
     TensorWasmKernelBlueprint::new("conv2d")
         .push(TensorWasmOp::Barrier)
-        .push(TensorWasmOp::LoadUnified { lanes: window_lanes })
-        .push(TensorWasmOp::LoadUnified { lanes: window_lanes })
-        .push(TensorWasmOp::LoadUnified { lanes: window_lanes })
-        .push(TensorWasmOp::VecFma { lanes: window_lanes })
-        .push(TensorWasmOp::StoreUnified { lanes: window_lanes })
+        .push(TensorWasmOp::LoadUnified {
+            lanes: window_lanes,
+        })
+        .push(TensorWasmOp::LoadUnified {
+            lanes: window_lanes,
+        })
+        .push(TensorWasmOp::LoadUnified {
+            lanes: window_lanes,
+        })
+        .push(TensorWasmOp::VecFma {
+            lanes: window_lanes,
+        })
+        .push(TensorWasmOp::StoreUnified {
+            lanes: window_lanes,
+        })
 }
 
 /// Pack a vec of f32s as little-endian bytes — the wire format the

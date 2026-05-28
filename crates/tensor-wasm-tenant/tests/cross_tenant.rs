@@ -81,7 +81,9 @@ fn unregister_returns_arc_option() {
     assert!(missing.is_none());
 
     // The remaining tenant is still reachable and its quota intact.
-    let twelve = reg.get(TenantId(12), &cap).expect("tenant 12 still present");
+    let twelve = reg
+        .get(TenantId(12), &cap)
+        .expect("tenant 12 still present");
     assert_eq!(twelve.id(), TenantId(12));
     assert_eq!(twelve.quota(), 1024);
 }

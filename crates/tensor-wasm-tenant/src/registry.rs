@@ -26,8 +26,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 
-use tensor_wasm_core::types::TenantId;
 use dashmap::DashMap;
+use tensor_wasm_core::types::TenantId;
 use thiserror::Error;
 
 use crate::context::{TenantCapability, TenantContext};
@@ -46,7 +46,9 @@ pub enum RegistryError {
     /// counter remained zero — effectively a per-tenant quota reset
     /// (tenant 1.6 #9). Wait for the orphan to drop and call
     /// [`TenantRegistry::collect_tombstones`] before retrying.
-    #[error("tenant {0} cannot be re-registered while an orphan Arc<TenantContext> is still alive")]
+    #[error(
+        "tenant {0} cannot be re-registered while an orphan Arc<TenantContext> is still alive"
+    )]
     OrphanStillAlive(TenantId),
     /// An admin-cap-gated method was invoked with a
     /// [`RegistryAdminCapability`] that was minted by a *different*
@@ -59,7 +61,9 @@ pub enum RegistryError {
     /// in the same process — see the `## Cap binding` section in the crate
     /// README for the upgrade path.
     #[cfg(feature = "strict-cap-binding")]
-    #[error("capability was minted by a different TenantRegistry; refusing cross-registry operation")]
+    #[error(
+        "capability was minted by a different TenantRegistry; refusing cross-registry operation"
+    )]
     CapabilityFromForeignRegistry,
 }
 
@@ -296,9 +300,7 @@ impl TenantRegistry {
             ctx.registry_token = Some(Arc::clone(&self.registry_token));
         }
         let outcome = match self.inner.entry(id) {
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                Err(RegistryError::AlreadyRegistered(id))
-            }
+            dashmap::mapref::entry::Entry::Occupied(_) => Err(RegistryError::AlreadyRegistered(id)),
             dashmap::mapref::entry::Entry::Vacant(slot) => {
                 // Hold the tombstone shard-guard for `id` across the
                 // strong-count check AND the tombstone removal so a racing
@@ -374,9 +376,8 @@ impl TenantRegistry {
     /// is small (the common case) and bounded by the number of
     /// previously-unregistered ids when it is not.
     fn prune_dead_tombstones_except(&self, skip_id: TenantId) {
-        self.tombstones.retain(|id, weak| {
-            *id == skip_id || weak.strong_count() > 0
-        });
+        self.tombstones
+            .retain(|id, weak| *id == skip_id || weak.strong_count() > 0);
     }
 
     /// Verify that `cap` was minted by *this* registry's [`Self::new`]
@@ -828,9 +829,9 @@ mod tests {
         assert_eq!(a_ctx.bytes_in_use(), 128);
 
         // Same for release: B's cap cannot tamper with A's counter.
-        a_ctx.release_bytes_with_capability(&b_cap, 128).expect_err(
-            "cross-tenant release must be rejected",
-        );
+        a_ctx
+            .release_bytes_with_capability(&b_cap, 128)
+            .expect_err("cross-tenant release must be rejected");
         assert_eq!(a_ctx.bytes_in_use(), 128);
 
         // And B's own counter is untouched throughout.
@@ -891,8 +892,7 @@ mod tests {
         const RACE_ID: u64 = 9001;
 
         let (reg, cap) = TenantRegistry::new();
-        let (orphan_arc, _orphan_cap) =
-            reg.register_with_capability(ctx(RACE_ID)).unwrap();
+        let (orphan_arc, _orphan_cap) = reg.register_with_capability(ctx(RACE_ID)).unwrap();
         // Unregister. Because we still hold `orphan_arc`, the tombstone
         // points to a Weak whose `strong_count() > 0` for as long as
         // `orphan_arc` is alive.
@@ -1018,8 +1018,7 @@ mod tests {
         const ORPHAN_ID: u64 = 9200;
 
         let (reg, cap) = TenantRegistry::new();
-        let (orphan_arc, _orphan_cap) =
-            reg.register_with_capability(ctx(ORPHAN_ID)).unwrap();
+        let (orphan_arc, _orphan_cap) = reg.register_with_capability(ctx(ORPHAN_ID)).unwrap();
         let _ = reg.unregister(TenantId(ORPHAN_ID), &cap).unwrap();
         // orphan_arc is still alive on this thread.
 
@@ -1086,9 +1085,8 @@ mod tests {
             // From a fresh registry with id ID never inserted: register
             // cannot fail (no occupant, no tombstone). The branch on
             // `u_res` distinguishes the two reachable serialisations.
-            let (r_arc, _r_cap) = r_res.expect(
-                "register against fresh id with only unregister racing must succeed",
-            );
+            let (r_arc, _r_cap) =
+                r_res.expect("register against fresh id with only unregister racing must succeed");
             assert_eq!(r_arc.id(), TenantId(ID));
             match u_res {
                 Some(removed) => {
@@ -1191,10 +1189,7 @@ mod tests {
         let _ = reg.register(ctx(3)).unwrap();
         reg.unregister(TenantId(3), &cap).unwrap();
         assert!(reg.tombstones.contains_key(&TenantId(3)));
-        assert_eq!(
-            reg.tombstones.get(&TenantId(3)).unwrap().strong_count(),
-            0
-        );
+        assert_eq!(reg.tombstones.get(&TenantId(3)).unwrap().strong_count(), 0);
 
         // Now unregister tenant 2. Tombstone 3 is dead (and id != 2),
         // so the unregister prune must drop it. Tombstone 2 (just
@@ -1244,8 +1239,7 @@ mod tests {
         assert!(reg.tombstones.contains_key(&TenantId(1)));
 
         // Set up a live orphan for id 2.
-        let (orphan_arc, _orphan_cap) =
-            reg.register_with_capability(ctx(2)).unwrap();
+        let (orphan_arc, _orphan_cap) = reg.register_with_capability(ctx(2)).unwrap();
         // register(2) just ran its prune — tombstone 1 should be gone.
         assert!(!reg.tombstones.contains_key(&TenantId(1)));
         reg.unregister(TenantId(2), &cap).unwrap();

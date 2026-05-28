@@ -16,10 +16,10 @@ use crate::audit::{audit_log_middleware, AuditConfig, TrustedProxies};
 use crate::http_metrics::{http_metrics_middleware, HttpMetricsLayerConfig, RouteAllowList};
 use crate::middleware::{
     bearer_auth, body_limit_layer, concurrency_limit_layer, cors_layer, host_validate,
-    tenant_scope, ENV_API_TOKENS, ENV_TRUSTED_HOSTS, INVOKE_CONCURRENCY_LIMIT,
-    PROBE_CONCURRENCY_LIMIT, READ_CONCURRENCY_LIMIT, WRITE_CONCURRENCY_LIMIT,
-    timeout_layer, trace_layer_with_propagation, AuthConfig, CorsConfig, KernelPublishTokens,
-    TenantConfig, TrustedHosts, MAX_REQUEST_BODY_BYTES,
+    tenant_scope, timeout_layer, trace_layer_with_propagation, AuthConfig, CorsConfig,
+    KernelPublishTokens, TenantConfig, TrustedHosts, ENV_API_TOKENS, ENV_TRUSTED_HOSTS,
+    INVOKE_CONCURRENCY_LIMIT, MAX_REQUEST_BODY_BYTES, PROBE_CONCURRENCY_LIMIT,
+    READ_CONCURRENCY_LIMIT, WRITE_CONCURRENCY_LIMIT,
 };
 use crate::rate_limit::{rate_limit, RateLimitConfig, RateLimiter};
 use crate::routes::{
@@ -492,10 +492,7 @@ fn build_router_full(
     // sub-router up with `protected_router` and `probe_router` for the
     // outer `.merge(...)` call.
     let openai_router: Router<Arc<AppState>> = Router::new()
-        .route(
-            "/v1/completions",
-            post(crate::openai::completions_handler),
-        )
+        .route("/v1/completions", post(crate::openai::completions_handler))
         .route(
             "/v1/chat/completions",
             post(crate::openai::chat_completions_handler),
@@ -578,9 +575,7 @@ fn build_router_full(
         .layer(axum::Extension(kernel_publish_tokens))
         .layer(concurrency_limit_layer(WRITE_CONCURRENCY_LIMIT));
 
-    let router = protected_router
-        .merge(probe_router)
-        .merge(openai_router);
+    let router = protected_router.merge(probe_router).merge(openai_router);
     #[cfg(feature = "kernel-registry-api")]
     let router = router.merge(kernel_router);
     router.layer(common_layers).with_state(state)

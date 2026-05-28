@@ -401,11 +401,10 @@ pub async fn completions_handler(
     tracing::Span::current().record("model", tracing::field::display(&req.model));
     let model_echo = req.model.clone();
 
-    let translated =
-        match translate_completions_request(&req, state.openai_model_map.as_ref()) {
-            Ok(t) => t,
-            Err(e) => return e.into_response(),
-        };
+    let translated = match translate_completions_request(&req, state.openai_model_map.as_ref()) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     tracing::Span::current().record("stream", tracing::field::display(translated.stream));
 
     run_translated(
@@ -457,11 +456,11 @@ pub async fn chat_completions_handler(
     tracing::Span::current().record("model", tracing::field::display(&req.model));
     let model_echo = req.model.clone();
 
-    let translated =
-        match translate_chat_completions_request(&req, state.openai_model_map.as_ref()) {
-            Ok(t) => t,
-            Err(e) => return e.into_response(),
-        };
+    let translated = match translate_chat_completions_request(&req, state.openai_model_map.as_ref())
+    {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     tracing::Span::current().record("stream", tracing::field::display(translated.stream));
 
     run_translated(
@@ -536,9 +535,25 @@ async fn run_translated(
     };
 
     if translated.stream {
-        run_streaming(state, tenant, wasm_bytes, translated, model_echo, object_kind).await
+        run_streaming(
+            state,
+            tenant,
+            wasm_bytes,
+            translated,
+            model_echo,
+            object_kind,
+        )
+        .await
     } else {
-        run_buffered(state, tenant, wasm_bytes, translated, model_echo, object_kind).await
+        run_buffered(
+            state,
+            tenant,
+            wasm_bytes,
+            translated,
+            model_echo,
+            object_kind,
+        )
+        .await
     }
 }
 
@@ -553,8 +568,7 @@ async fn run_buffered(
     model_echo: String,
     object_kind: OpenAiObject,
 ) -> Response {
-    let (chunk_tx, mut chunk_rx) =
-        tokio::sync::mpsc::channel::<Vec<u8>>(OPENAI_STREAM_BUFFER);
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OPENAI_STREAM_BUFFER);
     let streaming = StreamingContext::with_channel(chunk_tx);
 
     let executor = state.executor.clone();
@@ -597,11 +611,8 @@ async fn run_buffered(
     let exec_result = match exec_handle.await {
         Ok(r) => r,
         Err(e) => {
-            return OpenAiError::server_error(
-                format!("executor task panicked: {e}"),
-                "wasm_error",
-            )
-            .into_response();
+            return OpenAiError::server_error(format!("executor task panicked: {e}"), "wasm_error")
+                .into_response();
         }
     };
     if let Err(e) = exec_result {
@@ -658,11 +669,9 @@ async fn run_streaming(
     model_echo: String,
     object_kind: OpenAiObject,
 ) -> Response {
-    let (chunk_tx, chunk_rx) =
-        tokio::sync::mpsc::channel::<Vec<u8>>(OPENAI_STREAM_BUFFER);
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OPENAI_STREAM_BUFFER);
     let streaming = StreamingContext::with_channel(chunk_tx);
-    let (done_tx, done_rx) =
-        tokio::sync::oneshot::channel::<Result<(), ExecError>>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), ExecError>>();
 
     let executor = state.executor.clone();
     let args = translated.args.clone();
@@ -696,7 +705,10 @@ async fn run_streaming(
         let model_echo = model_echo.clone();
         async move {
             match st {
-                OpenAiStreamState::Streaming { mut rx, mut done_rx } => {
+                OpenAiStreamState::Streaming {
+                    mut rx,
+                    mut done_rx,
+                } => {
                     tokio::select! {
                         biased;
                         maybe = rx.recv() => match maybe {
@@ -765,33 +777,28 @@ async fn run_streaming(
                         }
                     }
                 }
-                OpenAiStreamState::DrainOnly { mut rx, terminal } => {
-                    match rx.try_recv() {
-                        Ok(chunk) => {
-                            let ev = make_chunk_event(
-                                &response_id,
-                                created,
-                                &model_echo,
-                                object_kind,
-                                &chunk,
-                            );
-                            Some((
-                                Ok(ev),
-                                OpenAiStreamState::DrainOnly { rx, terminal },
-                            ))
-                        }
-                        Err(_) => Some((
-                            Ok(make_terminal_event(
-                                &response_id,
-                                created,
-                                &model_echo,
-                                object_kind,
-                                terminal.as_ref().and_then(|r| r.as_ref().err()),
-                            )),
-                            OpenAiStreamState::EmitDone,
-                        )),
+                OpenAiStreamState::DrainOnly { mut rx, terminal } => match rx.try_recv() {
+                    Ok(chunk) => {
+                        let ev = make_chunk_event(
+                            &response_id,
+                            created,
+                            &model_echo,
+                            object_kind,
+                            &chunk,
+                        );
+                        Some((Ok(ev), OpenAiStreamState::DrainOnly { rx, terminal }))
                     }
-                }
+                    Err(_) => Some((
+                        Ok(make_terminal_event(
+                            &response_id,
+                            created,
+                            &model_echo,
+                            object_kind,
+                            terminal.as_ref().and_then(|r| r.as_ref().err()),
+                        )),
+                        OpenAiStreamState::EmitDone,
+                    )),
+                },
                 OpenAiStreamState::EmitDone => Some((
                     Ok(Event::default().data("[DONE]")),
                     OpenAiStreamState::Closed,
@@ -931,7 +938,6 @@ fn exec_error_code(err: &ExecError) -> &'static str {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1003,9 +1009,6 @@ mod tests {
             inner.get("type").and_then(|x| x.as_str()),
             Some("invalid_request_error"),
         );
-        assert_eq!(
-            inner.get("param").and_then(|x| x.as_str()),
-            Some("model"),
-        );
+        assert_eq!(inner.get("param").and_then(|x| x.as_str()), Some("model"),);
     }
 }

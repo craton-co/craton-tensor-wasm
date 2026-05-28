@@ -19,11 +19,9 @@
 
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::types::{InstanceId, TenantId};
-use tensor_wasm_snapshot::reader::SnapshotReader;
-use tensor_wasm_snapshot::writer::{
-    InstanceState, Snapshot, SnapshotWriter, DEFAULT_ZSTD_LEVEL,
-};
 use tensor_wasm_snapshot::payload_crc32;
+use tensor_wasm_snapshot::reader::SnapshotReader;
+use tensor_wasm_snapshot::writer::{InstanceState, Snapshot, SnapshotWriter, DEFAULT_ZSTD_LEVEL};
 
 /// Fixed HMAC key for the capture step. The restore step intentionally uses
 /// the *same* key — the rejection must come from the HMAC-over-tampered-bytes
@@ -69,8 +67,7 @@ fn tampered_wasm_memory_with_refixed_crc_is_rejected() {
     let sig_trailer = sig_trailer.to_vec();
 
     // 3. Decompress to recover the bincode-encoded Snapshot.
-    let decompressed =
-        zstd::decode_all(compressed_payload).expect("decompress signed payload");
+    let decompressed = zstd::decode_all(compressed_payload).expect("decompress signed payload");
 
     // 4. Decode, mutate one byte of wasm_memory, and re-fix CRC32 so the
     //    inner CRC check still passes for the tampered bytes. This proves

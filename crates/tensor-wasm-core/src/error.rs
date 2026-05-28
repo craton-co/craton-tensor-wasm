@@ -151,9 +151,7 @@ pub enum TensorWasmError {
     /// pin a CUDA driver-level cap via
     /// `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`
     /// (CUDA 11.2+).
-    #[error(
-        "gpu memory exhausted: requested {requested} bytes, limit {limit}, current {current}"
-    )]
+    #[error("gpu memory exhausted: requested {requested} bytes, limit {limit}, current {current}")]
     GpuMemoryExhausted {
         /// Bytes the tenant attempted to allocate on the GPU.
         requested: u64,
@@ -419,10 +417,7 @@ mod tests {
     fn display_serialization_is_opaque() {
         let e = TensorWasmError::Serialization("bad json at byte 42: 'secret-tenant-key'".into());
         assert_eq!(format!("{e}"), "serialization error");
-        assert_eq!(
-            e.inner(),
-            Some("bad json at byte 42: 'secret-tenant-key'"),
-        );
+        assert_eq!(e.inner(), Some("bad json at byte 42: 'secret-tenant-key'"),);
     }
 
     #[test]
@@ -460,8 +455,14 @@ mod tests {
     fn kind_stable_names() {
         assert_eq!(TensorWasmError::CudaError("x".into()).kind(), "cuda");
         assert_eq!(TensorWasmError::WasmTrap("x".into()).kind(), "wasm_trap");
-        assert_eq!(TensorWasmError::WasmCompile("x".into()).kind(), "wasm_compile");
-        assert_eq!(TensorWasmError::Serialization("x".into()).kind(), "serialization");
+        assert_eq!(
+            TensorWasmError::WasmCompile("x".into()).kind(),
+            "wasm_compile"
+        );
+        assert_eq!(
+            TensorWasmError::Serialization("x".into()).kind(),
+            "serialization"
+        );
     }
 
     #[test]

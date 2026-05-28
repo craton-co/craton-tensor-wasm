@@ -15,10 +15,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use clap::Args;
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::TensorWasmEngine;
-use tensor_wasm_exec::executor::{TensorWasmExecutor, SpawnConfig};
-use clap::Args;
+use tensor_wasm_exec::executor::{SpawnConfig, TensorWasmExecutor};
 
 /// Arguments to `tensor-wasm bench`.
 #[derive(Debug, Args)]

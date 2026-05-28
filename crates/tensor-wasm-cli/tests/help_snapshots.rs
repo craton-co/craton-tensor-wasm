@@ -14,10 +14,10 @@ use assert_cmd::Command;
 /// since `--help` is expected to exit 0.
 fn help(args: &[&str]) -> String {
     let mut cmd = Command::cargo_bin("tensor-wasm").expect("tensor-wasm binary built");
-    cmd.env_remove("TENSOR_WASM_TOKEN").env_remove("TENSOR_WASM_LOG");
+    cmd.env_remove("TENSOR_WASM_TOKEN")
+        .env_remove("TENSOR_WASM_LOG");
     let assertion = cmd.args(args).assert().success();
-    String::from_utf8(assertion.get_output().stdout.clone())
-        .expect("help output is UTF-8")
+    String::from_utf8(assertion.get_output().stdout.clone()).expect("help output is UTF-8")
 }
 
 #[test]
@@ -62,10 +62,7 @@ fn snapshot_save_help() {
 
 #[test]
 fn snapshot_restore_help() {
-    insta::assert_snapshot!(
-        "snapshot_restore",
-        help(&["snapshot", "restore", "--help"])
-    );
+    insta::assert_snapshot!("snapshot_restore", help(&["snapshot", "restore", "--help"]));
 }
 
 #[test]

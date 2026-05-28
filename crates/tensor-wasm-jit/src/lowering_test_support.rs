@@ -36,10 +36,10 @@
 #![cfg(feature = "cuda-oxide-backend")]
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::ir::{
     AbiParam, Function, Inst, InstBuilder, MemFlags, Opcode, Signature, Type, UserFuncName,
 };
-use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::isa::CallConv;
 
 /// Pointer-typed parameter used for `load` / `store` fixtures.
@@ -86,12 +86,7 @@ pub fn empty_function(name: &str, params: &[Type], returns: &[Type]) -> Function
     let block = func.dfg.make_block();
     // Append block params 1:1 with the signature so the entry block is
     // immediately usable by lowering passes that iterate block params.
-    let param_types: Vec<Type> = func
-        .signature
-        .params
-        .iter()
-        .map(|p| p.value_type)
-        .collect();
+    let param_types: Vec<Type> = func.signature.params.iter().map(|p| p.value_type).collect();
     for pty in param_types {
         func.dfg.append_block_param(block, pty);
     }
@@ -242,12 +237,7 @@ fn empty_function_no_return(name: &str, params: &[Type], returns: &[Type]) -> Fu
     }
     let mut func = Function::with_name_signature(UserFuncName::testcase(name.as_bytes()), sig);
     let block = func.dfg.make_block();
-    let param_types: Vec<Type> = func
-        .signature
-        .params
-        .iter()
-        .map(|p| p.value_type)
-        .collect();
+    let param_types: Vec<Type> = func.signature.params.iter().map(|p| p.value_type).collect();
     for pty in param_types {
         func.dfg.append_block_param(block, pty);
     }

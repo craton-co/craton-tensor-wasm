@@ -22,11 +22,11 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig};
 use tower::ServiceExt;
 
 async fn body_bytes(body: Body) -> Vec<u8> {
@@ -62,10 +62,7 @@ fn json_post(uri: &str, body: Value) -> Request<Body> {
 async fn deploy(router: &axum::Router, name: &str, wat_src: &str) -> String {
     let wasm_bytes = wat::parse_str(wat_src).expect("WAT parses");
     let wasm_b64 = BASE64.encode(&wasm_bytes);
-    let req = json_post(
-        "/functions",
-        json!({ "name": name, "wasm_b64": wasm_b64 }),
-    );
+    let req = json_post("/functions", json!({ "name": name, "wasm_b64": wasm_b64 }));
     let resp = router.clone().oneshot(req).await.expect("deploy oneshot");
     assert_eq!(resp.status(), StatusCode::OK, "deploy failed");
     body_json(resp.into_body())
@@ -104,7 +101,11 @@ async fn invoke_with_f64_arg_round_trips_through_response() {
         .and_then(Value::as_array)
         .expect("result is array");
     assert_eq!(arr.len(), 1, "single f64 result expected; got {arr:?}");
-    assert_eq!(arr[0].as_f64(), Some(3.0), "doubler returned wrong value: {payload}");
+    assert_eq!(
+        arr[0].as_f64(),
+        Some(3.0),
+        "doubler returned wrong value: {payload}"
+    );
 }
 
 #[tokio::test]
@@ -137,7 +138,11 @@ async fn invoke_with_i64_arg_escalates_above_i32_max() {
         .and_then(Value::as_array)
         .expect("result is array");
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0].as_i64(), Some(big), "identity returned wrong i64: {payload}");
+    assert_eq!(
+        arr[0].as_i64(),
+        Some(big),
+        "identity returned wrong i64: {payload}"
+    );
 }
 
 #[tokio::test]
@@ -198,5 +203,9 @@ async fn invoke_with_two_i32_args_returns_sum_via_spawn_config_path() {
         .and_then(Value::as_array)
         .expect("result is array");
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0].as_i64(), Some(42), "adder returned wrong value: {payload}");
+    assert_eq!(
+        arr[0].as_i64(),
+        Some(42),
+        "adder returned wrong value: {payload}"
+    );
 }

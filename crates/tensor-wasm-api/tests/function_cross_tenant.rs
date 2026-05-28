@@ -51,11 +51,7 @@ fn router_with_scopes(scopes: &[(&str, TokenScope)]) -> axum::Router {
         map.insert((*k).to_owned(), v.clone());
     }
     let auth = AuthConfig::from_scopes(map);
-    build_router_with_config(
-        Arc::new(AppState::default()),
-        auth,
-        TenantConfig::default(),
-    )
+    build_router_with_config(Arc::new(AppState::default()), auth, TenantConfig::default())
 }
 
 /// Trivial `_start`-only WAT module; deploy/invoke target for tests that
@@ -96,10 +92,7 @@ async fn create_function_rejects_other_tenant_with_scoped_token() {
     // Token "alpha" is scoped to tenant 1 only. Deploying with
     // X-TensorWasm-Tenant: 2 must yield 403 tenant_scope_denied — pre-fix this
     // returned 200 because create_function never called authorize_tenant.
-    let router = router_with_scopes(&[(
-        "alpha",
-        TokenScope::from_tenants([TenantId(1)]),
-    )]);
+    let router = router_with_scopes(&[("alpha", TokenScope::from_tenants([TenantId(1)]))]);
 
     let req = Request::builder()
         .method(Method::POST)
@@ -241,10 +234,7 @@ async fn token_scope_layer_runs_before_resource_check() {
     // scope could probe whether a given function id exists by comparing
     // a 403 (id exists, wrong tenant) vs 404 (id unknown). The contract is
     // that an out-of-scope token sees 403 regardless of registry state.
-    let router = router_with_scopes(&[(
-        "alpha",
-        TokenScope::from_tenants([TenantId(1)]),
-    )]);
+    let router = router_with_scopes(&[("alpha", TokenScope::from_tenants([TenantId(1)]))]);
 
     // Deploy a record owned by tenant 1 (the only tenant alpha is in scope
     // for).

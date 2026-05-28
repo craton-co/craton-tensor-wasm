@@ -92,7 +92,9 @@ fn dev_mode_loopback_bind_is_accepted() {
         .args(["serve", "--addr", "127.0.0.1:8080", "--check-only"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("check_only: configuration accepted"));
+        .stdout(predicate::str::contains(
+            "check_only: configuration accepted",
+        ));
 }
 
 /// IPv6 loopback parity for the accepted-config path.

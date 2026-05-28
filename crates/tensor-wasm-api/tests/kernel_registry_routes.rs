@@ -30,9 +30,7 @@ use tensor_wasm_api::{
     build_router_with_kernel_publish_tokens, AppState, AuditConfig, AuthConfig, CorsConfig,
     KernelPublishTokens, RateLimitConfig, RateLimiter, TenantConfig, TrustedProxies,
 };
-use tensor_wasm_jit::registry::{
-    sign_manifest, InMemoryRegistry, KernelManifest, KernelRegistry,
-};
+use tensor_wasm_jit::registry::{sign_manifest, InMemoryRegistry, KernelManifest, KernelRegistry};
 use tower::ServiceExt;
 
 /// Bearer token used by the publish-success tests below. It is added to
@@ -50,8 +48,7 @@ const TEST_KEY: [u8; 32] = [0x42u8; 32];
 /// matching kernel-publish token so the auth gate clears before the
 /// registry-level signature / digest checks fire.
 fn state_with_registry() -> Arc<AppState> {
-    let registry: Arc<dyn KernelRegistry> =
-        Arc::new(InMemoryRegistry::new(TEST_KEY));
+    let registry: Arc<dyn KernelRegistry> = Arc::new(InMemoryRegistry::new(TEST_KEY));
     Arc::new(AppState::default().with_kernel_registry(registry))
 }
 

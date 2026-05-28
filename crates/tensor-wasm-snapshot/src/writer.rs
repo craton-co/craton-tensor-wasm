@@ -12,15 +12,15 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tensor_wasm_core::error::{TensorWasmError, Result};
-use tensor_wasm_core::types::{InstanceId, TenantId};
 use serde::{Deserialize, Serialize};
+use tensor_wasm_core::error::{Result, TensorWasmError};
+use tensor_wasm_core::types::{InstanceId, TenantId};
 use tracing::{debug, instrument};
 
-#[cfg(feature = "signed-snapshots")]
-use crate::format::{SIGNATURE_KIND_HMAC_SHA256, SNAPSHOT_VERSION_V3, V3_TRAILER_MAGIC};
 #[cfg(feature = "artifact-backing")]
 use crate::format::SNAPSHOT_VERSION_V2;
+#[cfg(feature = "signed-snapshots")]
+use crate::format::{SIGNATURE_KIND_HMAC_SHA256, SNAPSHOT_VERSION_V3, V3_TRAILER_MAGIC};
 #[cfg(feature = "artifact-backing")]
 use tensor_wasm_artifacts::ArtifactStore;
 #[cfg(feature = "signed-snapshots")]
@@ -357,7 +357,10 @@ impl std::fmt::Debug for SnapshotWriter {
         #[cfg(feature = "signed-snapshots")]
         d.field(
             "hmac_key",
-            &self.hmac_key.as_ref().map(|_| "<REDACTED 32-byte HMAC key>"),
+            &self
+                .hmac_key
+                .as_ref()
+                .map(|_| "<REDACTED 32-byte HMAC key>"),
         );
         d.field("use_legacy_envelope", &self.use_legacy_envelope);
         d.finish()
@@ -547,10 +550,7 @@ impl SnapshotWriter {
     /// Returns the (`SnapshotRef`, `total_uncompressed_bytes`) pair so the
     /// caller can log the uncompressed size without redoing the sum.
     #[cfg(feature = "artifact-backing")]
-    fn build_snapshot_ref<'a>(
-        &self,
-        state: InstanceState<'a>,
-    ) -> Result<(SnapshotRef<'a>, u64)> {
+    fn build_snapshot_ref<'a>(&self, state: InstanceState<'a>) -> Result<(SnapshotRef<'a>, u64)> {
         let (metadata, crc32) = self.build_metadata(&state)?;
         let total_uncompressed_bytes = metadata.total_uncompressed_bytes;
         Ok((
@@ -712,8 +712,8 @@ impl SnapshotWriter {
         // peak-resident footprint past the reader's hard cap. The output
         // bytes are unchanged — this is purely about reducing reallocation
         // count on the write path.
-        let estimated_compressed = (total_uncompressed_bytes as usize / 4)
-            .clamp(8 * 1024, limits::MAX_INPUT_BYTES / 4);
+        let estimated_compressed =
+            (total_uncompressed_bytes as usize / 4).clamp(8 * 1024, limits::MAX_INPUT_BYTES / 4);
         let mut compressed: Vec<u8> = Vec::with_capacity(estimated_compressed);
         let mut encoder = zstd::stream::write::Encoder::new(&mut compressed, self.zstd_level)
             .map_err(|e| TensorWasmError::Serialization(format!("zstd init: {e}").into()))?;
@@ -844,9 +844,7 @@ impl SnapshotWriter {
         // change.
         let (snapshot_ref, total_uncompressed_bytes) = self.build_snapshot_ref(state)?;
         let bytes = bincode::serde::encode_to_vec(&snapshot_ref, bincode::config::legacy())
-            .map_err(|e| {
-                TensorWasmError::Serialization(format!("bincode encode: {e}").into())
-            })?;
+            .map_err(|e| TensorWasmError::Serialization(format!("bincode encode: {e}").into()))?;
         let hash = store.put(&bytes).map_err(|e| {
             // `ArtifactError` is not part of the `TensorWasmError` enum
             // (it lives in a leaf crate that does not depend on
@@ -855,9 +853,7 @@ impl SnapshotWriter {
             // The artifact store's error messages are already
             // operator-facing (no key bytes, no secret material) so the
             // forward is safe.
-            TensorWasmError::Serialization(
-                format!("artifact store put: {e}").into(),
-            )
+            TensorWasmError::Serialization(format!("artifact store put: {e}").into())
         })?;
         debug!(
             uncompressed = total_uncompressed_bytes,
@@ -885,7 +881,10 @@ impl SnapshotWriter {
     /// the artifact magic) — and, equivalently, through a
     /// `DiskArtifactStore` that has been seeded with the same bytes.
     #[cfg(all(feature = "artifact-backing", feature = "signed-snapshots"))]
-    #[cfg_attr(docsrs, doc(cfg(all(feature = "artifact-backing", feature = "signed-snapshots"))))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(feature = "artifact-backing", feature = "signed-snapshots")))
+    )]
     fn capture_via_artifact_envelope(
         &self,
         state: InstanceState<'_>,
@@ -894,11 +893,9 @@ impl SnapshotWriter {
         let (snapshot_ref, total_uncompressed_bytes) = self.build_snapshot_ref(state)?;
         let payload = bincode::serde::encode_to_vec(&snapshot_ref, bincode::config::legacy())
             .map_err(|e| TensorWasmError::Serialization(format!("bincode encode: {e}").into()))?;
-        let envelope = tensor_wasm_artifacts::encode_envelope_to_vec(&payload, hmac_key)
-            .map_err(|e| {
-                TensorWasmError::Serialization(
-                    format!("artifact envelope encode: {e}").into(),
-                )
+        let envelope =
+            tensor_wasm_artifacts::encode_envelope_to_vec(&payload, hmac_key).map_err(|e| {
+                TensorWasmError::Serialization(format!("artifact envelope encode: {e}").into())
             })?;
         debug!(
             uncompressed = total_uncompressed_bytes,

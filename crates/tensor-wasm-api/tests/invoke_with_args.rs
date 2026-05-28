@@ -14,11 +14,11 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig};
 use tower::ServiceExt;
 
 async fn body_bytes(body: Body) -> Vec<u8> {
@@ -95,7 +95,11 @@ async fn invoke_with_args_returns_sum() {
     let result = body.get("result").expect("result field present");
     let arr = result.as_array().expect("result is array");
     assert_eq!(arr.len(), 1, "expected single-element result; got {arr:?}");
-    assert_eq!(arr[0].as_i64(), Some(3), "adder returned wrong value: {body}");
+    assert_eq!(
+        arr[0].as_i64(),
+        Some(3),
+        "adder returned wrong value: {body}"
+    );
 }
 
 #[tokio::test]
@@ -121,8 +125,7 @@ async fn invoke_without_export_falls_back_to_start() {
     // Body omits `export` entirely → defaults to `_start` → `main`
     // discovery. Deploy a WASI command and confirm the legacy path
     // still works after wiring args through.
-    let wasm_bytes =
-        wat::parse_str(r#"(module (func (export "_start")))"#).expect("WAT parses");
+    let wasm_bytes = wat::parse_str(r#"(module (func (export "_start")))"#).expect("WAT parses");
     let wasm_b64 = BASE64.encode(&wasm_bytes);
     let router = router();
     let deploy = router

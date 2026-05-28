@@ -27,9 +27,7 @@
 
 use std::collections::HashSet;
 
-use tensor_wasm_jit::registry::{
-    sign_manifest, DiskRegistry, KernelManifest, KernelRegistry,
-};
+use tensor_wasm_jit::registry::{sign_manifest, DiskRegistry, KernelManifest, KernelRegistry};
 
 /// Helper: build a v2-signed manifest matching `ptx_text` under `key`.
 /// Mirrors the v0.4 CLI's `kernel publish` flow.
@@ -67,9 +65,27 @@ fn restart_repopulates_keymap_for_three_manifests() {
     // kernels" scenario the restart test in the task description aims
     // at.
     let entries = [
-        ("matmul.f32", "1.0.0", 80u32, "// matmul ptx body\n", "alice"),
-        ("attention.bf16", "0.2.1", 80u32, "// attention ptx body\n", "bob"),
-        ("conv2d.f16", "1.3.0", 80u32, "// conv2d ptx body\n", "carol"),
+        (
+            "matmul.f32",
+            "1.0.0",
+            80u32,
+            "// matmul ptx body\n",
+            "alice",
+        ),
+        (
+            "attention.bf16",
+            "0.2.1",
+            80u32,
+            "// attention ptx body\n",
+            "bob",
+        ),
+        (
+            "conv2d.f16",
+            "1.3.0",
+            80u32,
+            "// conv2d ptx body\n",
+            "carol",
+        ),
     ];
 
     // Phase 1: open a fresh DiskRegistry, publish three manifests, then

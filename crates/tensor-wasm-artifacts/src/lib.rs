@@ -191,8 +191,7 @@ fn new_mac(key: &[u8; 32]) -> ArtifactMac {
     // `new_from_slice` only errors on invalid key length; ours is a
     // fixed 32 bytes so the unwrap is sound (mirrors the same pattern
     // in `tensor-wasm-snapshot::SnapshotWriter::capture`).
-    <ArtifactMac as Mac>::new_from_slice(&key[..])
-        .expect("HMAC-SHA256 accepts any 32-byte key")
+    <ArtifactMac as Mac>::new_from_slice(&key[..]).expect("HMAC-SHA256 accepts any 32-byte key")
 }
 
 /// Finalise an incremental HMAC into the fixed-length tag.
@@ -211,7 +210,10 @@ fn finalize_into_tag(mac: ArtifactMac) -> [u8; ARTIFACT_HMAC_LEN] {
 /// always fail the HMAC check.
 fn key_fingerprint_hex(key: &[u8; 32]) -> String {
     let h = blake3::hash(&key[..]);
-    h.as_bytes()[..8].iter().map(|b| format!("{:02x}", b)).collect()
+    h.as_bytes()[..8]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 /// `Write` adapter that tees every byte into both an inner writer (the
@@ -377,8 +379,7 @@ impl ArtifactStore for DiskArtifactStore {
         // each byte into the 64 KiB BufWriter (then the on-disk file)
         // AND the running HMAC. No materialised framed buffer.
         {
-            let buf_writer =
-                BufWriter::with_capacity(STREAM_BUF_LEN, tmp.as_file_mut());
+            let buf_writer = BufWriter::with_capacity(STREAM_BUF_LEN, tmp.as_file_mut());
             let mut tee = MacWriter::new(buf_writer, &mut mac);
 
             // Header (magic || version || content_hash) is written
@@ -402,8 +403,8 @@ impl ArtifactStore for DiskArtifactStore {
             // emits compressed bytes downstream — those compressed bytes
             // pass through `tee`, so they're both written to disk AND
             // hashed into the MAC in one pass.
-            let mut encoder =
-                zstd::stream::write::Encoder::new(&mut tee, DEFAULT_ZSTD_LEVEL).map_err(|e| {
+            let mut encoder = zstd::stream::write::Encoder::new(&mut tee, DEFAULT_ZSTD_LEVEL)
+                .map_err(|e| {
                     warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed");
                     ArtifactError::Io
                 })?;
@@ -482,15 +483,18 @@ impl ArtifactStore for DiskArtifactStore {
                 return Err(ArtifactError::Io);
             }
         };
-        let file_len = file.metadata().map_err(|e| {
-            warn!(
-                target: "tensor_wasm_artifacts",
-                file = %path.display(),
-                error = %e,
-                "metadata failed"
-            );
-            ArtifactError::Io
-        })?.len();
+        let file_len = file
+            .metadata()
+            .map_err(|e| {
+                warn!(
+                    target: "tensor_wasm_artifacts",
+                    file = %path.display(),
+                    error = %e,
+                    "metadata failed"
+                );
+                ArtifactError::Io
+            })?
+            .len();
 
         // Minimum-length gate: header + at least one byte of zstd frame + HMAC.
         // Mirrors the old in-memory check; rejected here before we
@@ -581,9 +585,7 @@ impl ArtifactStore for DiskArtifactStore {
             let mac_reader = MacReader::new(body_take, &mut mac);
             match zstd::stream::read::Decoder::new(mac_reader) {
                 Ok(decoder) => {
-                    if let Err(e) =
-                        decoder.take(probe_limit).read_to_end(&mut payload)
-                    {
+                    if let Err(e) = decoder.take(probe_limit).read_to_end(&mut payload) {
                         warn!(target: "tensor_wasm_artifacts", error = %e, "zstd decode failed");
                         decode_result = Err(ArtifactError::Decompression(e.to_string()));
                     }
@@ -641,10 +643,12 @@ impl ArtifactStore for DiskArtifactStore {
             // because `body_take` caps it). Reposition so the next
             // read_exact pulls the tag; the MAC has over-counted and
             // will trip BadHmac below, which is the safe failure mode.
-            reader.seek(std::io::SeekFrom::Start(prefix_end)).map_err(|e| {
-                warn!(target: "tensor_wasm_artifacts", error = %e, "seek to tag failed");
-                ArtifactError::Io
-            })?;
+            reader
+                .seek(std::io::SeekFrom::Start(prefix_end))
+                .map_err(|e| {
+                    warn!(target: "tensor_wasm_artifacts", error = %e, "seek to tag failed");
+                    ArtifactError::Io
+                })?;
         }
 
         let mut tag_bytes = [0u8; ARTIFACT_HMAC_LEN];
@@ -751,11 +755,17 @@ impl ArtifactStore for DiskArtifactStore {
             for (i, chunk) in hash_hex.as_bytes().chunks(2).enumerate() {
                 let s = match std::str::from_utf8(chunk) {
                     Ok(s) => s,
-                    Err(_) => { ok = false; break; }
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
                 };
                 match u8::from_str_radix(s, 16) {
                     Ok(b) => bytes[i] = b,
-                    Err(_) => { ok = false; break; }
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
                 }
             }
             if ok {
@@ -834,9 +844,8 @@ pub fn encode_envelope_to_vec(
     // memory, so this overshoots harmlessly for small inputs and
     // undershoots only marginally on incompressible blobs) + the HMAC
     // trailer. The Vec grows on demand if the estimate is too small.
-    let mut buf: Vec<u8> = Vec::with_capacity(
-        ARTIFACT_HEADER_LEN + payload.len() / 4 + ARTIFACT_HMAC_LEN,
-    );
+    let mut buf: Vec<u8> =
+        Vec::with_capacity(ARTIFACT_HEADER_LEN + payload.len() / 4 + ARTIFACT_HMAC_LEN);
 
     // Header: 16-byte magic + 4-byte version + 32-byte content hash.
     buf.extend_from_slice(&ARTIFACT_MAGIC);

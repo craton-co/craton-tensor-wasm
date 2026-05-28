@@ -33,7 +33,9 @@ const TEST_KEY: [u8; 32] = [0x55u8; 32];
 
 fn synth_state() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let wasm: Vec<u8> = (0u32..1024).map(|i| (i % 251) as u8).collect();
-    let gpu: Vec<u8> = (0u32..512).map(|i| ((i.wrapping_mul(11)) % 253) as u8).collect();
+    let gpu: Vec<u8> = (0u32..512)
+        .map(|i| ((i.wrapping_mul(11)) % 253) as u8)
+        .collect();
     let regs: Vec<u8> = (0u32..32).map(|i| ((i ^ 0x55) & 0xFF) as u8).collect();
     (wasm, gpu, regs)
 }
@@ -155,7 +157,9 @@ fn garbage_input_is_rejected_without_panicking() {
     let reader = SnapshotReader::new();
 
     // Empty input — must be rejected.
-    let err = reader.restore(&[]).expect_err("empty input must be rejected");
+    let err = reader
+        .restore(&[])
+        .expect_err("empty input must be rejected");
     assert!(matches!(err, TensorWasmError::Serialization(_)));
 
     // Random bytes that don't match any envelope's leading magic and

@@ -54,12 +54,7 @@ fn cas_loop_is_linearizable_under_2_thread_interleavings() {
                 let mut cur = counter.load(Ordering::Acquire);
                 loop {
                     let next = cur.saturating_sub(K);
-                    match counter.compare_exchange(
-                        cur,
-                        next,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
+                    match counter.compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire) {
                         Ok(_) => break,
                         Err(observed) => cur = observed,
                     }
@@ -76,12 +71,7 @@ fn cas_loop_is_linearizable_under_2_thread_interleavings() {
                 let mut cur = counter.load(Ordering::Acquire);
                 loop {
                     let next = cur.saturating_add(K);
-                    match counter.compare_exchange(
-                        cur,
-                        next,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
+                    match counter.compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire) {
                         Ok(_) => break,
                         Err(observed) => cur = observed,
                     }

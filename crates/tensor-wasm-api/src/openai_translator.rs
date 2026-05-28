@@ -293,10 +293,7 @@ pub fn translate_chat_completions_request(
 
 /// Common model-lookup helper. Returns a `model_not_found` OpenAI
 /// envelope on miss.
-fn lookup_model(
-    model: &str,
-    model_map: &HashMap<String, Uuid>,
-) -> Result<Uuid, OpenAiError> {
+fn lookup_model(model: &str, model_map: &HashMap<String, Uuid>) -> Result<Uuid, OpenAiError> {
     match model_map.get(model) {
         Some(id) => Ok(*id),
         None => Err(OpenAiError::model_not_found(format!(

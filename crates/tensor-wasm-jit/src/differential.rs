@@ -64,7 +64,9 @@ pub struct DifferentialOracle {
 impl DifferentialOracle {
     /// Construct an oracle with default configuration.
     pub fn new() -> Self {
-        Self { cfg: OracleConfig::default() }
+        Self {
+            cfg: OracleConfig::default(),
+        }
     }
 
     /// Construct an oracle with a caller-provided configuration.
@@ -110,7 +112,9 @@ impl DifferentialOracle {
                     cpu_output_len: out.len(),
                     cpu_output_first_bytes: head_bytes(&out),
                 },
-                None => OracleVerdict::Skipped("reference-eval-unavailable; falling back to no-cuda"),
+                None => {
+                    OracleVerdict::Skipped("reference-eval-unavailable; falling back to no-cuda")
+                }
             }
         } else {
             match cpu_output {
@@ -273,7 +277,11 @@ pub struct Tolerance {
 
 impl Tolerance {
     /// Strict (bit-identical) tolerance — every axis is zero.
-    pub const STRICT: Tolerance = Tolerance { ulps: 0, abs: 0.0, rel: 0.0 };
+    pub const STRICT: Tolerance = Tolerance {
+        ulps: 0,
+        abs: 0.0,
+        rel: 0.0,
+    };
 
     /// Returns `true` iff `actual` is within tolerance of `expected`.
     pub fn approx_eq_f32(self, expected: f32, actual: f32) -> bool {
@@ -347,20 +355,40 @@ impl ToleranceTable {
     /// `docs/DIFFERENTIAL-ORACLE.md#tolerance-table-v037`.
     pub const fn default_table() -> Self {
         Self {
-            vector_add_f32: Tolerance { ulps: 1, abs: 0.0, rel: 0.0 },
-            vector_mul_f32: Tolerance { ulps: 1, abs: 0.0, rel: 0.0 },
+            vector_add_f32: Tolerance {
+                ulps: 1,
+                abs: 0.0,
+                rel: 0.0,
+            },
+            vector_mul_f32: Tolerance {
+                ulps: 1,
+                abs: 0.0,
+                rel: 0.0,
+            },
             // FMA: single-rounding contract on both paths means we
             // expect bit-identity, but we leave 1 ULP for the f32
             // round-mode tiebreak (round-to-nearest-even, which both
             // paths use).
-            vector_fma_f32: Tolerance { ulps: 1, abs: 0.0, rel: 0.0 },
+            vector_fma_f32: Tolerance {
+                ulps: 1,
+                abs: 0.0,
+                rel: 0.0,
+            },
             // Matmul: 2 ULP budget per output element + a small
             // absolute floor so reductions over k=16 lanes don't trip
             // on subnormals.
-            matmul_f32: Tolerance { ulps: 2, abs: 1e-6, rel: 1e-6 },
+            matmul_f32: Tolerance {
+                ulps: 2,
+                abs: 1e-6,
+                rel: 1e-6,
+            },
             // Conv2d: tracks matmul; the inner loop is the same MAC
             // shape.
-            conv2d_f32: Tolerance { ulps: 2, abs: 1e-6, rel: 1e-6 },
+            conv2d_f32: Tolerance {
+                ulps: 2,
+                abs: 1e-6,
+                rel: 1e-6,
+            },
             f16_ulp_multiplier: 4,
         }
     }
@@ -634,7 +662,10 @@ mod tests {
             .push(TensorWasmOp::LoadUnified { lanes })
             .push(TensorWasmOp::VecAdd { lanes })
             .push(TensorWasmOp::StoreUnified { lanes })
-            .with_grid(GridHint { total_threads: lanes, preferred_block_size: lanes })
+            .with_grid(GridHint {
+                total_threads: lanes,
+                preferred_block_size: lanes,
+            })
     }
 
     #[test]
@@ -675,8 +706,11 @@ mod tests {
 
     #[test]
     fn classify_picks_matmul() {
-        let bp =
-            TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::MatMul { m: 16, n: 16, k: 16 });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::MatMul {
+            m: 16,
+            n: 16,
+            k: 16,
+        });
         assert_eq!(BlueprintKind::classify(&bp), BlueprintKind::Matmul);
     }
 

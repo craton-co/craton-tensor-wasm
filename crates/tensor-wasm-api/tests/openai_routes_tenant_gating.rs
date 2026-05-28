@@ -38,9 +38,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use tensor_wasm_api::{
-    build_router_with_config, AppState, AuthConfig, TenantConfig, TokenScope,
-};
+use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig, TokenScope};
 use tensor_wasm_core::types::TenantId;
 use tower::ServiceExt;
 
@@ -56,11 +54,7 @@ fn router_with_scopes(scopes: &[(&str, TokenScope)]) -> axum::Router {
         map.insert((*k).to_owned(), v.clone());
     }
     let auth = AuthConfig::from_scopes(map);
-    build_router_with_config(
-        Arc::new(AppState::default()),
-        auth,
-        TenantConfig::default(),
-    )
+    build_router_with_config(Arc::new(AppState::default()), auth, TenantConfig::default())
 }
 
 fn openai_post(uri: &str, bearer: &str, body: Value) -> Request<Body> {
@@ -85,10 +79,7 @@ async fn completions_rejects_out_of_scope_token_before_dispatch() {
     // return 403 tenant_scope_denied; if it returned 404 model_not_found
     // (the T41 default for in-scope callers with an empty map) the gate
     // would have been skipped.
-    let router = router_with_scopes(&[(
-        "alpha",
-        TokenScope::from_tenants([TenantId(1)]),
-    )]);
+    let router = router_with_scopes(&[("alpha", TokenScope::from_tenants([TenantId(1)]))]);
 
     let resp = router
         .oneshot(openai_post(
@@ -171,10 +162,7 @@ async fn chat_completions_rejects_out_of_scope_token_before_dispatch() {
     // Same shape as the completions test, on the chat endpoint. A
     // single-handler regression that re-opened the hole on only one of
     // the two routes must surface here.
-    let router = router_with_scopes(&[(
-        "alpha",
-        TokenScope::from_tenants([TenantId(1)]),
-    )]);
+    let router = router_with_scopes(&[("alpha", TokenScope::from_tenants([TenantId(1)]))]);
 
     let resp = router
         .oneshot(openai_post(

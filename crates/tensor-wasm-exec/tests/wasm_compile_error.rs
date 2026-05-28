@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::TensorWasmEngine;
-use tensor_wasm_exec::executor::{TensorWasmExecutor, ExecError, SpawnConfig};
+use tensor_wasm_exec::executor::{ExecError, SpawnConfig, TensorWasmExecutor};
 
 #[tokio::test]
 async fn invalid_wasm_returns_wasmtime_variant() {

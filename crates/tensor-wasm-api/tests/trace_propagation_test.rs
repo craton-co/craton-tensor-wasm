@@ -26,18 +26,17 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
+use opentelemetry::trace::TraceContextExt;
 use tensor_wasm_api::{
     build_router_with_config, extract_parent_context, install_w3c_propagator, AppState, AuthConfig,
     TenantConfig, HEADER_TRACE_ID,
 };
-use opentelemetry::trace::TraceContextExt;
 use tower::ServiceExt;
 
 /// A well-formed W3C traceparent value with a known trace id. Copied from
 /// the trace-context spec examples. The trace id portion is the 32-char
 /// substring between the first two `-`-separated fields.
-const SAMPLE_TRACEPARENT: &str =
-    "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+const SAMPLE_TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
 const SAMPLE_TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
 
 fn router() -> axum::Router {

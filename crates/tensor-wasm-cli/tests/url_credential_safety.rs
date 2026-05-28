@@ -27,7 +27,7 @@
 //! would silently move parser helpers out of reach.
 
 use tensor_wasm_cli::cmd::snapshot::refuse_hmac_key_on_plaintext;
-use tensor_wasm_cli::cmd::{HttpContext, validate_server_url};
+use tensor_wasm_cli::cmd::{validate_server_url, HttpContext};
 
 /// `http://u:p@host` — reqwest would happily forward the userinfo as
 /// Basic auth and the password would land in every "{url}" formatted
@@ -68,8 +68,7 @@ fn validate_server_url_rejects_userinfo() {
 /// rewrite of `validate_server_url` that starts rejecting normal URLs.
 #[test]
 fn validate_server_url_accepts_clean_url() {
-    validate_server_url("https://host:8080")
-        .expect("clean https URL with a port must be accepted");
+    validate_server_url("https://host:8080").expect("clean https URL with a port must be accepted");
 }
 
 /// A userinfo-only URL (`http://token@host`, no password) is still
@@ -117,8 +116,7 @@ fn refuse_hmac_key_on_plaintext_blocks_remote_http() {
 /// `https://` is fine — TLS protects the key in flight.
 #[test]
 fn refuse_hmac_key_on_plaintext_allows_https() {
-    refuse_hmac_key_on_plaintext("https://prod.example.com")
-        .expect("https:// must not be refused");
+    refuse_hmac_key_on_plaintext("https://prod.example.com").expect("https:// must not be refused");
 }
 
 /// Loopback addresses are dev-only by construction; the dev quickstart
@@ -130,8 +128,7 @@ fn refuse_hmac_key_on_plaintext_allows_loopback() {
     refuse_hmac_key_on_plaintext("http://127.0.0.1:8080").expect("127.0.0.1 must be allowed");
     refuse_hmac_key_on_plaintext("http://[::1]:8080").expect("::1 must be allowed");
     // Any address in 127.0.0.0/8 is loopback per RFC 6890.
-    refuse_hmac_key_on_plaintext("http://127.255.0.42:8080")
-        .expect("127.0.0.0/8 must be allowed");
+    refuse_hmac_key_on_plaintext("http://127.255.0.42:8080").expect("127.0.0.0/8 must be allowed");
 }
 
 /// The plaintext-token warning is a one-shot, observed by flipping a
@@ -174,9 +171,7 @@ fn apply_warn_once_gate_trips_on_plaintext_http_token() {
 fn apply_warn_once_gate_does_not_trip_without_a_token() {
     let ctx = HttpContext::from_env_for_test_with_token_optional(None, 0);
     let client = reqwest::Client::new();
-    let _ = ctx
-        .apply(client.get("http://attacker.example.com"))
-        .build();
+    let _ = ctx.apply(client.get("http://attacker.example.com")).build();
     // We can't assert the gate is *unset* because a sibling test may have
     // tripped it. The meaningful assertion is the negative invariant on
     // the path: with no token, `apply` should never even reach the URL

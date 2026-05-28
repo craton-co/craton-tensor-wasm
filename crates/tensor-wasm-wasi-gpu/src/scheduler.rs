@@ -356,9 +356,7 @@ where
     linker.func_wrap(
         SCHEDULER_MODULE,
         FN_DEADLINE_REMAINING_MS,
-        move |caller: Caller<'_, T>| -> u32 {
-            get_ctx(caller.data()).deadline_remaining_ms()
-        },
+        move |caller: Caller<'_, T>| -> u32 { get_ctx(caller.data()).deadline_remaining_ms() },
     )?;
 
     Ok(())

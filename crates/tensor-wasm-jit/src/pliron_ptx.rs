@@ -176,11 +176,7 @@ mod with_llvm {
 
     use pliron::{
         basic_block::BasicBlock,
-        builtin::{
-            op_interfaces::SymbolOpInterface,
-            ops::FuncOp,
-            types::FunctionType,
-        },
+        builtin::{op_interfaces::SymbolOpInterface, ops::FuncOp, types::FunctionType},
         context::{Context, Ptr},
         op::Op,
         operation::Operation,
@@ -189,7 +185,9 @@ mod with_llvm {
     };
     use pliron_llvm::{
         attributes::FastmathFlagsAttr,
-        op_interfaces::{FastMathFlags, FloatBinArithOpWithFastMathFlags, IntBinArithOpWithOverflowFlag},
+        op_interfaces::{
+            FastMathFlags, FloatBinArithOpWithFastMathFlags, IntBinArithOpWithOverflowFlag,
+        },
         ops::{
             AddOp, BrOp, CondBrOp, FAddOp, FMulOp, FSubOp, IntToPtrOp, LoadOp, MulOp, ReturnOp,
             StoreOp, SubOp,
@@ -398,9 +396,10 @@ mod with_llvm {
             }
 
             "twasm.br" => {
-                let dest = new_successors.first().copied().ok_or_else(|| {
-                    PtxError::Lowering("twasm.br missing successor".to_string())
-                })?;
+                let dest = new_successors
+                    .first()
+                    .copied()
+                    .ok_or_else(|| PtxError::Lowering("twasm.br missing successor".to_string()))?;
                 let br = BrOp::new(ctx, dest, new_operands.clone());
                 let br_ptr = br.get_operation();
                 br_ptr.insert_at_back(out_bb, ctx);
@@ -448,19 +447,16 @@ mod with_llvm {
 
     /// Emit a `llvm.add` / `llvm.sub` / `llvm.mul` op with the empty
     /// default `IntegerOverflowFlagsAttr`.
-    fn emit_int_binop<O>(
-        ctx: &mut Context,
-        operands: &[Value],
-    ) -> Result<Ptr<Operation>, PtxError>
+    fn emit_int_binop<O>(ctx: &mut Context, operands: &[Value]) -> Result<Ptr<Operation>, PtxError>
     where
         O: Op + IntBinArithOpWithOverflowFlag,
     {
-        let lhs = *operands.first().ok_or_else(|| {
-            PtxError::Lowering("integer binop missing lhs operand".to_string())
-        })?;
-        let rhs = *operands.get(1).ok_or_else(|| {
-            PtxError::Lowering("integer binop missing rhs operand".to_string())
-        })?;
+        let lhs = *operands
+            .first()
+            .ok_or_else(|| PtxError::Lowering("integer binop missing lhs operand".to_string()))?;
+        let rhs = *operands
+            .get(1)
+            .ok_or_else(|| PtxError::Lowering("integer binop missing rhs operand".to_string()))?;
         let op = O::new_with_overflow_flag(ctx, lhs, rhs, Default::default());
         Ok(op.get_operation())
     }
@@ -474,12 +470,12 @@ mod with_llvm {
     where
         O: Op + FloatBinArithOpWithFastMathFlags,
     {
-        let lhs = *operands.first().ok_or_else(|| {
-            PtxError::Lowering("float binop missing lhs operand".to_string())
-        })?;
-        let rhs = *operands.get(1).ok_or_else(|| {
-            PtxError::Lowering("float binop missing rhs operand".to_string())
-        })?;
+        let lhs = *operands
+            .first()
+            .ok_or_else(|| PtxError::Lowering("float binop missing lhs operand".to_string()))?;
+        let rhs = *operands
+            .get(1)
+            .ok_or_else(|| PtxError::Lowering("float binop missing rhs operand".to_string()))?;
         let op = O::new_with_fast_math_flags(ctx, lhs, rhs, FastmathFlagsAttr::default());
         Ok(op.get_operation())
     }
@@ -517,10 +513,7 @@ mod with_llvm {
 /// # Errors
 ///
 /// Always [`PtxError::NotYetWired("llvm_dialect_to_text")`](PtxError::NotYetWired).
-pub fn llvm_dialect_to_text(
-    _ctx: &Context,
-    _func: Ptr<Operation>,
-) -> Result<String, PtxError> {
+pub fn llvm_dialect_to_text(_ctx: &Context, _func: Ptr<Operation>) -> Result<String, PtxError> {
     Err(PtxError::NotYetWired("llvm_dialect_to_text"))
 }
 
@@ -619,8 +612,8 @@ mod tests {
         use crate::pliron_lowering::lowered_function_to_pliron;
         let mut ctx = Context::new();
         let func = addi_fn();
-        let twasm_func = lowered_function_to_pliron(&mut ctx, &func)
-            .expect("W3.2 conversion should succeed");
+        let twasm_func =
+            lowered_function_to_pliron(&mut ctx, &func).expect("W3.2 conversion should succeed");
 
         let result = twasm_to_llvm_dialect(&mut ctx, twasm_func);
 
@@ -680,8 +673,8 @@ mod tests {
     #[test]
     fn lowered_function_to_ptx_round_trips_to_not_yet_wired() {
         let func = addi_fn();
-        let err = lowered_function_to_ptx(&func)
-            .expect_err("end-to-end should surface NotYetWired");
+        let err =
+            lowered_function_to_ptx(&func).expect_err("end-to-end should surface NotYetWired");
         match err {
             PtxError::NotYetWired(stage) => {
                 #[cfg(feature = "pliron-llvm-backend")]
@@ -719,8 +712,8 @@ mod tests {
         b0.ops.push(LoweredOp::Return { values: vec![3] });
         f.blocks.push(b0);
 
-        let twasm_func = lowered_function_to_pliron(&mut ctx, &f)
-            .expect("W3.2 should succeed for AddF");
+        let twasm_func =
+            lowered_function_to_pliron(&mut ctx, &f).expect("W3.2 should succeed for AddF");
         let llvm_func = twasm_to_llvm_dialect(&mut ctx, twasm_func)
             .expect("W3.3 stage 2 should succeed for AddF");
         use pliron::linked_list::ContainsLinkedList;

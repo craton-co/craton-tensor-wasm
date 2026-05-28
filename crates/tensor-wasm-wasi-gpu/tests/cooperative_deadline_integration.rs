@@ -57,10 +57,7 @@ const PROBE_WAT: &str = r#"
 /// deadline. Returns the store plus the instantiated wasm module.
 async fn make_probe_instance(
     bp_deadline: Option<Instant>,
-) -> (
-    wasmtime::Store<TestStore>,
-    wasmtime::Instance,
-) {
+) -> (wasmtime::Store<TestStore>, wasmtime::Instance) {
     let (engine, linker) = make_engine_and_linker();
     let wasm = wat::parse_str(PROBE_WAT).unwrap();
     let module = wasmtime::Module::new(&engine, &wasm).expect("compile");
@@ -127,8 +124,14 @@ async fn remaining_ms_decreases_under_bp_instant() {
         .expect("remaining_ms");
 
     let before = remaining.call_async(&mut store, ()).await.expect("call");
-    assert!(before > 0, "initial remaining must be positive, got {before}");
-    assert!(before <= 500, "initial remaining must be ≤ 500 ms, got {before}");
+    assert!(
+        before > 0,
+        "initial remaining must be positive, got {before}"
+    );
+    assert!(
+        before <= 500,
+        "initial remaining must be ≤ 500 ms, got {before}"
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
     let after = remaining.call_async(&mut store, ()).await.expect("call");
     assert!(

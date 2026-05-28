@@ -374,18 +374,15 @@ impl HttpRequestLabels {
             None => Cow::Owned(route.to_string()),
         };
 
-        let method_cow: Cow<'static, str> = match ALLOWED_HTTP_METHODS
-            .iter()
-            .copied()
-            .find(|&m| m == method)
-        {
-            Some(matched) => Cow::Borrowed(matched),
-            None => {
-                return Err(LabelError::InvalidMethod {
-                    method: method.to_string(),
-                });
-            }
-        };
+        let method_cow: Cow<'static, str> =
+            match ALLOWED_HTTP_METHODS.iter().copied().find(|&m| m == method) {
+                Some(matched) => Cow::Borrowed(matched),
+                None => {
+                    return Err(LabelError::InvalidMethod {
+                        method: method.to_string(),
+                    });
+                }
+            };
 
         let status_cow: Cow<'static, str> = match STATUS_STR.get(status) {
             Some(s) => Cow::Borrowed(s),
@@ -430,10 +427,7 @@ impl HttpInFlightLabels {
     /// components. Exists so callers do not have to name every field of
     /// a `#[non_exhaustive]` struct and can pass `&'static str` literals
     /// without writing `Cow::Borrowed(...)` themselves.
-    pub fn new(
-        route: impl Into<Cow<'static, str>>,
-        method: impl Into<Cow<'static, str>>,
-    ) -> Self {
+    pub fn new(route: impl Into<Cow<'static, str>>, method: impl Into<Cow<'static, str>>) -> Self {
         Self {
             route: route.into(),
             method: method.into(),
@@ -739,7 +733,10 @@ impl TensorWasmMetrics {
     /// Buckets must be sorted ascending and finite; behaviour with unsorted or
     /// non-finite values is implementation-defined by `prometheus-client`.
     pub fn with_buckets(buckets: impl IntoIterator<Item = f64>) -> Self {
-        Self::with_all_buckets(buckets, DEFAULT_HTTP_DURATION_BUCKETS_SECONDS.iter().copied())
+        Self::with_all_buckets(
+            buckets,
+            DEFAULT_HTTP_DURATION_BUCKETS_SECONDS.iter().copied(),
+        )
     }
 
     /// Construct a fresh metrics registry with caller-supplied HTTP-duration
@@ -1016,9 +1013,7 @@ impl TensorWasmMetrics {
     /// `tensor_wasm_gpu_memory_used_bytes`; the per-tenant family is the
     /// breakdown, not a replacement. See [`TenantLabels`] for the
     /// cardinality contract.
-    pub fn gpu_memory_bytes_per_tenant(
-        &self,
-    ) -> &Family<TenantLabels, Gauge<u64, AtomicU64>> {
+    pub fn gpu_memory_bytes_per_tenant(&self) -> &Family<TenantLabels, Gauge<u64, AtomicU64>> {
         &self.inner.gpu_memory_bytes_per_tenant
     }
 
@@ -1174,7 +1169,10 @@ mod tests {
         let s = m.encode_text();
         // After two inc + one dec the gauge is 1.
         assert!(s.contains("tensor_wasm_active_instances 1"), "got:\n{s}");
-        assert!(s.contains("tensor_wasm_gpu_memory_used_bytes 4096"), "got:\n{s}");
+        assert!(
+            s.contains("tensor_wasm_gpu_memory_used_bytes 4096"),
+            "got:\n{s}"
+        );
     }
 
     #[test]
@@ -1184,7 +1182,10 @@ mod tests {
         m.kernel_dispatches_total().inc();
         m.kernel_dispatches_total().inc();
         let s = m.encode_text();
-        assert!(s.contains("tensor_wasm_kernel_dispatches_total 3"), "got:\n{s}");
+        assert!(
+            s.contains("tensor_wasm_kernel_dispatches_total 3"),
+            "got:\n{s}"
+        );
     }
 
     #[test]
@@ -1208,7 +1209,10 @@ mod tests {
         a.kernel_dispatches_total().inc();
         b.kernel_dispatches_total().inc();
         let s = a.encode_text();
-        assert!(s.contains("tensor_wasm_kernel_dispatches_total 2"), "got:\n{s}");
+        assert!(
+            s.contains("tensor_wasm_kernel_dispatches_total 2"),
+            "got:\n{s}"
+        );
     }
 
     #[test]
@@ -1431,8 +1435,12 @@ mod tests {
         // (same contract as the W2.3 HTTP families). Prime two distinct
         // tenants and assert both series appear with the expected values.
         let m = TensorWasmMetrics::new();
-        let t1 = TenantLabels { tenant_id: Cow::Borrowed("T#1") };
-        let t2 = TenantLabels { tenant_id: Cow::Borrowed("T#2") };
+        let t1 = TenantLabels {
+            tenant_id: Cow::Borrowed("T#1"),
+        };
+        let t2 = TenantLabels {
+            tenant_id: Cow::Borrowed("T#2"),
+        };
         m.gpu_memory_bytes_per_tenant().get_or_create(&t1).set(4096);
         m.gpu_memory_bytes_per_tenant().get_or_create(&t2).set(8192);
         let s = m.encode_text();
@@ -1617,9 +1625,7 @@ mod tests {
         // here — timing is exercised by
         // `crates/tensor-wasm-bench/benches/metrics_label_validation.rs`).
         let routes: Vec<&'static str> = (0..128)
-            .map(|i| -> &'static str {
-                Box::leak(format!("/route_{i}").into_boxed_str())
-            })
+            .map(|i| -> &'static str { Box::leak(format!("/route_{i}").into_boxed_str()) })
             .collect();
         let list = RouteAllowlist::new(&routes);
         // Every registered route is found.
@@ -1738,8 +1744,8 @@ mod tests_b51 {
         // that `"get"` fails with `InvalidMethod` carrying the offending
         // string, while the corresponding uppercase value passes.
         let alw = RouteAllowlist::new(&["/x"]);
-        let err = HttpRequestLabels::try_new_with_allowlist("/x", "get", 200, Some(&alw))
-            .unwrap_err();
+        let err =
+            HttpRequestLabels::try_new_with_allowlist("/x", "get", 200, Some(&alw)).unwrap_err();
         match err {
             LabelError::InvalidMethod { method } => assert_eq!(method, "get"),
             other => panic!("expected InvalidMethod, got {other:?}"),
@@ -1759,9 +1765,8 @@ mod tests_b51 {
         // offending numeric code. Exercise both boundary misses.
         let alw = RouteAllowlist::new(&["/x"]);
         for bad in [99u16, 600u16] {
-            let err =
-                HttpRequestLabels::try_new_with_allowlist("/x", "GET", bad, Some(&alw))
-                    .unwrap_err();
+            let err = HttpRequestLabels::try_new_with_allowlist("/x", "GET", bad, Some(&alw))
+                .unwrap_err();
             match err {
                 LabelError::InvalidStatus { status } => assert_eq!(status, bad),
                 other => panic!("expected InvalidStatus for {bad}, got {other:?}"),

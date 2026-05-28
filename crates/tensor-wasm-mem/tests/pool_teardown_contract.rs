@@ -103,8 +103,8 @@ fn reset_succeeds_after_all_pooled_memories_drop() {
 
     // Drop the creator; we are now the sole `Arc` holder.
     drop(creator);
-    let pool_mut = Arc::get_mut(&mut pool)
-        .expect("creator dropped, this test holds the sole remaining Arc");
+    let pool_mut =
+        Arc::get_mut(&mut pool).expect("creator dropped, this test holds the sole remaining Arc");
 
     // Headline assertion: reset succeeds. Before T6, this would fail because
     // `live_allocations()` would still be 1 — permanently — even though we
@@ -129,10 +129,22 @@ fn reset_blocked_while_one_pooled_memory_outstanding() {
     let creator = TensorWasmMemoryCreator::with_pool(DeviceId::default(), Arc::clone(&pool));
 
     let mem_a = creator
-        .new_memory(MemoryType::new(1, Some(2)), 64 * 1024, Some(128 * 1024), None, 0)
+        .new_memory(
+            MemoryType::new(1, Some(2)),
+            64 * 1024,
+            Some(128 * 1024),
+            None,
+            0,
+        )
         .expect("carve A");
     let mem_b = creator
-        .new_memory(MemoryType::new(1, Some(2)), 64 * 1024, Some(128 * 1024), None, 0)
+        .new_memory(
+            MemoryType::new(1, Some(2)),
+            64 * 1024,
+            Some(128 * 1024),
+            None,
+            0,
+        )
         .expect("carve B");
     assert_eq!(pool.live_allocations(), 2);
 

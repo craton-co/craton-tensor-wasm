@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use tensor_wasm_api::{build_router, AppState};
 use base64::Engine;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use http_body_util::BodyExt;
+use tensor_wasm_api::{build_router, AppState};
 use tower::ServiceExt;
 
 fn wasm_header_b64() -> String {

@@ -464,7 +464,9 @@ mod tests {
     fn nearest_rank_known_distribution() {
         // 1..=100 sorted: P50 = 50, P95 = 95, P99 = 99, P99.9 = 100, max = 100.
         // Nearest-rank: rank(0.50, 100) = ceil(50) = 50 → samples[49] = 50.
-        let samples: Vec<Duration> = (1u128..=100).map(|n| Duration::from_nanos(n as u64)).collect();
+        let samples: Vec<Duration> = (1u128..=100)
+            .map(|n| Duration::from_nanos(n as u64))
+            .collect();
         assert_eq!(percentile_nearest_rank(&samples, 0.50), 50);
         assert_eq!(percentile_nearest_rank(&samples, 0.95), 95);
         assert_eq!(percentile_nearest_rank(&samples, 0.99), 99);
@@ -499,11 +501,21 @@ mod tests {
             metric: "test/metric".to_string(),
             backend: "unified-memory",
             samples: 10,
-            p50_ns: 1, p95_ns: 2, p99_ns: 3, p99_9_ns: 4, max_ns: 5,
+            p50_ns: 1,
+            p95_ns: 2,
+            p99_ns: 3,
+            p99_9_ns: 4,
+            max_ns: 5,
         };
         let s = r.to_json();
-        assert!(s.contains("\"backend\":\"unified-memory\""), "missing backend field: {s}");
-        assert!(s.contains("\"metric\":\"test/metric\""), "missing metric field: {s}");
+        assert!(
+            s.contains("\"backend\":\"unified-memory\""),
+            "missing backend field: {s}"
+        );
+        assert!(
+            s.contains("\"metric\":\"test/metric\""),
+            "missing metric field: {s}"
+        );
     }
 }
 

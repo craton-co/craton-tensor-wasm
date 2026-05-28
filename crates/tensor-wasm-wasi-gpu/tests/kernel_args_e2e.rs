@@ -168,7 +168,9 @@ fn build_vector_add_launch_wat(
     let mut data_segments = String::new();
     for (offset, bytes) in data_regions {
         let literal = wat_data_literal(bytes);
-        data_segments.push_str(&format!("\n          (data (i32.const {offset}) \"{literal}\")"));
+        data_segments.push_str(&format!(
+            "\n          (data (i32.const {offset}) \"{literal}\")"
+        ));
     }
     format!(
         r#"
@@ -227,9 +229,8 @@ fn register_real_kernel(
     // same process fails with "context already exists".
     use std::sync::OnceLock;
     static CTX: OnceLock<Result<cust::context::Context, String>> = OnceLock::new();
-    let init = CTX.get_or_init(|| {
-        cust::quick_init().map_err(|e| format!("cust::quick_init: {e:?}"))
-    });
+    let init =
+        CTX.get_or_init(|| cust::quick_init().map_err(|e| format!("cust::quick_init: {e:?}")));
     if let Err(msg) = init {
         panic!("register_real_kernel: CUDA init failed: {msg}");
     }
@@ -893,11 +894,7 @@ fn build_kernel_param_storage_uses_single_backing_buffer() {
 
     let backing = storage.backing();
     let slot_ptrs = storage.slot_ptrs();
-    assert_eq!(
-        slot_ptrs.len(),
-        args.len(),
-        "one pointer slot per argument"
-    );
+    assert_eq!(slot_ptrs.len(), args.len(), "one pointer slot per argument");
 
     // Every slot pointer must land inside the contiguous `backing`
     // buffer. We compute the byte-offset between the slot pointer and

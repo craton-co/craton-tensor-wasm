@@ -14,11 +14,11 @@
 
 use std::fs;
 
+use tempfile::NamedTempFile;
 use tensor_wasm_core::types::{InstanceId, TenantId};
 use tensor_wasm_snapshot::reader::SnapshotReader;
 use tensor_wasm_snapshot::writer::{InstanceState, SnapshotWriter, SNAPSHOT_MAGIC};
 use tensor_wasm_snapshot::SNAPSHOT_VERSION_V3;
-use tempfile::NamedTempFile;
 
 /// Fixed 32-byte test key. Stable across runs so a regression in HMAC keying
 /// surfaces as a deterministic failure rather than a flaky one.

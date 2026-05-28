@@ -100,10 +100,8 @@ pub fn lower_cf_inst(
         // ---- jump ----------------------------------------------------
         InstructionData::Jump { destination, .. } => {
             let target = *block_map.get(&destination.block(&func.dfg.value_lists))?;
-            let args = map_block_call_args(
-                destination.args_slice(&func.dfg.value_lists),
-                value_map,
-            )?;
+            let args =
+                map_block_call_args(destination.args_slice(&func.dfg.value_lists), value_map)?;
             Some(LoweredOp::Br { target, args })
         }
 
@@ -116,14 +114,10 @@ pub fn lower_cf_inst(
             let then_target = *block_map.get(&then_call.block(&func.dfg.value_lists))?;
             let else_target = *block_map.get(&else_call.block(&func.dfg.value_lists))?;
 
-            let then_args = map_block_call_args(
-                then_call.args_slice(&func.dfg.value_lists),
-                value_map,
-            )?;
-            let else_args = map_block_call_args(
-                else_call.args_slice(&func.dfg.value_lists),
-                value_map,
-            )?;
+            let then_args =
+                map_block_call_args(then_call.args_slice(&func.dfg.value_lists), value_map)?;
+            let else_args =
+                map_block_call_args(else_call.args_slice(&func.dfg.value_lists), value_map)?;
 
             Some(LoweredOp::CondBr {
                 cond,
@@ -143,8 +137,7 @@ pub fn lower_cf_inst(
             // successor; `as_slice()` excludes it and yields the
             // case-indexed entries in 0..N order.
             let default_call = jt.default_block();
-            let default_target =
-                *block_map.get(&default_call.block(&func.dfg.value_lists))?;
+            let default_target = *block_map.get(&default_call.block(&func.dfg.value_lists))?;
 
             // Block args on `br_table` successors must be empty in
             // well-formed Cranelift IR (the verifier rejects any
@@ -156,14 +149,12 @@ pub fn lower_cf_inst(
             // `cf.switch` lowering does not either), so we currently
             // ignore them and bail to `None` if any are present. This
             // keeps the conversion total and the schema honest.
-            let mut cases: Vec<(u32, LoweredBlockId)> =
-                Vec::with_capacity(jt.as_slice().len());
+            let mut cases: Vec<(u32, LoweredBlockId)> = Vec::with_capacity(jt.as_slice().len());
             for (idx, case_call) in jt.as_slice().iter().enumerate() {
                 if !case_call.args_slice(&func.dfg.value_lists).is_empty() {
                     return None;
                 }
-                let target =
-                    *block_map.get(&case_call.block(&func.dfg.value_lists))?;
+                let target = *block_map.get(&case_call.block(&func.dfg.value_lists))?;
                 // u32 cast: Cranelift jump tables are 0-based and limited
                 // in practice to ~2^31 entries by the surrounding
                 // `JumpTable` entity, so the cast is lossless. (A
@@ -275,8 +266,7 @@ mod tests {
         block_map.insert(entry, 0u32);
         block_map.insert(target, 1u32);
 
-        let op = lower_cf_inst(inst, &func, &value_map, &block_map)
-            .expect("jump must lower");
+        let op = lower_cf_inst(inst, &func, &value_map, &block_map).expect("jump must lower");
         match op {
             LoweredOp::Br { target, args } => {
                 assert_eq!(target, 1);
@@ -310,8 +300,8 @@ mod tests {
         block_map.insert(entry, 0u32);
         block_map.insert(target, 7u32);
 
-        let op = lower_cf_inst(inst, &func, &value_map, &block_map)
-            .expect("jump-with-args must lower");
+        let op =
+            lower_cf_inst(inst, &func, &value_map, &block_map).expect("jump-with-args must lower");
         match op {
             LoweredOp::Br { target, args } => {
                 assert_eq!(target, 7);
@@ -350,8 +340,7 @@ mod tests {
         block_map.insert(then_blk, 1u32);
         block_map.insert(else_blk, 2u32);
 
-        let op = lower_cf_inst(inst, &func, &value_map, &block_map)
-            .expect("brif must lower");
+        let op = lower_cf_inst(inst, &func, &value_map, &block_map).expect("brif must lower");
         match op {
             LoweredOp::CondBr {
                 cond,
@@ -406,8 +395,7 @@ mod tests {
         block_map.insert(case1, 201u32);
         block_map.insert(case2, 202u32);
 
-        let op = lower_cf_inst(inst, &func, &value_map, &block_map)
-            .expect("br_table must lower");
+        let op = lower_cf_inst(inst, &func, &value_map, &block_map).expect("br_table must lower");
         match op {
             LoweredOp::Switch {
                 value,
@@ -416,10 +404,7 @@ mod tests {
             } => {
                 assert_eq!(value, 42);
                 assert_eq!(default_target, 100);
-                assert_eq!(
-                    cases,
-                    vec![(0u32, 200u32), (1u32, 201u32), (2u32, 202u32)]
-                );
+                assert_eq!(cases, vec![(0u32, 200u32), (1u32, 201u32), (2u32, 202u32)]);
             }
             other => panic!("expected LoweredOp::Switch, got {other:?}"),
         }
@@ -439,8 +424,7 @@ mod tests {
         let value_map = HashMap::new();
         let block_map = HashMap::new();
 
-        let op = lower_cf_inst(inst, &func, &value_map, &block_map)
-            .expect("return must lower");
+        let op = lower_cf_inst(inst, &func, &value_map, &block_map).expect("return must lower");
         match op {
             LoweredOp::Return { values } => assert!(values.is_empty()),
             other => panic!("expected LoweredOp::Return, got {other:?}"),
@@ -474,8 +458,7 @@ mod tests {
         value_map.insert(v1, 2000u32);
         let block_map = HashMap::new();
 
-        let op = lower_cf_inst(inst, &func, &value_map, &block_map)
-            .expect("return must lower");
+        let op = lower_cf_inst(inst, &func, &value_map, &block_map).expect("return must lower");
         match op {
             LoweredOp::Return { values } => assert_eq!(values, vec![1000, 2000]),
             other => panic!("expected LoweredOp::Return, got {other:?}"),

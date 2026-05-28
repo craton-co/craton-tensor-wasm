@@ -16,9 +16,9 @@
 
 use std::time::Duration;
 
-use tensor_wasm_jit::ir::{TensorWasmKernelBlueprint, TensorWasmOp, GridHint};
-use tensor_wasm_jit::ptx_emit::emit;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use tensor_wasm_jit::ir::{GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
+use tensor_wasm_jit::ptx_emit::emit;
 
 fn vector_add_blueprint(lanes: u32) -> TensorWasmKernelBlueprint {
     TensorWasmKernelBlueprint::new("vector_add")
@@ -106,9 +106,9 @@ fn bench_blueprint_fingerprint(c: &mut Criterion) {
 }
 
 fn bench_cache_hit_vs_miss(c: &mut Criterion) {
+    use std::sync::Arc;
     use tensor_wasm_core::types::TenantId;
     use tensor_wasm_jit::cache::{CacheKey, CachedKernel, CompiledHandle, KernelCache};
-    use std::sync::Arc;
 
     let mut group = c.benchmark_group("jit_compile/cache");
     group.measurement_time(Duration::from_secs(3));
@@ -127,11 +127,8 @@ fn bench_cache_hit_vs_miss(c: &mut Criterion) {
             KernelCache::new,
             |cache| {
                 let ptx = emit(&bp).expect("emit");
-                let entry = CachedKernel::new(
-                    bp.fingerprint(),
-                    Arc::new(ptx),
-                    CompiledHandle::default(),
-                );
+                let entry =
+                    CachedKernel::new(bp.fingerprint(), Arc::new(ptx), CompiledHandle::default());
                 cache.put(key, entry);
                 criterion::black_box(cache.get(&key));
             },

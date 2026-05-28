@@ -378,49 +378,45 @@ async fn authorization_with_control_bytes_rejected() {
 
 #[test]
 fn missing_tenant_when_required() {
-    temp_env::with_var(
-        "TENSOR_WASM_API_REQUIRE_TENANT",
-        Some("1"),
-        || {
-            // Capture the env-var-derived config at the moment the var is
-            // live. The loader trims the value and compares against "1";
-            // any other value would resolve `require_header = false`.
-            let cfg = TenantConfig::from_env();
-            assert!(
-                cfg.require_header,
-                "TENSOR_WASM_API_REQUIRE_TENANT=1 must yield require_header=true",
-            );
+    temp_env::with_var("TENSOR_WASM_API_REQUIRE_TENANT", Some("1"), || {
+        // Capture the env-var-derived config at the moment the var is
+        // live. The loader trims the value and compares against "1";
+        // any other value would resolve `require_header = false`.
+        let cfg = TenantConfig::from_env();
+        assert!(
+            cfg.require_header,
+            "TENSOR_WASM_API_REQUIRE_TENANT=1 must yield require_header=true",
+        );
 
-            let router = tenant_router(cfg);
-            let req = Request::builder()
-                .method(Method::GET)
-                .uri("/probe")
-                .body(Body::empty())
-                .unwrap();
+        let router = tenant_router(cfg);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .body(Body::empty())
+            .unwrap();
 
-            // Drive the async oneshot on a private current-thread runtime
-            // so we do not need a `#[tokio::test]` attribute (which is
-            // incompatible with the synchronous `temp_env::with_var` scope).
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("current-thread runtime");
-            let (status, body) = rt.block_on(async move {
-                let resp = router.oneshot(req).await.unwrap();
-                let status = resp.status();
-                let body = body_json(resp.into_body()).await;
-                (status, body)
-            });
+        // Drive the async oneshot on a private current-thread runtime
+        // so we do not need a `#[tokio::test]` attribute (which is
+        // incompatible with the synchronous `temp_env::with_var` scope).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let (status, body) = rt.block_on(async move {
+            let resp = router.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = body_json(resp.into_body()).await;
+            (status, body)
+        });
 
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(
-                error_kind(&body),
-                Some("missing_tenant"),
-                "TENSOR_WASM_API_REQUIRE_TENANT=1 + absent header must surface as \
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error_kind(&body),
+            Some("missing_tenant"),
+            "TENSOR_WASM_API_REQUIRE_TENANT=1 + absent header must surface as \
                  missing_tenant: got {body}"
-            );
-        },
-    );
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------

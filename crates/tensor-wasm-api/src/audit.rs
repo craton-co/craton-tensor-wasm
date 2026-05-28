@@ -407,10 +407,7 @@ impl FileJsonSink {
     /// parent directory).
     pub fn open(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             path,
             file: Mutex::new(file),
@@ -1181,10 +1178,7 @@ mod tests {
 
     #[test]
     fn actor_from_bearer_context_renders_as_bearer() {
-        let ctx = AuthContext::with_scope(
-            "alpha",
-            TokenScope::from_tenants([TenantId(1)]),
-        );
+        let ctx = AuthContext::with_scope("alpha", TokenScope::from_tenants([TenantId(1)]));
         let actor = actor_from_auth(&ctx);
         assert_eq!(actor.kind, AuditActorKind::Bearer);
         assert!(actor.token_id.is_some());
@@ -1215,7 +1209,8 @@ mod tests {
         let dir = std::env::temp_dir();
         // Unique per-process file so parallel test runs don't collide.
         static N: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
-        let n = N.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+        let n = N
+            .get_or_init(|| std::sync::atomic::AtomicU64::new(0))
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = dir.join(format!(
             "tensor-wasm-audit-test-{}-{n}.log",

@@ -22,10 +22,10 @@
 
 use std::time::Duration;
 
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tensor_wasm_core::types::{InstanceId, TenantId};
 use tensor_wasm_snapshot::reader::SnapshotReader;
 use tensor_wasm_snapshot::writer::{InstanceState, SnapshotWriter};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 /// Build a `(wasm, gpu, regs)` triple totalling roughly `size_bytes`.
 fn fixture_bytes(size_bytes: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {

@@ -34,7 +34,11 @@ use base64::Engine;
 use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig};
 
 async fn body_bytes(body: Body) -> Vec<u8> {
-    body.collect().await.expect("collect body").to_bytes().to_vec()
+    body.collect()
+        .await
+        .expect("collect body")
+        .to_bytes()
+        .to_vec()
 }
 
 async fn body_json(body: Body) -> Value {

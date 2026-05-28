@@ -98,11 +98,7 @@ pub fn analyse(wasm: &[u8]) -> Result<Vec<OffloadVerdict>, AnalyseError> {
             // the detector approve cold code that would never amortise the
             // offload setup cost.
             let trip_count = if saw_loop { Some(128) } else { None };
-            let block = BlockIR::new(
-                format!("func{func_idx}"),
-                detector_ops.clone(),
-                trip_count,
-            );
+            let block = BlockIR::new(format!("func{func_idx}"), detector_ops.clone(), trip_count);
             let v = classify_default(&block);
             let op_count = detector_ops.len();
             let v128 = detector_ops.iter().filter(|o| o.is_v128()).count();

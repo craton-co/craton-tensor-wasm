@@ -44,7 +44,9 @@ fn put_rejects_payload_over_cap() {
     let store = DiskArtifactStore::new(tmp.path().to_path_buf(), [0x11u8; 32]);
     let payload = vec![0u8; MAX_PAYLOAD_LEN + 1];
 
-    let err = store.put(&payload).expect_err("must reject oversized payload");
+    let err = store
+        .put(&payload)
+        .expect_err("must reject oversized payload");
     match err {
         ArtifactError::TooLarge { actual, limit } => {
             assert_eq!(actual, MAX_PAYLOAD_LEN + 1, "actual size in error");
@@ -85,7 +87,10 @@ fn sign(key: &[u8; 32], bytes: &[u8]) -> [u8; ARTIFACT_HMAC_LEN] {
 /// Re-implemented here for the same reason `sign` above is.
 fn key_fp_hex(key: &[u8; 32]) -> String {
     let h = blake3::hash(&key[..]);
-    h.as_bytes()[..8].iter().map(|b| format!("{:02x}", b)).collect()
+    h.as_bytes()[..8]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 #[test]
@@ -102,8 +107,8 @@ fn get_rejects_zstd_bomb_over_cap() {
     let plaintext = vec![0u8; plaintext_len];
     // Level 1 is plenty: zeros compress to a tiny ratio regardless of
     // level, and a lower level keeps test wall-time down.
-    let zstd_body = zstd::encode_all(plaintext.as_slice(), DEFAULT_ZSTD_LEVEL)
-        .expect("zstd encode");
+    let zstd_body =
+        zstd::encode_all(plaintext.as_slice(), DEFAULT_ZSTD_LEVEL).expect("zstd encode");
     // Drop the huge plaintext immediately so peak RSS is bounded by
     // `plaintext_len + zstd_body.len()` during encode and by
     // `zstd_body.len() + decompressed_buffer` during the get below.
@@ -117,9 +122,8 @@ fn get_rejects_zstd_bomb_over_cap() {
     let content_hash_field = [0u8; 32];
 
     // Assemble: magic || version || content_hash || zstd(body)
-    let mut framed: Vec<u8> = Vec::with_capacity(
-        ARTIFACT_HEADER_LEN + zstd_body.len() + ARTIFACT_HMAC_LEN,
-    );
+    let mut framed: Vec<u8> =
+        Vec::with_capacity(ARTIFACT_HEADER_LEN + zstd_body.len() + ARTIFACT_HMAC_LEN);
     framed.write_all(&ARTIFACT_MAGIC).unwrap();
     framed.write_all(&ARTIFACT_VERSION.to_le_bytes()).unwrap();
     framed.write_all(&content_hash_field).unwrap();

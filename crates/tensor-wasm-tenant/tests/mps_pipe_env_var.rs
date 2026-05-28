@@ -21,8 +21,8 @@
 
 use std::fs::File;
 
-use tensor_wasm_tenant::{MpsDecision, TenantRegistry, MPS_PIPE_DIRECTORY_ENV};
 use tempfile::tempdir;
+use tensor_wasm_tenant::{MpsDecision, TenantRegistry, MPS_PIPE_DIRECTORY_ENV};
 
 #[test]
 fn mps_pipe_env_var_precedence_and_then_cached() {

@@ -100,8 +100,7 @@ fn build_snapshot(
     gpu_memory: Vec<u8>,
     registers: Vec<u8>,
 ) -> Snapshot {
-    let total_uncompressed_bytes =
-        (wasm_memory.len() + gpu_memory.len() + registers.len()) as u64;
+    let total_uncompressed_bytes = (wasm_memory.len() + gpu_memory.len() + registers.len()) as u64;
     let crc32 = payload_crc32(&wasm_memory, &gpu_memory, &registers);
     Snapshot {
         magic: SNAPSHOT_MAGIC,

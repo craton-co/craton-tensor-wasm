@@ -94,10 +94,7 @@ fn two_keys_in_same_dir_produce_distinct_paths_and_dont_collide() {
         paths.len(),
         paths,
     );
-    assert_ne!(
-        paths[0], paths[1],
-        "the two on-disk paths must be distinct"
-    );
+    assert_ne!(paths[0], paths[1], "the two on-disk paths must be distinct");
 
     // Assertion #2: each cache reads back only its own entry. We drop
     // the writer caches and reload from disk to make sure the L1 hit

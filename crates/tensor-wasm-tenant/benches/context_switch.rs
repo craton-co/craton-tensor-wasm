@@ -19,11 +19,9 @@
 
 use std::time::Duration;
 
-use tensor_wasm_core::types::TenantId;
-use tensor_wasm_tenant::{
-    IsolationKind, RegistryAdminCapability, TenantContext, TenantRegistry,
-};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use tensor_wasm_core::types::TenantId;
+use tensor_wasm_tenant::{IsolationKind, RegistryAdminCapability, TenantContext, TenantRegistry};
 
 fn populate(n: u64) -> (TenantRegistry, RegistryAdminCapability) {
     let (reg, cap) = TenantRegistry::new();

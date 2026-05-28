@@ -69,10 +69,7 @@ fn admin_cap_from_foreign_registry_is_rejected_via_strict_api() {
 
     // A's cap on A: every strict variant succeeds.
     assert_eq!(reg_a.len_strict(&cap_a).unwrap(), 1);
-    assert!(reg_a
-        .get_strict(TenantId(100), &cap_a)
-        .unwrap()
-        .is_some());
+    assert!(reg_a.get_strict(TenantId(100), &cap_a).unwrap().is_some());
     let snap = reg_a.tenants_strict(&cap_a).unwrap();
     assert_eq!(snap.len(), 1);
     assert_eq!(snap[0].id(), TenantId(100));
@@ -176,10 +173,7 @@ fn clone_of_registry_shares_token_so_caps_remain_valid() {
     // `cap` was minted by `reg`. After cloning, it must still work on
     // `reg_clone` because the clone shares the same token allocation.
     assert_eq!(reg_clone.len_strict(&cap).unwrap(), 1);
-    assert!(reg_clone
-        .get_strict(TenantId(1), &cap)
-        .unwrap()
-        .is_some());
+    assert!(reg_clone.get_strict(TenantId(1), &cap).unwrap().is_some());
 }
 
 #[test]

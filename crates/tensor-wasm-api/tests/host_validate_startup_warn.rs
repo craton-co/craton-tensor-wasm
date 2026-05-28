@@ -61,9 +61,7 @@
 use std::sync::{Arc, Mutex, Once};
 
 use tensor_wasm_api::server::__reset_host_validation_warn_for_test;
-use tensor_wasm_api::{
-    build_router, AppState, ENV_API_TOKENS, ENV_TRUSTED_HOSTS,
-};
+use tensor_wasm_api::{build_router, AppState, ENV_API_TOKENS, ENV_TRUSTED_HOSTS};
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
@@ -166,8 +164,7 @@ impl tracing::field::Visit for MessageVisitor {
 /// the suffix.
 fn install_capturing_subscriber() -> Arc<Mutex<Vec<CapturedEvent>>> {
     static INIT: Once = Once::new();
-    static EVENTS: std::sync::OnceLock<Arc<Mutex<Vec<CapturedEvent>>>> =
-        std::sync::OnceLock::new();
+    static EVENTS: std::sync::OnceLock<Arc<Mutex<Vec<CapturedEvent>>>> = std::sync::OnceLock::new();
     let events = EVENTS
         .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
         .clone();

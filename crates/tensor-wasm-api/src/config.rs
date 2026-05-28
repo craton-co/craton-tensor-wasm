@@ -100,7 +100,10 @@ impl std::fmt::Debug for AppConfig {
                     .as_ref()
                     .map(|_| "<REDACTED 32-byte HMAC key>"),
             )
-            .field("snapshot_require_signature", &self.snapshot_require_signature)
+            .field(
+                "snapshot_require_signature",
+                &self.snapshot_require_signature,
+            )
             .finish()
     }
 }
@@ -258,10 +261,9 @@ impl fmt::Display for ConfigError {
                      (32 bytes); got {actual}",
                     expected = SNAPSHOT_HMAC_KEY_LEN * 2,
                 ),
-                HexParseReason::InvalidCharacter => write!(
-                    f,
-                    "{var} must contain only hex characters (0-9, a-f, A-F)",
-                ),
+                HexParseReason::InvalidCharacter => {
+                    write!(f, "{var} must contain only hex characters (0-9, a-f, A-F)",)
+                }
             },
             ConfigError::InvalidBool { var, value } => write!(
                 f,

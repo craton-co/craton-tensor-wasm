@@ -84,12 +84,8 @@ fn bench_try_new(c: &mut Criterion) {
                 // measures the cost of *attempting* validation, not the
                 // cost of unwrapping the result. The `miss` case
                 // legitimately returns `Err(UnknownRoute)`.
-                let _ = HttpRequestLabels::try_new_with_allowlist(
-                    *route,
-                    "GET",
-                    200,
-                    Some(&allowlist),
-                );
+                let _ =
+                    HttpRequestLabels::try_new_with_allowlist(*route, "GET", 200, Some(&allowlist));
             });
         });
     }

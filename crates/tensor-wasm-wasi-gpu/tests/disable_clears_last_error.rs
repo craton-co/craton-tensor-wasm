@@ -41,7 +41,10 @@ fn disable_wasi_cuda_clears_last_error() {
 
     // Enable, record, then disable.
     ctx.enable_wasi_cuda();
-    assert!(ctx.wasi_cuda_enabled(), "enable_wasi_cuda must flip the flag");
+    assert!(
+        ctx.wasi_cuda_enabled(),
+        "enable_wasi_cuda must flip the flag"
+    );
     ctx.record_error_for_test("transient failure while enabled");
     assert_eq!(
         ctx.last_error().as_deref(),

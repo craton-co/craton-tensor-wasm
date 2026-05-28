@@ -105,5 +105,8 @@ fn streaming_put_at_cap_boundary_succeeds() {
     let got = store.get(&hash).expect("get at cap must succeed");
     assert_eq!(got.len(), MAX_PAYLOAD_LEN);
     assert_eq!(got[0], 0);
-    assert_eq!(got[MAX_PAYLOAD_LEN - 1], ((MAX_PAYLOAD_LEN - 1) & 0xFF) as u8);
+    assert_eq!(
+        got[MAX_PAYLOAD_LEN - 1],
+        ((MAX_PAYLOAD_LEN - 1) & 0xFF) as u8
+    );
 }

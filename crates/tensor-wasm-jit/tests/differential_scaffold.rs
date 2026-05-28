@@ -17,8 +17,7 @@ use tensor_wasm_jit::differential::{
 use tensor_wasm_jit::ir::{TensorWasmKernelBlueprint, TensorWasmOp};
 
 fn fixture_blueprint() -> TensorWasmKernelBlueprint {
-    TensorWasmKernelBlueprint::new("oracle_fixture")
-        .push(TensorWasmOp::VecAdd { lanes: 4 })
+    TensorWasmKernelBlueprint::new("oracle_fixture").push(TensorWasmOp::VecAdd { lanes: 4 })
 }
 
 #[test]

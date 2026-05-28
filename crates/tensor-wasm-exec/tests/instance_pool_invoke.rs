@@ -48,10 +48,7 @@ async fn invoke_without_pool_uses_spawn_path() {
     let wasm = noop_wasm();
 
     let cfg = SpawnConfig::for_tenant(TenantId(1));
-    let r = exec
-        .invoke(cfg, &wasm, "noop", &[])
-        .await
-        .expect("invoke");
+    let r = exec.invoke(cfg, &wasm, "noop", &[]).await.expect("invoke");
     // No-op export returns an empty result list.
     assert_eq!(r, serde_json::Value::Array(Vec::new()));
     // Instance was auto-terminated by the spawn_instance + then_terminate
@@ -72,10 +69,7 @@ async fn pool_pre_spawns_warm_instances_on_first_acquire() {
 
     let wasm = noop_wasm();
     let cfg = SpawnConfig::for_tenant(TenantId(1));
-    let _r = exec
-        .invoke(cfg, &wasm, "noop", &[])
-        .await
-        .expect("invoke");
+    let _r = exec.invoke(cfg, &wasm, "noop", &[]).await.expect("invoke");
 
     // After one invoke: pool was pre-warmed (2 instances), one was
     // drawn for the invoke, and one was placed back as a fresh
@@ -108,16 +102,16 @@ async fn pool_reuse_resets_guest_globals_to_initial_state() {
 
     for i in 0..3 {
         let cfg = SpawnConfig::for_tenant(tenant);
-        let result = exec
-            .invoke(cfg, &wasm, "tick", &[])
-            .await
-            .expect("invoke");
+        let result = exec.invoke(cfg, &wasm, "tick", &[]).await.expect("invoke");
         // Each invoke against a freshly-reset (or freshly-spawned)
         // instance must report `1` — the global starts at 0 and the
         // function increments before returning. If the pool returned
         // a recycled-without-reset instance, iterations 1+ would
         // observe values > 1.
-        let n = result.as_array().and_then(|a| a.first()).and_then(|v| v.as_i64());
+        let n = result
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_i64());
         assert_eq!(
             n,
             Some(1),
@@ -246,7 +240,10 @@ async fn pool_typed_args_pass_through_to_export() {
         .invoke(cfg, &adder, "add", &[WasmArg::I32(2), WasmArg::I32(40)])
         .await
         .expect("invoke add");
-    let n = result.as_array().and_then(|a| a.first()).and_then(|v| v.as_i64());
+    let n = result
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_i64());
     assert_eq!(n, Some(42));
 }
 

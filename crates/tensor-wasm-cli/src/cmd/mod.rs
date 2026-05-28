@@ -87,10 +87,7 @@ impl HttpContext {
     /// [`Self::from_env_for_test_with_token`] but lets a test exercise the
     /// "no token configured" branch deterministically.
     #[doc(hidden)]
-    pub fn from_env_for_test_with_token_optional(
-        token: Option<String>,
-        tenant: u64,
-    ) -> Self {
+    pub fn from_env_for_test_with_token_optional(token: Option<String>, tenant: u64) -> Self {
         Self { token, tenant }
     }
 
@@ -467,9 +464,7 @@ pub async fn bounded_bytes(
 /// Almost every CLI call site needs a `String` for `render_error_response`
 /// / `serde_json::from_str`, so this is the canonical helper to reach for.
 #[doc(hidden)]
-pub async fn bounded_text(
-    resp: reqwest::Response,
-) -> std::result::Result<String, ApiClientError> {
+pub async fn bounded_text(resp: reqwest::Response) -> std::result::Result<String, ApiClientError> {
     let bytes = bounded_bytes(resp).await?;
     String::from_utf8(bytes).map_err(ApiClientError::Utf8)
 }

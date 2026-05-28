@@ -125,7 +125,11 @@ fn thirty_two_threads_register_disjoint_ids_concurrently() {
     // Every id is retrievable, and the lookup returns the same Arc the
     // winning registration handed back — no fresh allocations on get.
     let winners = winners.lock().unwrap();
-    assert_eq!(winners.len(), THREADS, "every thread should have parked its winner");
+    assert_eq!(
+        winners.len(),
+        THREADS,
+        "every thread should have parked its winner"
+    );
     for (id, winner_arc) in winners.iter() {
         let looked_up = reg
             .get(*id, &cap)

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::TensorWasmEngine;
-use tensor_wasm_exec::executor::{TensorWasmExecutor, SpawnConfig};
+use tensor_wasm_exec::executor::{SpawnConfig, TensorWasmExecutor};
 
 fn noop_wasm() -> Vec<u8> {
     wat::parse_str(r#"(module (func (export "noop")))"#).expect("wat")

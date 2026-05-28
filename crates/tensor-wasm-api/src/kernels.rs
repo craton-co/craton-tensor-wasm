@@ -205,9 +205,7 @@ pub async fn publish_kernel(
              TENSOR_WASM_API_KERNEL_PUBLISH_TOKENS",
         ));
     }
-    let allow = publish_tokens
-        .map(|Extension(t)| t)
-        .unwrap_or_default();
+    let allow = publish_tokens.map(|Extension(t)| t).unwrap_or_default();
     if !allow.allows(auth.token_id) {
         return Err(ApiError::forbidden(
             "kernel_publish_scope_required",
@@ -216,15 +214,12 @@ pub async fn publish_kernel(
         ));
     }
 
-    let registry = state
-        .kernel_registry
-        .as_ref()
-        .ok_or_else(|| {
-            ApiError::service_unavailable(
-                "kernel_registry_not_configured",
-                "set TENSOR_WASM_API_KERNEL_HMAC_KEY to enable /kernels",
-            )
-        })?;
+    let registry = state.kernel_registry.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "kernel_registry_not_configured",
+            "set TENSOR_WASM_API_KERNEL_HMAC_KEY to enable /kernels",
+        )
+    })?;
     // The InMemoryRegistry::publish does signature + digest verification.
     // Snapshot the (name, version) BEFORE handing the manifest off — the
     // call takes the manifest by value so we cannot read its fields on
@@ -270,9 +265,7 @@ pub async fn publish_kernel(
             // for a manifest we just verified, so the bytes are well-
             // formed). Map to 500 internal — there is no client action
             // that resolves this.
-            tensor_wasm_jit::registry::RegistryError::Codec(_) => {
-                ApiError::internal(e.to_string())
-            }
+            tensor_wasm_jit::registry::RegistryError::Codec(_) => ApiError::internal(e.to_string()),
             // Forward-compat catch-all: future RegistryError variants
             // (e.g. NotFound, which `publish` cannot actually produce
             // today) collapse to 400 invalid_request rather than masking
@@ -313,21 +306,17 @@ pub async fn list_kernels(
     Extension(_tenant): Extension<TenantId>,
     Query(query): Query<ListKernelsQuery>,
 ) -> Result<Json<ListKernelsResponse>, ApiError> {
-    let registry = state
-        .kernel_registry
-        .as_ref()
-        .ok_or_else(|| {
-            ApiError::service_unavailable(
-                "kernel_registry_not_configured",
-                "set TENSOR_WASM_API_KERNEL_HMAC_KEY to enable /kernels",
-            )
-        })?;
+    let registry = state.kernel_registry.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "kernel_registry_not_configured",
+            "set TENSOR_WASM_API_KERNEL_HMAC_KEY to enable /kernels",
+        )
+    })?;
     let offset = query.offset.unwrap_or(0);
     let raw_limit = query
         .limit
         .unwrap_or(tensor_wasm_jit::registry::DISK_REGISTRY_DEFAULT_LIMIT);
-    let effective_limit =
-        raw_limit.min(tensor_wasm_jit::registry::DISK_REGISTRY_MAX_LIMIT);
+    let effective_limit = raw_limit.min(tensor_wasm_jit::registry::DISK_REGISTRY_MAX_LIMIT);
     Ok(Json(ListKernelsResponse {
         manifests: registry.list_paginated(offset, effective_limit),
         offset,
@@ -351,15 +340,12 @@ pub async fn resolve_kernel(
     Extension(_tenant): Extension<TenantId>,
     Path((name, version)): Path<(String, String)>,
 ) -> Result<Json<ResolveKernelResponse>, ApiError> {
-    let registry = state
-        .kernel_registry
-        .as_ref()
-        .ok_or_else(|| {
-            ApiError::service_unavailable(
-                "kernel_registry_not_configured",
-                "set TENSOR_WASM_API_KERNEL_HMAC_KEY to enable /kernels",
-            )
-        })?;
+    let registry = state.kernel_registry.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "kernel_registry_not_configured",
+            "set TENSOR_WASM_API_KERNEL_HMAC_KEY to enable /kernels",
+        )
+    })?;
     let entry = registry
         .get(&name, &version)
         .map_err(|_| ApiError::not_found(format!("kernel {name}@{version} not found")))?;

@@ -41,8 +41,8 @@ fn spawn_config_default_args_is_empty() {
 
 #[test]
 fn with_args_captures_supplied_list() {
-    let cfg = SpawnConfig::for_tenant(TenantId(1))
-        .with_args(vec![WasmArg::I32(1), WasmArg::I32(2)]);
+    let cfg =
+        SpawnConfig::for_tenant(TenantId(1)).with_args(vec![WasmArg::I32(1), WasmArg::I32(2)]);
     assert_eq!(cfg.args.len(), 2);
     assert_eq!(cfg.args[0], WasmArg::I32(1));
     assert_eq!(cfg.args[1], WasmArg::I32(2));
@@ -57,8 +57,8 @@ fn with_args_captures_supplied_list() {
 async fn spawn_with_args_then_call_export_succeeds() {
     let engine = Arc::new(TensorWasmEngine::new().expect("engine"));
     let exec = TensorWasmExecutor::new(engine);
-    let cfg = SpawnConfig::for_tenant(TenantId(1))
-        .with_args(vec![WasmArg::I32(3), WasmArg::I32(4)]);
+    let cfg =
+        SpawnConfig::for_tenant(TenantId(1)).with_args(vec![WasmArg::I32(3), WasmArg::I32(4)]);
     let id = exec
         .spawn_instance(cfg, &adder_wasm())
         .await

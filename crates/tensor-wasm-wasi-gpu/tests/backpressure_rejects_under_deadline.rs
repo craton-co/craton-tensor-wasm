@@ -11,9 +11,7 @@
 use std::time::{Duration, Instant};
 
 use tensor_wasm_wasi_gpu::abi::AbiError;
-use tensor_wasm_wasi_gpu::async_dispatch::{
-    BackPressure, BackPressureError, DEADLINE_NEAR_WINDOW,
-};
+use tensor_wasm_wasi_gpu::async_dispatch::{BackPressure, BackPressureError, DEADLINE_NEAR_WINDOW};
 
 #[tokio::test]
 async fn cap2_near_deadline_rejects_new_acquires_with_typed_error() {
@@ -86,7 +84,10 @@ async fn no_deadline_clone_passes_acquire_through() {
     // a permit because the inner Arc is shared.
     assert_eq!(bp_base.active(), 0);
     // bp_none must succeed; bp_near must refuse.
-    let permit = bp_none.acquire_borrowed().await.expect("no-deadline succeeds");
+    let permit = bp_none
+        .acquire_borrowed()
+        .await
+        .expect("no-deadline succeeds");
     assert_eq!(bp_base.active(), 1);
     let err = bp_near
         .acquire_borrowed()

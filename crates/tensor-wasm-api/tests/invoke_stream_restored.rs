@@ -216,11 +216,8 @@ async fn cross_tenant_returns_403() {
         TokenScope::from_tenants([TenantId(1), TenantId(2)]),
     );
     let auth = AuthConfig::from_scopes(scopes);
-    let router = build_router_with_config(
-        Arc::new(AppState::default()),
-        auth,
-        TenantConfig::default(),
-    );
+    let router =
+        build_router_with_config(Arc::new(AppState::default()), auth, TenantConfig::default());
 
     // Deploy the trivial fixture with an in-scope tenant header so the
     // bearer is accepted.

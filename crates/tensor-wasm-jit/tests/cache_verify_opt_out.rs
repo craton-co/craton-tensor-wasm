@@ -78,9 +78,7 @@ fn verify_on_get_false_skips_recompute() {
     // Opting out: each L1 hit increments the skip counter that backs
     // `tensor_wasm_jit_cache_verify_skipped_total` and the BLAKE3
     // recompute is not performed.
-    let cache = KernelCache::with_config(
-        KernelCacheConfig::default().with_verify_on_get(false),
-    );
+    let cache = KernelCache::with_config(KernelCacheConfig::default().with_verify_on_get(false));
     assert!(
         !cache.config().verify_on_get,
         "explicit opt-out must persist in the cache config"
@@ -127,9 +125,7 @@ fn verify_on_get_false_still_rejects_zero_hash() {
     // `put` rejects this same shape eagerly, so we bypass it via the
     // doc-hidden test-only insert to install a hostile entry directly
     // into L1 storage.
-    let cache = KernelCache::with_config(
-        KernelCacheConfig::default().with_verify_on_get(false),
-    );
+    let cache = KernelCache::with_config(KernelCacheConfig::default().with_verify_on_get(false));
     let key = CacheKey::for_tenant(TenantId(3), 0xBADD_F00D, 80);
     let bad = CachedKernel {
         fingerprint: 0xBADD_F00D,

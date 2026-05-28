@@ -201,11 +201,7 @@ pub async fn http_metrics_middleware(req: Request, next: Next) -> Response {
     // Snapshot the config; if the production router was bypassed, fall
     // through to a plain pass-through so misconfigured test drivers do not
     // panic.
-    let Some(cfg) = req
-        .extensions()
-        .get::<HttpMetricsLayerConfig>()
-        .cloned()
-    else {
+    let Some(cfg) = req.extensions().get::<HttpMetricsLayerConfig>().cloned() else {
         return next.run(req).await;
     };
 

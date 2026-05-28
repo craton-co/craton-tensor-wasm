@@ -78,8 +78,7 @@ async fn empty_args_unchanged_for_unit_export() {
     let engine = Arc::new(TensorWasmEngine::new().expect("engine"));
     let exec = TensorWasmExecutor::new(engine);
 
-    let wasm =
-        wat::parse_str(r#"(module (func (export "noop")))"#).expect("noop wat compiles");
+    let wasm = wat::parse_str(r#"(module (func (export "noop")))"#).expect("noop wat compiles");
     let id = exec
         .spawn_instance(SpawnConfig::for_tenant(TenantId(1)), &wasm)
         .await

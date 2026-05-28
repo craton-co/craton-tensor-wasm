@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig};
 use tower::ServiceExt;
 
 async fn body_json(body: Body) -> Value {
@@ -112,8 +112,7 @@ async fn invoke_async_failure_recorded_as_failed_with_kind() {
     // A module with no `_start` and no `main` should make the executor
     // return MissingExport, which the async path records as Failed with
     // kind="missing_export".
-    let wasm_bytes =
-        wat::parse_str(r#"(module (func (export "noop")))"#).expect("wat");
+    let wasm_bytes = wat::parse_str(r#"(module (func (export "noop")))"#).expect("wat");
     let wasm_b64 = BASE64.encode(&wasm_bytes);
 
     let router = router();

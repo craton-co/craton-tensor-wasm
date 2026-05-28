@@ -274,7 +274,10 @@ mod tests {
         let op = lower_float_inst(fx.inst, &fx.func, &map, &mut next).expect("fadd lowers");
         match op {
             LoweredOp::AddF {
-                ty, lhs, rhs, result,
+                ty,
+                lhs,
+                rhs,
+                result,
             } => {
                 assert_eq!(ty, LoweredType::F32);
                 assert_eq!(lhs, 0);

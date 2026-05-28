@@ -13,10 +13,8 @@
 
 use std::time::Duration;
 
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use tensor_wasm_wasi_gpu::async_dispatch::{BackPressure, DispatchFuture};
-use criterion::{
-    criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
 
 fn bench_serial(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()

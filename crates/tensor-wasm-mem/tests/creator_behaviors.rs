@@ -108,9 +108,7 @@ fn creator_with_pool_device_mismatch_warns_on_fallback() {
     // Pool on device 0; creator targets device 7 — and the pool is too
     // small to carve a single Wasm page so the very first allocation
     // exhausts it and trips the fallback path that emits the warning.
-    let pool = Arc::new(
-        UnifiedMemoryPool::new_on(1024, DeviceId(0)).expect("pool on device 0"),
-    );
+    let pool = Arc::new(UnifiedMemoryPool::new_on(1024, DeviceId(0)).expect("pool on device 0"));
     let creator = TensorWasmMemoryCreator::with_pool(DeviceId(7), pool);
 
     let subscriber = tracing_subscriber::registry().with(capture);

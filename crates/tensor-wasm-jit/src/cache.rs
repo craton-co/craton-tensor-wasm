@@ -32,9 +32,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
-use tensor_wasm_artifacts::{
-    ArtifactError, ArtifactStore, ContentHash, DiskArtifactStore,
-};
+use tensor_wasm_artifacts::{ArtifactError, ArtifactStore, ContentHash, DiskArtifactStore};
 use tensor_wasm_core::types::TenantId;
 use zeroize::Zeroizing;
 
@@ -567,24 +565,24 @@ impl KernelCache {
             // inner `CachedKernel` value.
             let kernel: Arc<CachedKernel> = Arc::clone(entry.value());
             drop(entry); // release shard lock before the hash recompute
-            // jit S-3: verify the in-memory entry hasn't been tampered
-            // with since `put`. A mismatch should be impossible (the
-            // `CachedKernel` is owned by the cache and never handed out
-            // mutably) but failing closed costs ~µs over the public
-            // PTX bytes and definitively closes the in-mem poisoning
-            // path the audit flagged.
-            //
-            // The recompute can be opted out of via
-            // [`KernelCacheConfig::verify_on_get`] for high-QPS callers
-            // where the ~10 µs BLAKE3 cost over multi-MB PTX dominates.
-            // Even on the opt-out path we keep a cheap defence-in-depth
-            // check: refuse entries whose `integrity_hash` is all-zero,
-            // because that is the signature of a `CachedKernel`
-            // constructed via the `#[doc(hidden)]` struct-literal path
-            // without [`CachedKernel::new`] having computed a real hash.
-            // A real BLAKE3 over any PTX text is overwhelmingly unlikely
-            // to collide with the zero hash (probability `2^-256`), so
-            // the rejection is unambiguous.
+                         // jit S-3: verify the in-memory entry hasn't been tampered
+                         // with since `put`. A mismatch should be impossible (the
+                         // `CachedKernel` is owned by the cache and never handed out
+                         // mutably) but failing closed costs ~µs over the public
+                         // PTX bytes and definitively closes the in-mem poisoning
+                         // path the audit flagged.
+                         //
+                         // The recompute can be opted out of via
+                         // [`KernelCacheConfig::verify_on_get`] for high-QPS callers
+                         // where the ~10 µs BLAKE3 cost over multi-MB PTX dominates.
+                         // Even on the opt-out path we keep a cheap defence-in-depth
+                         // check: refuse entries whose `integrity_hash` is all-zero,
+                         // because that is the signature of a `CachedKernel`
+                         // constructed via the `#[doc(hidden)]` struct-literal path
+                         // without [`CachedKernel::new`] having computed a real hash.
+                         // A real BLAKE3 over any PTX text is overwhelmingly unlikely
+                         // to collide with the zero hash (probability `2^-256`), so
+                         // the rejection is unambiguous.
             if self.config.verify_on_get {
                 if !kernel.verify_integrity() {
                     tracing::error!(
@@ -1049,8 +1047,7 @@ impl DiskCache {
         let mut cache_key_hex_buf = [0u8; 32];
         hex::encode_to_slice(&digest[..16], &mut cache_key_hex_buf)
             .expect("32 byte buf for 16 byte input");
-        let cache_key_hex =
-            std::str::from_utf8(&cache_key_hex_buf).expect("hex is utf8");
+        let cache_key_hex = std::str::from_utf8(&cache_key_hex_buf).expect("hex is utf8");
         // First 8 bytes of blake3(hmac_key), packed LE → u64 → 16 hex chars.
         // `&self.hmac_key[..]` Deref-borrows the underlying `[u8; 32]` and
         // takes the full slice; `Zeroizing` is `Deref<Target=[u8; 32]>`.
@@ -1061,8 +1058,7 @@ impl DiskCache {
         let mut key_prefix_buf = [0u8; 16];
         hex::encode_to_slice(&key_fp.as_bytes()[..8], &mut key_prefix_buf)
             .expect("16 byte buf for 8 byte input");
-        let key_prefix_hex =
-            std::str::from_utf8(&key_prefix_buf).expect("hex is utf8");
+        let key_prefix_hex = std::str::from_utf8(&key_prefix_buf).expect("hex is utf8");
         self.dir
             .join(format!("{key_prefix_hex}-{cache_key_hex}.ptxbin"))
     }
@@ -1134,8 +1130,7 @@ impl DiskCache {
         let sidecar_path = self.path_for(key);
         let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
         tmp.as_file_mut().write_all(&sidecar)?;
-        tmp.persist(&sidecar_path)
-            .map_err(std::io::Error::other)?;
+        tmp.persist(&sidecar_path).map_err(std::io::Error::other)?;
         Ok(())
     }
 
@@ -1393,7 +1388,11 @@ mod tests {
         });
         cache.put(
             key,
-            CachedKernel::new(bp.fingerprint(), original.clone(), CompiledHandle::default()),
+            CachedKernel::new(
+                bp.fingerprint(),
+                original.clone(),
+                CompiledHandle::default(),
+            ),
         );
         let hit = cache.get(&key).expect("cache hit");
         // The hit returns the same underlying allocation — no re-emit.
@@ -1414,11 +1413,8 @@ mod tests {
             let cache = cache.clone();
             handles.push(thread::spawn(move || {
                 for i in 0..KEYS_PER_THREAD {
-                    let key = CacheKey::for_tenant(
-                        TenantId(0),
-                        (t as u64) * KEYS_PER_THREAD + i,
-                        80,
-                    );
+                    let key =
+                        CacheKey::for_tenant(TenantId(0), (t as u64) * KEYS_PER_THREAD + i, 80);
                     cache.put(key, dummy_kernel(key.blueprint));
                     // Interleave reads of own and (possibly absent) others.
                     let _ = cache.get(&key);
@@ -1431,11 +1427,7 @@ mod tests {
         // Every key written must still be retrievable.
         for t in 0..N_THREADS {
             for i in 0..KEYS_PER_THREAD {
-                let key = CacheKey::for_tenant(
-                    TenantId(0),
-                    (t as u64) * KEYS_PER_THREAD + i,
-                    80,
-                );
+                let key = CacheKey::for_tenant(TenantId(0), (t as u64) * KEYS_PER_THREAD + i, 80);
                 assert!(
                     cache.get(&key).is_some(),
                     "missing key after concurrent inserts: ({t}, {i})"

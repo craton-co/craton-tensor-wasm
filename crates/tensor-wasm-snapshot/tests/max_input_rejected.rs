@@ -21,9 +21,7 @@ fn input_one_byte_over_cap_is_rejected_before_zstd() {
         // Not enough RAM on this host to materialise the oversized buffer;
         // the cap is still enforced by the same code path the in-RAM run
         // would have exercised, so a skip here does not weaken coverage.
-        eprintln!(
-            "skipping max_input_rejected: host lacks {oversize} bytes of free RAM"
-        );
+        eprintln!("skipping max_input_rejected: host lacks {oversize} bytes of free RAM");
         return;
     }
     buf.resize(oversize, 0);

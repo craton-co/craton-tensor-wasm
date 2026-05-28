@@ -16,9 +16,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use http_body_util::BodyExt;
 use serde_json::json;
-use tensor_wasm_api::{
-    build_router_with_config, AppState, AuthConfig, TenantConfig,
-};
+use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, TenantConfig};
 use tower::ServiceExt;
 
 /// Minimal but legal empty Wasm module. Matches the fixture used by
@@ -83,7 +81,9 @@ async fn healthz_increments_counter_with_route_template_label() {
     // handler returns the body), so /healthz must show count == 1 here.
     let body = scrape_metrics(&router).await;
     assert!(
-        body.contains("tensor_wasm_http_requests_total{route=\"/healthz\",method=\"GET\",status=\"200\"} 1"),
+        body.contains(
+            "tensor_wasm_http_requests_total{route=\"/healthz\",method=\"GET\",status=\"200\"} 1"
+        ),
         "missing /healthz counter sample in:\n{body}"
     );
     // Histogram sample for /healthz must exist (count series).
@@ -137,9 +137,7 @@ async fn create_function_post_emits_counter_and_histogram() {
                 && line.contains("method=\"POST\"")
                 && line.contains("status=\"200\"")
         })
-        .unwrap_or_else(|| {
-            panic!("missing /functions histogram bucket sample in:\n{body}")
-        });
+        .unwrap_or_else(|| panic!("missing /functions histogram bucket sample in:\n{body}"));
     assert!(
         bucket_line.contains("le=\""),
         "histogram bucket line is missing `le` label: {bucket_line}"

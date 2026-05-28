@@ -41,9 +41,7 @@ use tensor_wasm_api::{
     build_router_with_kernel_publish_tokens, AppState, AuditConfig, AuthConfig, CorsConfig,
     KernelPublishTokens, RateLimitConfig, RateLimiter, TenantConfig, TrustedProxies,
 };
-use tensor_wasm_jit::registry::{
-    sign_manifest, InMemoryRegistry, KernelManifest, KernelRegistry,
-};
+use tensor_wasm_jit::registry::{sign_manifest, InMemoryRegistry, KernelManifest, KernelRegistry};
 use tower::ServiceExt;
 
 /// HMAC key shared by every test below. Same constant the
@@ -64,8 +62,7 @@ const READ_ONLY_TOKEN: &str = "read-only-token";
 /// dispatch, but each successful-publish path still needs a backing
 /// registry, so we install one unconditionally.
 fn state_with_registry() -> Arc<AppState> {
-    let registry: Arc<dyn KernelRegistry> =
-        Arc::new(InMemoryRegistry::new(TEST_KEY));
+    let registry: Arc<dyn KernelRegistry> = Arc::new(InMemoryRegistry::new(TEST_KEY));
     Arc::new(AppState::default().with_kernel_registry(registry))
 }
 
@@ -113,10 +110,7 @@ fn publish_payload(name: &str, version: &str) -> Value {
 /// Build a router with the supplied auth-token allowlist and the
 /// supplied publish-token allowlist. Every test below uses this so the
 /// authorization knobs are explicit at the call site.
-fn router_with(
-    auth_tokens: &[&str],
-    publish_tokens: &[&str],
-) -> axum::Router {
+fn router_with(auth_tokens: &[&str], publish_tokens: &[&str]) -> axum::Router {
     let auth = if auth_tokens.is_empty() {
         AuthConfig::default()
     } else {

@@ -18,8 +18,8 @@
 //! routes themselves.
 
 use tensor_wasm_api::{
-    AppConfig, ConfigError, HexParseReason, ENV_SNAPSHOT_HMAC_KEY,
-    ENV_SNAPSHOT_REQUIRE_SIGNATURE, SNAPSHOT_HMAC_KEY_LEN,
+    AppConfig, ConfigError, HexParseReason, ENV_SNAPSHOT_HMAC_KEY, ENV_SNAPSHOT_REQUIRE_SIGNATURE,
+    SNAPSHOT_HMAC_KEY_LEN,
 };
 
 #[test]
@@ -61,7 +61,10 @@ fn snapshot_hmac_env_var_round_trip() {
     // --- Case 4: surrounding whitespace stripped -----------------------
     std::env::set_var(ENV_SNAPSHOT_HMAC_KEY, format!("  {hex}\n"));
     let cfg = AppConfig::from_env().expect("trimmed hex parses");
-    assert!(cfg.snapshot_hmac_key.is_some(), "trim should accept padding");
+    assert!(
+        cfg.snapshot_hmac_key.is_some(),
+        "trim should accept padding"
+    );
 
     // --- Case 5: short hex string → hard error -------------------------
     std::env::set_var(ENV_SNAPSHOT_HMAC_KEY, "deadbeef");
@@ -99,16 +102,25 @@ fn snapshot_hmac_env_var_round_trip() {
     std::env::set_var(ENV_SNAPSHOT_HMAC_KEY, hex);
     std::env::set_var(ENV_SNAPSHOT_REQUIRE_SIGNATURE, "true");
     let cfg = AppConfig::from_env().expect("true parses");
-    assert!(cfg.snapshot_require_signature, "true must turn the toggle on");
+    assert!(
+        cfg.snapshot_require_signature,
+        "true must turn the toggle on"
+    );
 
     std::env::set_var(ENV_SNAPSHOT_REQUIRE_SIGNATURE, "FALSE");
     let cfg = AppConfig::from_env().expect("FALSE parses");
-    assert!(!cfg.snapshot_require_signature, "FALSE must turn the toggle off");
+    assert!(
+        !cfg.snapshot_require_signature,
+        "FALSE must turn the toggle off"
+    );
 
     // --- Case 9: garbage bool → hard error ----------------------------
     std::env::set_var(ENV_SNAPSHOT_REQUIRE_SIGNATURE, "yes");
     let err = AppConfig::from_env().expect_err("non-bool must fail");
-    assert!(matches!(err, ConfigError::InvalidBool { .. }), "got {err:?}");
+    assert!(
+        matches!(err, ConfigError::InvalidBool { .. }),
+        "got {err:?}"
+    );
 
     // --- Case 10: require=true with no key emits warn but still loads -
     std::env::remove_var(ENV_SNAPSHOT_HMAC_KEY);

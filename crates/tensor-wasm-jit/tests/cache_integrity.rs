@@ -179,8 +179,7 @@ fn disk_cache_rejects_tampered_payload() {
     // 52-byte header prefix and the 32-byte HMAC tail). The body is
     // HMAC-covered, so any bit-flip here invalidates the MAC and the
     // store rejects on read.
-    let flip_at =
-        ARTIFACT_HEADER_LEN + (bytes.len() - ARTIFACT_HEADER_LEN - ARTIFACT_HMAC_LEN) / 2;
+    let flip_at = ARTIFACT_HEADER_LEN + (bytes.len() - ARTIFACT_HEADER_LEN - ARTIFACT_HMAC_LEN) / 2;
     bytes[flip_at] ^= 0xFF;
     std::fs::write(&path, &bytes).expect("rewrite tampered blob");
 

@@ -372,7 +372,7 @@ pub fn emit_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{TensorWasmKernelBlueprint, TensorWasmOp, GridHint};
+    use crate::ir::{GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
 
     #[test]
     fn vector_add_emits_add_f32() {
@@ -419,10 +419,7 @@ mod tests {
                 k: 16,
             })
             .push(TensorWasmOp::StoreUnified { lanes: 4 });
-        assert!(matches!(
-            emit(&bp),
-            Err(EmitError::NotYetImplemented(_))
-        ));
+        assert!(matches!(emit(&bp), Err(EmitError::NotYetImplemented(_))));
     }
 
     #[test]

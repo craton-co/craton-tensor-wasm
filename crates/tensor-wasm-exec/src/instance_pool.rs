@@ -365,7 +365,10 @@ impl InstancePool {
         // remains. If it overruns the budget we drop the replacement
         // and let the next acquire spawn fresh on its own time.
         let start = Instant::now();
-        let replacement = match executor.rebuild_pooled_from_module(cfg, &entry.module).await {
+        let replacement = match executor
+            .rebuild_pooled_from_module(cfg, &entry.module)
+            .await
+        {
             Ok(inst) => inst,
             Err(err) => {
                 // Reset failed — defensible failure modes are
@@ -452,8 +455,7 @@ impl InstancePool {
                 break;
             }
             if i == 0 {
-                let (inst, module, _) =
-                    executor.build_pooled_instance(cfg, wasm).await?;
+                let (inst, module, _) = executor.build_pooled_instance(cfg, wasm).await?;
                 if sender.try_send(inst).is_err() {
                     // Channel filled by a concurrent pre-warm? Drop
                     // and release the slot — defence against the
@@ -493,8 +495,7 @@ impl InstancePool {
                 // here too and immediately release the slot + drop the
                 // instance — simplest path that keeps every internal
                 // invariant honest.
-                let (inst, module, _) =
-                    executor.build_pooled_instance(cfg, wasm).await?;
+                let (inst, module, _) = executor.build_pooled_instance(cfg, wasm).await?;
                 drop(inst);
                 executor.release_instance_slot();
                 module

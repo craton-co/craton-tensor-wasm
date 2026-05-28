@@ -19,10 +19,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use clap::Args;
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::TensorWasmEngine;
 use tensor_wasm_exec::executor::{SpawnConfig, TensorWasmExecutor, WasmArg};
-use clap::Args;
 
 /// Arguments to `tensor-wasm run`.
 #[derive(Debug, Args)]

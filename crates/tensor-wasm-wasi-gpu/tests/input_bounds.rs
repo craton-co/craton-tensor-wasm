@@ -17,9 +17,7 @@
 //! [`MAX_RECORDED_ERROR_BYTES`] and [`MAX_ENTRY_NAME_BYTES`].
 
 use tensor_wasm_core::types::InstanceId;
-use tensor_wasm_wasi_gpu::host::{
-    WasiCudaContext, MAX_ENTRY_NAME_BYTES, MAX_RECORDED_ERROR_BYTES,
-};
+use tensor_wasm_wasi_gpu::host::{WasiCudaContext, MAX_ENTRY_NAME_BYTES, MAX_RECORDED_ERROR_BYTES};
 
 /// `record_error` must truncate messages longer than
 /// [`MAX_RECORDED_ERROR_BYTES`] (and append a single ellipsis) so a

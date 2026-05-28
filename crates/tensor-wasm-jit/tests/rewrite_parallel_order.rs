@@ -48,9 +48,7 @@ fn build_n_candidate_module(n: usize) -> Vec<u8> {
         ));
         // Unique op count per slot: `16 + i` v128 adds.
         for _ in 0..(16 + i) {
-            wat.push_str(
-                "      (local.set $v (i32x4.add (local.get $v) (local.get $v)))\n",
-            );
+            wat.push_str("      (local.set $v (i32x4.add (local.get $v) (local.get $v)))\n");
         }
         wat.push_str("    )\n    (i32.const 0)\n  )\n");
     }
@@ -141,8 +139,7 @@ fn parallel_analyse_preserves_source_order_for_16_candidates() {
         .collect();
     for trial in 0..4 {
         let cache_n = KernelCache::new();
-        let out_n =
-            rewrite_wasm(&wasm, &permissive_opts(), &cache_n).expect("re-run rewrite");
+        let out_n = rewrite_wasm(&wasm, &permissive_opts(), &cache_n).expect("re-run rewrite");
         let observed: Vec<(u32, u64)> = out_n
             .offloaded_functions
             .iter()

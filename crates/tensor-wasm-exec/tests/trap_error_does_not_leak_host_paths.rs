@@ -27,17 +27,16 @@ use tensor_wasm_exec::executor::{SpawnConfig, TensorWasmExecutor};
 /// represents a class of host-internal detail that the pre-fix `format!("{err:#}")`
 /// path was observed to (or could plausibly) emit.
 const FORBIDDEN_SUBSTRINGS: &[&str] = &[
-    "0x",            // any hex pointer address (also covers e.g. "0x1234abcd")
-    "/usr/",         // POSIX system paths
-    "\\\\?\\C:\\",   // Windows extended-length device paths
+    "0x",               // any hex pointer address (also covers e.g. "0x1234abcd")
+    "/usr/",            // POSIX system paths
+    "\\\\?\\C:\\",      // Windows extended-length device paths
     "wasmtime/runtime", // wasmtime internal module path
-    "__libc_",       // glibc symbol names from stack traces
-    "cranelift",     // Cranelift compiler internals
+    "__libc_",          // glibc symbol names from stack traces
+    "cranelift",        // Cranelift compiler internals
 ];
 
 fn trapping_wasm() -> Vec<u8> {
-    wat::parse_str(r#"(module (func (export "go") (unreachable)))"#)
-        .expect("trapping wat parses")
+    wat::parse_str(r#"(module (func (export "go") (unreachable)))"#).expect("trapping wat parses")
 }
 
 fn assert_no_leaks(label: &str, rendered: &str) {

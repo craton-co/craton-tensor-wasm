@@ -21,14 +21,14 @@ use axum::http::{Method, Request, StatusCode};
 use axum::middleware::from_fn;
 use axum::routing::get;
 use axum::{Json, Router};
-use tensor_wasm_api::{
-    build_router_with_config, AppState, AuthConfig, TenantConfig, HEADER_TENANT,
-};
-use tensor_wasm_core::types::TenantId;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use tensor_wasm_api::{
+    build_router_with_config, AppState, AuthConfig, TenantConfig, HEADER_TENANT,
+};
+use tensor_wasm_core::types::TenantId;
 use tower::ServiceExt;
 
 async fn body_json(body: Body) -> Value {
@@ -53,9 +53,7 @@ fn probe_router(cfg: TenantConfig) -> Router {
     let stack = tower::ServiceBuilder::new()
         .layer(axum::Extension(cfg))
         .layer(from_fn(tensor_wasm_api::middleware::tenant_scope));
-    Router::new()
-        .route("/probe", get(echo_tenant))
-        .layer(stack)
+    Router::new().route("/probe", get(echo_tenant)).layer(stack)
 }
 
 #[tokio::test]

@@ -9,10 +9,12 @@
 
 use std::fs;
 
+use tempfile::NamedTempFile;
 use tensor_wasm_core::types::{InstanceId, TenantId};
 use tensor_wasm_snapshot::reader::SnapshotReader;
-use tensor_wasm_snapshot::writer::{InstanceState, SnapshotWriter, SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
-use tempfile::NamedTempFile;
+use tensor_wasm_snapshot::writer::{
+    InstanceState, SnapshotWriter, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
+};
 
 /// Build a deterministic-but-not-trivial set of memory bodies so the test
 /// catches off-by-one / aliasing bugs in the writer.
@@ -91,11 +93,13 @@ fn re_export_at_crate_root_works() {
 /// accidental switch to varint) without us noticing.
 #[test]
 fn bincode_legacy_encoding_is_deterministic_across_calls() {
-    use tensor_wasm_snapshot::writer::{Snapshot, SnapshotMetadata};
     use tensor_wasm_snapshot::payload_crc32;
+    use tensor_wasm_snapshot::writer::{Snapshot, SnapshotMetadata};
 
     let wasm: Vec<u8> = (0u32..1024).map(|i| (i % 251) as u8).collect();
-    let gpu: Vec<u8> = (0u32..512).map(|i| ((i.wrapping_mul(31)) % 253) as u8).collect();
+    let gpu: Vec<u8> = (0u32..512)
+        .map(|i| ((i.wrapping_mul(31)) % 253) as u8)
+        .collect();
     let regs: Vec<u8> = (0u32..64).map(|i| ((i ^ 0x5A) & 0xFF) as u8).collect();
     let crc = payload_crc32(&wasm, &gpu, &regs);
 

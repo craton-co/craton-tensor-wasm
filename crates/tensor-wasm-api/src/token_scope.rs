@@ -150,9 +150,7 @@ impl fmt::Display for ScopeParseError {
             ScopeParseError::MissingBearer => {
                 f.write_str("token entry has scope clause but no bearer token")
             }
-            ScopeParseError::EmptyTenantList => {
-                f.write_str("tenant= clause has no value")
-            }
+            ScopeParseError::EmptyTenantList => f.write_str("tenant= clause has no value"),
             ScopeParseError::InvalidTenant(s) => {
                 write!(f, "tenant id {s:?} is neither '*' nor a u64")
             }
@@ -295,8 +293,7 @@ pub fn parse_tokens_env(env_value: &str) -> ParsedTokens {
         // `foo`) is treated as a new entry — otherwise `a:tenant=*,foo` would
         // silently glue `foo` onto the wildcard list and fail with
         // `WildcardMixedWithIds`, rather than parsing as two entries.
-        let looks_like_tenant_continuation =
-            trimmed == "*" || trimmed.parse::<u64>().is_ok();
+        let looks_like_tenant_continuation = trimmed == "*" || trimmed.parse::<u64>().is_ok();
         if in_tenant_list && !has_colon && looks_like_tenant_continuation {
             // Continuation of the previous entry's tenant list.
             current.push(',');
@@ -401,8 +398,14 @@ mod tests {
 
     #[test]
     fn parse_empty_entry_errors() {
-        assert_eq!(parse_token_entry("").unwrap_err(), ScopeParseError::EmptyEntry);
-        assert_eq!(parse_token_entry("   ").unwrap_err(), ScopeParseError::EmptyEntry);
+        assert_eq!(
+            parse_token_entry("").unwrap_err(),
+            ScopeParseError::EmptyEntry
+        );
+        assert_eq!(
+            parse_token_entry("   ").unwrap_err(),
+            ScopeParseError::EmptyEntry
+        );
     }
 
     #[test]

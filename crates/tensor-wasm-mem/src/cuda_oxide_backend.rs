@@ -558,9 +558,8 @@ mod host_backend {
             // Make the primary context current on this thread so the
             // driver call below is well-defined. Mirrors cuda-core's own
             // `bind_to_thread` discipline.
-            ctx.bind_to_thread().map_err(|e| {
-                UnifiedError::Cuda(format!("CudaContext::bind_to_thread: {e:?}"))
-            })?;
+            ctx.bind_to_thread()
+                .map_err(|e| UnifiedError::Cuda(format!("CudaContext::bind_to_thread: {e:?}")))?;
 
             let mut raw: cuda_sys::CUdeviceptr = 0;
             // SAFETY: `raw` is a valid out-parameter; `size > 0`; the
@@ -575,14 +574,10 @@ mod host_backend {
                 )
             };
             if res != cuda_sys::cudaError_enum_CUDA_SUCCESS {
-                return Err(UnifiedError::Cuda(format!(
-                    "cuMemAllocManaged -> {res:?}"
-                )));
+                return Err(UnifiedError::Cuda(format!("cuMemAllocManaged -> {res:?}")));
             }
             let ptr = NonNull::new(raw as *mut u8).ok_or_else(|| {
-                UnifiedError::Allocation(
-                    "cuMemAllocManaged returned null with CUDA_SUCCESS".into(),
-                )
+                UnifiedError::Allocation("cuMemAllocManaged returned null with CUDA_SUCCESS".into())
             })?;
             Ok(Self {
                 ptr,
@@ -747,9 +742,7 @@ mod host_backend {
             // not been freed yet; the cached `Arc<CudaContext>` we hold
             // ensures the primary context is still alive when we call
             // `cuMemFree_v2`.
-            let res = unsafe {
-                cuda_sys::cuMemFree_v2(raw_ptr as cuda_sys::CUdeviceptr)
-            };
+            let res = unsafe { cuda_sys::cuMemFree_v2(raw_ptr as cuda_sys::CUdeviceptr) };
             if res != cuda_sys::cudaError_enum_CUDA_SUCCESS {
                 // Failed free: the driver still considers the VA mapped,
                 // so the next allocator pass could hand it to another
@@ -794,9 +787,9 @@ mod host_backend {
     ) -> Result<(), UnifiedError> {
         // Re-bind the buffer's owning context onto this thread so the
         // driver call below targets the correct primary context.
-        buf.ctx.bind_to_thread().map_err(|e| {
-            UnifiedError::Cuda(format!("CudaContext::bind_to_thread: {e:?}"))
-        })?;
+        buf.ctx
+            .bind_to_thread()
+            .map_err(|e| UnifiedError::Cuda(format!("CudaContext::bind_to_thread: {e:?}")))?;
         let ptr = buf.ptr.as_ptr() as cuda_sys::CUdeviceptr;
         let size = buf.size;
         let (advice_kind, device) = match advice {
@@ -804,9 +797,7 @@ mod host_backend {
             CudaOxideAdvice::PreferredLocation(d) => {
                 (CU_MEM_ADVISE_SET_PREFERRED_LOCATION_INLINE, d.0 as i32)
             }
-            CudaOxideAdvice::AccessedBy(d) => {
-                (CU_MEM_ADVISE_SET_ACCESSED_BY_INLINE, d.0 as i32)
-            }
+            CudaOxideAdvice::AccessedBy(d) => (CU_MEM_ADVISE_SET_ACCESSED_BY_INLINE, d.0 as i32),
             CudaOxideAdvice::UnsetPreferredLocation => {
                 (CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION_INLINE, 0i32)
             }
@@ -818,9 +809,7 @@ mod host_backend {
         // CudaOxideUnifiedBuffer. `advice_kind as _` casts the numeric
         // `u32` constant into whatever the bindgen-generated enum repr is
         // (typedef'd to `i32` on every CUDA toolkit version observed).
-        let res = unsafe {
-            cuda_sys::cuMemAdvise(ptr, size, advice_kind as _, device)
-        };
+        let res = unsafe { cuda_sys::cuMemAdvise(ptr, size, advice_kind as _, device) };
         if res == cuda_sys::cudaError_enum_CUDA_SUCCESS {
             Ok(())
         } else {
@@ -843,9 +832,9 @@ mod host_backend {
         buf: &CudaOxideUnifiedBuffer,
         dst_device: DeviceId,
     ) -> Result<(), UnifiedError> {
-        buf.ctx.bind_to_thread().map_err(|e| {
-            UnifiedError::Cuda(format!("CudaContext::bind_to_thread: {e:?}"))
-        })?;
+        buf.ctx
+            .bind_to_thread()
+            .map_err(|e| UnifiedError::Cuda(format!("CudaContext::bind_to_thread: {e:?}")))?;
         let dst = if dst_device.0 == u32::MAX {
             CU_DEVICE_CPU
         } else {

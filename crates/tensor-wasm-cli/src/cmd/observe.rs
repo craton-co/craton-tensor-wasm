@@ -186,7 +186,7 @@ fn parse_labels(raw: &str) -> HashMap<String, String> {
         }
         let key = raw[key_start..i].trim().to_string();
         i += 1; // skip `=`
-        // Expect a quote.
+                // Expect a quote.
         if i >= bytes.len() {
             break;
         }
@@ -351,17 +351,10 @@ async fn fetch_healthz(client: &reqwest::Client, ctx: &HttpContext, base: &str) 
     }
 }
 
-async fn fetch_metrics(
-    client: &reqwest::Client,
-    ctx: &HttpContext,
-    base: &str,
-) -> Result<String> {
+async fn fetch_metrics(client: &reqwest::Client, ctx: &HttpContext, base: &str) -> Result<String> {
     let url = format!("{base}/metrics");
     let req = ctx.apply(client.get(&url));
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
+    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
     let status = resp.status();
     let text = resp.text().await.with_context(|| format!("read {url}"))?;
     if !status.is_success() {
@@ -555,12 +548,7 @@ fn scalar(metrics: &Metrics, name: &str) -> Option<f64> {
 /// matching label *and* extra dimensions (e.g. `status`, `method`) are
 /// aggregated by summing the cumulative bucket counts — the operator-facing
 /// quantile is intentionally per-route, not per-status.
-fn histogram_quantile(
-    metrics: &Metrics,
-    base_name: &str,
-    route: &str,
-    q: f64,
-) -> Option<f64> {
+fn histogram_quantile(metrics: &Metrics, base_name: &str, route: &str, q: f64) -> Option<f64> {
     let bucket_name = format!("{base_name}_bucket");
     let series = metrics.get(&bucket_name)?;
     // First filter to the samples that name our route, then collapse
@@ -628,10 +616,7 @@ fn parse_uptime_seconds(body: &str) -> Option<u64> {
         if let Some(pos) = body.find(&needle) {
             let after = &body[pos + needle.len()..];
             let after = after.trim_start_matches([' ', ':', '\t']);
-            let num: String = after
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
+            let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
             if let Ok(v) = num.parse::<u64>() {
                 return Some(v);
             }
@@ -786,15 +771,22 @@ tensor_wasm_gpu_memory_used_bytes 1073741824
     fn scalar_returns_single_observation() {
         let m = parse_metrics(SAMPLE_BODY);
         assert_eq!(scalar(&m, "tensor_wasm_active_instances"), Some(3.0));
-        assert_eq!(scalar(&m, "tensor_wasm_kernel_dispatches_total"), Some(17.0));
+        assert_eq!(
+            scalar(&m, "tensor_wasm_kernel_dispatches_total"),
+            Some(17.0)
+        );
         assert!(scalar(&m, "tensor_wasm_does_not_exist").is_none());
     }
 
     #[test]
     fn histogram_quantile_interpolates_buckets() {
         let m = parse_metrics(SAMPLE_BODY);
-        let p50 =
-            histogram_quantile(&m, "tensor_wasm_http_request_duration_seconds", "/invoke", 0.5);
+        let p50 = histogram_quantile(
+            &m,
+            "tensor_wasm_http_request_duration_seconds",
+            "/invoke",
+            0.5,
+        );
         // 50% of 10 = 5. The 0.01 bucket has count=5 exactly, so p50 == 0.01.
         assert!(p50.is_some());
         assert!((p50.unwrap() - 0.01).abs() < 1e-9);
@@ -877,9 +869,7 @@ tensor_wasm_gpu_memory_used_bytes 1073741824
 
     #[test]
     fn render_board_computes_rate_between_snapshots() {
-        let metrics_now = parse_metrics(
-            "tensor_wasm_http_requests_total{path=\"/invoke\"} 100\n",
-        );
+        let metrics_now = parse_metrics("tensor_wasm_http_requests_total{path=\"/invoke\"} 100\n");
         let t0 = Instant::now() - Duration::from_secs(2);
         let t1 = Instant::now();
         let prev = Snapshot {

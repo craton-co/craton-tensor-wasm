@@ -287,14 +287,8 @@ async fn audit_record_round_trips_through_serde_json() {
         back["request_id"].as_str().is_some(),
         "request_id is a string",
     );
-    assert!(
-        back["ts_unix_ms"].as_u64().is_some(),
-        "ts_unix_ms is a u64",
-    );
-    assert!(
-        back["latency_ms"].as_u64().is_some(),
-        "latency_ms is a u64",
-    );
+    assert!(back["ts_unix_ms"].as_u64().is_some(), "ts_unix_ms is a u64",);
+    assert!(back["latency_ms"].as_u64().is_some(), "latency_ms is a u64",);
 }
 
 #[tokio::test]

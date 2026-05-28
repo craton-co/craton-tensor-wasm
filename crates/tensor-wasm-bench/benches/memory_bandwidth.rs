@@ -15,8 +15,8 @@
 
 use std::time::Duration;
 
-use tensor_wasm_mem::pinned_host::GuardedHostBuffer;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use tensor_wasm_mem::pinned_host::GuardedHostBuffer;
 
 fn bench_sequential_copy(c: &mut Criterion) {
     let mut group = c.benchmark_group("memory_bandwidth/sequential");

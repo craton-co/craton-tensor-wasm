@@ -148,8 +148,8 @@ fn forged_trailer_with_kind_byte_in_mac_input_reaches_post_hmac_pipeline() {
     // will fail at the magic / bincode layer. The point is to land *past*
     // the HMAC gate, proving the verifier accepted the trailer.
     let garbage = vec![0u8; 32];
-    let compressed_prefix = zstd::encode_all(garbage.as_slice(), DEFAULT_ZSTD_LEVEL)
-        .expect("zstd encode garbage");
+    let compressed_prefix =
+        zstd::encode_all(garbage.as_slice(), DEFAULT_ZSTD_LEVEL).expect("zstd encode garbage");
 
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&KEY).expect("HMAC init");
     mac.update(&compressed_prefix);

@@ -24,8 +24,8 @@ use std::sync::Arc;
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_jit::cache::{CacheKey, KernelCache, KernelCacheConfig};
 use tensor_wasm_jit::registry::{
-    sign_manifest, InMemoryBlueprintResolver, InMemoryRegistry,
-    KernelManifest, KernelRegistry, RegistryError,
+    sign_manifest, InMemoryBlueprintResolver, InMemoryRegistry, KernelManifest, KernelRegistry,
+    RegistryError,
 };
 
 /// Helper: build a signed manifest for `ptx_text` under `key`.
@@ -219,12 +219,7 @@ fn registry_signature_verified_at_publish_not_resolve() {
 #[test]
 fn no_registry_attached_returns_none_even_with_resolver_hit() {
     let mut resolver = InMemoryBlueprintResolver::new();
-    resolver.insert(
-        42,
-        80,
-        "matmul.f32".to_string(),
-        "1.0.0".to_string(),
-    );
+    resolver.insert(42, 80, "matmul.f32".to_string(), "1.0.0".to_string());
 
     // No registry attached.
     let cache = KernelCache::new();
@@ -247,12 +242,7 @@ fn registry_via_trait_object() {
     let reg_arc: Arc<dyn KernelRegistry> = Arc::new(reg);
 
     let mut resolver = InMemoryBlueprintResolver::new();
-    resolver.insert(
-        7,
-        80,
-        "attention.bf16".to_string(),
-        "0.2.1".to_string(),
-    );
+    resolver.insert(7, 80, "attention.bf16".to_string(), "0.2.1".to_string());
 
     let cache = KernelCache::with_config(KernelCacheConfig::default().with_registry(reg_arc));
     let cache_key = CacheKey::for_tenant(TenantId(1), 7, 80);

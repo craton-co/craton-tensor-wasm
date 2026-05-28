@@ -18,9 +18,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use tensor_wasm_core::types::TenantId;
 use serde_json::json;
 use subtle::ConstantTimeEq;
+use tensor_wasm_core::types::TenantId;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::classify::{ServerErrorsAsFailures, SharedClassifier};
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -766,7 +766,8 @@ pub async fn bearer_auth(mut req: Request, next: Next) -> Response {
         .unwrap_or_default();
 
     if cfg.is_dev_mode() {
-        req.extensions_mut().insert(crate::rate_limit::AuthContext::dev());
+        req.extensions_mut()
+            .insert(crate::rate_limit::AuthContext::dev());
         return next.run(req).await;
     }
 
@@ -1033,8 +1034,8 @@ fn sanitise_traceparent(raw: &str) -> std::borrow::Cow<'_, str> {
     }
 
     // Fast path: already short, already printable ASCII -> borrow.
-    let is_clean = raw.len() <= TRACEPARENT_MAX_BYTES
-        && raw.bytes().all(|b| (0x20..=0x7E).contains(&b));
+    let is_clean =
+        raw.len() <= TRACEPARENT_MAX_BYTES && raw.bytes().all(|b| (0x20..=0x7E).contains(&b));
     if is_clean {
         return Cow::Borrowed(raw);
     }
@@ -1119,9 +1120,9 @@ pub fn sanitize_path(raw: &str) -> std::borrow::Cow<'_, str> {
     // compiler fuse the checks; we only allocate when something
     // actually needs rewriting.
     let is_clean = raw.len() <= MAX_PATH_LEN
-        && raw.bytes().all(|b| {
-            (0x20..=0x7E).contains(&b) && b != b'\r' && b != b'\n' && b != 0
-        });
+        && raw
+            .bytes()
+            .all(|b| (0x20..=0x7E).contains(&b) && b != b'\r' && b != b'\n' && b != 0);
     if is_clean {
         return Cow::Borrowed(raw);
     }
@@ -1356,13 +1357,19 @@ mod tests {
     fn auth_config_from_tokens_defaults_to_wildcard_scope() {
         let cfg = AuthConfig::from_tokens(["foo"]);
         let scope = cfg.scope_for("foo").expect("scope present");
-        assert!(scope.tenants.is_all(), "from_tokens must default to wildcard");
+        assert!(
+            scope.tenants.is_all(),
+            "from_tokens must default to wildcard"
+        );
     }
 
     #[test]
     fn auth_config_from_scopes_round_trips() {
         let cfg = AuthConfig::from_scopes([
-            ("foo", crate::token_scope::TokenScope::from_tenants([TenantId(1)])),
+            (
+                "foo",
+                crate::token_scope::TokenScope::from_tenants([TenantId(1)]),
+            ),
             ("bar", crate::token_scope::TokenScope::all()),
         ]);
         assert!(cfg.accepts("foo"));

@@ -12,8 +12,8 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use tensor_wasm_api::{
-    build_router_with_full_config, AppState, AuthConfig, PerTenantRateLimitConfig,
-    RateLimitConfig, RateLimiter, TenantConfig,
+    build_router_with_full_config, AppState, AuthConfig, PerTenantRateLimitConfig, RateLimitConfig,
+    RateLimiter, TenantConfig,
 };
 use tower::ServiceExt;
 

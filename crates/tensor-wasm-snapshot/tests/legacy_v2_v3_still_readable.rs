@@ -35,7 +35,9 @@ use tensor_wasm_snapshot::writer::{InstanceState, SnapshotWriter, SNAPSHOT_MAGIC
 /// across files.
 fn synth_state() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let wasm: Vec<u8> = (0u32..2048).map(|i| (i % 251) as u8).collect();
-    let gpu: Vec<u8> = (0u32..1024).map(|i| ((i.wrapping_mul(17)) % 253) as u8).collect();
+    let gpu: Vec<u8> = (0u32..1024)
+        .map(|i| ((i.wrapping_mul(17)) % 253) as u8)
+        .collect();
     let regs: Vec<u8> = (0u32..64).map(|i| ((i ^ 0xA5) & 0xFF) as u8).collect();
     (wasm, gpu, regs)
 }

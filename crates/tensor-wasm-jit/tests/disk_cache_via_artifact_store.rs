@@ -143,10 +143,7 @@ fn t30_put_writes_sidecar_and_artifact_blob_with_v2_magic() {
     // and key reads the kernel back through the L2 path with the
     // launch_geometry preserved (T22 streaming + V2 envelope intact).
     drop(cache);
-    let reloaded = KernelCache::new().with_disk_persistence(DiskCacheConfig {
-        dir,
-        hmac_key,
-    });
+    let reloaded = KernelCache::new().with_disk_persistence(DiskCacheConfig { dir, hmac_key });
     let hit = reloaded
         .get(&key)
         .expect("L2 round-trip through the unified artifact store must hit");
@@ -197,8 +194,7 @@ fn t30_tampered_artifact_blob_is_treated_as_miss() {
         bytes.len() > ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN,
         "blob must have non-empty zstd body"
     );
-    let mid =
-        ARTIFACT_HEADER_LEN + (bytes.len() - ARTIFACT_HEADER_LEN - ARTIFACT_HMAC_LEN) / 2;
+    let mid = ARTIFACT_HEADER_LEN + (bytes.len() - ARTIFACT_HEADER_LEN - ARTIFACT_HMAC_LEN) / 2;
     bytes[mid] ^= 0xFF;
     std::fs::write(&blobs[0], &bytes).expect("rewrite tampered blob");
 
@@ -215,10 +211,7 @@ fn t30_tampered_artifact_blob_is_treated_as_miss() {
     // The cache must then collapse to a miss when the user calls `get`
     // through a fresh `KernelCache` (so no L1 entry masks the L2 path).
     drop(cache);
-    let reloaded = KernelCache::new().with_disk_persistence(DiskCacheConfig {
-        dir,
-        hmac_key,
-    });
+    let reloaded = KernelCache::new().with_disk_persistence(DiskCacheConfig { dir, hmac_key });
     assert!(
         reloaded.get(&key).is_none(),
         "tampered artifact-store blob must surface as a clean cache miss"

@@ -179,20 +179,17 @@ impl TenantMemPool {
             let mut props: cuda_sys::CUmemPoolProps = std::mem::zeroed();
             // `allocType` = pinned device memory. The release-threshold
             // attribute below only makes sense on a pinned pool.
-            props.allocType =
-                cuda_sys::CUmemAllocationType_enum::CU_MEM_ALLOCATION_TYPE_PINNED;
+            props.allocType = cuda_sys::CUmemAllocationType_enum::CU_MEM_ALLOCATION_TYPE_PINNED;
             // No IPC handle export: tenants live within a single
             // process today; cross-process shareable pools are a v0.5
             // follow-up.
-            props.handleTypes =
-                cuda_sys::CUmemAllocationHandleType_enum::CU_MEM_HANDLE_TYPE_NONE;
+            props.handleTypes = cuda_sys::CUmemAllocationHandleType_enum::CU_MEM_HANDLE_TYPE_NONE;
             // Location: device-local memory on the requested ordinal.
-            props.location.type_ =
-                cuda_sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE;
+            props.location.type_ = cuda_sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE;
             props.location.id = device_ordinal as core::ffi::c_int;
 
-            let res = cuda_sys::lib()
-                .cuMemPoolCreate(&mut pool as *mut cuda_sys::CUmemoryPool, &props);
+            let res =
+                cuda_sys::lib().cuMemPoolCreate(&mut pool as *mut cuda_sys::CUmemoryPool, &props);
             if res != cuda_sys::cudaError_enum::CUDA_SUCCESS {
                 return Err(MemPoolError::Create(format!("{res:?}")));
             }
@@ -329,10 +326,8 @@ impl TenantMemPool {
         // `UnifiedBuffer::drop` path that calls this method runs once
         // per buffer). The pool handle is still live (held by `self`).
         let res = unsafe {
-            cuda_sys::lib().cuMemFreeAsync(
-                ptr.as_ptr() as cuda_sys::CUdeviceptr,
-                std::ptr::null_mut(),
-            )
+            cuda_sys::lib()
+                .cuMemFreeAsync(ptr.as_ptr() as cuda_sys::CUdeviceptr, std::ptr::null_mut())
         };
         if res != cuda_sys::cudaError_enum::CUDA_SUCCESS {
             return Err(UnifiedError::Cuda(format!("cuMemFreeAsync -> {res:?}")));

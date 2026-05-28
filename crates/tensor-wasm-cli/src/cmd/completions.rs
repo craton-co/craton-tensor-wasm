@@ -64,15 +64,14 @@ pub fn run(shell: Shell, out_dir: Option<PathBuf>) -> Result<()> {
 /// fresh checkout does not fail on a missing `completions/` directory.
 fn ensure_dir(dir: &Path) -> Result<()> {
     if dir.exists() {
-        let meta = fs::metadata(dir)
-            .with_context(|| format!("stat'ing --out-dir {}", dir.display()))?;
+        let meta =
+            fs::metadata(dir).with_context(|| format!("stat'ing --out-dir {}", dir.display()))?;
         if !meta.is_dir() {
             anyhow::bail!("--out-dir {} exists but is not a directory", dir.display());
         }
         return Ok(());
     }
-    fs::create_dir_all(dir)
-        .with_context(|| format!("creating --out-dir {}", dir.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("creating --out-dir {}", dir.display()))?;
     Ok(())
 }
 

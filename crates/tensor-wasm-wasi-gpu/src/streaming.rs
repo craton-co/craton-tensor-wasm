@@ -133,7 +133,9 @@ impl StreamingContext {
     /// * `-3` if the receiver has been dropped — the downstream HTTP
     ///   client disconnected. The counter is rolled back symmetrically.
     pub async fn emit_chunk(&self, bytes: Vec<u8>) -> i32 {
-        let Some(s) = &self.sender else { return -1; };
+        let Some(s) = &self.sender else {
+            return -1;
+        };
         let added = bytes.len() as u64;
         // Optimistic-add + rollback-on-failure keeps the success path a
         // single atomic op while preserving an accurate running total

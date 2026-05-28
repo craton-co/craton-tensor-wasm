@@ -138,8 +138,8 @@ fn valid_hmac_over_corrupted_payload_still_reaches_bincode() {
     use sha2::Sha256;
 
     let garbage_uncompressed = vec![0xFFu8; 16];
-    let compressed_prefix = zstd::encode_all(garbage_uncompressed.as_slice(), DEFAULT_ZSTD_LEVEL)
-        .expect("zstd encode");
+    let compressed_prefix =
+        zstd::encode_all(garbage_uncompressed.as_slice(), DEFAULT_ZSTD_LEVEL).expect("zstd encode");
 
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&KEY).expect("HMAC init");
     mac.update(&compressed_prefix);

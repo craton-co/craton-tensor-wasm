@@ -49,9 +49,7 @@ fn imported_huge_memory_module() -> Vec<u8> {
     // Variant: the offending memory is *imported*, not exported. Pre-fix
     // we only would have inspected the instance after instantiation;
     // the host was still on the hook to honour the declared maximum.
-    let src = format!(
-        "(module (import \"env\" \"mem\" (memory {FOUR_GIB_PAGES})))",
-    );
+    let src = format!("(module (import \"env\" \"mem\" (memory {FOUR_GIB_PAGES})))",);
     wat::parse_str(&src).expect("valid wat")
 }
 

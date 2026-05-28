@@ -262,8 +262,7 @@ impl CudarcUnifiedBuffer {
         // We dodge `static_assertions` to keep the dep tree tight — a plain
         // `const _: () = assert!(...)` works on stable since 1.57.
         const _: () = assert!(
-            CU_MEM_ATTACH_GLOBAL
-                == cuda_sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL as u32,
+            CU_MEM_ATTACH_GLOBAL == cuda_sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL as u32,
             "cudarc renumbered CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL; \
              update the inlined constant in cudarc_backend.rs",
         );

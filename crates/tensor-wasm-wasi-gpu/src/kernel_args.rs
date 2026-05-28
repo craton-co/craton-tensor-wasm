@@ -749,14 +749,18 @@ mod tests {
         assert!(matches!(parsed[2], LoweredArg::F64(v) if v == 1.5));
         assert!(matches!(parsed[4], LoweredArg::U64(42)));
         match &parsed[1] {
-            LoweredArg::Ptr { guest_offset, len, .. } => {
+            LoweredArg::Ptr {
+                guest_offset, len, ..
+            } => {
                 assert_eq!(*guest_offset, 32);
                 assert_eq!(*len, 16);
             }
             _ => panic!("idx 1 not Ptr"),
         }
         match &parsed[3] {
-            LoweredArg::Ptr { guest_offset, len, .. } => {
+            LoweredArg::Ptr {
+                guest_offset, len, ..
+            } => {
                 assert_eq!(*guest_offset, 1024);
                 assert_eq!(*len, 8);
             }

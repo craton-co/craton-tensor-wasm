@@ -101,9 +101,7 @@ use pliron::{
 };
 use thiserror::Error;
 
-use crate::lowered_ir::{
-    LoweredBlockId, LoweredFunction, LoweredOp, LoweredType, LoweredValueId,
-};
+use crate::lowered_ir::{LoweredBlockId, LoweredFunction, LoweredOp, LoweredType, LoweredValueId};
 
 // ---------------------------------------------------------------------------
 // Custom `twasm.*` dialect ops.
@@ -325,8 +323,7 @@ pub fn lowered_function_to_pliron(
         .iter()
         .map(|t| translate_type(ctx, t))
         .collect::<Result<_, _>>()?;
-    let func_ty: TypePtr<FunctionType> =
-        FunctionType::get(ctx, param_types.clone(), return_types);
+    let func_ty: TypePtr<FunctionType> = FunctionType::get(ctx, param_types.clone(), return_types);
 
     // ---- 2. Create the FuncOp -----------------------------------------
     //
@@ -334,10 +331,11 @@ pub fn lowered_function_to_pliron(
     // already enforces non-empty + identifier-shaped names through the
     // detector reject list, but we guard here so a bad name surfaces
     // through our typed error instead of panicking in pliron internals.
-    let name_ident: pliron::identifier::Identifier =
-        func.name.as_str().try_into().map_err(|e| {
-            PlironConversionError::Context(format!("invalid function name: {e}"))
-        })?;
+    let name_ident: pliron::identifier::Identifier = func
+        .name
+        .as_str()
+        .try_into()
+        .map_err(|e| PlironConversionError::Context(format!("invalid function name: {e}")))?;
     let func_op = FuncOp::new(ctx, name_ident, func_ty);
     let func_op_ptr = func_op.get_operation();
 
@@ -388,10 +386,7 @@ pub fn lowered_function_to_pliron(
             .iter()
             .map(|(_, ty)| translate_type(ctx, ty))
             .collect::<Result<_, _>>()?;
-        let label = format!("bb{}", lowered_block.id)
-            .as_str()
-            .try_into()
-            .ok();
+        let label = format!("bb{}", lowered_block.id).as_str().try_into().ok();
         let bb = BasicBlock::new(ctx, label, arg_types);
         bb.insert_at_back(region, ctx);
         {
@@ -586,33 +581,25 @@ fn emit_op(
         LoweredOp::Fma { .. } => Err(PlironConversionError::NotYetWired { variant: "Fma" }),
         LoweredOp::FNeg { .. } => Err(PlironConversionError::NotYetWired { variant: "FNeg" }),
         LoweredOp::FAbs { .. } => Err(PlironConversionError::NotYetWired { variant: "FAbs" }),
-        LoweredOp::StackAlloc { .. } => {
-            Err(PlironConversionError::NotYetWired { variant: "StackAlloc" })
-        }
+        LoweredOp::StackAlloc { .. } => Err(PlironConversionError::NotYetWired {
+            variant: "StackAlloc",
+        }),
         LoweredOp::Switch { .. } => Err(PlironConversionError::NotYetWired { variant: "Switch" }),
         LoweredOp::VMin { .. } => Err(PlironConversionError::NotYetWired { variant: "VMin" }),
         LoweredOp::VMax { .. } => Err(PlironConversionError::NotYetWired { variant: "VMax" }),
         LoweredOp::VSplat { .. } => Err(PlironConversionError::NotYetWired { variant: "VSplat" }),
-        LoweredOp::VSelect { .. } => {
-            Err(PlironConversionError::NotYetWired { variant: "VSelect" })
-        }
-        LoweredOp::VAllTrue { .. } => {
-            Err(PlironConversionError::NotYetWired { variant: "VAllTrue" })
-        }
-        LoweredOp::VAnyTrue { .. } => {
-            Err(PlironConversionError::NotYetWired { variant: "VAnyTrue" })
-        }
+        LoweredOp::VSelect { .. } => Err(PlironConversionError::NotYetWired { variant: "VSelect" }),
+        LoweredOp::VAllTrue { .. } => Err(PlironConversionError::NotYetWired {
+            variant: "VAllTrue",
+        }),
+        LoweredOp::VAnyTrue { .. } => Err(PlironConversionError::NotYetWired {
+            variant: "VAnyTrue",
+        }),
         LoweredOp::Select { .. } => Err(PlironConversionError::NotYetWired { variant: "Select" }),
-        LoweredOp::Bitcast { .. } => {
-            Err(PlironConversionError::NotYetWired { variant: "Bitcast" })
-        }
+        LoweredOp::Bitcast { .. } => Err(PlironConversionError::NotYetWired { variant: "Bitcast" }),
         LoweredOp::TruncI { .. } => Err(PlironConversionError::NotYetWired { variant: "TruncI" }),
-        LoweredOp::ExtendU { .. } => {
-            Err(PlironConversionError::NotYetWired { variant: "ExtendU" })
-        }
-        LoweredOp::ExtendS { .. } => {
-            Err(PlironConversionError::NotYetWired { variant: "ExtendS" })
-        }
+        LoweredOp::ExtendU { .. } => Err(PlironConversionError::NotYetWired { variant: "ExtendU" }),
+        LoweredOp::ExtendS { .. } => Err(PlironConversionError::NotYetWired { variant: "ExtendS" }),
     }
 }
 
@@ -707,8 +694,8 @@ mod tests {
     fn convert_addi_single_block() {
         let mut ctx = Context::new();
         let func = addi_fn();
-        let op = lowered_function_to_pliron(&mut ctx, &func)
-            .expect("AddI conversion should succeed");
+        let op =
+            lowered_function_to_pliron(&mut ctx, &func).expect("AddI conversion should succeed");
 
         // The returned op should be a builtin.func.
         let op_ref = op.deref(&ctx);
@@ -728,7 +715,12 @@ mod tests {
         // The entry block should contain exactly 2 ops: addi + return.
         let entry = region.deref(&ctx).get_head().expect("entry block");
         let entry_ops: Vec<_> = entry.deref(&ctx).iter(&ctx).collect();
-        assert_eq!(entry_ops.len(), 2, "expected 2 ops, got {}", entry_ops.len());
+        assert_eq!(
+            entry_ops.len(),
+            2,
+            "expected 2 ops, got {}",
+            entry_ops.len()
+        );
 
         // First op should be twasm.addi.
         let first = entry_ops[0];
@@ -745,8 +737,8 @@ mod tests {
     fn convert_addf_single_block() {
         let mut ctx = Context::new();
         let func = addf_fn();
-        let op = lowered_function_to_pliron(&mut ctx, &func)
-            .expect("AddF conversion should succeed");
+        let op =
+            lowered_function_to_pliron(&mut ctx, &func).expect("AddF conversion should succeed");
 
         let op_ref = op.deref(&ctx);
         let opid = Operation::get_opid(op, &ctx);
@@ -786,8 +778,7 @@ mod tests {
         // looking up operands, so this still surfaces NotYetWired (which
         // is the contract under test). If a future agent wires VMin,
         // they should add new operand-aware fixtures.
-        let err = lowered_function_to_pliron(&mut ctx, &f)
-            .expect_err("VMin should not be wired");
+        let err = lowered_function_to_pliron(&mut ctx, &f).expect_err("VMin should not be wired");
         match err {
             PlironConversionError::NotYetWired { variant } => assert_eq!(variant, "VMin"),
             other => panic!("expected NotYetWired{{ variant: VMin }}, got {other:?}"),
@@ -824,8 +815,8 @@ mod tests {
         b0.ops.push(LoweredOp::Return { values: vec![] });
         f.blocks.push(b0);
 
-        let op = lowered_function_to_pliron(&mut ctx, &f)
-            .expect("Load/Store conversion should succeed");
+        let op =
+            lowered_function_to_pliron(&mut ctx, &f).expect("Load/Store conversion should succeed");
         let region = op.deref(&ctx).get_region(0);
         let entry = region.deref(&ctx).get_head().expect("entry block");
         let entry_ops: Vec<_> = entry.deref(&ctx).iter(&ctx).collect();
@@ -892,8 +883,8 @@ mod tests {
             args: vec![],
         });
         f.blocks.push(b0);
-        let err = lowered_function_to_pliron(&mut ctx, &f)
-            .expect_err("missing target should surface");
+        let err =
+            lowered_function_to_pliron(&mut ctx, &f).expect_err("missing target should surface");
         match err {
             PlironConversionError::UndefinedBlock(99) => {}
             other => panic!("expected UndefinedBlock(99), got {other:?}"),

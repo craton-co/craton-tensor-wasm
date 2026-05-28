@@ -279,8 +279,7 @@ mod tests {
     use super::*;
     use cranelift_codegen::ir::immediates::Offset32;
     use cranelift_codegen::ir::{
-        types, AbiParam, Function, MemFlags, Signature, StackSlotData, StackSlotKind,
-        UserFuncName,
+        types, AbiParam, Function, MemFlags, Signature, StackSlotData, StackSlotKind, UserFuncName,
     };
     use cranelift_codegen::isa::CallConv;
 
@@ -288,7 +287,12 @@ mod tests {
     /// pointer block param, and an `i32` second block param (for the
     /// value-to-store cases). Returns the function plus the two values
     /// and an empty value map seeded with them.
-    fn skeleton() -> (Function, ir::Value, ir::Value, HashMap<ir::Value, LoweredValueId>) {
+    fn skeleton() -> (
+        Function,
+        ir::Value,
+        ir::Value,
+        HashMap<ir::Value, LoweredValueId>,
+    ) {
         let mut sig = Signature::new(CallConv::SystemV);
         sig.params.push(AbiParam::new(types::I64)); // ptr-ish base
         sig.params.push(AbiParam::new(types::I32)); // store value
@@ -389,11 +393,8 @@ mod tests {
     #[test]
     fn lower_stack_load_first_touch_emits_alloca_then_load() {
         let (mut func, _base_v, _val_v, value_map) = skeleton();
-        let ss = func.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            16,
-            0,
-        ));
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 0));
         let inst = func.dfg.make_inst(InstructionData::StackLoad {
             opcode: Opcode::StackLoad,
             stack_slot: ss,
@@ -442,11 +443,8 @@ mod tests {
     #[test]
     fn lower_stack_load_second_touch_reuses_alloca() {
         let (mut func, _base_v, _val_v, value_map) = skeleton();
-        let ss = func.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            8,
-            0,
-        ));
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
         let inst = func.dfg.make_inst(InstructionData::StackLoad {
             opcode: Opcode::StackLoad,
             stack_slot: ss,
@@ -481,11 +479,8 @@ mod tests {
     #[test]
     fn lower_stack_store_first_touch_emits_alloca_then_store() {
         let (mut func, _base_v, val_v, value_map) = skeleton();
-        let ss = func.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            4,
-            0,
-        ));
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 0));
         let inst = func.dfg.make_inst(InstructionData::StackStore {
             opcode: Opcode::StackStore,
             arg: val_v,
@@ -585,8 +580,7 @@ mod tests {
             stack_slot_map: &mut stack_map,
             next_value_id: &mut next_id,
         };
-        let err = lower_memory_inst(inst, &func, &mut ctx)
-            .expect_err("unmapped base must error");
+        let err = lower_memory_inst(inst, &func, &mut ctx).expect_err("unmapped base must error");
         assert_eq!(err, MemLowerError::UnmappedValue(base_v));
     }
 

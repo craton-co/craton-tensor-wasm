@@ -141,7 +141,9 @@ impl From<LoweringError> for crate::pliron_dialect::PlironLoweringError {
     /// can bubble driver errors into the trait surface without churn
     /// later.
     fn from(err: LoweringError) -> Self {
-        Self::UnsupportedOp { op: err.to_string() }
+        Self::UnsupportedOp {
+            op: err.to_string(),
+        }
     }
 }
 
@@ -190,10 +192,7 @@ mod tests {
         };
         let s = err.to_string();
         assert!(s.contains("iadd_imm"), "got: {s}");
-        assert!(
-            s.contains("no lower_* family matched"),
-            "got: {s}"
-        );
+        assert!(s.contains("no lower_* family matched"), "got: {s}");
     }
 
     #[test]

@@ -100,9 +100,7 @@ fn cuda_oxide_scaffold_allocate_blocks_snapshot_producer_path() {
                 "expected RFC reference in sentinel error, got: {msg}",
             );
         }
-        other => panic!(
-            "expected UnifiedError::Cuda(NOT_YET_WIRED), got {other:?}",
-        ),
+        other => panic!("expected UnifiedError::Cuda(NOT_YET_WIRED), got {other:?}",),
     }
 }
 
@@ -136,9 +134,5 @@ fn cuda_oxide_host_backend_snapshot_round_trip_on_device() {
         regs_buf.as_mut_slice(),
     );
 
-    snapshot_round_trip_with_source(
-        wasm_buf.as_slice(),
-        gpu_buf.as_slice(),
-        regs_buf.as_slice(),
-    );
+    snapshot_round_trip_with_source(wasm_buf.as_slice(), gpu_buf.as_slice(), regs_buf.as_slice());
 }

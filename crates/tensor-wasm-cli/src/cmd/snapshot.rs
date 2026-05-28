@@ -327,8 +327,7 @@ async fn save(
     let mut writer = BufWriter::with_capacity(64 * 1024, tmp);
     let mut stream = resp.bytes_stream();
     while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res
-            .with_context(|| format!("streaming snapshot body from {url}"))?;
+        let chunk = chunk_res.with_context(|| format!("streaming snapshot body from {url}"))?;
         received = received.saturating_add(chunk.len() as u64);
         if received > cap {
             drop(writer); // discard the temp file (BufWriter drops the inner NamedTempFile)
@@ -356,8 +355,7 @@ async fn save(
         // underlying `io::Error` from the implicit flush — surface it to the
         // caller so a disk-full or perms problem doesn't silently corrupt
         // the persisted snapshot.
-        anyhow::Error::new(e.into_error())
-            .context("flushing snapshot tempfile buffer on close")
+        anyhow::Error::new(e.into_error()).context("flushing snapshot tempfile buffer on close")
     })?;
     tmp.persist(output)
         .map_err(|e| anyhow::anyhow!("renaming tempfile to {}: {}", output.display(), e))?;
@@ -499,12 +497,8 @@ fn validate_parent_writable(path: &Path) -> Result<()> {
     } else {
         parent
     };
-    let meta = std::fs::metadata(parent).with_context(|| {
-        format!(
-            "checking --output parent directory {}",
-            parent.display()
-        )
-    })?;
+    let meta = std::fs::metadata(parent)
+        .with_context(|| format!("checking --output parent directory {}", parent.display()))?;
     if !meta.is_dir() {
         return Err(local_err(format!(
             "--output parent {} is not a directory",
@@ -613,8 +607,7 @@ pub(crate) fn load_hmac_key(path: &Path) -> Result<[u8; 32]> {
     // copy of the key material is scrubbed on every return path, success
     // or error. The returned `[u8; 32]` is the caller's responsibility.
     let raw = Zeroized(
-        std::fs::read(path)
-            .with_context(|| format!("reading HMAC key file {}", path.display()))?,
+        std::fs::read(path).with_context(|| format!("reading HMAC key file {}", path.display()))?,
     );
 
     // Try the hex path first: a file that's pure ASCII hex (after trimming

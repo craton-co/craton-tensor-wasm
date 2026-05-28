@@ -207,11 +207,7 @@ pub fn snapshot_round_trip_with_source(
 /// Panics if any destination length differs from the corresponding
 /// `CONFORMANCE_*_LEN` constant — that mismatch indicates a test wrote
 /// the wrong setup code, not a backend regression.
-pub fn populate_payloads_into(
-    wasm_dst: &mut [u8],
-    gpu_dst: &mut [u8],
-    registers_dst: &mut [u8],
-) {
+pub fn populate_payloads_into(wasm_dst: &mut [u8], gpu_dst: &mut [u8], registers_dst: &mut [u8]) {
     assert_eq!(
         wasm_dst.len(),
         CONFORMANCE_WASM_LEN,

@@ -67,8 +67,8 @@ fn cudarc_unified_buffer_snapshot_round_trip_on_device() {
         CudarcUnifiedBuffer::new(CONFORMANCE_WASM_LEN).expect("alloc wasm-memory cudarc buffer");
     let mut gpu_buf =
         CudarcUnifiedBuffer::new(CONFORMANCE_GPU_LEN).expect("alloc gpu-memory cudarc buffer");
-    let mut regs_buf = CudarcUnifiedBuffer::new(CONFORMANCE_REGISTERS_LEN)
-        .expect("alloc registers cudarc buffer");
+    let mut regs_buf =
+        CudarcUnifiedBuffer::new(CONFORMANCE_REGISTERS_LEN).expect("alloc registers cudarc buffer");
 
     populate_payloads_into(
         wasm_buf.as_mut_slice(),
@@ -76,9 +76,5 @@ fn cudarc_unified_buffer_snapshot_round_trip_on_device() {
         regs_buf.as_mut_slice(),
     );
 
-    snapshot_round_trip_with_source(
-        wasm_buf.as_slice(),
-        gpu_buf.as_slice(),
-        regs_buf.as_slice(),
-    );
+    snapshot_round_trip_with_source(wasm_buf.as_slice(), gpu_buf.as_slice(), regs_buf.as_slice());
 }

@@ -49,7 +49,11 @@ const HELLO_EMIT_WAT: &str = r#"
 "#;
 
 async fn body_bytes(body: Body) -> Vec<u8> {
-    body.collect().await.expect("collect body").to_bytes().to_vec()
+    body.collect()
+        .await
+        .expect("collect body")
+        .to_bytes()
+        .to_vec()
 }
 
 async fn body_json(body: Body) -> Value {

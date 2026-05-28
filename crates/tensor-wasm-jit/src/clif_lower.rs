@@ -6,7 +6,7 @@
 use thiserror::Error;
 
 use crate::detector::{BlockIR, Op};
-use crate::ir::{TensorWasmKernelBlueprint, TensorWasmOp, GridHint};
+use crate::ir::{GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
 
 /// Errors produced by the lowering pass.
 #[derive(Debug, Error, PartialEq)]
@@ -86,8 +86,7 @@ pub fn lower_block(block: &BlockIR) -> Result<TensorWasmKernelBlueprint, LowerEr
 
     // Trip count clamped into u32; saturate rather than truncate so a
     // (genuinely huge) static loop doesn't masquerade as a tiny grid.
-    let total_threads =
-        u32::try_from(block.loop_trip_count.unwrap_or(256)).unwrap_or(u32::MAX);
+    let total_threads = u32::try_from(block.loop_trip_count.unwrap_or(256)).unwrap_or(u32::MAX);
     bp.grid_hint = GridHint {
         total_threads,
         preferred_block_size: 128,
@@ -169,7 +168,9 @@ mod tests {
         for op in &bp.ops {
             assert!(matches!(
                 op,
-                TensorWasmOp::VecFma { .. } | TensorWasmOp::VecMul { .. } | TensorWasmOp::VecAdd { .. }
+                TensorWasmOp::VecFma { .. }
+                    | TensorWasmOp::VecMul { .. }
+                    | TensorWasmOp::VecAdd { .. }
             ));
         }
     }

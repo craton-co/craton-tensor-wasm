@@ -16,9 +16,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::TensorWasmEngine;
 use tensor_wasm_exec::executor::{SpawnConfig, TensorWasmExecutor};
-use tensor_wasm_core::types::TenantId;
 
 fn long_running_wasm() -> Vec<u8> {
     // An infinite loop in `noop` so call_export never returns on its own —

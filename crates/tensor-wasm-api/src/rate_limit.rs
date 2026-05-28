@@ -216,10 +216,7 @@ impl PerTenantRateLimitConfig {
 
     /// Disabled config: per-tenant layer admits unconditionally.
     pub const fn disabled() -> Self {
-        Self {
-            burst: 0,
-            qps: 0.0,
-        }
+        Self { burst: 0, qps: 0.0 }
     }
 
     /// `true` if the per-tenant layer is disabled. Determined solely by
@@ -682,7 +679,8 @@ fn rate_limited_response(retry_after_secs: u64) -> Response {
     // `Retry-After` per RFC 9110 §10.2.3 may be either an HTTP-date or a
     // non-negative decimal integer of seconds. We emit the latter.
     if let Ok(hv) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-        resp.headers_mut().insert(axum::http::header::RETRY_AFTER, hv);
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, hv);
     }
     resp
 }
@@ -837,12 +835,18 @@ mod tests {
             assert!(matches!(limiter.try_admit(a, TENANT), AdmitResult::Admit));
         }
         // A is drained.
-        assert!(matches!(limiter.try_admit(a, TENANT), AdmitResult::Reject { .. }));
+        assert!(matches!(
+            limiter.try_admit(a, TENANT),
+            AdmitResult::Reject { .. }
+        ));
         // B is untouched.
         for _ in 0..2 {
             assert!(matches!(limiter.try_admit(b, TENANT), AdmitResult::Admit));
         }
-        assert!(matches!(limiter.try_admit(b, TENANT), AdmitResult::Reject { .. }));
+        assert!(matches!(
+            limiter.try_admit(b, TENANT),
+            AdmitResult::Reject { .. }
+        ));
     }
 
     #[test]

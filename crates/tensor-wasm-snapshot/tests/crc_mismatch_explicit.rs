@@ -11,9 +11,11 @@
 
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::types::{InstanceId, TenantId};
-use tensor_wasm_snapshot::reader::SnapshotReader;
-use tensor_wasm_snapshot::writer::{Snapshot, SnapshotMetadata, DEFAULT_ZSTD_LEVEL, SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
 use tensor_wasm_snapshot::payload_crc32;
+use tensor_wasm_snapshot::reader::SnapshotReader;
+use tensor_wasm_snapshot::writer::{
+    Snapshot, SnapshotMetadata, DEFAULT_ZSTD_LEVEL, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
+};
 
 #[test]
 fn crc_mismatch_after_payload_mutation_is_rejected() {

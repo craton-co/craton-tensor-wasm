@@ -84,9 +84,5 @@ fn cust_unified_buffer_snapshot_round_trip_on_device() {
         regs_buf.as_mut_slice(),
     );
 
-    snapshot_round_trip_with_source(
-        wasm_buf.as_slice(),
-        gpu_buf.as_slice(),
-        regs_buf.as_slice(),
-    );
+    snapshot_round_trip_with_source(wasm_buf.as_slice(), gpu_buf.as_slice(), regs_buf.as_slice());
 }

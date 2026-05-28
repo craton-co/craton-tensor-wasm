@@ -18,16 +18,14 @@
 use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tensor_wasm_core::error::{TensorWasmError, Result};
+use tensor_wasm_core::error::{Result, TensorWasmError};
 use tracing::{debug, instrument};
 
 use crate::format::{SNAPSHOT_VERSION_V2, SNAPSHOT_VERSION_V3};
 use crate::writer::{check_blob_size, limits, payload_crc32, Snapshot, SNAPSHOT_MAGIC};
 
 #[cfg(feature = "signed-snapshots")]
-use crate::format::{
-    SignatureKind, SIGNATURE_TRAILER_LEN, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN,
-};
+use crate::format::{SignatureKind, SIGNATURE_TRAILER_LEN, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN};
 #[cfg(feature = "artifact-backing")]
 use tensor_wasm_artifacts::ArtifactStore;
 #[cfg(feature = "signed-snapshots")]
@@ -107,7 +105,10 @@ impl std::fmt::Debug for SnapshotReader {
         #[cfg(feature = "signed-snapshots")]
         d.field(
             "hmac_key",
-            &self.hmac_key.as_ref().map(|_| "<REDACTED 32-byte HMAC key>"),
+            &self
+                .hmac_key
+                .as_ref()
+                .map(|_| "<REDACTED 32-byte HMAC key>"),
         );
         d.field("require_signature", &self.require_signature);
         d.field("max_age", &self.max_age);
@@ -441,8 +442,9 @@ impl SnapshotReader {
         let cfg = bincode::config::legacy()
             .with_limit::<{ crate::writer::limits::MAX_TOTAL_PAYLOAD_BYTES }>();
         let (snapshot, _read): (Snapshot, usize) =
-            bincode::serde::decode_from_slice(decompressed.as_slice(), cfg)
-                .map_err(|e| TensorWasmError::Serialization(format!("bincode decode: {e}").into()))?;
+            bincode::serde::decode_from_slice(decompressed.as_slice(), cfg).map_err(|e| {
+                TensorWasmError::Serialization(format!("bincode decode: {e}").into())
+            })?;
 
         if snapshot.magic != SNAPSHOT_MAGIC {
             return Err(TensorWasmError::Serialization(
@@ -592,9 +594,7 @@ impl SnapshotReader {
             .checked_add(snapshot.gpu_memory.len())
             .and_then(|s| s.checked_add(snapshot.registers.len()))
             .ok_or_else(|| {
-                TensorWasmError::Serialization(
-                    "snapshot blob length sum overflowed usize".into(),
-                )
+                TensorWasmError::Serialization("snapshot blob length sum overflowed usize".into())
             })?;
         if (actual_total as u64) != snapshot.metadata.total_uncompressed_bytes {
             return Err(TensorWasmError::Serialization(
@@ -739,9 +739,7 @@ impl SnapshotReader {
         let kind_byte = trailer[V3_TRAILER_MAGIC_LEN];
         let sig_bytes = &trailer[V3_TRAILER_MAGIC_LEN + 1..];
         let kind = SignatureKind::from_byte(kind_byte).ok_or_else(|| {
-            TensorWasmError::Serialization(
-                format!("unknown signature_kind: {kind_byte}").into(),
-            )
+            TensorWasmError::Serialization(format!("unknown signature_kind: {kind_byte}").into())
         })?;
         debug_assert_eq!(sig_bytes.len(), kind.signature_len());
 
@@ -778,11 +776,7 @@ impl SnapshotReader {
                 mac.update(&[kind_byte]);
                 let expected = mac.finalize().into_bytes();
                 // ConstantTimeEq returns `Choice` (0 or 1) without short-circuiting.
-                let ok: bool = expected
-                    .as_slice()
-                    .ct_eq(sig_bytes)
-                    .unwrap_u8()
-                    == 1;
+                let ok: bool = expected.as_slice().ct_eq(sig_bytes).unwrap_u8() == 1;
                 if !ok {
                     return Err(TensorWasmError::Serialization(
                         "snapshot HMAC mismatch".into(),
@@ -839,9 +833,7 @@ impl SnapshotReader {
             // generic Serialization variant — `ArtifactError` is not part
             // of the `TensorWasmError` enum, and the messages are already
             // operator-facing (no key bytes leak).
-            TensorWasmError::Serialization(
-                format!("artifact store get: {e}").into(),
-            )
+            TensorWasmError::Serialization(format!("artifact store get: {e}").into())
         })?;
 
         // Static allocator ceiling for bincode, identical to the legacy
@@ -917,9 +909,7 @@ impl SnapshotReader {
             .checked_add(snapshot.gpu_memory.len())
             .and_then(|s| s.checked_add(snapshot.registers.len()))
             .ok_or_else(|| {
-                TensorWasmError::Serialization(
-                    "snapshot blob length sum overflowed usize".into(),
-                )
+                TensorWasmError::Serialization("snapshot blob length sum overflowed usize".into())
             })?;
         if (actual_total as u64) != snapshot.metadata.total_uncompressed_bytes {
             return Err(TensorWasmError::Serialization(
@@ -997,8 +987,8 @@ impl SnapshotReader {
         // the call site below — no explicit `&**key` dance needed, and
         // the underlying 32 bytes are never copied out of the
         // zeroizing wrapper.
-        let payload = tensor_wasm_artifacts::decode_envelope_from_bytes(bytes, key)
-            .map_err(|e| match e {
+        let payload =
+            tensor_wasm_artifacts::decode_envelope_from_bytes(bytes, key).map_err(|e| match e {
                 // `BadMagic` should be impossible here — we already
                 // checked the leading 16 bytes — but treat it as a
                 // hard failure rather than a fall-through. Otherwise
@@ -1083,9 +1073,7 @@ impl SnapshotReader {
             .checked_add(snapshot.gpu_memory.len())
             .and_then(|s| s.checked_add(snapshot.registers.len()))
             .ok_or_else(|| {
-                TensorWasmError::Serialization(
-                    "snapshot blob length sum overflowed usize".into(),
-                )
+                TensorWasmError::Serialization("snapshot blob length sum overflowed usize".into())
             })?;
         if (actual_total as u64) != snapshot.metadata.total_uncompressed_bytes {
             return Err(TensorWasmError::Serialization(
@@ -1158,8 +1146,9 @@ pub fn restore_to_gpu(bytes: &[u8], device_index: u32) -> Result<RestoredOnGpu> 
     // a zero-length snapshot is allowed — we just produce an empty buffer.
     let mut gpu_buf: UnifiedBuffer<u8> = if snapshot.gpu_memory.is_empty() {
         // SAFETY: capacity 0 -> no allocation, no uninitialised reads possible.
-        unsafe { UnifiedBuffer::uninitialized(0) }
-            .map_err(|e| TensorWasmError::CudaError(format!("UnifiedBuffer::uninitialized(0): {e:?}")))?
+        unsafe { UnifiedBuffer::uninitialized(0) }.map_err(|e| {
+            TensorWasmError::CudaError(format!("UnifiedBuffer::uninitialized(0): {e:?}"))
+        })?
     } else {
         UnifiedBuffer::new(&0u8, snapshot.gpu_memory.len())
             .map_err(|e| TensorWasmError::CudaError(format!("UnifiedBuffer::new: {e:?}")))?
@@ -1192,9 +1181,9 @@ pub fn restore_to_gpu(bytes: &[u8], device_index: u32) -> Result<RestoredOnGpu> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writer::{InstanceState, SnapshotWriter, SNAPSHOT_VERSION};
     #[cfg(feature = "signed-snapshots")]
     use crate::format::{HMAC_SHA256_SIG_LEN, SIGNATURE_KIND_HMAC_SHA256};
+    use crate::writer::{InstanceState, SnapshotWriter, SNAPSHOT_VERSION};
     use tensor_wasm_core::types::{InstanceId, TenantId};
 
     #[test]
@@ -1448,10 +1437,9 @@ mod tests {
             .restore(&bytes)
             .expect_err("rewritten trailer magic must be rejected");
         match err {
-            TensorWasmError::Serialization(m) => assert!(
-                m.contains("v3 trailer missing"),
-                "unexpected message: {m}",
-            ),
+            TensorWasmError::Serialization(m) => {
+                assert!(m.contains("v3 trailer missing"), "unexpected message: {m}",)
+            }
             other => panic!("expected Serialization, got {other:?}"),
         }
     }

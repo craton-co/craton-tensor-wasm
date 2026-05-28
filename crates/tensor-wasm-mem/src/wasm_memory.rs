@@ -499,7 +499,8 @@ impl MemoryCreatorConfig {
     /// The effective per-instance cap: the smaller of the configured value
     /// and the workspace's [`HARD_MAX_LINEAR_MEMORY_BYTES`] ceiling.
     pub fn effective_max_linear_memory_bytes(&self) -> usize {
-        self.max_linear_memory_bytes.min(HARD_MAX_LINEAR_MEMORY_BYTES)
+        self.max_linear_memory_bytes
+            .min(HARD_MAX_LINEAR_MEMORY_BYTES)
     }
 }
 
@@ -1008,7 +1009,11 @@ mod tests {
             *p.add(128 * 1024 - 1) = 0xEF;
         }
         let s = mem.as_slice();
-        assert_eq!(s.len(), 128 * 1024, "slice tracks current_size, not capacity");
+        assert_eq!(
+            s.len(),
+            128 * 1024,
+            "slice tracks current_size, not capacity"
+        );
         assert_eq!(s[0], 0xDE);
         assert_eq!(s[1], 0xAD);
         assert_eq!(s[64 * 1024], 0xBE);
@@ -1082,9 +1087,7 @@ mod tests {
         assert_eq!(mem.byte_size(), MAX);
         // Step 2: anything past the cap is rejected; the pre-allocated
         // region cannot be resized in place under `cuMemAllocManaged`.
-        let err = mem
-            .grow_to(MAX + 1)
-            .expect_err("grow past cap must fail");
+        let err = mem.grow_to(MAX + 1).expect_err("grow past cap must fail");
         assert!(err.to_string().contains("maximum"));
     }
 

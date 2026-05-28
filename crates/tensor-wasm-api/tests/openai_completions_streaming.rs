@@ -47,7 +47,11 @@ const EMIT_THREE_WAT: &str = r#"
 "#;
 
 async fn body_bytes(body: Body) -> Vec<u8> {
-    body.collect().await.expect("collect body").to_bytes().to_vec()
+    body.collect()
+        .await
+        .expect("collect body")
+        .to_bytes()
+        .to_vec()
 }
 
 fn router_with_model() -> (axum::Router, Uuid) {
@@ -150,8 +154,8 @@ async fn completions_stream_true_returns_sse_frames_and_done_terminator() {
         if f == "[DONE]" {
             continue;
         }
-        let v: Value = serde_json::from_str(f)
-            .unwrap_or_else(|e| panic!("frame is not JSON: {e}; frame={f}"));
+        let v: Value =
+            serde_json::from_str(f).unwrap_or_else(|e| panic!("frame is not JSON: {e}; frame={f}"));
         if let Some(text) = v.pointer("/choices/0/text").and_then(Value::as_str) {
             reconstructed.push_str(text);
         }

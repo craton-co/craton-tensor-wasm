@@ -65,8 +65,7 @@ fn spec_path() -> PathBuf {
 /// Read the YAML spec source.
 fn read_spec() -> String {
     let path = spec_path();
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read openapi spec at {path:?}: {e}"))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read openapi spec at {path:?}: {e}"))
 }
 
 /// Source-of-truth list of HTTP routes the live router exposes. Keep
@@ -480,7 +479,11 @@ async fn assert_router_serves(method: &str, path: &str) {
 #[test]
 fn spec_file_exists_and_is_nonempty() {
     let yaml = read_spec();
-    assert!(yaml.len() > 256, "spec is suspiciously short ({} bytes)", yaml.len());
+    assert!(
+        yaml.len() > 256,
+        "spec is suspiciously short ({} bytes)",
+        yaml.len()
+    );
     assert!(
         yaml.starts_with("# SPDX-License-Identifier: Apache-2.0"),
         "spec must start with SPDX header",
@@ -504,7 +507,9 @@ fn spec_paths_cover_router() {
         let all = parse_spec_path_keys(&yaml);
         #[cfg(not(feature = "kernel-registry-api"))]
         {
-            all.into_iter().filter(|p| !p.starts_with("/kernels")).collect()
+            all.into_iter()
+                .filter(|p| !p.starts_with("/kernels"))
+                .collect()
         }
         #[cfg(feature = "kernel-registry-api")]
         {
@@ -745,11 +750,15 @@ components:
 
     let methods = parse_spec_path_methods(yaml);
     assert_eq!(
-        methods.get("/a").map(|m| m.iter().cloned().collect::<Vec<_>>()),
+        methods
+            .get("/a")
+            .map(|m| m.iter().cloned().collect::<Vec<_>>()),
         Some(vec!["GET".to_string()]),
     );
     assert_eq!(
-        methods.get("/b/{id}").map(|m| m.iter().cloned().collect::<Vec<_>>()),
+        methods
+            .get("/b/{id}")
+            .map(|m| m.iter().cloned().collect::<Vec<_>>()),
         Some(vec!["POST".to_string()]),
     );
 
@@ -771,10 +780,7 @@ components:
       additionalProperties: false
 ";
     let (required, strict) = parse_schema_required_and_strictness(yaml, "Bar");
-    assert_eq!(
-        required,
-        ["a", "b"].iter().map(|s| s.to_string()).collect()
-    );
+    assert_eq!(required, ["a", "b"].iter().map(|s| s.to_string()).collect());
     assert!(strict);
 }
 

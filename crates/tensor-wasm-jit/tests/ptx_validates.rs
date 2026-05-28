@@ -8,7 +8,7 @@
 
 use std::process::Command;
 
-use tensor_wasm_jit::ir::{TensorWasmKernelBlueprint, TensorWasmOp, GridHint};
+use tensor_wasm_jit::ir::{GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
 use tensor_wasm_jit::ptx_emit::{emit, EmitError};
 
 fn ptxas_path() -> Option<String> {

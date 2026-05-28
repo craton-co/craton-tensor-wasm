@@ -97,10 +97,7 @@ pub async fn run(args: DeployArgs, ctx: &HttpContext) -> Result<()> {
             .unwrap_or_else(|| "function".to_string()),
     };
     if name.trim().is_empty() {
-        anyhow::bail!(
-            "--name must be non-empty / non-whitespace (got `{}`)",
-            name
-        );
+        anyhow::bail!("--name must be non-empty / non-whitespace (got `{}`)", name);
     }
 
     // cli fix 2: encode the wasm file into base64 in chunks rather than

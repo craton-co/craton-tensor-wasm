@@ -189,7 +189,9 @@ pub enum PlironLoweringError {
     /// is now on crates.io at 0.15.0 per W3.1 / 2026-05-27, so the
     /// version check operates over a regular semver-pinned dep rather
     /// than the original git-rev pin.) No scaffold path returns it.
-    #[error("pliron_dialect: dialect-mir version mismatch -- expected `{expected}`, found `{found}`")]
+    #[error(
+        "pliron_dialect: dialect-mir version mismatch -- expected `{expected}`, found `{found}`"
+    )]
     DialectVersionMismatch {
         /// Pinned dialect-mir version that `tensor-wasm-jit` was built
         /// against (e.g. `"dialect-mir@0.1.0"`).
@@ -320,10 +322,7 @@ mod tests {
     /// [`PlironLoweringError::UnsupportedOp`]). Suitable for the
     /// [`StubLowerer`] tests that never reach the driver.
     fn trivial_function() -> Function {
-        Function::with_name_signature(
-            UserFuncName::user(0, 0),
-            Signature::new(CallConv::SystemV),
-        )
+        Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::SystemV))
     }
 
     /// Build a minimal well-formed `fn() -> ()` Cranelift `Function`: a
@@ -354,9 +353,7 @@ mod tests {
             PlironLoweringError::NotYetImplemented(tag) => {
                 assert_eq!(tag, "StubLowerer::lower");
             }
-            other => panic!(
-                "expected PlironLoweringError::NotYetImplemented, got {other:?}"
-            ),
+            other => panic!("expected PlironLoweringError::NotYetImplemented, got {other:?}"),
         }
     }
 
@@ -367,8 +364,7 @@ mod tests {
     #[test]
     fn cranelift_to_dialect_mir_lowers_minimal_function_via_driver() {
         let func = minimal_unit_function();
-        let lowered =
-            cranelift_to_dialect_mir(&func).expect("minimal fn() -> () must lower");
+        let lowered = cranelift_to_dialect_mir(&func).expect("minimal fn() -> () must lower");
         assert_eq!(lowered.blocks.len(), 1, "one block expected");
         assert!(
             lowered.signature.params.is_empty(),

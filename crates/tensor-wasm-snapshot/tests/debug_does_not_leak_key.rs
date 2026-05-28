@@ -14,8 +14,8 @@
 
 #![cfg(feature = "signed-snapshots")]
 
-use tensor_wasm_snapshot::writer::SnapshotWriter;
 use tensor_wasm_snapshot::reader::SnapshotReader;
+use tensor_wasm_snapshot::writer::SnapshotWriter;
 
 const SENTINEL_KEY: [u8; 32] = [0xAB; 32];
 

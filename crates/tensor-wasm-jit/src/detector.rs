@@ -224,9 +224,7 @@ pub struct PlironCandidate {
 ///   directly).
 /// * Feature enabled, opt-in on, lowering succeeds → returns `Some`.
 #[cfg(feature = "cuda-oxide-backend")]
-pub fn try_pliron_candidate(
-    func: &cranelift_codegen::ir::Function,
-) -> Option<PlironCandidate> {
+pub fn try_pliron_candidate(func: &cranelift_codegen::ir::Function) -> Option<PlironCandidate> {
     if !pliron_pipeline_enabled() {
         return None;
     }
@@ -495,10 +493,8 @@ mod pliron_pipeline_tests {
         // at the opcode, so the dummy `Value(0)` arg is fine.
         let mut sig = Signature::new(CallConv::SystemV);
         sig.params.push(AbiParam::new(types::I32));
-        let mut func = Function::with_name_signature(
-            UserFuncName::testcase("atomic_fn".as_bytes()),
-            sig,
-        );
+        let mut func =
+            Function::with_name_signature(UserFuncName::testcase("atomic_fn".as_bytes()), sig);
         let block = func.dfg.make_block();
         let _param = func.dfg.append_block_param(block, types::I32);
         func.layout.append_block(block);

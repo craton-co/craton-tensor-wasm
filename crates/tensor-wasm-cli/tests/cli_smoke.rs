@@ -17,7 +17,8 @@ use predicates::prelude::*;
 /// silently leak credentials into the test runs.
 fn tensor_wasm() -> AssertCmd {
     let mut cmd = AssertCmd::cargo_bin("tensor-wasm").expect("tensor-wasm binary built");
-    cmd.env_remove("TENSOR_WASM_TOKEN").env_remove("TENSOR_WASM_LOG");
+    cmd.env_remove("TENSOR_WASM_TOKEN")
+        .env_remove("TENSOR_WASM_LOG");
     cmd
 }
 
@@ -609,4 +610,3 @@ fn kernel_help_lists_all_subactions() {
         .stdout(predicate::str::contains("list"))
         .stdout(predicate::str::contains("verify"));
 }
-

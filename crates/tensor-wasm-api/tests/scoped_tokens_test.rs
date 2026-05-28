@@ -49,11 +49,7 @@ fn router_with_scopes(scopes: &[(&str, TokenScope)]) -> axum::Router {
         map.insert((*k).to_owned(), v.clone());
     }
     let auth = AuthConfig::from_scopes(map);
-    build_router_with_config(
-        Arc::new(AppState::default()),
-        auth,
-        TenantConfig::default(),
-    )
+    build_router_with_config(Arc::new(AppState::default()), auth, TenantConfig::default())
 }
 
 /// Deploy a trivial `_start`-only module so the synchronous `/invoke` path

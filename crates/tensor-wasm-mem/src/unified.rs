@@ -325,9 +325,7 @@ mod backing {
         /// pattern-match this variant from outside the construction
         /// + drop paths in this module.
         #[cfg(feature = "gpu-mem-pool")]
-        TenantPool(
-            super::TenantPoolBacking,
-        ),
+        TenantPool(super::TenantPoolBacking),
     }
 
     /// Process-wide CUDA context init via cust::quick_init. cust 0.3
@@ -339,9 +337,8 @@ mod backing {
     fn ensure_cuda_init() -> Result<(), UnifiedError> {
         use std::sync::OnceLock;
         static CTX: OnceLock<Result<cust::context::Context, String>> = OnceLock::new();
-        let r = CTX.get_or_init(|| {
-            cust::quick_init().map_err(|e| format!("cust::quick_init: {e:?}"))
-        });
+        let r =
+            CTX.get_or_init(|| cust::quick_init().map_err(|e| format!("cust::quick_init: {e:?}")));
         match r {
             Ok(_) => Ok(()),
             Err(msg) => Err(UnifiedError::Cuda(msg.clone())),
@@ -446,9 +443,7 @@ mod backing {
         /// pattern-match this variant from outside the construction
         /// + drop paths in this module.
         #[cfg(feature = "gpu-mem-pool")]
-        TenantPool(
-            super::TenantPoolBacking,
-        ),
+        TenantPool(super::TenantPoolBacking),
     }
 
     impl Backing {
@@ -1063,12 +1058,8 @@ impl UnifiedBacking for UnifiedBuffer {
                 UvmAdvice::SetPreferredLocation(d) => {
                     crate::advise::Advice::PreferredLocation(DeviceId(d))
                 }
-                UvmAdvice::UnsetPreferredLocation => {
-                    crate::advise::Advice::UnsetPreferredLocation
-                }
-                UvmAdvice::SetAccessedBy(d) => {
-                    crate::advise::Advice::AccessedBy(DeviceId(d))
-                }
+                UvmAdvice::UnsetPreferredLocation => crate::advise::Advice::UnsetPreferredLocation,
+                UvmAdvice::SetAccessedBy(d) => crate::advise::Advice::AccessedBy(DeviceId(d)),
                 UvmAdvice::UnsetAccessedBy(d) => {
                     crate::advise::Advice::UnsetAccessedBy(DeviceId(d))
                 }
@@ -1165,10 +1156,14 @@ impl From<UnifiedError> for tensor_wasm_core::error::TensorWasmError {
             UnifiedError::ZeroSize => tensor_wasm_core::error::TensorWasmError::Serialization(
                 "unified buffer: zero-byte allocation rejected".into(),
             ),
-            UnifiedError::Allocation(msg) => tensor_wasm_core::error::TensorWasmError::Serialization(
-                format!("unified buffer allocation failed: {msg}").into(),
-            ),
-            UnifiedError::Cuda(msg) => tensor_wasm_core::error::TensorWasmError::CudaError(msg.into()),
+            UnifiedError::Allocation(msg) => {
+                tensor_wasm_core::error::TensorWasmError::Serialization(
+                    format!("unified buffer allocation failed: {msg}").into(),
+                )
+            }
+            UnifiedError::Cuda(msg) => {
+                tensor_wasm_core::error::TensorWasmError::CudaError(msg.into())
+            }
             UnifiedError::TooLarge { requested, limit } => {
                 tensor_wasm_core::error::TensorWasmError::MemoryExhausted { requested, limit }
             }
@@ -1183,10 +1178,8 @@ impl From<UnifiedError> for tensor_wasm_core::error::TensorWasmError {
             // mapping body-only.
             UnifiedError::NotSupported { feature, backing } => {
                 tensor_wasm_core::error::TensorWasmError::Serialization(
-                    format!(
-                        "unified backing {backing:?} does not support feature {feature:?}"
-                    )
-                    .into(),
+                    format!("unified backing {backing:?} does not support feature {feature:?}")
+                        .into(),
                 )
             }
         }
@@ -1265,7 +1258,10 @@ mod tests {
     fn from_unified_error_to_tensor_wasm_error_zero_size() {
         let e = UnifiedError::ZeroSize;
         let b: tensor_wasm_core::error::TensorWasmError = e.into();
-        assert!(matches!(b, tensor_wasm_core::error::TensorWasmError::Serialization(_)));
+        assert!(matches!(
+            b,
+            tensor_wasm_core::error::TensorWasmError::Serialization(_)
+        ));
         assert!(b.to_string().contains("zero-byte"));
     }
 
@@ -1274,7 +1270,9 @@ mod tests {
         let e = UnifiedError::Cuda("ctx not current".into());
         let b: tensor_wasm_core::error::TensorWasmError = e.into();
         match b {
-            tensor_wasm_core::error::TensorWasmError::CudaError(s) => assert_eq!(&*s, "ctx not current"),
+            tensor_wasm_core::error::TensorWasmError::CudaError(s) => {
+                assert_eq!(&*s, "ctx not current")
+            }
             other => panic!("expected CudaError, got {other:?}"),
         }
     }
@@ -1306,7 +1304,10 @@ mod tests {
         // `cuMemAllocManaged`. This is the compile-time guarantee that the
         // `TensorWasmLinearMemory` zero-copy promise rests on.
         let b = UnifiedBuffer::new(64).expect("alloc under feature");
-        assert!(b.is_uvm_backed(), "unified-memory build must use UVM backing");
+        assert!(
+            b.is_uvm_backed(),
+            "unified-memory build must use UVM backing"
+        );
     }
 
     #[test]
@@ -1368,7 +1369,11 @@ mod tests {
         {
             let s = b.as_slice();
             for (i, byte) in s.iter().enumerate() {
-                assert_eq!(*byte, (i & 0xFF) as u8, "byte {i} mismatch — aliasing regression?");
+                assert_eq!(
+                    *byte,
+                    (i & 0xFF) as u8,
+                    "byte {i} mismatch — aliasing regression?"
+                );
             }
         }
         // Drop the buffer at end of scope. The `Drop` impl must free
@@ -1387,7 +1392,10 @@ mod tests {
         // simply forwards the detail string into `Serialization`.
         let e = UnifiedError::Allocation("minimum 1024 > maximum 512".into());
         let b: tensor_wasm_core::error::TensorWasmError = e.into();
-        assert!(matches!(b, tensor_wasm_core::error::TensorWasmError::Serialization(_)));
+        assert!(matches!(
+            b,
+            tensor_wasm_core::error::TensorWasmError::Serialization(_)
+        ));
         assert!(b.to_string().contains("minimum 1024"));
     }
 }

@@ -54,8 +54,9 @@ fn signed_manifest(
 fn allowlist_rejects_eve_accepts_alice() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let key = [0xe7u8; 32];
-    let allowlist: HashSet<String> =
-        ["alice".to_string(), "bob".to_string()].into_iter().collect();
+    let allowlist: HashSet<String> = ["alice".to_string(), "bob".to_string()]
+        .into_iter()
+        .collect();
     let reg = DiskRegistry::open(tmp.path().to_path_buf(), key)
         .expect("open")
         .with_publisher_allowlist(allowlist);
@@ -64,8 +65,7 @@ fn allowlist_rejects_eve_accepts_alice() {
     // is valid (under the registry key); the rejection is purely the
     // allowlist's doing.
     let ptx_eve = "// eve's ptx\n";
-    let eve_manifest =
-        signed_manifest("matmul.f32", "1.0.0", "eve", ptx_eve, &key);
+    let eve_manifest = signed_manifest("matmul.f32", "1.0.0", "eve", ptx_eve, &key);
     match reg.publish(eve_manifest, ptx_eve.to_string()) {
         Err(RegistryError::PublisherNotAllowed(name)) => {
             assert_eq!(name, "matmul.f32");
@@ -77,13 +77,19 @@ fn allowlist_rejects_eve_accepts_alice() {
     // so we also confirm Eve's rejected attempt did not leave a stale
     // tombstone in the keymap that would conflict.
     let ptx_alice = "// alice's ptx\n";
-    let alice_manifest =
-        signed_manifest("matmul.f32", "1.0.0", "alice", ptx_alice, &key);
+    let alice_manifest = signed_manifest("matmul.f32", "1.0.0", "alice", ptx_alice, &key);
     reg.publish(alice_manifest, ptx_alice.to_string())
         .expect("alice's publish must succeed");
 
     // The accepted publish landed in the registry.
     let listed = reg.list();
-    assert_eq!(listed.len(), 1, "exactly one manifest after the two attempts");
-    assert_eq!(listed[0].publisher, "alice", "alice is the recorded publisher");
+    assert_eq!(
+        listed.len(),
+        1,
+        "exactly one manifest after the two attempts"
+    );
+    assert_eq!(
+        listed[0].publisher, "alice",
+        "alice is the recorded publisher"
+    );
 }

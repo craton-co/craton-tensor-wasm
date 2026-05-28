@@ -160,7 +160,10 @@ async fn unbounded_remaining_ms_is_max_sentinel() {
         .expect("remaining_ms");
     let remaining = f.call_async(&mut store, ()).await.expect("call");
     // u32::MAX reinterpreted as i32 is -1.
-    assert_eq!(remaining, -1, "unbounded context should report the u32::MAX sentinel");
+    assert_eq!(
+        remaining, -1,
+        "unbounded context should report the u32::MAX sentinel"
+    );
 }
 
 #[tokio::test]
@@ -186,7 +189,10 @@ async fn expired_deadline_returns_stop_to_guest() {
         .expect("tight_loop");
     let n = f.call_async(&mut store, ()).await.expect("call");
     // First yield trips → loop returns after exactly 1 iteration.
-    assert_eq!(n, 1, "expired deadline must stop the loop on its first yield");
+    assert_eq!(
+        n, 1,
+        "expired deadline must stop the loop on its first yield"
+    );
 }
 
 #[tokio::test]

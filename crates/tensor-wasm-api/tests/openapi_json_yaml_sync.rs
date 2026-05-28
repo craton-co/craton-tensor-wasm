@@ -104,8 +104,8 @@ fn read_yaml() -> String {
 
 fn read_json() -> Value {
     let p = json_path();
-    let raw = std::fs::read_to_string(&p)
-        .unwrap_or_else(|e| panic!("read openapi JSON at {p:?}: {e}"));
+    let raw =
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read openapi JSON at {p:?}: {e}"));
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse openapi JSON at {p:?}: {e}"))
 }
 
@@ -170,10 +170,10 @@ fn json_info_title_and_version_match_yaml() {
     // tooling reads. Even if `paths:` parity passes, a stale
     // `info.version` would mislead consumers. Pin both.
     let yaml = read_yaml();
-    let yaml_title = scan_info_scalar(&yaml, "title")
-        .unwrap_or_else(|| panic!("YAML missing info.title"));
-    let yaml_version = scan_info_scalar(&yaml, "version")
-        .unwrap_or_else(|| panic!("YAML missing info.version"));
+    let yaml_title =
+        scan_info_scalar(&yaml, "title").unwrap_or_else(|| panic!("YAML missing info.title"));
+    let yaml_version =
+        scan_info_scalar(&yaml, "version").unwrap_or_else(|| panic!("YAML missing info.version"));
 
     let json = read_json();
     let info = json

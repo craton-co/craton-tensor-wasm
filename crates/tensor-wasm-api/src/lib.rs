@@ -85,12 +85,12 @@ pub mod trace_propagation;
 
 pub use audit::{
     audit_log_middleware, AuditAction, AuditActor, AuditActorKind, AuditConfig, AuditOutcome,
-    AuditRecord, AuditResource, AuditSink, FileJsonSink, NoopSink, StdoutJsonSink,
-    TokenScopeView, TrustedProxies, ENV_AUDIT_LOG, ENV_TRUSTED_XFCC_PROXIES, HEADER_XFCC,
+    AuditRecord, AuditResource, AuditSink, FileJsonSink, NoopSink, StdoutJsonSink, TokenScopeView,
+    TrustedProxies, ENV_AUDIT_LOG, ENV_TRUSTED_XFCC_PROXIES, HEADER_XFCC,
 };
 pub use config::{
-    AppConfig, ConfigError, HexParseReason, ENV_SNAPSHOT_HMAC_KEY,
-    ENV_SNAPSHOT_REQUIRE_SIGNATURE, SNAPSHOT_HMAC_KEY_LEN,
+    AppConfig, ConfigError, HexParseReason, ENV_SNAPSHOT_HMAC_KEY, ENV_SNAPSHOT_REQUIRE_SIGNATURE,
+    SNAPSHOT_HMAC_KEY_LEN,
 };
 pub use http_metrics::{
     http_metrics_middleware, HttpMetricsLayerConfig, RouteAllowList, DEFAULT_ROUTE_ALLOWLIST,
@@ -107,17 +107,16 @@ pub use openai::{
 };
 pub use openai_translator::{
     assemble_chat_prompt, model_map_from_env, parse_model_map_env,
-    translate_chat_completions_request, translate_completions_request, ModelMap,
-    TranslatedRequest, ENV_OPENAI_MODEL_MAP,
+    translate_chat_completions_request, translate_completions_request, ModelMap, TranslatedRequest,
+    ENV_OPENAI_MODEL_MAP,
 };
 pub use rate_limit::{
     AuthContext, PerTenantRateLimitConfig, RateLimitConfig, RateLimiter, TokenId,
 };
 pub use routes::{ApiError, AppState, FunctionRecord, JobRecord, JobStatus};
 pub use server::{
-    build_router, build_router_with_audit, build_router_with_config,
-    build_router_with_full_config, build_router_with_kernel_publish_tokens,
-    build_router_with_trusted_proxies, serve,
+    build_router, build_router_with_audit, build_router_with_config, build_router_with_full_config,
+    build_router_with_kernel_publish_tokens, build_router_with_trusted_proxies, serve,
 };
 pub use token_scope::{
     parse_token_entry, parse_tokens_env, ParsedTokens, ScopeParseError, TenantScope, TokenScope,

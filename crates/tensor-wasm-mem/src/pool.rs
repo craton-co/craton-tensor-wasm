@@ -122,7 +122,9 @@ impl UnifiedMemoryPool {
         // `Acquire` pairs with the `Release` CAS in `allocate`: any caller
         // reading `remaining` after observing a successful `allocate` on
         // another thread sees the bumped value.
-        self.slab.len().saturating_sub(self.bump.load(Ordering::Acquire))
+        self.slab
+            .len()
+            .saturating_sub(self.bump.load(Ordering::Acquire))
     }
 
     /// Outstanding allocation count.
@@ -619,7 +621,7 @@ mod tests {
         // Power-of-two alignment beyond the 1 GiB cap must be rejected
         // (would otherwise overflow when computing the aligned bump).
         let huge = (1usize << 31) + 1; // > 2 GiB
-        // Use a clean power-of-two above the cap.
+                                       // Use a clean power-of-two above the cap.
         let too_big = 1usize << 31;
         assert!(pool.allocate(8, too_big).is_err());
         let _ = huge; // silence unused
@@ -648,8 +650,8 @@ mod tests {
         // private data. This pins the `ptr::write_bytes` zero-fill added in
         // `UnifiedMemoryPool::allocate`.
         const SIZE: usize = 4 * 1024; // 4 KiB — large enough to detect any
-                                       // off-by-one in the memset bounds.
-        // `reset` now takes `&mut self` (audit T4); see `reset_only_when_empty`.
+                                      // off-by-one in the memset bounds.
+                                      // `reset` now takes `&mut self` (audit T4); see `reset_only_when_empty`.
         let mut pool = UnifiedMemoryPool::new(64 * 1024).unwrap();
 
         // Tenant A: poison every byte with the sentinel.
@@ -703,9 +705,7 @@ mod tests {
         const ITERS: usize = 1000;
         const SIZE: usize = 1000;
 
-        let pool = Arc::new(
-            UnifiedMemoryPool::new(THREADS * ITERS * SIZE + 4096).expect("pool"),
-        );
+        let pool = Arc::new(UnifiedMemoryPool::new(THREADS * ITERS * SIZE + 4096).expect("pool"));
 
         let mut handles = Vec::with_capacity(THREADS);
         for _ in 0..THREADS {

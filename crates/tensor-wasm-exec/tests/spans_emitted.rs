@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::TensorWasmEngine;
-use tensor_wasm_exec::executor::{TensorWasmExecutor, SpawnConfig};
+use tensor_wasm_exec::executor::{SpawnConfig, TensorWasmExecutor};
 use tracing::span::{Attributes, Id, Record};
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Context, SubscriberExt};

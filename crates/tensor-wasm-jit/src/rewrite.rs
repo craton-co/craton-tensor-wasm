@@ -438,11 +438,7 @@ fn analyse(
 /// the blueprint fingerprint on success, `None` on any rejection — the
 /// rejection reasons are logged at the same severities as the previous
 /// inline emit path, so existing log-scraping continues to work.
-fn emit_for_slot(
-    pre: &PreFuncInfo,
-    opts: &RewriteOptions,
-    cache: &KernelCache,
-) -> Option<u64> {
+fn emit_for_slot(pre: &PreFuncInfo, opts: &RewriteOptions, cache: &KernelCache) -> Option<u64> {
     if !matches!(pre.verdict, DetectorVerdict::Offload) {
         return None;
     }
@@ -667,10 +663,7 @@ fn build_trampoline(
     // params.len() + 1) for the dispatch return-code trap below.
     let scratch_local_idx: u32 = params.len() as u32;
     let rc_local_idx: u32 = scratch_local_idx + 1;
-    let mut func = wasm_encoder::Function::new(std::iter::once((
-        2u32,
-        wasm_encoder::ValType::I32,
-    )));
+    let mut func = wasm_encoder::Function::new(std::iter::once((2u32, wasm_encoder::ValType::I32)));
 
     use wasm_encoder::Instruction as I;
 
@@ -1171,11 +1164,7 @@ mod tests {
         assert_eq!(swapped.function_index, 0);
         // Rewriter pre-populates under the placeholder `TenantId(0)`; see the
         // `key = CacheKey::for_tenant(TenantId(0), ...)` site above.
-        let key = CacheKey::for_tenant(
-            TenantId(0),
-            swapped.fingerprint,
-            DEFAULT_SM_VERSION,
-        );
+        let key = CacheKey::for_tenant(TenantId(0), swapped.fingerprint, DEFAULT_SM_VERSION);
         assert!(cache.get(&key).is_some(), "kernel was pre-populated");
 
         // The rewritten module must validate.

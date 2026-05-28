@@ -53,19 +53,29 @@ pub mod pliron_dialect;
 // Cranelift-IR lowering passes. See [`lowered_ir`] for the IR contract
 // and [`pliron_dialect`] for the trait surface that ties them together.
 #[cfg(feature = "cuda-oxide-backend")]
-pub mod lowered_ir;
+pub mod blueprint_adapter;
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod lower_arith;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lower_cf;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lower_conv;
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod lower_float;
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod lower_memory;
 #[cfg(feature = "cuda-oxide-backend")]
-pub mod lower_cf;
+pub mod lower_signature;
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod lower_vector;
 #[cfg(feature = "cuda-oxide-backend")]
-pub mod lower_conv;
+pub mod lowered_ir;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lowering_builder;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lowering_driver;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod lowering_errors;
 /// Internal test fixtures for the lowering passes.
 ///
 /// Gated behind the opt-in `test-utils` feature so the symbols don't leak
@@ -78,21 +88,11 @@ pub mod lower_conv;
 #[cfg(any(test, feature = "test-utils"))]
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod lowering_test_support;
-#[cfg(feature = "cuda-oxide-backend")]
-pub mod reject_list;
-#[cfg(feature = "cuda-oxide-backend")]
-pub mod lower_signature;
-#[cfg(feature = "cuda-oxide-backend")]
-pub mod lowering_builder;
-#[cfg(feature = "cuda-oxide-backend")]
-pub mod lowering_errors;
-#[cfg(feature = "cuda-oxide-backend")]
-pub mod blueprint_adapter;
-#[cfg(feature = "cuda-oxide-backend")]
-pub mod lowering_driver;
 #[doc(hidden)]
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod pliron_lowering;
 #[doc(hidden)]
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod pliron_ptx;
+#[cfg(feature = "cuda-oxide-backend")]
+pub mod reject_list;

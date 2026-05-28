@@ -36,17 +36,17 @@ use axum::{
     },
     Json,
 };
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use dashmap::DashMap;
 use futures::stream;
+use serde::{Deserialize, Serialize};
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::metrics::TensorWasmMetrics;
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::TensorWasmEngine;
 use tensor_wasm_exec::executor::{ExecError, SpawnConfig, TensorWasmExecutor, WasmArg};
 use tensor_wasm_wasi_gpu::streaming::StreamingContext;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
-use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Default per-invocation deadline used by the synchronous `/invoke` handler.
@@ -153,8 +153,7 @@ pub struct AppState {
     /// the URL surface. Only compiled when the `kernel-registry-api`
     /// feature is enabled — the default build keeps the lean dep graph.
     #[cfg(feature = "kernel-registry-api")]
-    pub kernel_registry:
-        Option<Arc<dyn tensor_wasm_jit::registry::KernelRegistry>>,
+    pub kernel_registry: Option<Arc<dyn tensor_wasm_jit::registry::KernelRegistry>>,
     /// OpenAI `model → FunctionId` resolution map (T41). Read from
     /// `TENSOR_WASM_API_OPENAI_MODEL_MAP` at startup; empty map means
     /// every OpenAI request returns `404 model_not_found`. See
@@ -185,7 +184,8 @@ impl AppState {
     fn try_build() -> Result<Self, TensorWasmError> {
         let metrics = Arc::new(TensorWasmMetrics::new());
         let engine = Arc::new(
-            TensorWasmEngine::new().map_err(|e| TensorWasmError::WasmCompile(format!("{e:#}").into()))?,
+            TensorWasmEngine::new()
+                .map_err(|e| TensorWasmError::WasmCompile(format!("{e:#}").into()))?,
         );
         let executor = Arc::new(TensorWasmExecutor::with_metrics(engine, (*metrics).clone()));
         Ok(Self {
@@ -235,7 +235,8 @@ impl AppState {
     /// initialisation failure for ergonomic parity with [`Self::new`].
     pub fn with_metrics(mut self, metrics: Arc<TensorWasmMetrics>) -> Self {
         let engine = Arc::new(
-            TensorWasmEngine::new().expect("TensorWasmEngine::new must succeed for AppState::with_metrics"),
+            TensorWasmEngine::new()
+                .expect("TensorWasmEngine::new must succeed for AppState::with_metrics"),
         );
         self.executor = Arc::new(TensorWasmExecutor::with_metrics(engine, (*metrics).clone()));
         self.metrics = metrics;
@@ -289,8 +290,7 @@ impl AppState {
 /// error: the kernel registry is a non-critical add-on whereas a snapshot
 /// signing key misconfiguration would silently downgrade integrity.
 #[cfg(feature = "kernel-registry-api")]
-fn build_kernel_registry_from_env(
-) -> Option<Arc<dyn tensor_wasm_jit::registry::KernelRegistry>> {
+fn build_kernel_registry_from_env() -> Option<Arc<dyn tensor_wasm_jit::registry::KernelRegistry>> {
     /// Environment variable carrying the hex-encoded 32-byte HMAC-SHA256
     /// key the kernel registry uses to verify inbound manifests.
     const ENV_KERNEL_HMAC_KEY: &str = "TENSOR_WASM_API_KERNEL_HMAC_KEY";
@@ -516,10 +516,7 @@ impl ApiError {
     /// from `capacity_exhausted` (also 503) because the failure mode is
     /// configuration, not load — a client should NOT retry, it should
     /// surface the error to an operator who can flip the env knob.
-    pub fn service_unavailable(
-        kind: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn service_unavailable(kind: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             kind: kind.into(),
@@ -701,8 +698,7 @@ impl From<ExecError> for ApiError {
                 ApiError {
                     status: StatusCode::PAYLOAD_TOO_LARGE,
                     kind: "module_memory_too_large".to_string(),
-                    message: "module declares memory above per-instance cap"
-                        .to_string(),
+                    message: "module declares memory above per-instance cap".to_string(),
                 }
             }
             // Per exec S-10: the engine-wide live-instance cap is
@@ -720,8 +716,7 @@ impl From<ExecError> for ApiError {
                 ApiError {
                     status: StatusCode::SERVICE_UNAVAILABLE,
                     kind: "capacity_exhausted".to_string(),
-                    message: "engine instance capacity exhausted; retry later"
-                        .to_string(),
+                    message: "engine instance capacity exhausted; retry later".to_string(),
                 }
             }
             // Per B3.2: adversarial Wasm bytes that exceed the pre-compile
@@ -972,10 +967,7 @@ fn parse_invoke_args(raw: &[serde_json::Value]) -> Result<Vec<WasmArg>, ApiError
         .enumerate()
         .map(|(i, v)| {
             WasmArg::from_json(v).map_err(|msg| {
-                ApiError::bad_request(
-                    "invalid_args",
-                    format!("args[{i}]: {msg} (value: {v})"),
-                )
+                ApiError::bad_request("invalid_args", format!("args[{i}]: {msg} (value: {v})"))
             })
         })
         .collect()
@@ -1315,61 +1307,59 @@ pub async fn invoke_function_async(
         function_id = %id,
         tenant = %tenant,
     );
-    tokio::spawn(
-        tracing::Instrument::instrument(
-            async move {
-                // The guard is moved into the spawned task so its lifetime
-                // covers the entire async invocation, including any panic
-                // unwind from `run_invoke` or the result-write block.
-                let guard = jobs_active_guard;
+    tokio::spawn(tracing::Instrument::instrument(
+        async move {
+            // The guard is moved into the spawned task so its lifetime
+            // covers the entire async invocation, including any panic
+            // unwind from `run_invoke` or the result-write block.
+            let guard = jobs_active_guard;
 
-                // Test-only panic injection point: lets the gauge test
-                // exercise the Drop-based dec without needing a wasm
-                // module that actually traps an unwind. The probe is a
-                // single `Relaxed` atomic load in steady state — see
-                // [`test_hooks`] for the rationale.
-                test_hooks::maybe_panic_for_test();
+            // Test-only panic injection point: lets the gauge test
+            // exercise the Drop-based dec without needing a wasm
+            // module that actually traps an unwind. The probe is a
+            // single `Relaxed` atomic load in steady state — see
+            // [`test_hooks`] for the rationale.
+            test_hooks::maybe_panic_for_test();
 
-                let outcome = run_invoke(
-                    &executor,
-                    &wasm_bytes,
-                    tenant,
-                    id,
-                    export_override.as_deref(),
-                    &args,
-                )
-                .await;
-                if let Some(mut entry) = jobs.get_mut(&job_id) {
-                    match outcome {
-                        Ok(value) => {
-                            entry.status = JobStatus::Completed;
-                            entry.result = Some(value);
-                        }
-                        Err(api_err) => {
-                            let (kind, message) = api_err.to_kind_message();
-                            entry.status = JobStatus::Failed;
-                            entry.result = Some(serde_json::json!({
-                                "kind": kind,
-                                "message": message,
-                            }));
-                        }
+            let outcome = run_invoke(
+                &executor,
+                &wasm_bytes,
+                tenant,
+                id,
+                export_override.as_deref(),
+                &args,
+            )
+            .await;
+            if let Some(mut entry) = jobs.get_mut(&job_id) {
+                match outcome {
+                    Ok(value) => {
+                        entry.status = JobStatus::Completed;
+                        entry.result = Some(value);
+                    }
+                    Err(api_err) => {
+                        let (kind, message) = api_err.to_kind_message();
+                        entry.status = JobStatus::Failed;
+                        entry.result = Some(serde_json::json!({
+                            "kind": kind,
+                            "message": message,
+                        }));
                     }
                 }
-                // Balanced release: paired with the `JobsActiveGuard::new`
-                // before the spawn above. Runs once per terminal-state
-                // transition regardless of outcome (Completed | Failed) so
-                // the gauge converges back to zero on a quiescent node.
-                // NOTE: if the jobs map no longer contains the entry (e.g.
-                // an admin purge between insert and resolution) we still
-                // decrement — the contract is "one `dec` per `inc`", not
-                // "one `dec` per surviving JobRecord". If this task panics
-                // before reaching `release`, the guard's `Drop` impl
-                // decrements the gauge with a warn-level log instead.
-                guard.release();
-            },
-            job_span,
-        ),
-    );
+            }
+            // Balanced release: paired with the `JobsActiveGuard::new`
+            // before the spawn above. Runs once per terminal-state
+            // transition regardless of outcome (Completed | Failed) so
+            // the gauge converges back to zero on a quiescent node.
+            // NOTE: if the jobs map no longer contains the entry (e.g.
+            // an admin purge between insert and resolution) we still
+            // decrement — the contract is "one `dec` per `inc`", not
+            // "one `dec` per surviving JobRecord". If this task panics
+            // before reaching `release`, the guard's `Drop` impl
+            // decrements the gauge with a warn-level log instead.
+            guard.release();
+        },
+        job_span,
+    ));
 
     Ok((
         StatusCode::ACCEPTED,
@@ -1685,21 +1675,19 @@ pub async fn invoke_function_stream(
                         }
                     }
                 }
-                StreamWriterState::DrainOnly(mut rx, terminal) => {
-                    match rx.try_recv() {
-                        Ok(c) => {
-                            metrics.streaming_chunks_emitted_total().inc();
-                            Some((
-                                StreamFrame::Chunk(c),
-                                StreamWriterState::DrainOnly(rx, terminal),
-                            ))
-                        }
-                        Err(_) => Some((
-                            StreamFrame::Done(terminal.unwrap_or(Ok(()))),
-                            StreamWriterState::Done,
-                        )),
+                StreamWriterState::DrainOnly(mut rx, terminal) => match rx.try_recv() {
+                    Ok(c) => {
+                        metrics.streaming_chunks_emitted_total().inc();
+                        Some((
+                            StreamFrame::Chunk(c),
+                            StreamWriterState::DrainOnly(rx, terminal),
+                        ))
                     }
-                }
+                    Err(_) => Some((
+                        StreamFrame::Done(terminal.unwrap_or(Ok(()))),
+                        StreamWriterState::Done,
+                    )),
+                },
                 StreamWriterState::Done => None,
             }
         }
@@ -1867,7 +1855,9 @@ pub mod test_hooks {
                 .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
-            panic!("test_hooks::maybe_panic_for_test: deliberate panic for JobsActiveGuard Drop test");
+            panic!(
+                "test_hooks::maybe_panic_for_test: deliberate panic for JobsActiveGuard Drop test"
+            );
         }
     }
 }
@@ -1992,8 +1982,8 @@ mod tests {
 
     #[test]
     fn exec_error_timeout_maps_to_invoke_timeout() {
-        use tensor_wasm_exec::executor::TimeoutContext;
         use tensor_wasm_core::types::InstanceId;
+        use tensor_wasm_exec::executor::TimeoutContext;
         let err = ExecError::Timeout(TimeoutContext {
             id: InstanceId(7),
             elapsed_ms: 1000,
@@ -2068,13 +2058,9 @@ mod tests {
         let api: ApiError = err.into();
         assert_eq!(api.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(api.kind, "module_memory_too_large");
-        assert_eq!(
-            api.message,
-            "module declares memory above per-instance cap",
-        );
+        assert_eq!(api.message, "module declares memory above per-instance cap",);
         assert!(
-            !api.message.contains("4294967296")
-                && !api.message.contains("67108864"),
+            !api.message.contains("4294967296") && !api.message.contains("67108864"),
             "leaked byte figures: {}",
             api.message,
         );
@@ -2111,8 +2097,7 @@ mod tests {
         assert_eq!(api.kind, "module_too_large");
         assert_eq!(api.message, "module bytes above per-tenant cap");
         assert!(
-            !api.message.contains("16777217")
-                && !api.message.contains("16777216"),
+            !api.message.contains("16777217") && !api.message.contains("16777216"),
             "leaked size figures: {}",
             api.message,
         );

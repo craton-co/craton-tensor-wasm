@@ -92,7 +92,9 @@ fn bench_with_args(c: &mut Criterion) {
             rt.block_on(async {
                 let id = exec.spawn_instance(&wasm, spawn_cfg.clone()).await.unwrap();
                 let args = vec![WasmArg::I32(1), WasmArg::I32(2)];
-                let _ = exec.call_export_with_args(id, "add", black_box(&args)).await;
+                let _ = exec
+                    .call_export_with_args(id, "add", black_box(&args))
+                    .await;
                 let _ = exec.terminate(id).await;
             });
         });

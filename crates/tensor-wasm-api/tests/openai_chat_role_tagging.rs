@@ -140,12 +140,18 @@ fn assembled_prompt_handles_multimodal_content_array_text_only() {
         prompt.contains("part1"),
         "first text part dropped: {prompt}",
     );
-    assert!(prompt.contains("part2"), "second text part dropped: {prompt}");
+    assert!(
+        prompt.contains("part2"),
+        "second text part dropped: {prompt}"
+    );
 }
 
 #[test]
 fn assembled_prompt_empty_role_defaults_to_user() {
     let messages = vec![msg("", json!("hi"))];
     let prompt = assemble_chat_prompt(&messages);
-    assert!(prompt.contains("user: hi"), "empty role must default to user: {prompt}");
+    assert!(
+        prompt.contains("user: hi"),
+        "empty role must default to user: {prompt}"
+    );
 }

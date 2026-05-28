@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
-use tensor_wasm_core::types::{InstanceId, KernelId};
 use dashmap::DashMap;
+use tensor_wasm_core::types::{InstanceId, KernelId};
 
 use crate::abi::{AbiError, MAX_KERNELS_PER_INSTANCE, MAX_PTX_BYTES};
 
@@ -203,11 +203,11 @@ impl KernelRegistry {
         // Decrement aggregate-bytes counter. Saturating_sub guards against
         // underflow if ever the counter drifts; the entry's own
         // `ptx_bytes_len` is the source of truth.
-        let _ = self.total_ptx_bytes.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |cur| Some(cur.saturating_sub(entry.ptx_bytes_len as u64)),
-        );
+        let _ = self
+            .total_ptx_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some(cur.saturating_sub(entry.ptx_bytes_len as u64))
+            });
         Some(entry)
     }
 

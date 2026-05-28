@@ -46,10 +46,7 @@ fn l2_hit_preserves_launch_geometry() {
     // Fresh cache pointed at the same dir — no L1 entry, so any hit must
     // come from the L2 (disk) path. With V1 the geometry came back as
     // (0, 0); with V2 it must round-trip the value we wrote.
-    let cache_b = KernelCache::new().with_disk_persistence(DiskCacheConfig {
-        dir,
-        hmac_key,
-    });
+    let cache_b = KernelCache::new().with_disk_persistence(DiskCacheConfig { dir, hmac_key });
     let hit = cache_b
         .get(&key)
         .expect("V2 L2 hit must reconstruct the kernel");
@@ -136,10 +133,7 @@ fn l2_legacy_v1_file_is_treated_as_miss() {
     f.write_all(&buf).unwrap();
     drop(f);
 
-    let cache = KernelCache::new().with_disk_persistence(DiskCacheConfig {
-        dir,
-        hmac_key,
-    });
+    let cache = KernelCache::new().with_disk_persistence(DiskCacheConfig { dir, hmac_key });
     assert!(
         cache.get(&key).is_none(),
         "legacy pre-T30 records must be treated as miss so the L1 path \

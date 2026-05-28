@@ -44,7 +44,10 @@ fn main() {
     let target = env::var("TARGET").unwrap_or_else(|_| "unknown".into());
 
     println!("cargo:rustc-env=TENSOR_WASM_GIT_SHA={}", git_sha);
-    println!("cargo:rustc-env=TENSOR_WASM_RUSTC_VERSION={}", rustc_version);
+    println!(
+        "cargo:rustc-env=TENSOR_WASM_RUSTC_VERSION={}",
+        rustc_version
+    );
     println!("cargo:rustc-env=TENSOR_WASM_PROFILE={}", profile);
     println!("cargo:rustc-env=TENSOR_WASM_TARGET={}", target);
 }

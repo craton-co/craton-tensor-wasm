@@ -14,17 +14,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use tensor_wasm_core::metrics::TensorWasmMetrics;
-use tensor_wasm_core::types::{InstanceId, TenantId};
 use dashmap::{mapref::entry::Entry, DashMap};
 use lru::LruCache;
+use tensor_wasm_core::metrics::TensorWasmMetrics;
+use tensor_wasm_core::types::{InstanceId, TenantId};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
 use wasmtime::{ExternType, Module, ResourceLimiter, Store, Val};
 
 use crate::engine::TensorWasmEngine;
-use crate::instance::{TensorWasmInstance, InstanceState};
+use crate::instance::{InstanceState, TensorWasmInstance};
 use crate::instance_pool::{InstancePool, ModuleHash};
 use tensor_wasm_wasi_gpu::streaming::{add_streaming_to_linker, StreamingContext};
 
@@ -561,7 +561,10 @@ struct InstanceSlotGuard {
 
 impl InstanceSlotGuard {
     fn new(counter: Arc<AtomicUsize>) -> Self {
-        Self { counter, committed: false }
+        Self {
+            counter,
+            committed: false,
+        }
     }
 
     fn commit(mut self) {
@@ -868,9 +871,7 @@ impl TensorWasmExecutor {
         // hit.
         let digest = blake3::hash(wasm);
         let module_hash: ModuleHash = *digest.as_bytes();
-        let inst = self
-            .instantiate_detached(cfg, &module)
-            .await?;
+        let inst = self.instantiate_detached(cfg, &module).await?;
         // A wasmtime instance was successfully created — count it
         // against the monotonic spawn counter exactly once per genuine
         // instantiation. The `active_instances` gauge moves only at
@@ -920,8 +921,8 @@ impl TensorWasmExecutor {
         module: &Module,
     ) -> Result<TensorWasmInstance, ExecError> {
         let max_memory_bytes = self.engine.config().max_memory_bytes;
-        let mut state = InstanceState::new(cfg.tenant_id, InstanceId(0))
-            .with_memory_limit(max_memory_bytes);
+        let mut state =
+            InstanceState::new(cfg.tenant_id, InstanceId(0)).with_memory_limit(max_memory_bytes);
         if let Some(ref s) = cfg.streaming {
             state = state.with_streaming(s.clone());
         }
@@ -945,9 +946,7 @@ impl TensorWasmExecutor {
         let deadline_class_applies =
             cfg.deadline.is_some() || MAX_START_FN_DURATION > Duration::ZERO;
         if deadline_class_applies && !self.engine.is_epoch_ticker_running() {
-            let flag = self
-                .ticker_warned
-                .get_or_init(|| AtomicBool::new(false));
+            let flag = self.ticker_warned.get_or_init(|| AtomicBool::new(false));
             if !flag.swap(true, Ordering::AcqRel) {
                 tracing::error!(
                     target: "tensor_wasm_exec::executor",
@@ -1150,7 +1149,9 @@ impl TensorWasmExecutor {
         // instead we keep the unit-typed surface here and delegate to the
         // shared implementation. The result value is discarded — callers
         // wanting it should use [`Self::call_export_with_args`] directly.
-        self.call_export_with_args(id, export, &[]).await.map(|_| ())
+        self.call_export_with_args(id, export, &[])
+            .await
+            .map(|_| ())
     }
 
     /// Invoke `export` with the supplied `args` (which may be empty) and
@@ -1250,7 +1251,10 @@ impl TensorWasmExecutor {
             // the export's declared result arity exactly or wasmtime
             // returns an error.
             let mut results: Vec<Val> = vec![Val::I32(0); func_ty.results().len()];
-            match func.call_async(&mut guard.store, &params, &mut results).await {
+            match func
+                .call_async(&mut guard.store, &params, &mut results)
+                .await
+            {
                 Ok(()) => {
                     let json: Vec<serde_json::Value> = results.iter().map(val_to_json).collect();
                     Ok(serde_json::Value::Array(json))
@@ -1266,9 +1270,7 @@ impl TensorWasmExecutor {
                 // it, classify the failure as Timeout with real numbers.
                 // Otherwise propagate the raw wasmtime error.
                 let elapsed = call_start.elapsed();
-                let past_deadline = deadline_at
-                    .map(|d| Instant::now() >= d)
-                    .unwrap_or(false);
+                let past_deadline = deadline_at.map(|d| Instant::now() >= d).unwrap_or(false);
                 if past_deadline {
                     Err(ExecError::Timeout(TimeoutContext {
                         id,
@@ -1403,7 +1405,8 @@ impl TensorWasmExecutor {
             // + terminate flow verbatim, including the auto-terminate
             // drop guard (api S-20).
             let id = self.spawn_instance(cfg, wasm).await?;
-            self.call_export_with_args_then_terminate(id, export, args).await
+            self.call_export_with_args_then_terminate(id, export, args)
+                .await
         }
     }
 
@@ -1575,14 +1578,20 @@ mod tests {
             text.contains("tensor_wasm_instance_spawns_total 1"),
             "got:\n{text}"
         );
-        assert!(text.contains("tensor_wasm_active_instances 1"), "got:\n{text}");
+        assert!(
+            text.contains("tensor_wasm_active_instances 1"),
+            "got:\n{text}"
+        );
         exec.terminate(id).await.unwrap();
         let text = metrics.encode_text();
         assert!(
             text.contains("tensor_wasm_instance_terminations_total 1"),
             "got:\n{text}"
         );
-        assert!(text.contains("tensor_wasm_active_instances 0"), "got:\n{text}");
+        assert!(
+            text.contains("tensor_wasm_active_instances 0"),
+            "got:\n{text}"
+        );
     }
 
     #[test]
@@ -1644,9 +1653,7 @@ mod tests {
     fn resource_limiter_respects_module_maximum() {
         let mut lim = TensorWasmResourceLimiter::new(usize::MAX);
         // Even if the engine cap is unbounded, the module's declared max wins.
-        assert!(!lim
-            .memory_growing(0, 4096, Some(2048))
-            .unwrap());
+        assert!(!lim.memory_growing(0, 4096, Some(2048)).unwrap());
     }
 
     #[test]
