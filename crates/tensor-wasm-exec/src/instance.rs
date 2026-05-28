@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use tensor_wasm_core::types::{InstanceId, TenantId};
 use tensor_wasm_wasi_gpu::scheduler::SchedulerContext;
+use tensor_wasm_wasi_gpu::streaming::{HasStreaming, StreamingContext};
 
 use crate::executor::TensorWasmResourceLimiter;
 use crate::jit_dispatch::{ArenaState, JitArenaProvider};
@@ -81,6 +82,18 @@ pub struct InstanceState {
     /// via [`SchedulerContext::unbounded`] and every `yield()` returns
     /// `YIELD_CODE_CONTINUE`.
     pub(crate) scheduler: SchedulerContext,
+    /// Per-instance streaming context backing the
+    /// `wasi:tensor/host@0.1.0` `emit-chunk` / `flush` host functions
+    /// (roadmap feature #2). Constructed via
+    /// [`StreamingContext::disabled`] for spawns the gateway did not
+    /// opt into the streaming response path — every `emit-chunk` then
+    /// returns the documented `-1` code immediately.
+    ///
+    /// Set by [`crate::executor::SpawnConfig::with_streaming`] at
+    /// spawn time. v0.4 wires this through to the
+    /// `POST /functions/{id}/invoke-stream` route — see
+    /// `docs/STREAMING.md`.
+    pub(crate) streaming: StreamingContext,
 }
 
 impl InstanceState {
@@ -110,7 +123,34 @@ impl InstanceState {
             // — `yield()` is a no-op CONTINUE and
             // `deadline-remaining-ms` returns u32::MAX.
             scheduler: SchedulerContext::unbounded(),
+            // Streaming disabled by default; spawns through
+            // `/invoke-stream` install a real channel-backed context
+            // via `SpawnConfig::with_streaming`. Guests that import
+            // `wasi:tensor/host` and run under the non-streaming
+            // `/invoke` route see every `emit-chunk` return `-1`.
+            streaming: StreamingContext::disabled(),
         }
+    }
+
+    /// Install a [`StreamingContext`] on this state; returns `self`
+    /// for builder-style chaining.
+    ///
+    /// Called from [`crate::executor::TensorWasmExecutor::spawn_instance`]
+    /// when [`crate::executor::SpawnConfig::streaming`] is set so the
+    /// `wasi:tensor/host.emit-chunk` host function reaches a live
+    /// downstream receiver. Spawns without a streaming context retain
+    /// the default [`StreamingContext::disabled`] shape.
+    pub fn with_streaming(mut self, streaming: StreamingContext) -> Self {
+        self.streaming = streaming;
+        self
+    }
+
+    /// Borrow the per-instance streaming context. Used by the
+    /// `wasi:tensor/host` linker registration to plumb the
+    /// per-instance state into the `emit-chunk` and `flush` host
+    /// functions.
+    pub fn streaming(&self) -> &StreamingContext {
+        &self.streaming
     }
 
     /// Set the per-instance linear-memory cap (in bytes). Returns `self`
@@ -203,6 +243,12 @@ impl InstanceState {
 impl JitArenaProvider for InstanceState {
     fn jit_arena_mut(&mut self) -> &mut ArenaState {
         InstanceState::jit_arena_mut(self)
+    }
+}
+
+impl HasStreaming for InstanceState {
+    fn streaming(&self) -> &StreamingContext {
+        InstanceState::streaming(self)
     }
 }
 

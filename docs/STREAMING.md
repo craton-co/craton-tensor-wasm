@@ -100,33 +100,43 @@ a clone-able value owning a `tokio::sync::mpsc::Sender<Vec<u8>>`. The
 gateway holds the matching `Receiver` and drives the SSE / chunked
 response body off it.
 
-## v0.4 implementation plan
+## v0.4 wiring (T34, landed)
 
-1. `InstanceState` in `tensor-wasm-exec` grows a `StreamingContext`
-   field, set via a new `SpawnConfig::with_streaming(sender)` builder.
-2. `tensor_wasm_wasi_gpu::add_streaming_to_linker` is called from the
-   executor's linker build path, gated on the new spawn-config field.
-3. The route handler in `crates/tensor-wasm-api/src/routes.rs` swaps
-   the scaffold `event: scaffold` body for a real
-   `mpsc::Receiver<Vec<u8>>` drain, instrumented with a per-chunk
-   sanitiser (see Security below).
-4. OpenAPI: the v0.3.7 entry already documents the SSE / chunked
-   shapes; v0.4 only refines the response-body schema.
+1. `InstanceState` in `tensor-wasm-exec` carries a `StreamingContext`
+   field. Default is `StreamingContext::disabled()`; spawns through
+   `/invoke-stream` install a real channel-backed context via the new
+   `SpawnConfig::with_streaming(ctx)` builder.
+2. `tensor_wasm_wasi_gpu::add_streaming_to_linker` is invoked from
+   `TensorWasmExecutor::spawn_instance` when `SpawnConfig::streaming`
+   is `Some`; non-streaming spawns retain the empty-imports
+   `Instance::new_async` path verbatim so existing callers are
+   unaffected.
+3. The `invoke_function_stream` handler in
+   `crates/tensor-wasm-api/src/routes.rs` builds the `(tx, rx)` pair,
+   spawns the executor call onto a Tokio task, and converts `rx` into
+   an `axum::response::sse::Sse` (SSE branch) or
+   `Body::from_stream` (chunked-transfer branch). A `oneshot::channel`
+   carries the terminal status (success / deadline_elapsed /
+   wasm_error) so the writer can emit a final `event: done` /
+   `event: error` frame.
+4. OpenAPI: the operation description now references the
+   `event: chunk` / `event: done` / `event: error` framing instead of
+   the v0.3.7 `event: scaffold` placeholder.
 
-The URL, method, and response framing are pinned by v0.3.7 — no
-breaking changes between v0.3.7 and v0.4.
+The URL, method, and response framing are unchanged between v0.3.7
+and v0.4 — only the body content swapped from the scaffold marker to
+real guest output.
 
 ## Security
 
-* **Log-injection / ANSI-escape stripping.** Guest-emitted bytes flow
-  through a `sanitize_path`-equivalent filter before they hit the SSE
-  / chunked response body. The filter strips ASCII control bytes
-  (`\x00`-`\x1F` except `\t`, `\n`, `\r`) and 7-bit ANSI escape
-  sequences (`\x1B[...m`) so a hostile guest cannot smuggle escape
-  sequences through an operator's `journalctl` window when the request
-  hits a debugging proxy. This filter lives in v0.4; the v0.3.7
-  scaffold returns only host-controlled bytes, so the filter is
-  deliberately not yet on the response path.
+* **Per-chunk byte payload sanitisation.** Per the threat model, the
+  host does NOT sanitise chunk payloads on the server side — bytes
+  flow guest→client verbatim. Sanitisation (ASCII control / ANSI
+  escape stripping) is the client's responsibility; the CLI's T18
+  receive-side scrubber handles incoming text. The reason: any
+  server-side filter on byte payloads would prevent legitimate
+  binary streaming (Parquet pages, protobuf-encoded events,
+  image tiles).
 * **Downstream disconnect.** The gateway monitors the
   `mpsc::Sender::send` result for `SendError`; on receiver drop the
   guest's next `emit-chunk` returns `-3` and the executor's deadline

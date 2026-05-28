@@ -609,6 +609,18 @@ struct TensorWasmMetricsInner {
     /// (`TenantContext::bytes_in_use`) and the existing single-series
     /// total at `tensor_wasm_gpu_memory_used_bytes`.
     gpu_memory_bytes_per_tenant: Family<TenantLabels, Gauge<u64, AtomicU64>>,
+    /// Cumulative count of streaming chunks emitted via
+    /// `wasi:tensor/host.emit-chunk` and successfully forwarded onto
+    /// the SSE / chunked-transfer response body of
+    /// `POST /functions/{id}/invoke-stream`. Incremented from the
+    /// `tensor-wasm-api` route handler on every chunk that passes
+    /// the per-stream cap and reaches the wire — rejected emits
+    /// (`-1`, `-2`, `-3`) do NOT bump the counter.
+    ///
+    /// Single series in v0.4; the per-tenant breakdown reuses the
+    /// `TenantLabels` shape and will land alongside the per-tenant
+    /// streaming-bytes histogram in a future revision.
+    streaming_chunks_emitted_total: Counter<u64>,
 }
 
 /// Compile-time crate version, from `CARGO_PKG_VERSION`. Public so callers
@@ -761,6 +773,7 @@ impl TensorWasmMetrics {
         let jobs_active: Gauge<i64, AtomicI64> = Gauge::default();
         let gpu_memory_bytes_per_tenant: Family<TenantLabels, Gauge<u64, AtomicU64>> =
             Family::default();
+        let streaming_chunks_emitted_total: Counter<u64> = Counter::default();
         // Prime the single build-info series so it is observable on the
         // very first scrape (Family<...> emits nothing until at least
         // one label tuple has been touched). The value is `1` per the
@@ -856,6 +869,15 @@ impl TensorWasmMetrics {
              expected to track that total within scrape jitter",
             gpu_memory_bytes_per_tenant.clone(),
         );
+        registry.register(
+            "tensor_wasm_streaming_chunks_emitted",
+            "Cumulative count of streaming chunks emitted via \
+             `wasi:tensor/host.emit-chunk` and successfully forwarded \
+             onto the SSE / chunked-transfer response body of \
+             `POST /functions/{id}/invoke-stream`. Rejected emits \
+             (caps exceeded, receiver dropped) are NOT counted",
+            streaming_chunks_emitted_total.clone(),
+        );
 
         Self {
             inner: Arc::new(TensorWasmMetricsInner {
@@ -874,6 +896,7 @@ impl TensorWasmMetrics {
                 build_info,
                 jobs_active,
                 gpu_memory_bytes_per_tenant,
+                streaming_chunks_emitted_total,
             }),
         }
     }
@@ -991,6 +1014,19 @@ impl TensorWasmMetrics {
         &self,
     ) -> &Family<TenantLabels, Gauge<u64, AtomicU64>> {
         &self.inner.gpu_memory_bytes_per_tenant
+    }
+
+    /// Cumulative count of streaming chunks emitted via
+    /// `wasi:tensor/host.emit-chunk` and successfully forwarded onto
+    /// the `/invoke-stream` HTTP response body (counter).
+    ///
+    /// Incremented from the `tensor-wasm-api` route handler on every
+    /// chunk that crosses the host→client boundary. Cap rejections
+    /// (`-1`, `-2`, `-3` return codes) do NOT bump this counter — the
+    /// metric measures real bytes-on-wire throughput, not guest emit
+    /// attempts.
+    pub fn streaming_chunks_emitted_total(&self) -> &Counter<u64> {
+        &self.inner.streaming_chunks_emitted_total
     }
 
     /// Snapshot every gauge and counter into a plain struct with one

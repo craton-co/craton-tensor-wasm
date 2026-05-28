@@ -26,6 +26,7 @@ use wasmtime::{ExternType, Module, ResourceLimiter, Store, Val};
 use crate::engine::TensorWasmEngine;
 use crate::instance::{TensorWasmInstance, InstanceState};
 use crate::instance_pool::InstancePool;
+use tensor_wasm_wasi_gpu::streaming::{add_streaming_to_linker, StreamingContext};
 
 /// Convert a wall-clock [`Duration`] into a number of epoch ticks suitable
 /// for [`wasmtime::Store::set_epoch_deadline`].
@@ -267,6 +268,19 @@ pub struct SpawnConfig {
     /// Multi-call flows should ignore this field and pass arguments directly
     /// to each `call_export_with_args` invocation.
     pub args: Vec<WasmArg>,
+    /// Optional streaming context (roadmap feature #2). When `Some`,
+    /// [`TensorWasmExecutor::spawn_instance`] builds a wasmtime
+    /// [`wasmtime::Linker`] that wires the `wasi:tensor/host` host
+    /// functions (`emit-chunk`, `flush`) against this context — guest
+    /// emits land on the matching `mpsc::Receiver<Vec<u8>>` the
+    /// gateway is draining into the SSE / chunked HTTP response.
+    ///
+    /// `None` means streaming is disabled: the spawn uses the
+    /// historical empty-imports `Instance::new_async` path, and a
+    /// guest that imports `wasi:tensor/host` will fail to link.
+    /// `/invoke` (the synchronous route) takes the `None` path; only
+    /// `/invoke-stream` opts in.
+    pub streaming: Option<StreamingContext>,
 }
 
 impl SpawnConfig {
@@ -276,6 +290,7 @@ impl SpawnConfig {
             tenant_id,
             deadline: None,
             args: Vec::new(),
+            streaming: None,
         }
     }
 
@@ -288,6 +303,21 @@ impl SpawnConfig {
     /// Attach an argument list for the upcoming call. See [`SpawnConfig::args`].
     pub fn with_args(mut self, args: Vec<WasmArg>) -> Self {
         self.args = args;
+        self
+    }
+
+    /// Attach a streaming context (roadmap feature #2). See
+    /// [`SpawnConfig::streaming`].
+    ///
+    /// Builder method; pairs with [`Self::for_tenant`] /
+    /// [`Self::with_deadline`]. The API gateway's `/invoke-stream`
+    /// route constructs an `mpsc::channel`, wraps the sender in a
+    /// `StreamingContext` via [`StreamingContext::with_channel`], and
+    /// passes it here so the guest's `wasi:tensor/host.emit-chunk`
+    /// calls land on the matching receiver — which the gateway
+    /// concurrently drains into the SSE / chunked response body.
+    pub fn with_streaming(mut self, ctx: StreamingContext) -> Self {
+        self.streaming = Some(ctx);
         self
     }
 }
@@ -831,6 +861,9 @@ impl TensorWasmExecutor {
         let max_memory_bytes = self.engine.config().max_memory_bytes;
         let mut state =
             InstanceState::new(cfg.tenant_id, id).with_memory_limit(max_memory_bytes);
+        if let Some(ref s) = cfg.streaming {
+            state = state.with_streaming(s.clone());
+        }
         if let Some(d) = cfg.deadline {
             // Seed the absolute deadline at spawn time so the first call has
             // a meaningful window even if it fires before `call_export` gets
@@ -934,7 +967,26 @@ impl TensorWasmExecutor {
         store.limiter(|state| &mut state.limiter as &mut dyn ResourceLimiter);
         // Use the *start*-function deadline for the instantiation phase.
         store.set_epoch_deadline(start_deadline_ticks);
-        let instance = wasmtime::Instance::new_async(&mut store, &module, &[]).await?;
+        // Branch on the streaming opt-in (T34, roadmap feature #2).
+        // Without streaming, preserve the historical empty-imports
+        // `Instance::new_async` path — every existing /invoke caller
+        // and every test using `SpawnConfig::for_tenant` keeps the
+        // exact same instantiation surface. With streaming, build a
+        // `Linker<InstanceState>` and register the
+        // `wasi:tensor/host` host functions so a guest that imports
+        // `emit-chunk` / `flush` link-resolves and emits land on the
+        // gateway-held `mpsc::Receiver<Vec<u8>>`.
+        let instance = if cfg.streaming.is_some() {
+            let mut linker: wasmtime::Linker<InstanceState> =
+                wasmtime::Linker::new(self.engine.inner());
+            add_streaming_to_linker(&mut linker).map_err(ExecError::Wasmtime)?;
+            linker
+                .instantiate_async(&mut store, &module)
+                .await
+                .map_err(ExecError::Wasmtime)?
+        } else {
+            wasmtime::Instance::new_async(&mut store, &module, &[]).await?
+        };
         // Restore the per-call deadline budget so subsequent
         // `call_export` invocations get the full configured deadline
         // (or unbounded `u64::MAX` when the caller did not supply one).

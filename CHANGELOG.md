@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- tensor-wasm-api (T34): /functions/{id}/invoke-stream now plumbed end-to-end through `StreamingContext`. Guest `wasi:tensor/host.emit-chunk` calls surface as SSE `event: chunk` frames. Honors T36 cooperative deadlines (DEADLINE-ELAPSED → final `event: error`). Replaces the 0.3.7 scaffold that emitted a single not_yet_wired frame.
+
 ### Roadmap
 - 13 new strategic feature directions added under docs/PATH-TO-V1.md#post-v036-strategic-features; tracked in ACTIONABLE-ITEMS-PENDING.md.
 

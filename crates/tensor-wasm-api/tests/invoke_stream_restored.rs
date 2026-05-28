@@ -2,13 +2,16 @@
 // Copyright 2026 Craton Software Company
 
 //! Integration coverage for the restored `POST
-//! /functions/{id}/invoke-stream` route (roadmap feature #2, v0.3.7
-//! scaffold).
+//! /functions/{id}/invoke-stream` route (roadmap feature #2). T34
+//! (v0.4) replaced the v0.3.7 `event: scaffold` placeholder with the
+//! real end-to-end wire through
+//! [`tensor_wasm_wasi_gpu::streaming::StreamingContext`]; these tests
+//! pin the post-wiring surface so a future merge cannot silently
+//! regress it.
 //!
 //! The route was originally mounted by B6.1 and then transiently un-routed
 //! by the B6.2 merge (see `f00822b — fix(api): un-route /invoke-stream`).
-//! These tests pin the wire surface a v0.4 implementation must preserve so
-//! a future merge cannot silently drop the route again:
+//! The asserts below cover:
 //!
 //! 1. `sse_negotiation_returns_event_stream_content_type` — `Accept:
 //!    text/event-stream` selects the SSE response shape; the body carries
@@ -119,13 +122,17 @@ async fn sse_negotiation_returns_event_stream_content_type() {
     );
 
     let body = String::from_utf8(body_bytes(resp.into_body()).await).expect("utf-8 body");
+    // T34 swap: the v0.3.7 `event: scaffold` / `not_yet_wired`
+    // placeholder is replaced by an `event: done` terminator. The
+    // fixture's `_start` emits no chunks so the body carries only
+    // the terminal frame.
     assert!(
-        body.contains("event: scaffold"),
-        "scaffold event missing from SSE body: {body:?}"
+        body.contains("event: done"),
+        "expected terminal `event: done` frame in SSE body: {body:?}"
     );
     assert!(
-        body.contains("not_yet_wired"),
-        "scaffold payload missing from SSE body: {body:?}"
+        !body.contains("not_yet_wired"),
+        "stale `not_yet_wired` placeholder must be gone: {body:?}"
     );
 }
 
@@ -156,12 +163,16 @@ async fn default_accept_returns_octet_stream() {
     );
 
     let body = String::from_utf8(body_bytes(resp.into_body()).await).expect("utf-8 body");
-    // The chunked branch reuses the SSE event shape verbatim so existing
-    // clients can detect the not-yet-wired state from either negotiation
-    // outcome.
+    // T34: the chunked branch reuses the `event: done` terminator
+    // from the SSE branch so clients on either negotiation outcome
+    // can detect end-of-stream the same way.
     assert!(
-        body.contains("not_yet_wired"),
-        "scaffold payload missing from chunked body: {body:?}"
+        body.contains("event: done"),
+        "expected terminal `event: done` line in chunked body: {body:?}"
+    );
+    assert!(
+        !body.contains("not_yet_wired"),
+        "stale `not_yet_wired` placeholder must be gone: {body:?}"
     );
 }
 

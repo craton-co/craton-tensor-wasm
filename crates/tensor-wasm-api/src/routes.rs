@@ -42,6 +42,7 @@ use tensor_wasm_core::metrics::TensorWasmMetrics;
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::TensorWasmEngine;
 use tensor_wasm_exec::executor::{ExecError, SpawnConfig, TensorWasmExecutor, WasmArg};
+use tensor_wasm_wasi_gpu::streaming::StreamingContext;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use dashmap::DashMap;
@@ -1254,58 +1255,89 @@ fn accept_wants_sse(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// `POST /functions/{id}/invoke-stream` — streaming invocation.
+/// Channel buffer size for the gateway-side
+/// `mpsc::channel::<Vec<u8>>` paired with each `/invoke-stream`
+/// invocation.
 ///
-/// Mirrors the body / auth surface of [`invoke_function`]. The response
-/// shape is chosen from the request's `Accept` header:
+/// 32 frames in flight is enough to absorb a short burst from the
+/// guest while the SSE / chunked writer drains its TCP send buffer,
+/// but small enough to apply natural back-pressure: once the writer
+/// stalls (slow / blocked client), the channel fills, the guest's
+/// next `emit-chunk` blocks on `Sender::send`, and the cooperative
+/// yield path observes the back-pressure window. See
+/// `docs/STREAMING.md` for the threat model.
+pub const STREAMING_CHANNEL_BUFFER: usize = 32;
+
+/// `POST /functions/{id}/invoke-stream` — streaming invocation
+/// (roadmap feature #2; T34 wired this through end-to-end in v0.4).
+///
+/// Mirrors the body / auth surface of [`invoke_function`]. The
+/// response shape is chosen from the request's `Accept` header:
 ///
 /// * `Accept: text/event-stream` — Server-Sent Events. Each chunk the
-///   guest emits via `wasi:tensor/host.emit-chunk` becomes one `data:`
-///   line. A `keep-alive` comment is injected on idle so intermediate
-///   proxies don't reap the connection. Stream terminates with an
-///   `event: end` frame when the guest returns.
+///   guest emits via `wasi:tensor/host.emit-chunk` becomes one
+///   `event: chunk` frame. A `keep-alive` comment is injected on idle
+///   so intermediate proxies don't reap the connection. The stream
+///   terminates with an `event: done` frame (`{"status":"ok"}`) on
+///   guest success or an `event: error` frame on guest failure.
 /// * Anything else — `Content-Type: application/octet-stream`,
-///   chunked-transfer encoding. Each guest chunk is forwarded verbatim
-///   as one HTTP chunk frame.
+///   chunked-transfer encoding. Each guest chunk is forwarded
+///   verbatim as one HTTP chunk frame, followed by the same `done` /
+///   `error` framing for terminal status.
 ///
-/// ## v0.3.7 scaffold behaviour
+/// ## Wiring
 ///
-/// The handler does NOT yet drive the executor through a streaming
-/// invocation path — that wiring lands in v0.4 alongside the
-/// `tensor_wasm_wasi_gpu::StreamingContext` hookup on `InstanceState`.
-/// For now the handler:
+/// The handler builds a `tokio::sync::mpsc::channel::<Vec<u8>>` of
+/// depth [`STREAMING_CHANNEL_BUFFER`], wraps the sender in a
+/// [`StreamingContext`] via [`StreamingContext::with_channel`], and
+/// passes it to the executor through
+/// [`SpawnConfig::with_streaming`]. The executor's
+/// `spawn_instance` path then builds a wasmtime `Linker` registering
+/// `wasi:tensor/host.emit-chunk` / `flush` against the context so
+/// guest emits land on the matching receiver.
 ///
-/// 1. Authorizes the caller (bearer + tenant scope) exactly like
-///    `/invoke`, so the route shares the existing security envelope.
-/// 2. Confirms the requested function exists.
-/// 3. Emits a single `scaffold` SSE event (or chunked frame) carrying
-///    `{"status":"not_yet_wired"}` and closes the stream.
+/// The receiver is then converted into a `futures::stream::Stream`
+/// via `stream::unfold` and either:
+///   * wrapped in `axum::response::sse::Sse` (SSE branch) — each
+///     `Vec<u8>` becomes one `event: chunk` frame, terminated by a
+///     final `event: done` / `event: error`,
+///   * collected into a `Body::from_stream` (chunked branch) — each
+///     `Vec<u8>` becomes one HTTP chunk frame.
 ///
-/// Clients that hit this route today learn the wire shape (status
-/// code, content-type, event framing) without committing to a
-/// behaviour the executor cannot yet honour. Once v0.4 lands the
-/// scaffold body is replaced with a real `mpsc::Receiver` drain
-/// without any URL / method / body-shape change.
+/// The guest call runs concurrently with the SSE writer via
+/// `tokio::spawn`. A `oneshot::channel` carries the terminal status
+/// (success / error / deadline-elapsed) so the writer can emit the
+/// final `done` / `error` event.
+///
+/// ## Cancellation
+///
+/// If the HTTP client disconnects, axum drops the response future
+/// which drops the SSE writer which drops the `mpsc::Receiver`. The
+/// guest's next `emit-chunk` then returns `-3` (receiver dropped) and
+/// the existing deadline / epoch interrupt tears the instance down.
+/// Per `docs/STREAMING.md`, this is the documented disconnect path.
 ///
 /// ## Security
 ///
-/// Bytes the guest emits will eventually pass through a `sanitize_path`-
-/// style filter before they hit the wire — log-injection and ANSI-
-/// escape stripping is documented in `docs/STREAMING.md` and lives in
-/// the v0.4 follow-up. The scaffold returns only host-controlled
-/// bytes, so the filter is intentionally not in this code path yet.
+/// Per `docs/STREAMING.md`, the host does NOT sanitise chunk
+/// payloads — the bytes flow guest→client verbatim. Sanitisation
+/// (control-byte / ANSI-escape stripping) is the client's
+/// responsibility; the CLI's T18 sanitisation handles received text.
+/// The host's contribution is the per-stream byte cap
+/// ([`MAX_TOTAL_STREAM_BYTES`](tensor_wasm_wasi_gpu::streaming::MAX_TOTAL_STREAM_BYTES))
+/// enforced inside [`StreamingContext::emit_chunk`], which bounds the
+/// per-invocation memory footprint independent of the guest's intent.
 ///
 /// ## Body handling
 ///
-/// As with `/invoke` and `/invoke-async` (api S-31), the request body
-/// is intentionally not parsed by the handler — the per-route body cap
-/// in [`crate::middleware::body_limit_layer`] still rejects oversized
-/// payloads with `413 Payload Too Large` before the handler runs, so
-/// the streaming route inherits the same DoS-protection envelope as
-/// the synchronous and async invoke variants.
+/// The request body matches [`InvokeRequest`] (optional `export` and
+/// `args`), parsed the same way the synchronous [`invoke_function`]
+/// route does. An empty body is treated as the all-defaults case so
+/// the historical "fire-and-forget no body" wire contract still
+/// works.
 #[tracing::instrument(
     name = "http.invoke_function_stream",
-    skip(state, auth, headers),
+    skip(state, auth, headers, payload),
     fields(
         function_id = %id,
         tenant = tracing::field::Empty,
@@ -1318,6 +1350,7 @@ pub async fn invoke_function_stream(
     tenant: Option<Extension<TenantId>>,
     auth: Option<Extension<crate::rate_limit::AuthContext>>,
     headers: HeaderMap,
+    payload: Result<Json<InvokeRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
     tracing::Span::current().record("tenant", tracing::field::display(tenant));
@@ -1326,51 +1359,299 @@ pub async fn invoke_function_stream(
     }
 
     // 404 before any negotiation work, mirroring `/invoke`.
-    if !state.functions.contains_key(&id) {
-        return Err(ApiError::not_found(format!("function {id} not found")));
-    }
+    let wasm_bytes = match state.functions.get(&id) {
+        Some(entry) => Arc::clone(&entry.value().wasm_bytes),
+        None => return Err(ApiError::not_found(format!("function {id} not found"))),
+    };
+
+    let req = read_invoke_request(payload).await?;
+    let args = parse_invoke_args(&req.args)?;
+    let export_override = req.export;
 
     let wants_sse = accept_wants_sse(&headers);
     tracing::Span::current().record("sse", tracing::field::display(wants_sse));
 
-    // The scaffold payload — host-controlled, no guest bytes — that the
-    // v0.4 follow-up will replace with a drain of the
-    // `mpsc::Receiver<Vec<u8>>` produced by `StreamingContext`.
-    let scaffold_payload =
-        serde_json::json!({ "status": "not_yet_wired", "function_id": id.to_string() })
-            .to_string();
+    // Build the (sender, receiver) pair. The sender side wraps in a
+    // `StreamingContext` that the executor will plumb into the guest
+    // store via `SpawnConfig::with_streaming`; the receiver side stays
+    // here and feeds the SSE / chunked-transfer response body.
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STREAMING_CHANNEL_BUFFER);
+    let streaming = StreamingContext::with_channel(chunk_tx);
 
+    // `oneshot` carrying the terminal status so the SSE writer can emit
+    // the final `event: done` / `event: error` frame after the guest
+    // returns. `Result<(), StreamTerminalError>` distinguishes success
+    // from failure without forcing the writer to box every error
+    // variant.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), StreamTerminalError>>();
+
+    // Spawn the executor call concurrently with the SSE writer. The
+    // guest emits land on `chunk_rx` while the writer drains; the
+    // spawn's terminal status lands on `done_rx`.
+    let executor = state.executor.clone();
+    tokio::spawn(async move {
+        let cfg = SpawnConfig::for_tenant(tenant)
+            .with_deadline(INVOKE_DEFAULT_DEADLINE)
+            .with_streaming(streaming);
+        let outcome = match executor.spawn_instance(cfg, &wasm_bytes).await {
+            Ok(instance_id) => {
+                let call_result = match export_override.as_deref() {
+                    Some(name) => {
+                        executor
+                            .call_export_with_args_then_terminate(instance_id, name, &args)
+                            .await
+                    }
+                    None => {
+                        // Try `_start` then `main`, matching the
+                        // synchronous /invoke fallback.
+                        match executor
+                            .call_export_with_args_then_terminate(instance_id, "_start", &args)
+                            .await
+                        {
+                            Ok(v) => Ok(v),
+                            Err(ExecError::MissingExport(_)) => {
+                                let cfg2 = SpawnConfig::for_tenant(tenant)
+                                    .with_deadline(INVOKE_DEFAULT_DEADLINE);
+                                // No streaming on the retry: the first
+                                // spawn consumed the StreamingContext.
+                                // Guest emits on the retry would `-1`,
+                                // but `main` is rare on streaming
+                                // workloads — they almost always export
+                                // a custom entry point.
+                                match executor.spawn_instance(cfg2, &wasm_bytes).await {
+                                    Ok(retry_id) => {
+                                        executor
+                                            .call_export_with_args_then_terminate(
+                                                retry_id, "main", &args,
+                                            )
+                                            .await
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            Err(other) => Err(other),
+                        }
+                    }
+                };
+                call_result.map(|_| ())
+            }
+            Err(e) => Err(e),
+        };
+        let terminal = match outcome {
+            Ok(()) => Ok(()),
+            Err(ExecError::Timeout(ctx)) => {
+                // T36 cooperative-yield ↔ deadline integration: a
+                // wall-clock deadline elapse surfaces as a structured
+                // `deadline_elapsed` error event so SSE clients can
+                // distinguish it from a generic trap.
+                Err(StreamTerminalError {
+                    kind: "deadline_elapsed",
+                    message: format!(
+                        "instance exceeded deadline ({} ms / {} ms)",
+                        ctx.elapsed_ms, ctx.deadline_ms,
+                    ),
+                })
+            }
+            Err(e) => Err(StreamTerminalError {
+                kind: "wasm_error",
+                message: format!("{e}"),
+            }),
+        };
+        // Best-effort: if the receiver is gone (client disconnected)
+        // we have nothing to deliver — the response future already
+        // dropped.
+        let _ = done_tx.send(terminal);
+    });
+
+    // Build the body stream. The shape is the same for both SSE and
+    // chunked branches: drain `chunk_rx` until empty AND the
+    // `done_rx` has fired, then emit one final terminal event.
+    let metrics_for_writer = state.metrics.clone();
+    let initial = StreamWriterState::Streaming(chunk_rx, done_rx);
+    let body_stream = stream::unfold(initial, move |st| {
+        let metrics = metrics_for_writer.clone();
+        async move {
+            match st {
+                StreamWriterState::Streaming(mut rx, mut done_rx) => {
+                    // Race the next chunk against the terminal signal.
+                    // `biased` so a ready chunk is delivered before
+                    // the terminal frame fires — important when the
+                    // guest emits N chunks and immediately returns,
+                    // since both branches are then ready at once.
+                    tokio::select! {
+                        biased;
+                        maybe_chunk = rx.recv() => {
+                            match maybe_chunk {
+                                Some(c) => {
+                                    metrics.streaming_chunks_emitted_total().inc();
+                                    Some((
+                                        StreamFrame::Chunk(c),
+                                        StreamWriterState::Streaming(rx, done_rx),
+                                    ))
+                                }
+                                None => {
+                                    // Channel closed (sender dropped =
+                                    // guest finished + executor task
+                                    // completed). Pick up the terminal
+                                    // status; if the oneshot is gone
+                                    // too, surface a wasm_error.
+                                    let terminal = done_rx.await.unwrap_or_else(|_| {
+                                        Err(StreamTerminalError {
+                                            kind: "wasm_error",
+                                            message: "executor task dropped without signalling".to_string(),
+                                        })
+                                    });
+                                    Some((StreamFrame::Done(terminal), StreamWriterState::Done))
+                                }
+                            }
+                        }
+                        done = &mut done_rx => {
+                            // Guest finished. Drain any in-flight
+                            // chunks before emitting the terminal
+                            // frame so the client sees every chunk
+                            // the guest successfully emitted.
+                            let terminal = done.unwrap_or_else(|_| {
+                                Err(StreamTerminalError {
+                                    kind: "wasm_error",
+                                    message: "executor task dropped without signalling".to_string(),
+                                })
+                            });
+                            // Try to pop one more chunk synchronously
+                            // — `try_recv` returns Empty if the buffer
+                            // is drained, in which case we emit the
+                            // terminal frame immediately.
+                            match rx.try_recv() {
+                                Ok(c) => {
+                                    metrics.streaming_chunks_emitted_total().inc();
+                                    Some((
+                                        StreamFrame::Chunk(c),
+                                        StreamWriterState::DrainOnly(rx, Some(terminal)),
+                                    ))
+                                }
+                                Err(_) => Some((
+                                    StreamFrame::Done(terminal),
+                                    StreamWriterState::Done,
+                                )),
+                            }
+                        }
+                    }
+                }
+                StreamWriterState::DrainOnly(mut rx, terminal) => {
+                    match rx.try_recv() {
+                        Ok(c) => {
+                            metrics.streaming_chunks_emitted_total().inc();
+                            Some((
+                                StreamFrame::Chunk(c),
+                                StreamWriterState::DrainOnly(rx, terminal),
+                            ))
+                        }
+                        Err(_) => Some((
+                            StreamFrame::Done(terminal.unwrap_or(Ok(()))),
+                            StreamWriterState::Done,
+                        )),
+                    }
+                }
+                StreamWriterState::Done => None,
+            }
+        }
+    });
+
+    use futures::StreamExt;
     if wants_sse {
-        // One `event: scaffold` frame, then end-of-stream. The
-        // `KeepAlive` layer is wired even though the stream closes
-        // immediately so the v0.4 swap (long-lived streams) inherits
-        // the correct keep-alive cadence without a separate edit.
-        let scaffold_event = Event::default()
-            .event("scaffold")
-            .data(scaffold_payload);
-        let end_event = Event::default().event("end").data("");
-        let s = stream::iter(vec![
-            Ok::<Event, std::convert::Infallible>(scaffold_event),
-            Ok(end_event),
-        ]);
-        Ok(Sse::new(s)
+        let sse_stream = body_stream.map(|item| {
+            let ev = match item {
+                StreamFrame::Chunk(bytes) => {
+                    // SSE `data:` requires UTF-8; for arbitrary bytes
+                    // we lossy-decode so the wire stays valid. Strict
+                    // byte-preservation is the chunked-transfer
+                    // branch's job. The CLI's T18 sanitisation is
+                    // responsible for control-byte handling on the
+                    // receive side.
+                    let s = String::from_utf8_lossy(&bytes).into_owned();
+                    Event::default().event("chunk").data(s)
+                }
+                StreamFrame::Done(Ok(())) => Event::default()
+                    .event("done")
+                    .data(serde_json::json!({"status":"ok"}).to_string()),
+                StreamFrame::Done(Err(err)) => Event::default().event("error").data(
+                    serde_json::json!({
+                        "reason": err.kind,
+                        "message": err.message,
+                    })
+                    .to_string(),
+                ),
+            };
+            Ok::<Event, std::convert::Infallible>(ev)
+        });
+        Ok(Sse::new(sse_stream)
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
-        // Chunked-transfer branch. axum infers `Transfer-Encoding:
-        // chunked` from the lack of `Content-Length` on a
-        // `Body::from_stream` response.
-        let chunk = format!("event: scaffold\ndata: {scaffold_payload}\n\n");
-        let s = stream::iter(vec![Ok::<axum::body::Bytes, std::io::Error>(
-            axum::body::Bytes::from(chunk),
-        )]);
-        let mut resp = Response::new(Body::from_stream(s));
+        // Chunked-transfer branch. Each chunk is forwarded verbatim;
+        // the terminal `done` / `error` frame is formatted as an
+        // SSE-style line so existing clients that parse the chunked
+        // body uniformly can detect end-of-stream without inspecting
+        // headers.
+        let byte_stream = body_stream.map(|item| {
+            let bytes: axum::body::Bytes = match item {
+                StreamFrame::Chunk(c) => axum::body::Bytes::from(c),
+                StreamFrame::Done(Ok(())) => axum::body::Bytes::from(format!(
+                    "event: done\ndata: {}\n\n",
+                    serde_json::json!({"status":"ok"})
+                )),
+                StreamFrame::Done(Err(err)) => axum::body::Bytes::from(format!(
+                    "event: error\ndata: {}\n\n",
+                    serde_json::json!({"reason": err.kind, "message": err.message})
+                )),
+            };
+            Ok::<axum::body::Bytes, std::io::Error>(bytes)
+        });
+        let mut resp = Response::new(Body::from_stream(byte_stream));
         resp.headers_mut().insert(
             header::CONTENT_TYPE,
             CHUNKED_MIME.parse().expect("static mime parses"),
         );
         Ok(resp)
     }
+}
+
+/// Terminal status carried from the executor task to the SSE writer
+/// via the `oneshot` channel. `kind` is the stable machine-readable
+/// identifier (`"deadline_elapsed"`, `"wasm_error"`); `message` is
+/// the human-readable detail.
+#[derive(Debug, Clone)]
+struct StreamTerminalError {
+    kind: &'static str,
+    message: String,
+}
+
+/// One frame in the body stream the [`invoke_function_stream`] writer
+/// emits. Lives at module scope so the `unfold` closure can name it
+/// across `.await` points.
+enum StreamFrame {
+    Chunk(Vec<u8>),
+    Done(Result<(), StreamTerminalError>),
+}
+
+/// State machine driving the [`invoke_function_stream`] body
+/// `stream::unfold`.
+///
+/// `Streaming` is the active phase — both the guest's chunk channel
+/// AND the executor's terminal-status oneshot are live. `DrainOnly`
+/// is the post-completion phase where the guest has returned but
+/// chunks may still be buffered in the channel; we drain them before
+/// emitting the final `done` frame so the client sees every chunk
+/// the guest successfully forwarded. `Done` ends the stream.
+enum StreamWriterState {
+    Streaming(
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+        tokio::sync::oneshot::Receiver<Result<(), StreamTerminalError>>,
+    ),
+    DrainOnly(
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+        Option<Result<(), StreamTerminalError>>,
+    ),
+    Done,
 }
 
 /// `GET /jobs/{id}` — poll an async invocation.
