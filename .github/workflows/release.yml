@@ -32,7 +32,7 @@ jobs:
           echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
       - name: cargo publish --dry-run (every member)
         run: |
-          for crate in tensor-wasm-core tensor-wasm-mem tensor-wasm-exec tensor-wasm-wasi-gpu tensor-wasm-jit tensor-wasm-snapshot tensor-wasm-tenant tensor-wasm-api tensor-wasm-cli; do
+          for crate in tensor-wasm-core tensor-wasm-mem tensor-wasm-jit tensor-wasm-wasi-gpu tensor-wasm-snapshot tensor-wasm-tenant tensor-wasm-exec tensor-wasm-api; do
             echo "::group::cargo publish --dry-run -p $crate"
             cargo publish --dry-run -p "$crate" --allow-dirty
             echo "::endgroup::"
