@@ -448,6 +448,31 @@ impl From<ExecError> for ApiError {
                 kind: "capacity_exhausted".to_string(),
                 message: err.to_string(),
             },
+            // Pre-compile size cap tripped. 413 mirrors
+            // `ModuleMemoryTooLarge` — the client submitted a wasm
+            // blob bigger than the executor will compile, and the
+            // remedy is the same (ship a smaller module).
+            ExecError::ModuleTooLarge { .. } => ApiError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                kind: "module_too_large".to_string(),
+                message: err.to_string(),
+            },
+            // The engine's epoch ticker is not running, so the deadline
+            // contract cannot be honoured. This is an operational
+            // failure (the ticker is supposed to be spawned at startup),
+            // not a client error — surface as 500 and log loudly so
+            // operators see it.
+            ExecError::EpochTickerNotRunning => {
+                tracing::error!(
+                    target: "tensor_wasm_api::routes",
+                    "spawn refused: epoch ticker is not running; deadlines cannot fire",
+                );
+                ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    kind: "epoch_ticker_not_running".to_string(),
+                    message: "internal execution error".to_string(),
+                }
+            }
         }
     }
 }

@@ -55,7 +55,12 @@ pub struct InstanceState {
     pub gpu_bytes_allocated: AtomicU64,
     /// Per-instance linear-memory limiter. Mirrors the engine's
     /// `max_memory_bytes`; wasmtime invokes it from `memory.grow`.
-    pub limiter: TensorWasmResourceLimiter,
+    ///
+    /// Crate-private: external code must not mutate the per-instance
+    /// limiter mid-flight (doing so would let a host import widen its
+    /// own memory cap inside a host call, defeating the engine cap).
+    /// Construction routes through [`Self::with_memory_limit`] only.
+    pub(crate) limiter: TensorWasmResourceLimiter,
     /// Per-instance bump arena backing the JIT `alloc`/`free`/`dispatch`
     /// imports. Living in the per-store payload (rather than captured in
     /// the linker closures) is what keeps two tenants instantiated from
@@ -67,9 +72,10 @@ pub struct InstanceState {
 impl InstanceState {
     /// Construct a fresh state with `created_at = Instant::now()`.
     ///
-    /// The limiter is initialised with `usize::MAX` (no enforcement); callers
-    /// that want enforcement should overwrite the `limiter` field or use
-    /// [`InstanceState::with_memory_limit`].
+    /// The limiter is initialised with `usize::MAX` (no enforcement);
+    /// callers that want enforcement should chain
+    /// [`InstanceState::with_memory_limit`] (the `limiter` field is
+    /// `pub(crate)` so external code cannot widen it post-construction).
     pub fn new(tenant_id: TenantId, instance_id: InstanceId) -> Self {
         Self {
             tenant_id,

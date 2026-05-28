@@ -80,6 +80,15 @@ pub struct EngineConfig {
     /// keep the default ceiling. When the limit is hit `spawn_instance`
     /// returns [`crate::executor::ExecError::CapacityExhausted`].
     pub max_instances: Option<usize>,
+    /// Pre-compile cap on the byte length of a submitted Wasm module.
+    /// Bytes above this are rejected with
+    /// [`crate::executor::ExecError::ModuleTooLarge`] *before*
+    /// `Module::from_binary` runs, preventing pathological code
+    /// sections from forcing Cranelift to burn arbitrary CPU on
+    /// adversarial input. Default is
+    /// [`crate::executor::MAX_MODULE_BYTES`] (64 MiB); embedders may
+    /// tighten further but the constant is the documented floor.
+    pub max_module_bytes: usize,
 }
 
 impl Default for EngineConfig {
@@ -92,6 +101,7 @@ impl Default for EngineConfig {
             backend: MemoryBackend::default(),
             max_module_cache_entries: 1024,
             max_instances: Some(10_000),
+            max_module_bytes: crate::executor::MAX_MODULE_BYTES,
         }
     }
 }
