@@ -49,6 +49,11 @@ rayon.workspace = true
 # `Drop` is not required and the rest of the code keeps its byte-slice
 # borrow patterns via `Deref`/`DerefMut`.
 zeroize.workspace = true
+# Hex encoding for the on-disk L2 cache path derivation (T20 perf). Used by
+# `DiskCache::path_for` to render the 16-byte cache-key digest and the
+# 8-byte HMAC-key fingerprint as ASCII without per-byte `format!` String
+# allocations on every disk-cache op.
+hex.workspace = true
 
 # pliron — MLIR-style IR framework underpinning cuda-oxide's dialect-mir →
 # dialect-llvm → PTX pipeline (RFC 0001 "Pliron lever and the auto-offload

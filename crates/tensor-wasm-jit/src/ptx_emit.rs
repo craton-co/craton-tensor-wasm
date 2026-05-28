@@ -149,7 +149,14 @@ pub fn emit(blueprint: &TensorWasmKernelBlueprint) -> Result<EmittedPtx, EmitErr
 fn lower_body(
     blueprint: &TensorWasmKernelBlueprint,
 ) -> Result<(String, u32, u32, u32, u32), EmitError> {
-    let mut body = String::new();
+    // PERF (T20): pre-size the body buffer rather than letting `writeln!`
+    // grow it by doubling. Each lowered op emits a comment line plus one
+    // or more instruction lines (`add.f32 %f… %f… %f…;`, ~32 ASCII chars
+    // each); 80 chars per op is a comfortable upper-bound average across
+    // VecAdd/VecMul/VecFma/Load/Store lowering, so this single allocation
+    // covers the common case without a single realloc. Empty blueprints
+    // still get a usable (zero-byte) capacity.
+    let mut body = String::with_capacity(blueprint.ops.len() * 80);
     // Pre-size the value stack to `ops.len()` — each lowered op pushes at
     // most one register, and most pop more than they push, so this is a
     // safe upper bound that avoids grow-by-doubling reallocs on the hot

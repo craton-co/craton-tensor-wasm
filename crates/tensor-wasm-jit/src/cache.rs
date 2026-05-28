@@ -342,7 +342,13 @@ pub struct CompiledHandle {
 #[derive(Clone)]
 pub struct KernelCache {
     /// Lock-free storage of the cached values themselves.
-    storage: Arc<DashMap<CacheKey, CachedKernel>>,
+    ///
+    /// T20 perf: values are held as `Arc<CachedKernel>` so a cache hit only
+    /// bumps the strong-count refcount instead of cloning the wrapper
+    /// (32-byte integrity hash + fingerprint + an inner `Arc<EmittedPtx>`
+    /// refcount bump). The inner PTX text was already `Arc`-shared; this
+    /// extension closes the matching gap on the outer wrapper.
+    storage: Arc<DashMap<CacheKey, Arc<CachedKernel>>>,
     /// LRU policy: keys ordered by recency. `Mutex` (parking_lot) for
     /// fast, panic-safe contention. The value side is `()` — the real value
     /// lives in `storage`.
@@ -366,6 +372,17 @@ pub struct KernelCache {
     /// so clones of `KernelCache` share the same counter (the storage
     /// and LRU policy are likewise `Arc`-shared).
     verify_skipped_total: Arc<AtomicU64>,
+    /// Cumulative count of `get` calls that returned an entry (L1 hit, L2
+    /// disk hit, or L3 registry hit). Exposed via [`Self::cache_hits_total`]
+    /// for the Prometheus counter `tensor_wasm_jit_cache_hits_total`.
+    /// `Arc`-shared so cache clones agree on the count.
+    cache_hits_total: Arc<AtomicU64>,
+    /// Cumulative count of `get` calls that returned `None` (full miss after
+    /// L1, L2, and any registry fallback). Exposed via
+    /// [`Self::cache_misses_total`] for the Prometheus counter
+    /// `tensor_wasm_jit_cache_misses_total`. `Arc`-shared so cache clones
+    /// agree on the count.
+    cache_misses_total: Arc<AtomicU64>,
 }
 
 impl KernelCache {
@@ -395,6 +412,8 @@ impl KernelCache {
             config,
             disk: None,
             verify_skipped_total: Arc::new(AtomicU64::new(0)),
+            cache_hits_total: Arc::new(AtomicU64::new(0)),
+            cache_misses_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -473,7 +492,9 @@ impl KernelCache {
                 );
             }
         }
-        self.storage.insert(key, kernel);
+        // T20 perf: storage holds `Arc<CachedKernel>` so cache hits return a
+        // refcount bump rather than a wrapper-clone.
+        self.storage.insert(key, Arc::new(kernel));
         // `LruCache::push` returns `Some((evicted_key, ()))` when sizing the
         // LRU triggers eviction of an older entry. We use this as the
         // authoritative signal for storage eviction so the two stay in sync.
@@ -520,7 +541,14 @@ impl KernelCache {
     }
 
     /// Look up a kernel; best-effort touches the LRU position.
-    pub fn get(&self, key: &CacheKey) -> Option<CachedKernel> {
+    ///
+    /// T20 perf: returns `Option<Arc<CachedKernel>>` rather than the
+    /// previous `Option<CachedKernel>` so a cache hit shares the wrapper
+    /// allocation via refcount bump instead of cloning the 32-byte
+    /// integrity hash + fingerprint + inner-`Arc` refcount bump. The
+    /// inner PTX text was already shared; this closes the matching
+    /// gap on the outer wrapper.
+    pub fn get(&self, key: &CacheKey) -> Option<Arc<CachedKernel>> {
         // Promote in the policy queue if we can grab the lock uncontended;
         // otherwise skip promotion this time so the read path stays
         // contention-free. Eviction order is approximate (not strict) LRU
@@ -532,7 +560,9 @@ impl KernelCache {
             let _ = lru.get(key);
         }
         if let Some(entry) = self.storage.get(key) {
-            let kernel = entry.value().clone();
+            // T20 perf: clone the Arc (refcount bump) rather than the
+            // inner `CachedKernel` value.
+            let kernel: Arc<CachedKernel> = Arc::clone(entry.value());
             drop(entry); // release shard lock before the hash recompute
             // jit S-3: verify the in-memory entry hasn't been tampered
             // with since `put`. A mismatch should be impossible (the
@@ -562,6 +592,7 @@ impl KernelCache {
                          evicting and refusing to return it"
                     );
                     self.storage.remove(key);
+                    self.cache_misses_total.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
             } else {
@@ -581,9 +612,11 @@ impl KernelCache {
                          CachedKernel::new — evicting and refusing to return it"
                     );
                     self.storage.remove(key);
+                    self.cache_misses_total.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
             }
+            self.cache_hits_total.fetch_add(1, Ordering::Relaxed);
             return Some(kernel);
         }
         // jit S-3 + audit P-4: L1 miss falls through to the optional L2
@@ -594,10 +627,14 @@ impl KernelCache {
             match disk.get(key) {
                 Ok(Some(kernel)) => {
                     // Promote the disk hit into L1 so subsequent lookups
-                    // stay on the fast path.
-                    self.storage.insert(*key, kernel.clone());
+                    // stay on the fast path. Storage owns an `Arc<CachedKernel>`;
+                    // wrap once here and clone the Arc for the return value
+                    // so the caller and the cache share the allocation.
+                    let arc = Arc::new(kernel);
+                    self.storage.insert(*key, Arc::clone(&arc));
                     let _ = self.lru.lock().push(*key, ());
-                    return Some(kernel);
+                    self.cache_hits_total.fetch_add(1, Ordering::Relaxed);
+                    return Some(arc);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -610,17 +647,22 @@ impl KernelCache {
                 }
             }
         }
+        self.cache_misses_total.fetch_add(1, Ordering::Relaxed);
         None
     }
 
     /// Look up by blueprint + sm_version for a given tenant; convenience
     /// wrapper around [`Self::get`].
+    ///
+    /// T20 perf: returns `Option<Arc<CachedKernel>>` to mirror
+    /// [`Self::get`]; callers that only need to peek at fields go
+    /// through auto-deref unchanged.
     pub fn get_for(
         &self,
         tenant_id: TenantId,
         blueprint: &TensorWasmKernelBlueprint,
         sm_version: u32,
-    ) -> Option<CachedKernel> {
+    ) -> Option<Arc<CachedKernel>> {
         self.get(&CacheKey::for_tenant(
             tenant_id,
             blueprint.fingerprint(),
@@ -638,9 +680,9 @@ impl KernelCache {
         key: &CacheKey,
         resolver: &dyn BlueprintResolver,
     ) -> Option<Arc<CachedKernel>> {
-        // L1 + L2
+        // L1 + L2 — `get` now already returns `Arc<CachedKernel>` (T20).
         if let Some(hit) = self.get(key) {
-            return Some(Arc::new(hit));
+            return Some(hit);
         }
         // L3
         let registry = self.config.registry.as_ref()?;
@@ -664,6 +706,13 @@ impl KernelCache {
         // the registry-derived `cached` were somehow rejected — the
         // caller still gets the verified `Arc<CachedKernel>` from this
         // call, the next call simply pays another L3 round-trip.
+        //
+        // T20 perf: `put` wraps the kernel in an `Arc` internally; we
+        // hand it a clone of the value rather than threading the Arc
+        // through to keep `put`'s public signature stable. The returned
+        // `Arc<CachedKernel>` to the caller is a separate allocation
+        // from the L1 copy — both share the inner `Arc<EmittedPtx>`,
+        // so PTX text is not duplicated.
         self.put(*key, cached.clone());
         Some(Arc::new(cached))
     }
@@ -701,6 +750,22 @@ impl KernelCache {
         self.verify_skipped_total.load(Ordering::Relaxed)
     }
 
+    /// Cumulative L1/L2/L3 cache hit count. Incremented once per `get`
+    /// call that returns `Some`. Surface on the Prometheus counter
+    /// `tensor_wasm_jit_cache_hits_total` so operators can compute the
+    /// hit ratio against [`Self::cache_misses_total`]. (T20 perf.)
+    pub fn cache_hits_total(&self) -> u64 {
+        self.cache_hits_total.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative cache miss count. Incremented once per `get` call that
+    /// returns `None` — including the rare path where an L1 entry failed
+    /// integrity verification and was evicted. Surface on the Prometheus
+    /// counter `tensor_wasm_jit_cache_misses_total`. (T20 perf.)
+    pub fn cache_misses_total(&self) -> u64 {
+        self.cache_misses_total.load(Ordering::Relaxed)
+    }
+
     /// Test-only insert that skips the `put`-side integrity check.
     ///
     /// `put` rejects any `CachedKernel` whose stored `integrity_hash`
@@ -720,7 +785,8 @@ impl KernelCache {
     /// Production code MUST go through [`Self::put`].
     #[doc(hidden)]
     pub fn __test_only_insert_unchecked(&self, key: CacheKey, kernel: CachedKernel) {
-        self.storage.insert(key, kernel);
+        // T20 perf: storage holds `Arc<CachedKernel>`; wrap on insert.
+        self.storage.insert(key, Arc::new(kernel));
         let _ = self.lru.lock().push(key, ());
     }
 }
@@ -905,21 +971,34 @@ impl DiskCache {
         hasher.update(&key.emit_config_hash.to_le_bytes());
         let h = hasher.finalize();
         // First 16 bytes (32 hex chars) is plenty of entropy for filenames.
-        let cache_key_hex: String = h
-            .as_bytes()
-            .iter()
-            .take(16)
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        //
+        // T20 perf: render the digest into a fixed 32-byte stack buffer via
+        // `hex::encode_to_slice` rather than 16× `format!("{b:02x}")` —
+        // the per-byte `format!` path used to allocate 16 transient `String`s
+        // (plus the `.collect()` target) on every disk-cache op. The slice
+        // form writes ASCII hex directly into the buffer with no heap
+        // traffic; `str::from_utf8` then borrows it as a `&str` for the
+        // final `format!`-built filename.
+        let digest = h.as_bytes();
+        let mut cache_key_hex_buf = [0u8; 32];
+        hex::encode_to_slice(&digest[..16], &mut cache_key_hex_buf)
+            .expect("32 byte buf for 16 byte input");
+        let cache_key_hex =
+            std::str::from_utf8(&cache_key_hex_buf).expect("hex is utf8");
         // First 8 bytes of blake3(hmac_key), packed LE → u64 → 16 hex chars.
         // `&self.hmac_key[..]` Deref-borrows the underlying `[u8; 32]` and
         // takes the full slice; `Zeroizing` is `Deref<Target=[u8; 32]>`.
+        //
+        // T20 perf: same encode-to-slice treatment as the cache-key digest —
+        // 8 bytes of HMAC-key fingerprint → 16 hex chars into a stack buf.
         let key_fp = blake3::hash(&self.hmac_key[..]);
-        let mut key_fp_le = [0u8; 8];
-        key_fp_le.copy_from_slice(&key_fp.as_bytes()[..8]);
-        let key_prefix = u64::from_le_bytes(key_fp_le);
+        let mut key_prefix_buf = [0u8; 16];
+        hex::encode_to_slice(&key_fp.as_bytes()[..8], &mut key_prefix_buf)
+            .expect("16 byte buf for 8 byte input");
+        let key_prefix_hex =
+            std::str::from_utf8(&key_prefix_buf).expect("hex is utf8");
         self.dir
-            .join(format!("{key_prefix:016x}-{cache_key_hex}.ptxbin"))
+            .join(format!("{key_prefix_hex}-{cache_key_hex}.ptxbin"))
     }
 
     /// Write a kernel to disk under an HMAC-keyed integrity tag.
@@ -1262,6 +1341,87 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// T20 perf regression: `KernelCache::get` returns a shared
+    /// `Arc<CachedKernel>` rather than a cloned wrapper value. Two
+    /// successive hits on the same key must yield pointer-equal Arcs
+    /// (same allocation, just a refcount bump per hit) — proving the
+    /// hot path no longer clones the 32-byte integrity hash, the
+    /// fingerprint word, and the inner `Arc<EmittedPtx>` refcount on
+    /// every dispatch.
+    #[test]
+    fn cache_get_returns_arc_no_clone() {
+        let cache = KernelCache::new();
+        let key = CacheKey::for_tenant(TenantId(1), 0xABCD, 80);
+        let original_ptx = Arc::new(EmittedPtx {
+            text: ".visible .entry t20_arc(){}".into(),
+            launch_geometry: (1, 32),
+        });
+        cache.put(
+            key,
+            CachedKernel::new(0xABCD, original_ptx.clone(), CompiledHandle::default()),
+        );
+        let first = cache.get(&key).expect("first hit");
+        let second = cache.get(&key).expect("second hit");
+        // The two `Arc<CachedKernel>` handles must point at the same
+        // allocation. If `get` had reverted to cloning the wrapper, the
+        // two handles would point at distinct allocations (still sharing
+        // the inner `Arc<EmittedPtx>`, but that is a different invariant).
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cache.get must return refcount-bumped Arc handles, not cloned \
+             wrappers — distinct allocations indicate the T20 perf fix \
+             regressed (clone-on-hit reintroduced)"
+        );
+        // Bonus: the inner PTX is still shared with the original (this was
+        // already pinned by `cache_hit_returns_arc_shared_ptx` above).
+        assert!(Arc::ptr_eq(&first.ptx, &original_ptx));
+    }
+
+    /// T20 perf: `get` increments `cache_hits_total` on every Some-returning
+    /// call and `cache_misses_total` on every None-returning call. A miss
+    /// followed by a hit must produce one of each, with neither counter
+    /// double-counting.
+    #[test]
+    fn cache_hits_misses_counter() {
+        let cache = KernelCache::new();
+        assert_eq!(cache.cache_hits_total(), 0);
+        assert_eq!(cache.cache_misses_total(), 0);
+
+        let key = CacheKey::for_tenant(TenantId(9), 0xC0FFEE, 80);
+
+        // Miss: nothing has been inserted yet.
+        assert!(cache.get(&key).is_none(), "fresh cache must miss");
+        assert_eq!(
+            cache.cache_misses_total(),
+            1,
+            "first miss must bump the miss counter exactly once"
+        );
+        assert_eq!(
+            cache.cache_hits_total(),
+            0,
+            "a miss must not bump the hit counter"
+        );
+
+        // Hit: install then look up.
+        cache.put(key, dummy_kernel(0xC0FFEE));
+        assert!(cache.get(&key).is_some(), "post-put get must hit");
+        assert_eq!(
+            cache.cache_hits_total(),
+            1,
+            "first hit must bump the hit counter exactly once"
+        );
+        assert_eq!(
+            cache.cache_misses_total(),
+            1,
+            "a hit must not bump the miss counter"
+        );
+
+        // Second hit increments hits again.
+        assert!(cache.get(&key).is_some());
+        assert_eq!(cache.cache_hits_total(), 2);
+        assert_eq!(cache.cache_misses_total(), 1);
     }
 
     /// jit S-3 T13 regression: `DiskCacheConfig`'s `Debug` impl MUST NOT
