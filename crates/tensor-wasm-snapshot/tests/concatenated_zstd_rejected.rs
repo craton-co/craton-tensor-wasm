@@ -44,8 +44,12 @@ fn two_concatenated_zstd_frames_under_valid_hmac_are_rejected() {
     // is one valid zstd frame containing a valid bincode-encoded snapshot.
     // We will concatenate it with a second valid frame to construct the
     // forgery.
+    // T40: this test forges around the v3 inline envelope, so pin
+    // the writer to the legacy envelope. The artifact-envelope
+    // default is a different shape and would invalidate the splice.
     let real_blob = SnapshotWriter::new()
         .with_hmac_sha256_key(KEY)
+        .with_legacy_envelope()
         .capture(InstanceState {
             tenant_id: TenantId(0x1111),
             instance_id: InstanceId(0x2222),

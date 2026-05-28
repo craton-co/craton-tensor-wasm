@@ -39,7 +39,14 @@ fn synth_state() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 fn signed_round_trip_through_temp_file() {
     let (wasm, gpu, regs) = synth_state();
 
-    let writer = SnapshotWriter::new().with_hmac_sha256_key(TEST_KEY);
+    // T40: opt into the legacy envelope so this v3-specific test keeps
+    // asserting the inline trailer shape. With the v0.4 default
+    // (artifact-envelope) the writer would emit `b"twasm-artifact01"`
+    // and `restored.version` would read as `SNAPSHOT_VERSION_V2`
+    // (the inner discriminant artifact-backed snapshots use).
+    let writer = SnapshotWriter::new()
+        .with_hmac_sha256_key(TEST_KEY)
+        .with_legacy_envelope();
     let blob = writer
         .capture(InstanceState {
             tenant_id: TenantId(0xABCD),
@@ -85,7 +92,14 @@ fn signed_round_trip_through_temp_file() {
 fn signed_round_trip_with_empty_bodies() {
     // Edge case: zero-length payload still produces a valid HMAC. Restoring
     // with the same key must succeed and yield empty bodies.
-    let writer = SnapshotWriter::new().with_hmac_sha256_key(TEST_KEY);
+    // T40: opt into the legacy envelope so this v3-specific test keeps
+    // asserting the inline trailer shape. With the v0.4 default
+    // (artifact-envelope) the writer would emit `b"twasm-artifact01"`
+    // and `restored.version` would read as `SNAPSHOT_VERSION_V2`
+    // (the inner discriminant artifact-backed snapshots use).
+    let writer = SnapshotWriter::new()
+        .with_hmac_sha256_key(TEST_KEY)
+        .with_legacy_envelope();
     let blob = writer
         .capture(InstanceState {
             tenant_id: TenantId(0),

@@ -35,9 +35,14 @@ const KEY: [u8; 32] = [0x5Au8; 32];
 /// deserialisation ran.
 #[test]
 fn tampered_trailer_fails_with_hmac_error_before_decoders_run() {
-    // Build a valid v3 blob.
+    // Build a valid v3 blob. T40: this test pins the v3 trailer
+    // shape (HMAC verified before bincode/zstd run); the v0.4
+    // artifact-envelope is a separate code path with its own
+    // pre-decode HMAC guarantee, so we explicitly opt into the
+    // legacy envelope here.
     let mut blob = SnapshotWriter::new()
         .with_hmac_sha256_key(KEY)
+        .with_legacy_envelope()
         .capture(InstanceState {
             tenant_id: TenantId(0xABCD),
             instance_id: InstanceId(0x1234),

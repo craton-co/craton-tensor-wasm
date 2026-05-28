@@ -55,7 +55,16 @@ tempfile.workspace = true
 proptest = { workspace = true }
 
 [features]
-default = ["signed-snapshots"]
+# T40 (v0.4 default flip): `artifact-backing` is now a default feature so new
+# writes route through the unified `DiskArtifactStore` envelope when the
+# writer has an HMAC key configured. Legacy v2/v3 reads remain supported
+# indefinitely; operators who depend on the inline v3 wire format for
+# writes can either (a) explicitly call `SnapshotWriter::with_legacy_envelope()`
+# / `SnapshotWriter::capture_legacy()`, or (b) build this crate with
+# `--no-default-features --features signed-snapshots` to keep the v0.3.x
+# behaviour. See `FORMAT.md` § "v4 (artifact-store-backed, default)" and
+# `CHANGELOG.md` under [Unreleased] for the migration story.
+default = ["signed-snapshots", "artifact-backing"]
 # Enables the GPU-side restore path that materialises the snapshot's
 # `gpu_memory` blob directly into a CUDA UnifiedBuffer and prefetches it to
 # the target device. Pulls in `cust`; off by default so the crate builds on
@@ -66,14 +75,17 @@ cuda = ["dep:cust"]
 # `SnapshotReader::with_hmac_sha256_key` become available; without it the
 # writer/reader continue to handle only the unsigned v2 wire format.
 signed-snapshots = ["dep:hmac", "dep:sha2", "dep:subtle", "dep:zeroize"]
-# Opt-in artifact-store backing for snapshots. When enabled, exposes
-# `SnapshotWriter::capture_to_artifact_store` and
-# `SnapshotReader::restore_from_artifact_store` for routing snapshots
-# through the unified `tensor-wasm-artifacts::DiskArtifactStore` envelope
-# (BLAKE3 content-hash + HMAC-SHA256 trailer + key-fingerprinted
-# filenames). The legacy inline v2/v3 envelope produced by `capture` and
-# parsed by `restore` is unaffected — v0.4 will flip the default
-# capture/restore path; v0.3.8 only ships the opt-in.
+# Artifact-store backing for snapshots (T40, now the default in v0.4).
+# When enabled the writer's default `capture` path routes through the
+# unified `tensor-wasm-artifacts` envelope (BLAKE3 content-hash + zstd +
+# HMAC-SHA256 + 16-byte ARTIFACT_MAGIC prefix) and the reader auto-detects
+# that envelope by its magic prefix, falling back to legacy v3 (T8
+# trailer-magic) and v2 detection for older blobs. The feature itself
+# remains separable so downstream consumers that need the byte-for-byte
+# legacy envelope on writes can build with
+# `--no-default-features --features signed-snapshots` to disable it.
+# `SnapshotWriter::with_legacy_envelope()` / `SnapshotWriter::capture_legacy`
+# also opt out per-call when the feature is enabled.
 artifact-backing = ["dep:tensor-wasm-artifacts"]
 
 [package.metadata.docs.rs]

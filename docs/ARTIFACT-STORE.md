@@ -107,16 +107,23 @@ own formats today. The v0.4 follow-up does the actual fold:
    bespoke v3 trailer. The on-disk magic changes; the v2 / v3 reader
    stays in the crate as a legacy decoder so existing operator
    snapshots can be migrated in place via a one-shot tool.
-   - **Snapshot migration: opt-in via feature `artifact-backing` as
-     of v0.3.8.** `SnapshotWriter::capture_to_artifact_store` and
-     `SnapshotReader::restore_from_artifact_store` route through this
-     crate's `DiskArtifactStore` when the consuming crate enables
-     the feature. The default `SnapshotWriter::capture` /
-     `SnapshotReader::restore` still emit and parse the inline v2/v3
-     envelope byte-for-byte unchanged — v0.4 will flip that default
-     once operator snapshot tooling has caught up. See
-     [`crates/tensor-wasm-snapshot/FORMAT.md`](../crates/tensor-wasm-snapshot/FORMAT.md#artifact-store-backing-opt-in-v038)
-     for the new methods.
+   - **Snapshot migration: LANDED in v0.3.7 (T40).**
+     `SnapshotWriter::capture` now routes through the unified
+     envelope (via `tensor_wasm_artifacts::encode_envelope_to_vec`)
+     when the writer has an HMAC key configured, and
+     `SnapshotReader::restore` auto-detects the envelope by its
+     leading 16-byte magic and falls through to the legacy v3 / v2
+     decoders otherwise. The `artifact-backing` feature is on by
+     default; operators who depend on the legacy v3 wire format
+     for writes can use `SnapshotWriter::with_legacy_envelope()` /
+     `SnapshotWriter::capture_legacy()` or build the crate with
+     `--no-default-features --features signed-snapshots`. See
+     [`crates/tensor-wasm-snapshot/FORMAT.md`](../crates/tensor-wasm-snapshot/FORMAT.md#v4-artifact-store-backed-default-in-v04--t40)
+     for the detection ordering and opt-out semantics. The
+     persistent-store methods (`capture_to_artifact_store` /
+     `restore_from_artifact_store`) remain available under the same
+     feature for callers that want content-addressed disk storage
+     rather than just the framed envelope bytes.
 3. **CLI surface.** A new `tensor-wasm artifact list|get|verify`
    command goes against the unified directory layout, so operators
    have one inspection command instead of two.
