@@ -403,14 +403,31 @@ impl KernelCache {
     ///
     /// Construct via:
     /// ```
+    /// # // Hidden doctest stub — real deployments must read the key from
+    /// # // an out-of-process secret store (Vault, KMS, sealed file under
+    /// # // mode 0400, etc.) and never embed it in source. This stub lets
+    /// # // the doctest compile without shipping a fake key literal that
+    /// # // operators might copy-paste verbatim.
+    /// # fn load_hmac_key_from_secret_store() -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    /// #     Ok([0u8; 32])
+    /// # }
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use std::path::PathBuf;
     /// use tensor_wasm_jit::cache::{KernelCache, DiskCacheConfig};
     /// let cache = KernelCache::new().with_disk_persistence(DiskCacheConfig {
     ///     dir: PathBuf::from("/var/cache/tensor-wasm/kernels"),
-    ///     hmac_key: [0xAB; 32],
+    ///     hmac_key: load_hmac_key_from_secret_store()?, /* loaded from secrets at startup */
     /// });
     /// # let _ = cache;
+    /// # Ok(())
+    /// # }
     /// ```
+    ///
+    /// jit S-3 (T13): the example deliberately routes the key through a
+    /// `load_hmac_key_from_secret_store()` stub rather than an inline
+    /// literal — operators have a habit of copy-pasting rustdoc examples
+    /// verbatim, and an embedded `[0xAB; 32]` (or similar) would survive
+    /// into production deployments as a fixed, attacker-known key.
     ///
     /// The directory is created lazily on the first `put`. The HMAC key
     /// MUST be stable across process restarts AND treated as a server-
@@ -732,7 +749,13 @@ impl KernelCache {
 /// [`DiskCache`] which wipes them on drop. The caller's own copy is the
 /// caller's responsibility (e.g. construct via `Zeroizing::new` upstream
 /// and let it drop after the call).
-#[derive(Debug, Clone)]
+///
+/// jit S-3 hardening (T13): `Debug` is implemented manually so the
+/// `hmac_key` bytes are redacted in any `{:?}` formatting, panic message,
+/// or `tracing` field expansion — the derived `Debug` would have dumped
+/// the raw 32-byte array. `Drop` zeroizes `hmac_key` on drop so the
+/// construction-time copy does not survive in freed memory.
+#[derive(Clone)]
 pub struct DiskCacheConfig {
     /// Directory where the L2 cache files live. Created lazily on first
     /// `put`.
@@ -741,7 +764,39 @@ pub struct DiskCacheConfig {
     /// cache's lifetime and SHOULD be treated as a server-side secret.
     /// The long-lived copy held by the cache is zeroized on drop; this
     /// field is the construction-time hand-off only.
+    ///
+    /// jit S-3 (T13): redacted in the manual [`std::fmt::Debug`] impl
+    /// below and zeroized in [`Drop`] so the construction-time copy
+    /// does not linger in freed memory after the value is moved into
+    /// the long-lived [`DiskCache`].
     pub hmac_key: [u8; 32],
+}
+
+// Manual `Debug` so `hmac_key` never appears verbatim in formatted output
+// (jit S-3 T13). Any `{:?}` print, panic message, or `tracing::error!`
+// field expansion that includes a `DiskCacheConfig` would otherwise dump
+// the raw key bytes into the log stream — which is the exact server-side
+// secret the disk cache is supposed to protect.
+impl std::fmt::Debug for DiskCacheConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskCacheConfig")
+            .field("dir", &self.dir)
+            .field("hmac_key", &"<redacted 32 bytes>")
+            .finish()
+    }
+}
+
+// Zeroize the in-place HMAC key bytes when the config is dropped so the
+// construction-time copy does not survive in freed memory once
+// [`KernelCache::with_disk_persistence`] has consumed the value (jit S-3
+// T13). The long-lived copy in [`DiskCache`] already lives inside
+// `Zeroizing<[u8; 32]>`; this `Drop` plugs the matching gap for the
+// caller-side hand-off struct.
+impl Drop for DiskCacheConfig {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.hmac_key.zeroize();
+    }
 }
 
 /// Disk-backed L2 cache. Wraps a directory of `*.ptxbin` files, each of
@@ -797,15 +852,20 @@ const DISK_CACHE_HEADER_LEN_V2: usize = 16 + 8 + 4 + 4 + 4 + 8;
 const DISK_CACHE_HMAC_LEN: usize = 32;
 
 impl DiskCache {
-    fn new(cfg: DiskCacheConfig) -> Self {
+    fn new(mut cfg: DiskCacheConfig) -> Self {
         // Move the key bytes into a `Zeroizing` newtype so the long-lived
-        // copy is wiped on `DiskCache::drop`. The caller's `DiskCacheConfig`
-        // still holds a plain `[u8; 32]` copy until the value passed in
-        // here is dropped at the end of this constructor — there's no way
-        // to avoid that without changing the public API.
+        // copy is wiped on `DiskCache::drop`. We cannot partially move
+        // fields out of `cfg` directly because `DiskCacheConfig` now
+        // implements `Drop` (jit S-3 T13) — the language forbids
+        // partial moves out of a `Drop` type. Instead we `mem::take`
+        // each field, leaving the source struct in a default-valued
+        // state before its `Drop::drop` runs and zeroizes the (now
+        // already-defaulted) `hmac_key` array a second time.
+        let dir = std::mem::take(&mut cfg.dir);
+        let key_bytes = std::mem::take(&mut cfg.hmac_key);
         Self {
-            dir: cfg.dir,
-            hmac_key: Zeroizing::new(cfg.hmac_key),
+            dir,
+            hmac_key: Zeroizing::new(key_bytes),
         }
     }
 
@@ -1202,5 +1262,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// jit S-3 T13 regression: `DiskCacheConfig`'s `Debug` impl MUST NOT
+    /// dump the raw `hmac_key` bytes. A derived `Debug` would have
+    /// formatted the array as `[222, 222, 222, …]` (or `[de, de, …]`
+    /// under hex), leaking the server-side secret into any log line,
+    /// panic message, or `tracing` field expansion that happens to
+    /// include a `DiskCacheConfig`.
+    ///
+    /// We use the sentinel byte `0xDE` repeated 32 times because the
+    /// derived `Debug` would have produced either `222` (decimal —
+    /// stdlib default for `u8` arrays) or `de` (hex) at every position;
+    /// asserting that neither pattern appears anywhere in the formatted
+    /// output catches both cases. We also positively assert the
+    /// "redacted" substring is present so the test fails informatively
+    /// if someone replaces the manual impl with something else that
+    /// happens to omit the bytes but also omits the redaction marker.
+    #[test]
+    fn disk_cache_config_debug_redacts_hmac_key() {
+        let cfg = DiskCacheConfig {
+            dir: PathBuf::from("/tmp/tensor-wasm-jit-debug-test"),
+            hmac_key: [0xDEu8; 32],
+        };
+        let dbg = format!("{cfg:?}");
+        let lowered = dbg.to_ascii_lowercase();
+        // Negative: neither decimal nor hex representation of the key
+        // bytes should appear in the formatted output. Derived `Debug`
+        // for `[u8; 32]` would have produced `222` thirty-two times
+        // (decimal) or `de` thirty-two times (hex/upper-hex
+        // alternatives); a single occurrence of either is suspicious,
+        // but to keep the assertion robust against incidental
+        // substrings in `dir` we count occurrences instead.
+        let decimal_hits = lowered.matches("222").count();
+        let hex_hits = lowered.matches("de").count();
+        assert!(
+            decimal_hits < 32,
+            "DiskCacheConfig Debug output appears to contain the raw key in \
+             decimal form ({decimal_hits} occurrences of \"222\"): {dbg}"
+        );
+        assert!(
+            hex_hits < 32,
+            "DiskCacheConfig Debug output appears to contain the raw key in \
+             hex form ({hex_hits} occurrences of \"de\"): {dbg}"
+        );
+        // Positive: the redaction marker is present.
+        assert!(
+            lowered.contains("redacted"),
+            "DiskCacheConfig Debug output should mark hmac_key as redacted: {dbg}"
+        );
     }
 }
