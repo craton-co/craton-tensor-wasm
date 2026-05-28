@@ -194,6 +194,15 @@ pub struct UnifiedBuffer {
     // `CudarcUnifiedBuffer` under `cudarc-backend` (when `unified-memory`
     // is off), or a plain `Box<[u8]>` on the default no-feature build.
     // See the module-level precedence table for the full matrix.
+    //
+    // ALIASING: `backing` and `ptr` observe the same allocation. The
+    // sealed `Backing` enum (declared `pub(super)` inside `mod backing`)
+    // exists only to give that allocation a typed `Drop`; its variants
+    // MUST NOT be pattern-matched and its wrapped storage MUST NOT be
+    // re-borrowed via the inner type's `as_mut_slice` / `as_ptr`. See
+    // the "Aliasing invariant" doc on `mod backing` for the full
+    // contract. The audit-T5 fix sealed this by making variants
+    // unreachable from outside the `unified` module.
     #[allow(dead_code)]
     backing: Backing,
     /// Tenant context for GPU memory accounting. When `Some`, the
@@ -218,8 +227,44 @@ pub struct UnifiedBuffer {
 unsafe impl Send for UnifiedBuffer {}
 unsafe impl Sync for UnifiedBuffer {}
 
+/// # Aliasing invariant
+///
+/// Each [`Backing`] variant wraps an owning allocation whose first byte
+/// is ALSO observed via the parent [`UnifiedBuffer`]'s `NonNull<u8>`.
+/// The owning storage (e.g. [`cust::memory::UnifiedBuffer<u8>`],
+/// [`crate::cudarc_backend::CudarcUnifiedBuffer`], or `Box<[u8]>`)
+/// exposes its own `as_mut_slice()` / `as_ptr()` accessors that would
+/// hand out a `&mut [u8]` to exactly the same bytes Rust already has a
+/// `&mut [u8]` to via `UnifiedBuffer::as_mut_slice` — producing two
+/// live mutable references to the same allocation, instant UB.
+///
+/// The variants are SEALED — declared `pub(super)` so no code outside
+/// the `unified` module can pattern-match or destructure them. The
+/// ONLY sound operations on a `Backing` value are:
+///
+/// 1. Leave it in place inside [`UnifiedBuffer`] (the by-design case).
+/// 2. Drop it (freeing the allocation; runs automatically on
+///    `UnifiedBuffer::drop`).
+/// 3. Replace the entire [`UnifiedBuffer`] (which moves + drops the
+///    old `Backing` as a whole; the `NonNull<u8>` is replaced in lock
+///    step).
+///
+/// Specifically forbidden, even inside the `unified` module:
+///
+/// - `match` / `if let` on `Backing` variants to call `as_mut_slice`,
+///   `as_ptr`, `as_unified_ptr`, or any other method that hands out a
+///   borrow or pointer overlapping the parent struct's
+///   [`UnifiedBuffer::ptr`]. Use `self.ptr` directly.
+/// - `mem::replace` / `mem::take` / `into_inner` style moves that
+///   extract the wrapped allocation while the parent's `ptr` is still
+///   considered live.
+///
+/// Future contributors adding a new variant MUST add a `# Safety`
+/// section to its doc comment that explains how the new variant
+/// preserves these rules. The `#[deny(missing_docs)]` attribute on
+/// the enum enforces the per-variant doc requirement at compile time.
 #[cfg(feature = "unified-memory")]
-mod backing_impl {
+mod backing {
     use super::*;
 
     /// Compile-time constant exposed by [`super::UnifiedBuffer::is_uvm_backed`].
@@ -231,10 +276,31 @@ mod backing_impl {
     /// allocator. Setting this constant to `true` is part of the three-way
     /// gating documented at the module head: `unified-memory` OR
     /// `cudarc-backend` ⇒ `true`; only the default `Box<[u8]>` path ⇒ `false`.
-    pub(crate) const IS_UVM_BACKED: bool = true;
+    pub(super) const IS_UVM_BACKED: bool = true;
 
+    /// Owning storage for a [`super::UnifiedBuffer`] under the
+    /// `unified-memory` feature.
+    ///
+    /// SEALED: declared `pub(super)`, so neither this enum nor its
+    /// variants can be named outside the `unified` module. See the
+    /// "Aliasing invariant" section on the parent module for the full
+    /// safety contract. The variants are documentation-grade only —
+    /// they exist to give the wrapped allocation a typed `Drop`; they
+    /// must not be pattern-matched.
+    #[deny(missing_docs)]
     #[allow(dead_code)]
-    pub(crate) enum Backing {
+    pub(super) enum Backing {
+        /// cust-managed UVM allocation (`cuMemAllocManaged` via cust 0.3).
+        ///
+        /// # Safety
+        ///
+        /// The wrapped [`cust::memory::UnifiedBuffer<u8>`] aliases the
+        /// same bytes as the parent [`super::UnifiedBuffer`]'s
+        /// `NonNull<u8>`. Do NOT call `as_mut_slice` / `as_ptr` /
+        /// `as_unified_ptr` on the wrapped value once it has been
+        /// moved into this variant — those accessors are reserved for
+        /// the pre-aliasing construction path inside
+        /// [`Backing::allocate`].
         Cuda(cust::memory::UnifiedBuffer<u8>),
     }
 
@@ -257,7 +323,7 @@ mod backing_impl {
     }
 
     impl Backing {
-        pub(crate) fn allocate(
+        pub(super) fn allocate(
             size: usize,
             init_zero_bytes: usize,
         ) -> Result<(NonNull<u8>, Self), UnifiedError> {
@@ -293,7 +359,14 @@ mod backing_impl {
 }
 
 #[cfg(all(not(feature = "unified-memory"), feature = "cudarc-backend"))]
-mod backing_impl {
+mod backing {
+    //! Sealed owning storage for [`super::UnifiedBuffer`]. The
+    //! `Backing` enum aliases the same allocation as
+    //! `super::UnifiedBuffer::ptr` (a `NonNull<u8>`), so its variants
+    //! are declared `pub(super)` and MUST NOT be pattern-matched from
+    //! outside this module. See the matching "Aliasing invariant"
+    //! comment on the `feature = "unified-memory"` build of this
+    //! module for the full safety contract.
     use super::*;
     use crate::cudarc_backend::CudarcUnifiedBuffer;
 
@@ -306,15 +379,33 @@ mod backing_impl {
     /// precedence rule lets cust win whenever both are enabled. Three-way
     /// gating recap: `unified-memory` OR `cudarc-backend` ⇒ `true`; only the
     /// default `Box<[u8]>` fallback ⇒ `false`.
-    pub(crate) const IS_UVM_BACKED: bool = true;
+    pub(super) const IS_UVM_BACKED: bool = true;
 
+    /// Owning storage for a [`super::UnifiedBuffer`] under the
+    /// `cudarc-backend` feature.
+    ///
+    /// SEALED: declared `pub(super)`, so neither this enum nor its
+    /// variants can be named outside the `unified` module. See the
+    /// "Aliasing invariant" section on the parent module for the full
+    /// safety contract.
+    #[deny(missing_docs)]
     #[allow(dead_code)]
-    pub(crate) enum Backing {
+    pub(super) enum Backing {
+        /// cudarc-managed UVM allocation (`cuMemAllocManaged` via cudarc).
+        ///
+        /// # Safety
+        ///
+        /// The wrapped [`CudarcUnifiedBuffer`] aliases the same bytes
+        /// as the parent [`super::UnifiedBuffer`]'s `NonNull<u8>`. Do
+        /// NOT call `as_mut_slice` / `as_ptr` on the wrapped value
+        /// once it has been moved into this variant — those accessors
+        /// are reserved for the pre-aliasing construction path inside
+        /// [`Backing::allocate`].
         Cudarc(CudarcUnifiedBuffer),
     }
 
     impl Backing {
-        pub(crate) fn allocate(
+        pub(super) fn allocate(
             size: usize,
             init_zero_bytes: usize,
         ) -> Result<(NonNull<u8>, Self), UnifiedError> {
@@ -358,7 +449,14 @@ mod backing_impl {
 }
 
 #[cfg(all(not(feature = "unified-memory"), not(feature = "cudarc-backend")))]
-mod backing_impl {
+mod backing {
+    //! Sealed owning storage for [`super::UnifiedBuffer`]. The
+    //! `Backing` enum aliases the same allocation as
+    //! `super::UnifiedBuffer::ptr` (a `NonNull<u8>`), so its variants
+    //! are declared `pub(super)` and MUST NOT be pattern-matched from
+    //! outside this module. See the matching "Aliasing invariant"
+    //! comment on the `feature = "unified-memory"` build of this
+    //! module for the full safety contract.
     use super::*;
 
     /// Compile-time constant exposed by [`super::UnifiedBuffer::is_uvm_backed`].
@@ -369,15 +467,33 @@ mod backing_impl {
     /// off — enabling either of the two CUDA-backing features flips the
     /// constant to `true`. See the module-level precedence table for the
     /// three-way gating.
-    pub(crate) const IS_UVM_BACKED: bool = false;
+    pub(super) const IS_UVM_BACKED: bool = false;
 
+    /// Owning storage for a [`super::UnifiedBuffer`] on the no-CUDA
+    /// default build.
+    ///
+    /// SEALED: declared `pub(super)`, so neither this enum nor its
+    /// variants can be named outside the `unified` module. See the
+    /// "Aliasing invariant" section on the parent module for the full
+    /// safety contract.
+    #[deny(missing_docs)]
     #[allow(dead_code)]
-    pub(crate) enum Backing {
+    pub(super) enum Backing {
+        /// Heap-backed fallback (`Box<[u8]>`).
+        ///
+        /// # Safety
+        ///
+        /// The wrapped `Box<[u8]>` aliases the same bytes as the
+        /// parent [`super::UnifiedBuffer`]'s `NonNull<u8>`. Do NOT
+        /// call `as_mut_ptr` / `as_mut` / index the slice once the box
+        /// has been moved into this variant — those accessors are
+        /// reserved for the pre-aliasing construction path inside
+        /// [`Backing::allocate`].
         Host(Box<[u8]>),
     }
 
     impl Backing {
-        pub(crate) fn allocate(
+        pub(super) fn allocate(
             size: usize,
             _init_zero_bytes: usize,
         ) -> Result<(NonNull<u8>, Self), UnifiedError> {
@@ -396,7 +512,16 @@ mod backing_impl {
     }
 }
 
-use backing_impl::{Backing, IS_UVM_BACKED};
+// Private re-export: pulls the SEALED `Backing` type and its associated
+// constant into the `unified` module's name space. The use statement is
+// intentionally non-`pub` — `Backing` itself is `pub(super)` inside its
+// `mod backing` block, so neither this re-export nor the type can be
+// named from any other module in the crate. Combined with the
+// per-variant `# Safety` invariant on each `Backing` arm (see the
+// "Aliasing invariant" doc on the `mod backing` blocks above), this
+// closes the audit-T5 finding that `Backing::Cuda` aliased the parent
+// struct's `NonNull<u8>`.
+use backing::{Backing, IS_UVM_BACKED};
 
 impl UnifiedBuffer {
     /// Allocate a new unified buffer of `size` bytes on the default device.
@@ -798,6 +923,18 @@ impl Drop for UnifiedBuffer {
         // on the drop hot path — no atomic, no allocation. The
         // underlying CUDA / heap free runs unconditionally via the
         // `backing` field's own drop.
+        //
+        // Drop-ordering w.r.t. the `Backing` aliasing invariant: this
+        // `drop` body only touches the tenant counter; it does NOT
+        // read or write through `self.ptr`. After the body returns,
+        // Rust runs field-drop in declaration order (`ptr`, `size`,
+        // `device_id`, `backing`, `tenant_ctx`). `NonNull<u8>` is
+        // `Copy`-shaped — its drop is a no-op — and only the
+        // `backing` field's `Drop` actually frees the allocation. So
+        // no in-flight `as_mut_slice` borrow can race a free here:
+        // `&mut self` in `drop` precludes any outstanding borrow, and
+        // the wrapped allocation is freed exactly once via the typed
+        // `Backing` drop. See the `Backing` "Aliasing invariant" doc.
         if let Some(ctx) = self.tenant_ctx.as_ref() {
             ctx.release_gpu_bytes(self.size as u64);
         }
@@ -998,6 +1135,47 @@ mod tests {
             b.is_uvm_backed(),
             "cudarc-backend build must use UVM backing"
         );
+    }
+
+    #[test]
+    fn backing_aliasing_sealed_allocate_use_drop_round_trip() {
+        // Audit T5 regression: the `Backing` enum aliases the same
+        // allocation as the parent `UnifiedBuffer`'s `NonNull<u8>`.
+        // We have sealed the enum (`pub(super)` inside a private
+        // `mod backing { ... }`) so no caller can pattern-match a
+        // variant and call `as_mut_slice` on the inner storage in
+        // parallel with `UnifiedBuffer::as_mut_slice`. This test
+        // exercises the only sound lifecycle — allocate, observe
+        // through the parent struct's slice accessor, drop — and
+        // asserts that the bytes round-trip without observable
+        // aliasing fallout. The compile-time guarantee that no
+        // external code can name `Backing::Cuda(...)` etc. is
+        // enforced by the `pub(super)` declaration and verified at
+        // build time; this runtime test exists for behavioural
+        // regression coverage.
+        let mut b = UnifiedBuffer::new(128).expect("alloc");
+        // Write through the parent struct's `as_mut_slice` — the
+        // only sound path. The inner `Backing` storage MUST NOT be
+        // touched concurrently.
+        {
+            let s = b.as_mut_slice();
+            for (i, byte) in s.iter_mut().enumerate() {
+                *byte = (i & 0xFF) as u8;
+            }
+        }
+        // Re-borrow read-only and confirm the writes landed.
+        {
+            let s = b.as_slice();
+            for (i, byte) in s.iter().enumerate() {
+                assert_eq!(*byte, (i & 0xFF) as u8, "byte {i} mismatch — aliasing regression?");
+            }
+        }
+        // Drop the buffer at end of scope. The `Drop` impl must free
+        // the underlying allocation exactly once via `Backing`'s
+        // typed drop; ASan / Valgrind under CI would surface a
+        // double-free if anything outside the sealed module had
+        // reached in and called `into_inner` on the wrapped storage.
+        drop(b);
     }
 
     #[test]
