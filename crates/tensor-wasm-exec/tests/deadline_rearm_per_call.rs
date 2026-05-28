@@ -72,7 +72,7 @@ async fn second_call_after_elapsed_deadline_reports_honest_numbers() {
     // the deadline is re-armed to `now + 10ms`, the spin loop runs for
     // ~10 ms, and the epoch interrupt fires with honest numbers.
     let first = exec
-        .call_export(id, "spin")
+        .call_export_with_args(id, "spin", &[])
         .await
         .expect_err("first call must time out");
     match first {
@@ -101,7 +101,7 @@ async fn second_call_after_elapsed_deadline_reports_honest_numbers() {
     // After the fix the deadline is re-armed again and we get a second
     // round of honest numbers — not the degenerate 0/0.
     let second = exec
-        .call_export(id, "spin")
+        .call_export_with_args(id, "spin", &[])
         .await
         .expect_err("second call must time out");
     match second {

@@ -18,7 +18,7 @@ Every span listed below is part of TensorWasm's public observability contract. R
 |---|---|---|---|
 | `http.request` | tower-http | method, uri, version, traceparent | request_id |
 | `tensor_wasm_exec::executor::spawn_instance` | tensor-wasm-exec | tenant, instance_id | wasm_bytes |
-| `tensor_wasm_exec::executor::call_export` | tensor-wasm-exec | instance, export | — |
+| `tensor_wasm_exec::executor::call_export_with_args` | tensor-wasm-exec | instance, export, args_len | — |
 | `tensor_wasm_exec::executor::terminate` | tensor-wasm-exec | instance | — |
 | `wasi_cuda.load_ptx` | tensor-wasm-wasi-gpu | instance, ptx_bytes, entry_bytes | — |
 | `wasi_cuda.launch` | tensor-wasm-wasi-gpu | instance, kernel, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_mem | — |
@@ -33,14 +33,23 @@ Typical call tree for a single invocation through the API gateway:
 ```
 http.request
 └── tensor_wasm_exec::executor::spawn_instance
-    ├── tensor_wasm_exec::executor::call_export
+    ├── tensor_wasm_exec::executor::call_export_with_args
     │   ├── wasi_cuda.load_ptx
     │   ├── wasi_cuda.launch
     │   └── wasi_cuda.sync
     └── tensor_wasm_exec::executor::terminate
 ```
 
-A guest that never touches the GPU produces the same shape minus the `wasi_cuda.*` children. A guest that calls an export multiple times produces one `call_export` span per call, each with its own GPU subtree.
+A guest that never touches the GPU produces the same shape minus the `wasi_cuda.*` children. A guest that calls an export multiple times produces one `call_export_with_args` span per call, each with its own GPU subtree.
+
+> **v0.3.7 rename:** the per-invocation span moved from `call_export`
+> to `call_export_with_args` when the no-args entry point became a
+> deprecated wrapper. Dashboards that filter on the old name should be
+> updated; the legacy `call_export` shim still calls through to the
+> new method so the *new* span name fires either way. The `call_export`
+> shim itself is `#[deprecated(since = "0.3.7")]` and is slated for
+> removal in v0.4 — see `MIGRATING-FROM-WASMTIME-WASMER.md` §
+> "Typed exports".
 
 ## Local Jaeger setup
 
@@ -123,8 +132,8 @@ caller (sends `traceparent: 00-<trace_id>-<span_id>-01`)
    ├── [tensor-wasm-snapshot] restore_to_gpu                  (cuda only)
    │   fields: input_len, device_index
    │
-   └── [tensor-wasm-exec] tensor_wasm_exec::executor::call_export
-       │   fields: instance, export
+   └── [tensor-wasm-exec] tensor_wasm_exec::executor::call_export_with_args
+       │   fields: instance, export, args_len
        │
        ├── [tensor-wasm-wasi-gpu] wasi_cuda.load_ptx
        ├── [tensor-wasm-wasi-gpu] wasi_cuda.launch
@@ -165,7 +174,7 @@ Jaeger as one trace:
 trace_id=abc...                         (from inbound `traceparent`)
 └── http.request                        [tensor-wasm-api]            POST /functions/fn_x/invoke
     ├── tensor_wasm_exec::executor::spawn_instance  [tensor-wasm-exec]      tenant=t_42, instance_id=i_99
-    └── tensor_wasm_exec::executor::call_export     [tensor-wasm-exec]      instance=i_99, export=run
+    └── tensor_wasm_exec::executor::call_export_with_args  [tensor-wasm-exec]  instance=i_99, export=run, args_len=0
         ├── wasi_cuda.load_ptx               [tensor-wasm-wasi-gpu]  instance=i_99, ptx_bytes=2048, entry_bytes=10
         ├── wasi_cuda.launch                 [tensor-wasm-wasi-gpu]  instance=i_99, kernel=k_3, grid_x=64, ...
         └── wasi_cuda.sync                   [tensor-wasm-wasi-gpu]  instance=i_99

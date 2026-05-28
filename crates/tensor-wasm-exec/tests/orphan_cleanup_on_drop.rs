@@ -8,8 +8,8 @@
 //! 4. Instance remains in `instances` DashMap forever; `instance_count`
 //!    stays at 1; the caller never gets the id back to terminate it.
 //!
-//! Post-fix flow uses `call_export_then_terminate`, which installs an
-//! `AutoTerminateGuard` that syncronously removes the registry entry
+//! Post-fix flow uses `call_export_with_args_then_terminate`, which installs
+//! an `AutoTerminateGuard` that syncronously removes the registry entry
 //! and decrements the counter when the wrapping future is dropped
 //! mid-await.
 
@@ -58,7 +58,7 @@ async fn auto_terminate_guard_releases_slot_on_future_drop() {
     // tower's TimeoutLayer creates.
     let result = tokio::time::timeout(
         Duration::from_millis(100),
-        exec.call_export_then_terminate(id, "noop"),
+        exec.call_export_with_args_then_terminate(id, "noop", &[]),
     )
     .await;
     assert!(result.is_err(), "outer timeout must fire");
@@ -87,9 +87,9 @@ async fn call_then_terminate_clean_path_also_removes_instance() {
     let wasm = wat::parse_str(r#"(module (func (export "noop")))"#).unwrap();
     let cfg = SpawnConfig::for_tenant(TenantId(1)).with_deadline(Duration::from_secs(5));
     let id = exec.spawn_instance(cfg, &wasm).await.expect("spawn");
-    exec.call_export_then_terminate(id, "noop")
+    exec.call_export_with_args_then_terminate(id, "noop", &[])
         .await
-        .expect("call_export_then_terminate succeeds");
+        .expect("call_export_with_args_then_terminate succeeds");
     assert_eq!(
         exec.instances_len(),
         0,

@@ -5,7 +5,7 @@
 //! parent-child-linked spans matching the documented schema.
 //!
 //! The plan's done-when criterion requires `>= 4` spans with parent-child
-//! linkage exercised. Each of `spawn_instance`, `call_export`, and
+//! linkage exercised. Each of `spawn_instance`, `call_export_with_args`, and
 //! `terminate` is `#[instrument]`-annotated and therefore emits one span
 //! per call. We drive the full `spawn -> call -> terminate` sequence twice
 //! under a single enclosing `workflow` span, giving us six executor spans
@@ -82,7 +82,7 @@ async fn invocation_emits_at_least_four_spans_with_correct_parents() {
                 .spawn_instance(SpawnConfig::for_tenant(TenantId(7)), &trivial_wasm())
                 .await
                 .unwrap();
-            exec.call_export(id, "noop").await.unwrap();
+            exec.call_export_with_args(id, "noop", &[]).await.unwrap();
             exec.terminate(id).await.unwrap();
         }
     }
@@ -104,8 +104,8 @@ async fn invocation_emits_at_least_four_spans_with_correct_parents() {
         "missing spawn_instance span; got {names:?}"
     );
     assert!(
-        names.contains(&"call_export"),
-        "missing call_export span; got {names:?}"
+        names.contains(&"call_export_with_args"),
+        "missing call_export_with_args span; got {names:?}"
     );
     assert!(
         names.contains(&"terminate"),

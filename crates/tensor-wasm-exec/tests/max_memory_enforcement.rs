@@ -62,7 +62,7 @@ async fn memory_grow_past_limit_is_rejected() {
     // The call itself succeeds — wasm semantics for a rejected `memory.grow`
     // is "return -1", not a trap. So we have to drive the call, then look
     // at the memory size, to confirm the limiter actually blocked it.
-    exec.call_export(id, "grow_by_two_mb")
+    exec.call_export_with_args(id, "grow_by_two_mb", &[])
         .await
         .expect("call returns Ok; grow rejection is in-band");
 
@@ -89,7 +89,7 @@ async fn memory_grow_under_limit_succeeds() {
         .spawn_instance(SpawnConfig::for_tenant(TenantId(1)), &growable_wasm())
         .await
         .expect("spawn");
-    exec.call_export(id, "grow_by_two_mb")
+    exec.call_export_with_args(id, "grow_by_two_mb", &[])
         .await
         .expect("call");
     exec.terminate(id).await.expect("terminate");
