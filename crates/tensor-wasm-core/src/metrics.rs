@@ -9,8 +9,9 @@
 //! handles into the components that emit them — the underlying atomics are
 //! shared.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicI64, AtomicU64};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use prometheus_client::encoding::text::encode;
 use prometheus_client::encoding::EncodeLabelSet;
@@ -19,6 +20,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
+use thiserror::Error;
 
 /// Default histogram buckets for kernel-launch latency, in seconds.
 ///
@@ -51,15 +53,276 @@ pub const DEFAULT_HTTP_DURATION_BUCKETS_SECONDS: [f64; 12] = [
 /// drawn from the small set of HTTP verbs the router accepts (`GET`, `POST`,
 /// `DELETE`). `status` is the numeric status code rendered as a string —
 /// also bounded by HTTP's three-digit code space.
+///
+/// Fields are `Cow<'static, str>` so the validated-input constructor
+/// [`HttpRequestLabels::try_new`] can hand back borrowed `&'static str`
+/// pointers for the closed sets (HTTP verbs, allow-listed route templates,
+/// 3-digit status codes) without per-request `String` allocations.
+/// Construction via the public fields is still permitted as an escape
+/// hatch — the validated path is preferred.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct HttpRequestLabels {
     /// Axum route template that matched the request (e.g. `/functions/:id/invoke`).
     /// Never the substituted value — see crate-level docs on cardinality.
-    pub route: String,
+    pub route: Cow<'static, str>,
     /// HTTP method (`GET`, `POST`, `DELETE`).
-    pub method: String,
+    pub method: Cow<'static, str>,
     /// Numeric HTTP status code rendered as decimal (e.g. `"200"`, `"401"`).
-    pub status: String,
+    pub status: Cow<'static, str>,
+}
+
+/// Process-global allow-list of axum route templates that may appear in
+/// `HttpRequestLabels::route`.
+///
+/// The HTTP `Family<HttpRequestLabels, ...>` metrics insert a new series
+/// the first time any label tuple is observed and never evict — so if a
+/// caller ever lets a raw URL path (with unbounded path parameters) leak
+/// into the `route` label the registry grows without bound and eventually
+/// OOMs the process. The allow-list is the structural defence: the
+/// validated constructor [`HttpRequestLabels::try_new`] consults the
+/// registered allow-list and rejects any unknown route with
+/// [`LabelError::UnknownRoute`].
+///
+/// The intent is for the API binary to call
+/// [`register_route_allowlist`] exactly once at startup, listing every
+/// axum route template the router serves. Library and test code that
+/// never starts the API can leave the allow-list unregistered — in that
+/// state the validator is backward-compatible and accepts any route, so
+/// existing tests continue to work unchanged.
+///
+/// The stored strings are `&'static str` so the validator can hand them
+/// back to callers as zero-copy `Cow::Borrowed` and the `Family` map
+/// keys do not pay a per-request allocation for the closed route set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteAllowlist(Vec<&'static str>);
+
+impl RouteAllowlist {
+    /// Construct a fresh allow-list from a slice of static route templates.
+    ///
+    /// Returned in an [`Arc`] so the caller can clone the handle cheaply
+    /// into [`register_route_allowlist`] and into any test that wants to
+    /// inspect the registered set.
+    pub fn new(routes: &[&'static str]) -> Arc<Self> {
+        Arc::new(Self(routes.to_vec()))
+    }
+
+    /// Look up `route` in the allow-list. Returns the matching
+    /// `&'static str` so the caller can attach it to a label without
+    /// allocating, or `None` if the route is not registered.
+    pub fn lookup(&self, route: &str) -> Option<&'static str> {
+        self.0.iter().copied().find(|&r| r == route)
+    }
+
+    /// Return the registered route templates in declaration order.
+    pub fn routes(&self) -> &[&'static str] {
+        &self.0
+    }
+}
+
+/// Process-global storage for the route allow-list. Set exactly once
+/// via [`register_route_allowlist`] (the API binary does this at
+/// startup); read on every label validation. `None` (the default) means
+/// "no allow-list registered" — the validator falls through to accept
+/// any route for backward compatibility with library callers and tests.
+static ROUTE_ALLOWLIST: OnceLock<Arc<RouteAllowlist>> = OnceLock::new();
+
+/// Register the process-global HTTP route allow-list.
+///
+/// Intended to be called exactly once at API-binary startup, before the
+/// first request hits the metrics middleware. Returns
+/// [`LabelError::AllowlistAlreadyRegistered`] if called a second time —
+/// the allow-list is immutable for the lifetime of the process so
+/// dashboards and alert rules can rely on a stable set of `route` label
+/// values.
+///
+/// Test code that needs an allow-list should construct a fresh
+/// [`RouteAllowlist`] inline and call [`HttpRequestLabels::try_new_with_allowlist`]
+/// directly to avoid contending on the process-global slot.
+pub fn register_route_allowlist(routes: &[&'static str]) -> Result<(), LabelError> {
+    let list = RouteAllowlist::new(routes);
+    ROUTE_ALLOWLIST
+        .set(list)
+        .map_err(|_| LabelError::AllowlistAlreadyRegistered)
+}
+
+/// Read-only accessor for the process-global allow-list, primarily for
+/// test introspection. Returns `None` if no allow-list has been
+/// registered.
+pub fn registered_route_allowlist() -> Option<Arc<RouteAllowlist>> {
+    ROUTE_ALLOWLIST.get().cloned()
+}
+
+/// Errors returned by [`HttpRequestLabels::try_new`] when a candidate
+/// label tuple would inflate metric cardinality past the bounded set.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum LabelError {
+    /// The supplied `route` value is not present in the registered
+    /// [`RouteAllowlist`]. Carries the offending string for diagnostic
+    /// logging; callers MUST NOT attach the raw value to any unbounded
+    /// metric series (doing so reintroduces the very cardinality leak
+    /// the allow-list exists to prevent).
+    #[error("route `{route}` is not in the registered HTTP route allow-list")]
+    UnknownRoute {
+        /// The candidate route string that failed validation.
+        route: String,
+    },
+
+    /// The supplied `method` is not one of the nine HTTP verbs accepted
+    /// by the validator (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`,
+    /// `HEAD`, `OPTIONS`, `TRACE`, `CONNECT`).
+    #[error("HTTP method `{method}` is not in the allowed verb set")]
+    InvalidMethod {
+        /// The candidate method string that failed validation.
+        method: String,
+    },
+
+    /// The supplied numeric status code is outside the HTTP standard
+    /// range of `100..=599`.
+    #[error("HTTP status code {status} is outside the valid range 100..=599")]
+    InvalidStatus {
+        /// The candidate numeric status code that failed validation.
+        status: u16,
+    },
+
+    /// [`register_route_allowlist`] was called more than once. The
+    /// allow-list is immutable for the lifetime of the process.
+    #[error("HTTP route allow-list has already been registered")]
+    AllowlistAlreadyRegistered,
+}
+
+/// HTTP verbs that [`HttpRequestLabels::try_new`] accepts. Stored as
+/// `&'static str` so a successful match yields a zero-copy
+/// `Cow::Borrowed` for the `method` label.
+const ALLOWED_HTTP_METHODS: &[&str] = &[
+    "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT",
+];
+
+/// Decimal renderings of HTTP status codes `100..=599`, captured in a
+/// single static table so [`HttpRequestLabels::try_new`] can hand back a
+/// zero-copy `Cow::Borrowed(&'static str)` for any valid status. The
+/// table is indexed as `STATUS_STR[code as usize - 100]`.
+static STATUS_STR: once_cell_table::StatusTable = once_cell_table::StatusTable::new();
+
+mod once_cell_table {
+    //! Lazily-initialised `&'static str` table for HTTP status codes
+    //! `100..=599`. Constructed on first access via [`std::sync::OnceLock`]
+    //! so the strings live for `'static` without baking a 500-entry
+    //! `const` table into the binary.
+
+    use std::sync::OnceLock;
+
+    /// Lookup table of `&'static str` decimal renderings of HTTP status
+    /// codes `100..=599`. Initialised lazily on first lookup.
+    pub(crate) struct StatusTable(OnceLock<Vec<&'static str>>);
+
+    impl StatusTable {
+        /// Construct an empty (uninitialised) table. The inner `Vec`
+        /// is populated on the first call to [`Self::get`].
+        pub(crate) const fn new() -> Self {
+            Self(OnceLock::new())
+        }
+
+        /// Return the `&'static str` decimal rendering of `code`, or
+        /// `None` if `code` is outside the `100..=599` range. The
+        /// returned reference is good for the lifetime of the
+        /// process.
+        pub(crate) fn get(&self, code: u16) -> Option<&'static str> {
+            let table = self.0.get_or_init(|| {
+                (100..=599)
+                    .map(|n: u16| {
+                        // `Box::leak` is intentional: the table is
+                        // populated exactly once, lives for the
+                        // lifetime of the process, and the leaked
+                        // memory is bounded at 500 small strings.
+                        let s: Box<str> = n.to_string().into_boxed_str();
+                        &*Box::leak(s)
+                    })
+                    .collect()
+            });
+            if (100..=599).contains(&code) {
+                Some(table[(code - 100) as usize])
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl HttpRequestLabels {
+    /// Build a validated [`HttpRequestLabels`] from caller-supplied
+    /// route / method / status values.
+    ///
+    /// Validation rules:
+    ///
+    /// * `route` is looked up in the process-global allow-list
+    ///   registered via [`register_route_allowlist`]. If no allow-list
+    ///   has been registered the route is accepted as-is (backward
+    ///   compatibility for tests and library callers that do not run
+    ///   the API binary). If an allow-list IS registered and `route`
+    ///   is not in it, returns [`LabelError::UnknownRoute`].
+    /// * `method` must be one of the nine HTTP verbs in
+    ///   [`ALLOWED_HTTP_METHODS`]. Comparison is case-sensitive
+    ///   (uppercase) — the API middleware normalises before calling.
+    /// * `status` must be in the standard HTTP range `100..=599`.
+    ///
+    /// On success the returned struct embeds the matched
+    /// `&'static str` for `method` and `status` (and for `route` when
+    /// the allow-list is registered) as a `Cow::Borrowed`, avoiding
+    /// per-request allocations on the hot path.
+    pub fn try_new(route: &str, method: &str, status: u16) -> Result<Self, LabelError> {
+        Self::try_new_with_allowlist(route, method, status, ROUTE_ALLOWLIST.get())
+    }
+
+    /// Like [`Self::try_new`] but consults an explicit allow-list
+    /// instead of the process-global slot. Useful in test code that
+    /// wants deterministic behaviour without touching the
+    /// `OnceLock`-backed global.
+    ///
+    /// Pass `None` to skip the route allow-list check entirely
+    /// (mirrors the "no allow-list registered" path of
+    /// [`Self::try_new`]).
+    pub fn try_new_with_allowlist(
+        route: &str,
+        method: &str,
+        status: u16,
+        allowlist: Option<&Arc<RouteAllowlist>>,
+    ) -> Result<Self, LabelError> {
+        let route_cow: Cow<'static, str> = match allowlist {
+            Some(list) => match list.lookup(route) {
+                Some(matched) => Cow::Borrowed(matched),
+                None => {
+                    return Err(LabelError::UnknownRoute {
+                        route: route.to_string(),
+                    });
+                }
+            },
+            None => Cow::Owned(route.to_string()),
+        };
+
+        let method_cow: Cow<'static, str> = match ALLOWED_HTTP_METHODS
+            .iter()
+            .copied()
+            .find(|&m| m == method)
+        {
+            Some(matched) => Cow::Borrowed(matched),
+            None => {
+                return Err(LabelError::InvalidMethod {
+                    method: method.to_string(),
+                });
+            }
+        };
+
+        let status_cow: Cow<'static, str> = match STATUS_STR.get(status) {
+            Some(s) => Cow::Borrowed(s),
+            None => return Err(LabelError::InvalidStatus { status }),
+        };
+
+        Ok(HttpRequestLabels {
+            route: route_cow,
+            method: method_cow,
+            status: status_cow,
+        })
+    }
 }
 
 /// Label set for `tensor_wasm_http_requests_in_flight`.
@@ -616,9 +879,9 @@ mod tests {
     fn http_request_families_observable() {
         let m = TensorWasmMetrics::new();
         let labels = HttpRequestLabels {
-            route: "/healthz".to_string(),
-            method: "GET".to_string(),
-            status: "200".to_string(),
+            route: Cow::Borrowed("/healthz"),
+            method: Cow::Borrowed("GET"),
+            status: Cow::Borrowed("200"),
         };
         m.http_requests_total().get_or_create(&labels).inc();
         m.http_request_duration_seconds()
