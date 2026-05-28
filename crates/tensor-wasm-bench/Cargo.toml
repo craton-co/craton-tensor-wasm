@@ -17,6 +17,7 @@ publish = false
 [dependencies]
 tensor-wasm-api = { workspace = true }
 tensor-wasm-core = { workspace = true }
+tensor-wasm-exec = { workspace = true }
 tensor-wasm-jit = { workspace = true }
 tensor-wasm-mem = { workspace = true }
 tensor-wasm-snapshot = { workspace = true }
@@ -32,6 +33,7 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
+wat = { workspace = true }
 
 [[bench]]
 name = "kernel_dispatch"
@@ -65,6 +67,27 @@ harness = false
 # `crates/tensor-wasm-bench/benches/dispatch_future_backends.rs` for the
 # wiring contract.
 name = "dispatch_future_backends"
+harness = false
+
+[[bench]]
+# B6 — typed-args call_export harness. Compares
+# `TensorWasmExecutor::call_export_with_args` (empty slice and
+# two-i32 args) against the legacy no-args `call_export` baseline so
+# the regression gate catches a future args-marshalling slowdown on
+# the simplest possible export signature. See the file's module docs
+# for the two-group rationale (noargs vs args).
+name = "call_export_args"
+harness = false
+
+[[bench]]
+# B7 — streaming-invoke harness. Compares `/invoke-stream`
+# (SSE + chunked variants) against the `/invoke` baseline. The bench
+# is committed as a placeholder while B7.1 (route restoration) is
+# in flight — the three bench functions panic with `todo!()` so an
+# attempted run surfaces the missing route loudly rather than
+# emitting confusing numbers. See the file's module docs for the
+# post-B7.1 wiring contract.
+name = "streaming_invoke"
 harness = false
 
 [features]
