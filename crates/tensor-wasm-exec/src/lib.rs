@@ -14,4 +14,7 @@ pub mod auto_offload;
 pub mod engine;
 pub mod executor;
 pub mod instance;
+pub mod instance_pool;
 pub mod jit_dispatch;
+
+pub use instance_pool::{InstancePool, InstancePoolConfig, PooledInstance};

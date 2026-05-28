@@ -452,6 +452,31 @@ the commitment; the date is a guess.
 
 ---
 
+## Post-v0.3.6 strategic features
+
+A small list of strategic features lined up between v0.3.6 and v0.4.0.
+Each is scoped, has a single owner module, and ships behind an opt-in
+config knob so existing deployments are unaffected until they elect
+to turn it on. Order is by expected impact on cold-start / hot-path
+latency; numbering is stable for cross-linking.
+
+1. **OpenAI-shim compatibility layer** — drop-in `/v1/completions`
+   surface that forwards into a TensorWasm tenant. Scaffold landed
+   in `tensor-wasm-api`; full streaming in v0.4.
+2. **Snapshot replay-protection** — monotonic snapshot epoch + nonce,
+   verified on restore. Scaffold landed in `tensor-wasm-snapshot`.
+3. **Tenant-aware WASI-GPU back-pressure** — per-tenant queue depth
+   limits surfacing as `QuotaExceeded`. Scaffold in
+   `tensor-wasm-wasi-gpu`.
+4. **Configurable per-instance linear-memory cap** — `max_linear_memory`
+   in `EngineConfig`. Landed in `tensor-wasm-mem`.
+5. **Pre-instantiated instance pool** — pre-spawn N instances per
+   `(tenant, module-hash)` tuple under MPS; draw from a
+   `crossbeam-channel` on `invoke`. Scaffold lives in
+   `tensor-wasm-exec::instance_pool`; see
+   [docs/INSTANCE-POOL.md](INSTANCE-POOL.md) for the v0.4
+   implementation plan and the reset-on-return contract.
+
 ## Out of scope — deferred to v2.0
 
 For visibility, the v2.x line is likely to include:
