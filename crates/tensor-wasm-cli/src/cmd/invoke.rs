@@ -101,13 +101,18 @@ pub async fn run(args: InvokeArgs, ctx: &HttpContext) -> Result<()> {
     }
 
     // Pretty-print if the body is JSON; otherwise echo verbatim so the user
-    // still sees what the server sent.
+    // still sees what the server sent. T18: every branch outputs
+    // server-controlled bytes — sanitise to strip ANSI escapes / control
+    // bytes before they hit the terminal. The pretty-printed JSON case is
+    // included because string *values* embedded in the JSON envelope are
+    // server-controlled and `serde_json::to_string_pretty` will faithfully
+    // emit any control byte the server stashed in a string field.
     match serde_json::from_str::<serde_json::Value>(&text) {
         Ok(v) => match serde_json::to_string_pretty(&v) {
-            Ok(pretty) => println!("{pretty}"),
-            Err(_) => println!("{text}"),
+            Ok(pretty) => println!("{}", super::sanitise_terminal_output(&pretty)),
+            Err(_) => println!("{}", super::sanitise_terminal_output(&text)),
         },
-        Err(_) => println!("{text}"),
+        Err(_) => println!("{}", super::sanitise_terminal_output(&text)),
     }
     Ok(())
 }

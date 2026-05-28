@@ -278,6 +278,15 @@ pub async fn run(args: ObserveArgs, ctx: &HttpContext) -> Result<()> {
         };
         let snap = Snapshot::from_metrics(&metrics, now);
         let board = render_board(&base, interval, &health, &metrics, &prev, &snap, fetch_err);
+        // T18: the board is composed of server-derived text — `/healthz`
+        // body, route labels from `/metrics`, and fetch-error messages.
+        // A malicious server could embed ANSI escapes that survive
+        // through `parse_metrics` / `render_board` and rewrite the
+        // operator's terminal. Sanitise the rendered board before
+        // emitting; the `CLEAR_AND_HOME` constant we prepend is the
+        // *only* escape sequence the dashboard is allowed to use, and
+        // it is added outside the sanitised payload below.
+        let board = super::sanitise_terminal_output(&board);
         // cli fix 3: only emit the `\x1B[2J\x1B[H` clear-and-home escape when
         // stdout is a TTY. Piped / redirected output (CI logs, `tee`, files)
         // would otherwise capture the raw escape bytes and either render them

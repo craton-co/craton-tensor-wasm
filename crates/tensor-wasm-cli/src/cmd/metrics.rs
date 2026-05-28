@@ -52,6 +52,12 @@ pub async fn run(args: MetricsArgs, ctx: &HttpContext) -> Result<()> {
         return Err(super::render_error_response(status, &text));
     }
 
-    println!("{text}");
+    // T18: the Prometheus text-exposition format is *mostly* US-ASCII, but
+    // metric *labels* are server-controlled strings — a malicious server
+    // could stash an ANSI escape inside a label value and the verbatim
+    // print below would feed it straight to the terminal. Strip control
+    // bytes before display; the legitimate Prometheus format does not
+    // need them.
+    println!("{}", super::sanitise_terminal_output(&text));
     Ok(())
 }
