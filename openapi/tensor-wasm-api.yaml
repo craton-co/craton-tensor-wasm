@@ -242,23 +242,24 @@ paths:
 
         * `Accept: text/event-stream` — Server-Sent Events. Each chunk
           the guest emits via the `wasi:tensor/host.emit-chunk` host
-          function is rendered as one `data:` line. Stream terminates
-          with an `event: end` frame.
+          function is rendered as one `event: chunk` frame. The stream
+          terminates with an `event: done` frame on success or an
+          `event: error` frame on guest failure / deadline-elapsed.
         * Otherwise — `Content-Type: application/octet-stream`,
           `Transfer-Encoding: chunked`. Each guest chunk is forwarded
-          verbatim as one HTTP chunk frame.
+          verbatim as one HTTP chunk frame, followed by the same
+          terminal `event: done` / `event: error` line so clients on
+          either negotiation outcome detect end-of-stream uniformly.
 
-        ### v0.3.7 scaffold
+        ### v0.4 wiring (T34)
 
-        The route is mounted and stable in v0.3.7 but does not yet
-        drive the executor through a streaming invocation path. The
-        scaffold returns a single `event: scaffold` frame with
-        `{"status":"not_yet_wired"}` then closes the stream. Mid-
-        execution streaming wiring lands in v0.4 alongside the
-        `tensor_wasm_wasi_gpu::StreamingContext` hookup on
-        `InstanceState`. The wire shape (URL, method, response
-        framing, status codes) will not change between v0.3.7 and
-        v0.4 — see `docs/STREAMING.md`.
+        The route is wired end-to-end through
+        `tensor_wasm_wasi_gpu::StreamingContext`. Guest emits land on a
+        `tokio::sync::mpsc::Receiver<Vec<u8>>` the gateway drains into
+        the response body. The cooperative-deadline path (T36) routes
+        a deadline-elapsed signal into a final `event: error` with
+        `{"reason":"deadline_elapsed"}` so SSE clients can distinguish
+        it from a generic trap. See `docs/STREAMING.md`.
       operationId: invokeFunctionStream
       parameters:
         - $ref: "#/components/parameters/FunctionId"
@@ -297,15 +298,17 @@ paths:
                 type: string
                 description: |
                   Server-Sent Events stream. Each emitted chunk is
-                  one `data:` frame; the stream ends with an
-                  `event: end` frame.
+                  one `event: chunk` frame; the stream ends with an
+                  `event: done` frame on success or an `event: error`
+                  frame on failure / deadline-elapsed.
             application/octet-stream:
               schema:
                 type: string
                 format: binary
                 description: |
                   Raw chunked-transfer bytes — one HTTP chunk per
-                  guest-emitted chunk.
+                  guest-emitted chunk, followed by a final terminal
+                  `event: done` / `event: error` line.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":

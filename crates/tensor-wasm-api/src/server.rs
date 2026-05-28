@@ -431,9 +431,12 @@ fn build_router_full(
     let invoke_router = Router::new()
         .route("/functions/:id/invoke", post(invoke_function))
         .route("/functions/:id/invoke-async", post(invoke_function_async))
-        // Streaming invoke (roadmap feature #2). Restored by B7.1; the
-        // handler is the post-B6.2 scaffold (no body parsing yet, follows
-        // api S-31 contract). v0.4 lands the StreamingContext wire.
+        // Streaming invoke (roadmap feature #2). Restored by B7.1 and
+        // wired end-to-end by T34: the handler builds an mpsc channel,
+        // installs the sender on a `StreamingContext`, threads it
+        // through `SpawnConfig::with_streaming` to the executor, and
+        // drains the receiver into the SSE / chunked-transfer response
+        // body. See `docs/STREAMING.md`.
         .route("/functions/:id/invoke-stream", post(invoke_function_stream))
         .layer(concurrency_limit_layer(INVOKE_CONCURRENCY_LIMIT));
     let write_router = Router::new()

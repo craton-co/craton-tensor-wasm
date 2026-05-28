@@ -20,6 +20,11 @@ anyhow.workspace = true
 axum.workspace = true
 tensor-wasm-core = { workspace = true }
 tensor-wasm-exec = { workspace = true }
+# tensor-wasm-wasi-gpu: needed by the streaming `/invoke-stream` route to
+# construct a `StreamingContext` whose `mpsc::Sender<Vec<u8>>` is wired
+# into the executor's spawn config (T34). The receiver end stays in the
+# route handler and feeds the SSE / chunked-transfer response body.
+tensor-wasm-wasi-gpu = { workspace = true }
 # tensor-wasm-jit: pulled in only when the `kernel-registry-api` feature
 # is enabled. The api crate uses it solely to expose the `/kernels` HTTP
 # routes (B6.4) — manifest verification, in-memory storage, and the

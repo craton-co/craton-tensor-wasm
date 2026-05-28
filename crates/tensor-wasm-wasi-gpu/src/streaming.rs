@@ -207,13 +207,17 @@ pub const FN_FLUSH: &str = "flush";
 ///
 /// `T` is the store data type and must implement [`HasStreaming`].
 ///
-/// The host-fn wrappers registered here are SCAFFOLD implementations:
-/// they accept `(buf_ptr, buf_len)` from the guest, bounds-check the
-/// region against the guest's linear memory, then forward the bytes
-/// into [`StreamingContext::emit_chunk`]. The actual reads from guest
-/// memory and the chunk-size cap enforcement are the work the v0.4
-/// follow-up will land; this scaffold registers the names so a guest
-/// that imports `wasi:tensor/host` link-resolves cleanly.
+/// The host-fn wrappers registered here read the `(buf_ptr, buf_len)`
+/// argument pair from the guest, bounds-check the region against the
+/// guest's linear memory exported as `"memory"`, then forward the bytes
+/// into [`StreamingContext::emit_chunk`].
+///
+/// Single-chunk size cap: emits whose `buf_len` exceeds
+/// [`MAX_CHUNK_BYTES`] return `-2` (cap exceeded) without touching the
+/// channel — chunks above the cap would interleave badly with the
+/// downstream SSE / chunked-transfer framing, so we refuse them at the
+/// boundary. The total-bytes cap is still enforced inside
+/// [`StreamingContext::emit_chunk`] on top of this per-call check.
 ///
 /// Returns the same `wasmtime::Result` shape as [`crate::host::add_to_linker`]
 /// for parity. Idempotency: registering the same `(module, name)`
@@ -231,18 +235,26 @@ pub fn add_streaming_to_linker<T: HasStreaming + Send + 'static>(
     linker.func_wrap_async(
         STREAMING_MODULE,
         FN_EMIT_CHUNK,
-        |caller: Caller<'_, T>,
+        |mut caller: Caller<'_, T>,
          (buf_ptr, buf_len): (i32, i32)|
          -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
+            // Synchronously: validate the (ptr, len) pair, copy the
+            // bytes out of guest linear memory, and clone the streaming
+            // context out of store data. The `Caller`'s memory borrow
+            // cannot survive an `.await` (wasmtime's `Memory::data`
+            // borrow may be invalidated by any await on a different
+            // host fn or by guest re-entry), so we materialise the
+            // `Vec<u8>` up front and emit on the cloned context.
+            //
+            // Cloning `StreamingContext` is two refcount bumps — see
+            // the type's `Clone` impl — so the cost is negligible
+            // compared to the byte copy.
+            let prep = prepare_emit_chunk(&mut caller, buf_ptr, buf_len);
             Box::new(async move {
-                // SCAFFOLD: the guest-memory read + bounds check lands
-                // in v0.4. For the v0.3.7 scaffold we forward zero
-                // bytes through the channel so the disabled / cap /
-                // receiver-dropped branches are still observable when
-                // the host-fn is invoked, and the (buf_ptr, buf_len)
-                // signature is pinned.
-                let _ = (buf_ptr, buf_len);
-                caller.data().streaming().emit_chunk(Vec::new()).await
+                match prep {
+                    Ok((bytes, ctx)) => ctx.emit_chunk(bytes).await,
+                    Err(code) => code,
+                }
             })
         },
     )?;
@@ -252,6 +264,50 @@ pub fn add_streaming_to_linker<T: HasStreaming + Send + 'static>(
     })?;
 
     Ok(())
+}
+
+/// Synchronous preamble for [`add_streaming_to_linker`]'s `emit-chunk`
+/// host function. Validates the `(buf_ptr, buf_len)` pair against the
+/// guest's exported `"memory"`, copies the bytes out of linear memory,
+/// and clones the [`StreamingContext`] out of store data.
+///
+/// Returns `Err(-2)` (cap-exceeded / invalid pointer) on any failure
+/// path — both `MAX_CHUNK_BYTES` overflow and out-of-bounds region
+/// surface the same documented `-2` code so the guest cannot
+/// fingerprint the host's memory layout from the return value. The
+/// disabled / receiver-dropped branches (`-1` / `-3`) are reached only
+/// once the bytes have been forwarded onto the channel.
+fn prepare_emit_chunk<T: HasStreaming>(
+    caller: &mut Caller<'_, T>,
+    buf_ptr: i32,
+    buf_len: i32,
+) -> Result<(Vec<u8>, StreamingContext), i32> {
+    if buf_len < 0 || buf_ptr < 0 {
+        return Err(-2);
+    }
+    if (buf_len as usize) > MAX_CHUNK_BYTES {
+        return Err(-2);
+    }
+    let memory = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or(-2_i32)?;
+    let start = buf_ptr as usize;
+    let end = start.checked_add(buf_len as usize).ok_or(-2_i32)?;
+    // `Memory::data` returns a slice tied to the borrow of the
+    // store, so we scope the borrow tightly and copy out before the
+    // subsequent `caller.data()` call re-borrows for the
+    // streaming-context clone. Mirrors the pattern used by
+    // `wasi-cuda`'s `read_bytes` helper in `src/host.rs`.
+    let bytes: Vec<u8> = {
+        let data = memory.data(&caller);
+        if end > data.len() {
+            return Err(-2);
+        }
+        data[start..end].to_vec()
+    };
+    let ctx = caller.data().streaming().clone();
+    Ok((bytes, ctx))
 }
 
 #[cfg(test)]
