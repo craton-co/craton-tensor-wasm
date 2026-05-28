@@ -2,7 +2,7 @@
 
 Living document tracking architectural risks, upstream pinning decisions, and known limitations for maintainers. Updated alongside `CHANGELOG.md` releases.
 
-Last updated: 2026-05-27 (v0.3.6 — snapshot HMAC signing landed)
+Last updated: 2026-05-28 (v0.3.7 — workspace version bump)
 
 ---
 

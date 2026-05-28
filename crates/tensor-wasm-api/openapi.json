@@ -4,7 +4,7 @@
   "info": {
     "title": "TensorWasm HTTP API",
     "description": "REST surface of a Craton TensorWasm serverless Wasm node. Prose\ndocumentation, error semantics, and the full middleware stack live in\ncrates/tensor-wasm-api/API.md.\n",
-    "version": "0.1.0",
+    "version": "0.3.7",
     "license": {
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"

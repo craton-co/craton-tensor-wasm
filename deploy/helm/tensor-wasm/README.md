@@ -8,12 +8,12 @@ the plain YAML manifests at `../../k8s/`.
 | Field | Value |
 |---|---|
 | Chart version | `0.1.1` |
-| App version | `0.3.6` |
-| Default image | `ghcr.io/craton-co/tensor-wasm:0.3.6` (host-only); `…:0.3.6-cust` / `…-cudarc` / `…-cuda-oxide` when `image.backend` is set |
+| App version | `0.3.7` |
+| Default image | `ghcr.io/craton-co/tensor-wasm:0.3.7` (host-only); `…:0.3.7-cust` / `…-cudarc` / `…-cuda-oxide` when `image.backend` is set |
 | Kubernetes | `>= 1.23` |
 
 > **Image registry is not yet provisioned.** The `ghcr.io/craton-co/*` path is
-> aspirational as of v0.3.6 — operators must build + push locally until the
+> aspirational as of v0.3.7 — operators must build + push locally until the
 > v0.4 release-engineering pipeline lands. The repo root [`Dockerfile`](../../../Dockerfile)
 > produces all four variants via `--build-arg BACKEND={"",cust,cudarc,cuda-oxide}`.
 > Override `--set image.repository=my-registry/tensor-wasm` to point the chart
@@ -21,10 +21,10 @@ the plain YAML manifests at `../../k8s/`.
 >
 > Build commands (run from repo root):
 > ```sh
-> docker build                                  -t my-registry/tensor-wasm:0.3.6            .
-> docker build --build-arg BACKEND=cust         -t my-registry/tensor-wasm:0.3.6-cust       .
-> docker build --build-arg BACKEND=cudarc       -t my-registry/tensor-wasm:0.3.6-cudarc     .
-> docker build --build-arg BACKEND=cuda-oxide   -t my-registry/tensor-wasm:0.3.6-cuda-oxide .
+> docker build                                  -t my-registry/tensor-wasm:0.3.7            .
+> docker build --build-arg BACKEND=cust         -t my-registry/tensor-wasm:0.3.7-cust       .
+> docker build --build-arg BACKEND=cudarc       -t my-registry/tensor-wasm:0.3.7-cudarc     .
+> docker build --build-arg BACKEND=cuda-oxide   -t my-registry/tensor-wasm:0.3.7-cuda-oxide .
 > ```
 
 ## Install
@@ -129,7 +129,7 @@ a high-level summary.
 # values-gpu.yaml
 image:
   repository: my-registry/tensor-wasm-gpu
-  tag: "0.3.6"
+  tag: "0.3.7"
 gpu:
   enabled: true
   count: 1
@@ -204,7 +204,7 @@ Invalid values fail the install with a clear error rather than producing an
 `ImagePullBackOff` on a tag that does not exist (see
 `templates/_helpers.tpl` `tensor-wasm.validateBackend`).
 
-**Today (v0.3.6) this toggle is a "documentation handle".** The
+**Today (v0.3.7) this toggle is a "documentation handle".** The
 release-engineering pipeline that publishes per-backend container tags
 (`<tag>-unified-memory`, `<tag>-cudarc`, `<tag>-cuda-oxide`) is wave-4
 work; until those images exist on `ghcr.io/craton-co/*` the chart does
