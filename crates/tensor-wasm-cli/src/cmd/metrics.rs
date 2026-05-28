@@ -41,8 +41,10 @@ pub async fn run(args: MetricsArgs, ctx: &HttpContext) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("GET {url}: {e}"))?;
 
     let status = resp.status();
-    let text = resp
-        .text()
+    // T17: route the body through `bounded_text` so a malicious server
+    // streaming gigabytes of `text/plain` cannot OOM the CLI. The 16 MiB
+    // cap is comfortably above any legitimate Prometheus exposition.
+    let text = super::bounded_text(resp)
         .await
         .map_err(|e| anyhow::anyhow!("reading response body from {url}: {e}"))?;
 
