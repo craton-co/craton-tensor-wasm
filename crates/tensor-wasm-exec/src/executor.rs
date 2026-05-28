@@ -827,6 +827,98 @@ impl TensorWasmExecutor {
             None => Err(ExecError::NotFound(id)),
         }
     }
+
+    /// Call an export, then unconditionally terminate the instance —
+    /// even if the returned future is dropped mid-await (api S-20 +
+    /// orphan-instance cleanup).
+    ///
+    /// The previous flow (`call_export` + explicit `terminate` from the
+    /// caller) leaks the instance into `instances` when the caller's
+    /// future is dropped by an outer cancellation (e.g. tower's
+    /// `TimeoutLayer` firing). The leaked entry holds the wasmtime
+    /// `Store` and counts against `max_instances`, but is unreachable
+    /// by id (the caller lost the handle). This wrapper installs an
+    /// `AutoTerminateGuard`: on the normal exit paths it disarms the
+    /// guard and calls `terminate` via the async API; on a Future-drop
+    /// the guard's `Drop` synchronously removes the registry entry
+    /// (and frees the admission slot) so the leak window closes at
+    /// the await boundary.
+    ///
+    /// Known limitation: this wrapper cannot stop CPU work that is
+    /// already running inside Wasmtime's blocking compile path
+    /// (`Instance::new_async` invokes Cranelift, which does not expose
+    /// a cancellation hook). For now, the cap on
+    /// [`crate::engine::EngineConfig::max_module_cache_entries`]
+    /// limits the worst case to one compile per unique module.
+    /// Per-store epoch cancellation interrupts wasm execution at the
+    /// next epoch tick, which is what closes the actual run-time
+    /// window.
+    pub async fn call_export_then_terminate(
+        &self,
+        id: InstanceId,
+        export: &str,
+    ) -> Result<(), ExecError> {
+        let guard = AutoTerminateGuard {
+            instances: Arc::clone(&self.instances),
+            instance_count: Arc::clone(&self.instance_count),
+            metrics: self.metrics.clone(),
+            id,
+            // Re-arm on construction; only the success/error path below
+            // is allowed to disarm.
+            armed: true,
+        };
+        let result = self.call_export(id, export).await;
+        // Disarm BEFORE the async terminate so a panic in `terminate`
+        // does not double-fire. Both paths still remove the instance
+        // exactly once: the guard via the sync DashMap::remove if it
+        // is armed, the explicit terminate via the same DashMap::remove
+        // when the guard is disarmed.
+        let mut guard = guard;
+        guard.armed = false;
+        let _ = self.terminate(id).await; // ignore NotFound on success-after-cancel races
+        result
+    }
+}
+
+/// RAII drop-guard that synchronously removes an instance from the
+/// registry if it is still armed when dropped. See
+/// [`TensorWasmExecutor::call_export_then_terminate`] for the threat
+/// model that motivates the design.
+///
+/// Holds `Arc` clones of the registry and the admission counter so
+/// the guard can run without borrowing the executor — which matters
+/// because the original `&self` reference is consumed by the
+/// `call_export` await this guard wraps.
+struct AutoTerminateGuard {
+    instances: Arc<DashMap<InstanceId, Arc<Mutex<TensorWasmInstance>>>>,
+    instance_count: Arc<AtomicUsize>,
+    metrics: Option<TensorWasmMetrics>,
+    id: InstanceId,
+    armed: bool,
+}
+
+impl Drop for AutoTerminateGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Sync remove: we cannot await in Drop. The async `terminate`
+        // method does exactly the same work plus a debug! log, so this
+        // is a faithful sync mirror.
+        if self.instances.remove(&self.id).is_some() {
+            self.instance_count.fetch_sub(1, Ordering::AcqRel);
+            if let Some(m) = &self.metrics {
+                m.instance_terminations_total().inc();
+                m.active_instances().dec();
+            }
+            tracing::warn!(
+                target: "tensor_wasm_exec::executor",
+                instance = %self.id,
+                "instance auto-terminated by drop-guard (handler future cancelled \
+                 mid-call_export; see api S-20)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

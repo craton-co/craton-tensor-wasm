@@ -634,21 +634,29 @@ async fn run_invoke(
     // other than `MissingExport` from the first attempt bubbles up directly;
     // a missing `_start` falls through to `main`. If neither exists the
     // `MissingExport` from the second attempt is returned (mapped to 400).
-    let call_result = match executor.call_export(instance_id, "_start").await {
+    //
+    // api S-20 / exec orphan-instance: use `call_export_then_terminate` so
+    // the instance is cleaned up even if our future is dropped mid-await
+    // (e.g. by tower's `TimeoutLayer`). The previous `call_export` +
+    // explicit `terminate` flow leaked the registry entry into
+    // `instances` on outer cancellation, holding the wasmtime `Store`
+    // and counting against `max_instances` until process restart.
+    let call_result = match executor.call_export_then_terminate(instance_id, "_start").await {
         Ok(()) => Ok(()),
-        Err(ExecError::MissingExport(_)) => executor.call_export(instance_id, "main").await,
+        Err(ExecError::MissingExport(_)) => {
+            // `_start` was missing AND the instance was already terminated
+            // by the first guard. Re-spawn to try `main` — slightly more
+            // expensive than the old "reuse the instance" flow but only
+            // when `_start` is genuinely absent, and keeps the auto-
+            // terminate invariant intact.
+            let cfg = SpawnConfig::for_tenant(tenant).with_deadline(INVOKE_DEFAULT_DEADLINE);
+            let retry_id = executor.spawn_instance(cfg, wasm_bytes).await?;
+            executor.call_export_then_terminate(retry_id, "main").await
+        }
         Err(other) => Err(other),
     };
 
-    // Always terminate, even on call failure. Surface the call error in
-    // preference to the terminate error — the call result is what the
-    // operator wants to see.
-    let terminate_result = executor.terminate(instance_id).await;
-
     call_result?;
-    // If the call succeeded but terminate failed we still surface the
-    // terminate error: leaking instances is a real bug we want loud.
-    terminate_result?;
 
     Ok(serde_json::json!({
         "function_id": function_id.to_string(),
