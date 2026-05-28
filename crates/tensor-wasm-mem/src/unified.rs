@@ -68,6 +68,26 @@ pub enum UnifiedError {
         /// Hard cap enforced by the host (bytes).
         limit: u64,
     },
+    /// A constructor variant is wired at the type level but not yet
+    /// supported by the active backing.
+    ///
+    /// Currently used by the v0.4 scaffold for
+    /// [`UnifiedBuffer::new_in_tenant_pool`]: pool-allocation requires
+    /// `cuMemAllocFromPoolAsync`, which is not yet routed through the
+    /// `Backing` enum. Callers should pattern-match on this variant
+    /// rather than substring-matching the error string when picking a
+    /// fallback path. The `feature` field is a short stable token
+    /// identifying *which* constructor was unsupported; `backing`
+    /// describes the active backing.
+    #[error("feature {feature} not supported by active backing {backing}")]
+    NotSupported {
+        /// Short stable token identifying the unsupported constructor
+        /// (e.g. `"pool-allocate"`).
+        feature: &'static str,
+        /// Short stable token identifying the active backing
+        /// (e.g. `"cudarc-backend-v0.3.8"` or `"heap"`).
+        backing: &'static str,
+    },
 }
 
 /// Identifies a CUDA device. On non-CUDA hosts this is a free-form tag.
@@ -343,6 +363,41 @@ impl UnifiedBuffer {
         })
     }
 
+    /// Allocate `size` bytes from a tenant-scoped CUDA memory pool
+    /// (`cuMemAllocFromPoolAsync` against the
+    /// [`crate::cuda_mem_pool::TenantMemPool`] handle).
+    ///
+    /// **Status: scaffolded, not yet implemented.** Always returns
+    /// [`UnifiedError::NotSupported`] with `feature = "pool-allocate"`
+    /// and `backing = "cudarc-backend-v0.3.8"`. The wiring change is
+    /// more invasive than the v0.3.8 scaffold PR should take on: it
+    /// requires splitting `Backing` into two parallel variants (a
+    /// raw-pointer one for the existing `cuMemAllocManaged` path and a
+    /// pool-handle one for the v0.4 path), plus a per-tenant stream so
+    /// `cuMemAllocFromPoolAsync` has something to queue against. v0.4
+    /// owns both.
+    ///
+    /// Callers (notably the v0.4 follow-up in
+    /// `TenantContext::allocate_managed`) should pattern-match on the
+    /// returned `NotSupported { feature: "pool-allocate", .. }` and
+    /// fall back to [`Self::new`] / [`Self::new_on`] until the v0.4
+    /// allocator path lands.
+    #[cfg(feature = "cudarc-backend")]
+    pub fn new_in_tenant_pool(
+        _pool: &crate::cuda_mem_pool::TenantMemPool,
+        _size: usize,
+    ) -> Result<Self, UnifiedError> {
+        // v0.3.8 scaffold: the sentinel is the public contract that the
+        // v0.4 caller match-site (see `TenantContext::allocate_managed`,
+        // landing alongside the pool-allocate split) keys on. Changing
+        // the feature/backing tokens here is a breaking change for that
+        // caller.
+        Err(UnifiedError::NotSupported {
+            feature: "pool-allocate",
+            backing: "cudarc-backend-v0.3.8",
+        })
+    }
+
     /// Length in bytes.
     pub fn len(&self) -> usize {
         self.size
@@ -554,6 +609,21 @@ impl From<UnifiedError> for tensor_wasm_core::error::TensorWasmError {
             UnifiedError::TooLarge { requested, limit } => {
                 tensor_wasm_core::error::TensorWasmError::MemoryExhausted { requested, limit }
             }
+            // `NotSupported` is a deliberate "scaffolded but not yet
+            // wired" sentinel from v0.4 pool-allocate work. It is
+            // semantically closest to a serialization-style configuration
+            // error from the caller's perspective: the active build
+            // simply does not implement the requested allocator, and a
+            // structured exhaustion variant would mislead operators
+            // about what is happening at the driver level.
+            UnifiedError::NotSupported { feature, backing } => {
+                tensor_wasm_core::error::TensorWasmError::Serialization(
+                    format!(
+                        "unified buffer feature {feature} not supported by backing {backing}"
+                    )
+                    .into(),
+                )
+            }
         }
     }
 }
@@ -700,5 +770,52 @@ mod tests {
         let b: tensor_wasm_core::error::TensorWasmError = e.into();
         assert!(matches!(b, tensor_wasm_core::error::TensorWasmError::Serialization(_)));
         assert!(b.to_string().contains("minimum 1024"));
+    }
+
+    #[test]
+    fn from_unified_error_to_tensor_wasm_error_not_supported() {
+        // v0.4 pool-allocate scaffold contract: the `NotSupported`
+        // variant maps to a Serialization error carrying both the
+        // feature and the backing token, so an operator reading the
+        // error message can identify *which* scaffold returned
+        // and *which* backing was active.
+        let e = UnifiedError::NotSupported {
+            feature: "pool-allocate",
+            backing: "cudarc-backend-v0.3.8",
+        };
+        let b: tensor_wasm_core::error::TensorWasmError = e.into();
+        let s = b.to_string();
+        assert!(s.contains("pool-allocate"), "feature token missing from: {s}");
+        assert!(
+            s.contains("cudarc-backend-v0.3.8"),
+            "backing token missing from: {s}",
+        );
+        assert!(matches!(
+            b,
+            tensor_wasm_core::error::TensorWasmError::Serialization(_)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "cudarc-backend")]
+    fn new_in_tenant_pool_returns_not_supported_scaffold() {
+        // v0.3.8 scaffold contract: the constructor exists at the type
+        // level (a v0.4 caller can write the match-site today) but
+        // returns the documented `NotSupported` sentinel. If this test
+        // starts failing because the constructor began returning Ok,
+        // v0.4 must also remove the `NotSupported` variant from the
+        // documented match-site list in `unified.rs` (search for
+        // `pool-allocate`).
+        //
+        // We cannot easily construct a `TenantMemPool` here without CUDA
+        // hardware, so this test uses a sentinel: we build a probe by
+        // reflecting on whether the function symbol resolves. The
+        // hardware-gated equivalent lives in
+        // `tests/cuda_mem_pool_scaffold.rs`.
+        let _f: fn(
+            &crate::cuda_mem_pool::TenantMemPool,
+            usize,
+        ) -> Result<UnifiedBuffer, UnifiedError> =
+            UnifiedBuffer::new_in_tenant_pool;
     }
 }

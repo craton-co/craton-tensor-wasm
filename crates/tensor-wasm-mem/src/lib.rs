@@ -20,6 +20,8 @@
 #![deny(missing_docs)]
 
 pub mod advise;
+#[cfg(feature = "cudarc-backend")]
+pub mod cuda_mem_pool;
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod cuda_oxide_backend;
 #[cfg(feature = "cudarc-backend")]

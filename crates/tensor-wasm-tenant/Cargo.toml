@@ -22,6 +22,15 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 tensor-wasm-core = { workspace = true }
+# Optional — only pulled in under the `gpu-mem-pool` feature, which
+# layers the v0.4 driver-level `cuMemPool` enforcement on top of the
+# in-process `consume_bytes` / `release_bytes` quota counter already
+# enforced by `TenantContext`. The dep is gated separately from
+# `cust = { optional = true }` above because cust 0.3.x does not expose
+# the `cuMemPool*` API surface; the new scaffold lives in
+# `tensor-wasm-mem::cuda_mem_pool` and requires the `cudarc-backend`
+# feature on `tensor-wasm-mem`.
+tensor-wasm-mem = { workspace = true, optional = true }
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -42,3 +51,19 @@ harness = false
 default = []
 mps = []
 cuda = ["dep:cust"]
+# `gpu-mem-pool` layers driver-level `cuMemPool` enforcement on top of
+# the in-process `consume_bytes` / `release_bytes` quota counter (B6.5).
+# Pulls in `tensor-wasm-mem` with the `cudarc-backend` feature on,
+# because cust 0.3.x does not expose the `cuMemPool*` API surface. The
+# scaffold lives in `tensor-wasm-mem::cuda_mem_pool::TenantMemPool` and
+# is exposed via `TenantContextBuilder::with_driver_enforced_gpu_cap`.
+# v0.3.8 status: scaffold; the actual allocation path is wired in v0.4
+# (see `tensor-wasm-mem::cuda_mem_pool` for the rollout plan).
+#
+# If a downstream caller enables `gpu-mem-pool` without
+# `tensor-wasm-mem/cudarc-backend` somehow being transitively enabled,
+# the resolver errors out at the
+# `tensor-wasm-mem/cudarc-backend` line below — this is the
+# "feature-resolver errors out at Cargo.toml level" guarantee called
+# out in the module docs of `cuda_mem_pool.rs`.
+gpu-mem-pool = ["dep:tensor-wasm-mem", "tensor-wasm-mem/cudarc-backend"]
