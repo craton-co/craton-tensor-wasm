@@ -11,7 +11,7 @@
 #     -n tensor-wasm --create-namespace -f my-values.yaml
 
 # -- Image source. The default registry is a placeholder; ghcr.io/craton-co
-# is not yet provisioned (v0.3.5 era; the backend-suffixed variants below
+# is not yet provisioned (v0.3.6 era; the backend-suffixed variants below
 # are equally aspirational). Build and push from
 # docker/tensor-wasm-api.Dockerfile until the registry exists.
 image:
@@ -148,7 +148,7 @@ ingress:
   #   secretName: tensor-wasm-tls
 
 # -- Resource requests and limits. Tune to your function payload sizes; the
-# defaults are appropriate for the v0.3.5 reference workload.
+# defaults are appropriate for the v0.3.6 reference workload.
 resources:
   requests:
     cpu: "500m"

@@ -49,4 +49,4 @@ without a fork.
 
 ---
 
-_Status: Decision of record. Last reviewed: 2026-05-27 (v0.3.5)._
+_Status: Decision of record. Last reviewed: 2026-05-27 (v0.3.6)._

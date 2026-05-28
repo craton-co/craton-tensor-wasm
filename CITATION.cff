@@ -8,8 +8,8 @@ type: software
 license: Apache-2.0
 repository-code: "https://github.com/craton-co/craton-tensor-wasm"
 url: "https://github.com/craton-co/craton-tensor-wasm"
-version: "0.3.5"
-date-released: "2026-05-25"
+version: "0.3.6"
+date-released: "2026-05-27"
 keywords:
   - webassembly
   - wasm

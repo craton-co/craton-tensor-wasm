@@ -204,7 +204,7 @@ documents.
 |--------------------|---------|-----------------|
 | `1` | Initial release. Fields: `magic`, `version`, `wasm_memory`, `gpu_memory`, `registers`, `metadata`. No `crc32`, no enforced size caps. | Itself only. |
 | `2` *(current writer default)* | Added `Snapshot::crc32` (computed as described above). Added the `limits` size caps and reader enforcement. Switched byte blobs to `serde_bytes` for zero-copy write — wire-identical to the prior `Vec<u8>` encoding. | Itself, and v3 readers (which accept both). |
-| `3` | Adds an HMAC-SHA256 trailer after the zstd frame (`[signature_kind: u8][32-byte signature]`). The inner `version` field is `3`; the inner bincode payload is otherwise identical to v2. The HMAC covers the full v2-shaped prefix. Produced by writers that have had `SnapshotWriter::with_hmac_sha256_key` called; refused by readers without an HMAC key. | Itself only. v2 readers (pre-v0.3.5) refuse v3 because the `version` field is unknown to them. |
+| `3` | Adds an HMAC-SHA256 trailer after the zstd frame (`[signature_kind: u8][32-byte signature]`). The inner `version` field is `3`; the inner bincode payload is otherwise identical to v2. The HMAC covers the full v2-shaped prefix. Produced by writers that have had `SnapshotWriter::with_hmac_sha256_key` called; refused by readers without an HMAC key. | Itself only. v2 readers (pre-v0.3.6) refuse v3 because the `version` field is unknown to them. |
 
 A `version` mismatch (anything other than `2` or `3`) is a hard error;
 the reader does not attempt to migrate older snapshots in place. Re-

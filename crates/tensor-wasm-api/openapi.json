@@ -3,7 +3,7 @@
   "info": {
     "title": "TensorWasm HTTP API",
     "description": "REST surface of a Craton TensorWasm serverless Wasm node. Prose documentation, error semantics, and the full middleware stack live in crates/tensor-wasm-api/API.md. NOTE: This file is a hand-ported 3.0 mirror of the canonical 3.1 spec at openapi/tensor-wasm-api.yaml and is kept for tooling that does not yet parse 3.1.",
-    "version": "0.3.5",
+    "version": "0.3.6",
     "license": {
       "name": "Apache-2.0",
       "url": "https://www.apache.org/licenses/LICENSE-2.0"

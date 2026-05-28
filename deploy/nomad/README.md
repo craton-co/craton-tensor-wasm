@@ -12,9 +12,9 @@ single-instance deployments. The multi-instance constraints are
 documented under "Multi-instance constraints" below.
 
 > **Image and artifact placeholders.** The docker spec pins
-> `ghcr.io/craton-co/tensor-wasm:0.3.5`. The raw_exec spec fetches
+> `ghcr.io/craton-co/tensor-wasm:0.3.6`. The raw_exec spec fetches
 > `https://example.invalid/.../tensor-wasm-x86_64-linux`. Neither URL
-> resolves yet (v0.3.5 era). Until the `ghcr.io/craton-co/*` registry
+> resolves yet (v0.3.6 era). Until the `ghcr.io/craton-co/*` registry
 > and the GitHub Releases page are provisioned you must build and
 > publish artifacts yourself — see `../k8s/README.md` "Placeholder
 > image" for the build-and-push workflow.
@@ -152,7 +152,7 @@ renders `TENSOR_WASM_API_TOKENS` from a Vault KV secret. To wire it up:
 4. Un-comment the `template { ... }` stanza in the task. The default
    `change_mode = "restart"` re-rolls the task on rotation; switch to
    `change_mode = "signal", change_signal = "SIGHUP"` only if your
-   process supports it (v0.3.5 does not — restart is the safe choice).
+   process supports it (v0.3.6 does not — restart is the safe choice).
 
 Rotate the secret with `vault kv put kv/tensor-wasm/tokens
 allowlist=...`; the template renderer notices within Vault's lease TTL
@@ -215,7 +215,7 @@ un-commenting the cluster needs:
    GPU.
 
 4. **GPU-enabled image** built with the `unified-memory` / `cuda`
-   feature set. The default `ghcr.io/craton-co/tensor-wasm:0.3.5` is
+   feature set. The default `ghcr.io/craton-co/tensor-wasm:0.3.6` is
    host-only — flipping the device request on with a host-only image
    wastes GPU minutes and treats the GPU as unavailable at runtime.
 

@@ -161,16 +161,17 @@ ships with Wasmtime's upstream fuzz corpus only.
 ## Supported versions
 
 The `0.3.x` line is the current release line and receives security fixes
-during the preview window. The `0.1.x` line is also supported during the
+during the preview window; the latest patch is `0.3.6` (released
+2026-05-27). The `0.1.x` line is also supported during the
 v0.1 → v0.3 transition. Older pre-release tags are not supported. When
 `0.4.0` ships, this matrix will be revised; until then the table below
 applies.
 
-| Version | Supported |
-|---------|-----------|
-| 0.3.x   | Yes       |
-| 0.1.x   | Yes       |
-| < 0.1   | No        |
+| Version          | Supported |
+|------------------|-----------|
+| 0.3.x (≤ 0.3.6)  | Yes       |
+| 0.1.x            | Yes       |
+| < 0.1            | No        |
 
 ## Authentication
 

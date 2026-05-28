@@ -15,7 +15,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 rust-version = "1.78"
 license = "Apache-2.0"
@@ -31,14 +31,14 @@ repository = "https://github.com/craton-co/craton-tensor-wasm"
 # (required by crates.io publish) are specified. Member crates reference these
 # via `tensor-wasm-foo = { workspace = true }`. `tensor-wasm-cli` and
 # `tensor-wasm-bench` are `publish = false`, so they are intentionally omitted.
-tensor-wasm-core = { path = "crates/tensor-wasm-core", version = "0.3.5" }
-tensor-wasm-mem = { path = "crates/tensor-wasm-mem", version = "0.3.5" }
-tensor-wasm-exec = { path = "crates/tensor-wasm-exec", version = "0.3.5" }
-tensor-wasm-wasi-gpu = { path = "crates/tensor-wasm-wasi-gpu", version = "0.3.5" }
-tensor-wasm-jit = { path = "crates/tensor-wasm-jit", version = "0.3.5" }
-tensor-wasm-snapshot = { path = "crates/tensor-wasm-snapshot", version = "0.3.5" }
-tensor-wasm-tenant = { path = "crates/tensor-wasm-tenant", version = "0.3.5" }
-tensor-wasm-api = { path = "crates/tensor-wasm-api", version = "0.3.5" }
+tensor-wasm-core = { path = "crates/tensor-wasm-core", version = "0.3.6" }
+tensor-wasm-mem = { path = "crates/tensor-wasm-mem", version = "0.3.6" }
+tensor-wasm-exec = { path = "crates/tensor-wasm-exec", version = "0.3.6" }
+tensor-wasm-wasi-gpu = { path = "crates/tensor-wasm-wasi-gpu", version = "0.3.6" }
+tensor-wasm-jit = { path = "crates/tensor-wasm-jit", version = "0.3.6" }
+tensor-wasm-snapshot = { path = "crates/tensor-wasm-snapshot", version = "0.3.6" }
+tensor-wasm-tenant = { path = "crates/tensor-wasm-tenant", version = "0.3.6" }
+tensor-wasm-api = { path = "crates/tensor-wasm-api", version = "0.3.6" }
 
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }

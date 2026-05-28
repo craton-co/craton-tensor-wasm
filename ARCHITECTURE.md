@@ -172,4 +172,4 @@ Related documents authored in later sessions:
 
 ---
 
-_Status: current as of v0.3.5 (2026-05-27). All crates wired; see CHANGELOG.md for history._
+_Status: current as of v0.3.6 (2026-05-27). All crates wired; see CHANGELOG.md for history._

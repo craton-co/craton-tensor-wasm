@@ -3,7 +3,7 @@
 
 # Actionable items pending — what an AI agent could not do
 
-Complete checklist as of `v0.3.5` (2026-05-25). Every item below requires a
+Complete checklist as of `v0.3.6` (2026-05-27). Every item below requires a
 human, an organization, hardware, or upstream activity that the AI agent
 sessions that built waves W1-W5 + O + F + B + C + D could not perform.
 
@@ -337,5 +337,5 @@ entry and (if applicable) close the audit problem in `CHANGELOG.md`.
 
 ---
 
-_Status: as of `v0.3.5` tag (2026-05-25). Update each time an item moves
+_Status: as of `v0.3.6` tag (2026-05-27). Update each time an item moves
 state — this is a living checklist._
