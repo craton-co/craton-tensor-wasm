@@ -96,9 +96,12 @@ pub fn build_router_with_full_config(
 /// Build the router with full configuration including the audit sink and
 /// the CORS allowlist.
 ///
-/// The outer ServiceBuilder is layered top-to-bottom: tracing is the
-/// outermost layer (so it covers timeouts and rejections), followed by
-/// the CORS layer (so cross-origin preflight short-circuits before any
+/// The outer ServiceBuilder is layered top-to-bottom: `host_validate`
+/// (with its `TrustedHosts` extension) is the outermost pair — T19 perf
+/// — so hostile Host probes are rejected with `400` before any trace
+/// span is allocated or any propagator hop runs. The trace layer wraps
+/// the rest of the stack, followed by `inject_trace_id_header`, the
+/// CORS layer (so cross-origin preflight short-circuits before any
 /// expensive downstream work), the body limit (which guards every
 /// downstream layer from oversized payloads), the per-request timeout
 /// and the global concurrency cap. Auth and tenant resolution are
@@ -317,7 +320,41 @@ fn build_router_full(
     // documented in `openapi/tensor-wasm-api.yaml` as `security: []` (no
     // auth) so that k8s liveness/readiness probes and Prometheus scrapers
     // can hit them without holding bearer tokens.
+    //
+    // T19 perf: `host_validate` (with its `TrustedHosts` extension) is
+    // layered OUTSIDE `trace_layer_with_propagation` so a hostile Host
+    // probe gets rejected with `400` before any trace span is allocated
+    // or any `traceparent` parent context is propagated. Under a probe
+    // storm against a production deployment that has the allowlist set,
+    // this keeps the trace pipeline (and any downstream OTel collector
+    // budget) from being burnt on rejections. Rejections short-circuit
+    // before the trace layer (and before `http_metrics_middleware`
+    // which sits inside the trace layer), so a rejected request gets
+    // neither a span nor a metric increment — intentional tradeoff: a
+    // hostile Host probe storm cannot burn trace budget or metric
+    // cardinality, at the cost of losing observability on the rejected
+    // 4xx itself. The Host allowlist is opt-in via
+    // `TENSOR_WASM_API_TRUSTED_HOSTS`; deployments that leave it unset
+    // are unaffected by the re-order (the middleware is a pass-through
+    // and never short-circuits).
     let common_layers = ServiceBuilder::new()
+        // api S-30: reject requests whose Host header isn't in the
+        // operator-configured allowlist (TENSOR_WASM_API_TRUSTED_HOSTS).
+        // Default (env unset) is permissive — the previous behaviour —
+        // because most local-dev deployments don't set the env var.
+        // Production behind a layered proxy should set the allowlist.
+        //
+        // The parsed allowlist travels as an `axum::Extension<TrustedHosts>`
+        // so tests can override at build time
+        // (`router.layer(axum::Extension(TrustedHosts::from_hosts([...])))`)
+        // without poisoning the process environment. Inserted BEFORE the
+        // `from_fn(host_validate)` layer so the middleware sees it on the
+        // request extensions when it runs.
+        //
+        // T19 perf: this pair sits OUTERMOST so hostile Host probes are
+        // rejected before the trace layer allocates a span for them.
+        .layer(axum::Extension(TrustedHosts::from_env()))
+        .layer(axum::middleware::from_fn(host_validate))
         .layer(trace_layer_with_propagation())
         // `inject_trace_id_header` runs inside the trace layer so the
         // current span (the one the trace layer just created with its
@@ -338,20 +375,6 @@ fn build_router_full(
         // `API.md`: `Authorization`, `Content-Type`, `X-TensorWasm-Tenant`,
         // and `Traceparent`; methods `GET`, `POST`, `DELETE`.
         .layer(cors_layer(&cors))
-        // api S-30: reject requests whose Host header isn't in the
-        // operator-configured allowlist (TENSOR_WASM_API_TRUSTED_HOSTS).
-        // Default (env unset) is permissive — the previous behaviour —
-        // because most local-dev deployments don't set the env var.
-        // Production behind a layered proxy should set the allowlist.
-        //
-        // The parsed allowlist travels as an `axum::Extension<TrustedHosts>`
-        // so tests can override at build time
-        // (`router.layer(axum::Extension(TrustedHosts::from_hosts([...])))`)
-        // without poisoning the process environment. Inserted BEFORE the
-        // `from_fn(host_validate)` layer so the middleware sees it on the
-        // request extensions when it runs.
-        .layer(axum::Extension(TrustedHosts::from_env()))
-        .layer(axum::middleware::from_fn(host_validate))
         .layer(body_limit_layer(MAX_REQUEST_BODY_BYTES))
         .layer(timeout_layer(Duration::from_secs(30)))
         // NOTE (api S-26): the global ConcurrencyLimit(64) is removed.

@@ -356,11 +356,17 @@ impl KernelPublishTokens {
 ///    `:authority` pseudo-header in `hyper`'s normalised request form.
 /// 3. If both absent and the allowlist is non-empty, respond `400`.
 ///
-/// Closes api S-30. Should be layered AFTER trace/CORS (so the response
-/// is still observable) but BEFORE bearer_auth (so an attacker probing
-/// for valid hosts cannot also probe for valid tokens). The probe
-/// router inherits this gate too; operators with split-Host probes can
-/// simply omit the env var.
+/// Closes api S-30. T19 perf re-order: layered OUTSIDE the trace layer
+/// (and the CORS layer) so hostile Host probes are rejected before any
+/// trace span is allocated or any `traceparent` propagator hop runs.
+/// Still layered BEFORE bearer_auth so an attacker probing for valid
+/// hosts cannot also probe for valid tokens. The probe router inherits
+/// this gate too; operators with split-Host probes can simply omit the
+/// env var. Rejected requests do NOT get a trace span and are NOT
+/// counted by the HTTP metrics layer (which sits inside the trace
+/// layer) — an intentional tradeoff so a hostile Host probe storm
+/// cannot burn either trace budget or metric cardinality. See the
+/// comment block in `build_router_full`.
 pub async fn host_validate(req: Request, next: Next) -> Response {
     let allow = req
         .extensions()

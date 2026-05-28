@@ -58,7 +58,10 @@ pub const WASM_MIN_HEADER_BYTES: usize = 8;
 /// Body-size threshold above which base64 decoding is moved to
 /// [`tokio::task::spawn_blocking`]. Below this the inline decode is cheaper
 /// than the spawn handoff.
-pub const BASE64_OFFLOAD_THRESHOLD: usize = 256 * 1024;
+// T19 perf: lowered from 256 KiB to 32 KiB so a 32-concurrent burst
+// (per-tenant rate limit) of large-payload invokes can't occupy reactor
+// threads on inline base64 decode.
+pub const BASE64_OFFLOAD_THRESHOLD: usize = 32 * 1024;
 
 /// Maximum byte-length of a tenant-supplied function name. Names are echoed
 /// back on every read of [`FunctionRecord`], so an unchecked name field
