@@ -25,6 +25,7 @@ use wasmtime::{ExternType, Module, ResourceLimiter, Store};
 
 use crate::engine::TensorWasmEngine;
 use crate::instance::{TensorWasmInstance, InstanceState};
+use crate::instance_pool::InstancePool;
 
 /// Convert a wall-clock [`Duration`] into a number of epoch ticks suitable
 /// for [`wasmtime::Store::set_epoch_deadline`].
@@ -395,6 +396,15 @@ pub struct TensorWasmExecutor {
     /// the log). Scoped to the executor (and therefore the engine) so
     /// distinct engines in the same process each get their own warning.
     ticker_warned: Arc<OnceLock<AtomicBool>>,
+    /// Optional pre-instantiated instance pool (roadmap feature #5).
+    ///
+    /// v0.3.6 scaffold: when set, the pool is wired through to embedders
+    /// but its [`crate::instance_pool::InstancePool::acquire`] path falls
+    /// through to [`Self::spawn_instance`] on every call. v0.4 lands the
+    /// channel-driven warm-instance draw on top of this same field —
+    /// callers wiring it up today get forward-compatible plumbing for
+    /// free.
+    pool: Option<Arc<InstancePool>>,
 }
 
 /// Resolve a non-zero LRU cache capacity from a possibly-zero config
@@ -501,6 +511,7 @@ impl TensorWasmExecutor {
             instance_count: Arc::new(AtomicUsize::new(0)),
             metrics: None,
             ticker_warned: Arc::new(OnceLock::new()),
+            pool: None,
         }
     }
 
@@ -517,7 +528,28 @@ impl TensorWasmExecutor {
             instance_count: Arc::new(AtomicUsize::new(0)),
             metrics: Some(metrics),
             ticker_warned: Arc::new(OnceLock::new()),
+            pool: None,
         }
+    }
+
+    /// Attach an [`InstancePool`] to this executor and return the
+    /// modified executor.
+    ///
+    /// Builder method; pairs with [`Self::new`] / [`Self::with_metrics`].
+    /// The pool itself is opt-in — embedders that do not call this method
+    /// see the v0.3.5 behaviour (every `spawn_instance` does a fresh
+    /// compile/instantiate). Calling it today wires up the v0.3.6
+    /// scaffold; the same call gets the v0.4 warm-pool path for free
+    /// once that lands.
+    pub fn with_instance_pool(mut self, pool: Arc<InstancePool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Borrow the attached [`InstancePool`], if any. Returns `None` for
+    /// executors constructed without [`Self::with_instance_pool`].
+    pub fn instance_pool(&self) -> Option<&Arc<InstancePool>> {
+        self.pool.as_ref()
     }
 
     /// Borrow the underlying engine.
