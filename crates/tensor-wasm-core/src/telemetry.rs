@@ -17,6 +17,8 @@
 //! `init_with_otlp`) or `false` (for `init`).
 
 use std::sync::Once;
+#[cfg(feature = "otlp")]
+use std::sync::OnceLock;
 
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -61,6 +63,17 @@ static INIT: Once = Once::new();
 /// Guards [`init_with_otlp`]. See [`INIT`].
 #[cfg(feature = "otlp")]
 static INIT_OTLP: Once = Once::new();
+
+/// Records the outcome of the one-and-only successful or failed
+/// `init_with_otlp` body so that subsequent callers see the **same**
+/// `Result` instead of a stale `Ok(false)`.
+///
+/// Filled exactly once from inside the [`INIT_OTLP`] `call_once` closure.
+/// Subsequent invocations of [`init_with_otlp`] read this slot and replay
+/// the recorded outcome (mapping the first-call success to `Ok(false)` to
+/// preserve the "did this call perform initialisation?" contract).
+#[cfg(feature = "otlp")]
+static INIT_OTLP_RESULT: OnceLock<Result<(), OtlpInitError>> = OnceLock::new();
 
 /// Initialise the global tracing subscriber.
 ///
@@ -180,18 +193,26 @@ mod tests {
 /// by logging that OTLP is unavailable).
 ///
 /// Returns `Ok(true)` if this call performed the initialisation, `Ok(false)`
-/// if it was a duplicate `init_with_otlp` call (the OTLP exporter is already
-/// running), and `Err(OtlpInitError::AlreadyInitialized)` if `init` ran first.
+/// if it was a duplicate `init_with_otlp` call following a successful first
+/// call, and `Err(OtlpInitError::AlreadyInitialized)` if `init` ran first. If
+/// the first `init_with_otlp` call recorded an error (`Exporter(_)` or
+/// `AlreadyInitialized`), every subsequent call replays that same error
+/// instead of returning `Ok(false)` — without this the inconsistent global
+/// state described in M5 would be invisible to the caller.
+///
+/// **Ordering guarantee (M5 TOCTOU fix):** on the error path, the
+/// OpenTelemetry global tracer provider and propagator are NOT mutated.
+/// `tracing_subscriber::try_init` runs first, and only on its success do we
+/// call `opentelemetry::global::set_tracer_provider` /
+/// `set_text_map_propagator`. A failed `try_init` (e.g. another subscriber
+/// raced in between the `INIT.is_completed()` check and `try_init`) drops
+/// the freshly-built provider without touching the global slot.
 #[cfg(feature = "otlp")]
 pub fn init_with_otlp(
     level: LogLevel,
     json: bool,
     otlp_env_var: &str,
 ) -> Result<bool, OtlpInitError> {
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_otlp::WithExportConfig;
-    use tracing_subscriber::{fmt, prelude::*};
-
     // Reject the case where a plain `init()` already grabbed the global
     // subscriber slot. Without this check the OTLP pipeline would silently
     // fail to install while we returned `Ok(true)`.
@@ -199,79 +220,141 @@ pub fn init_with_otlp(
         return Err(OtlpInitError::AlreadyInitialized);
     }
 
+    // `performed` flips to `true` *only* on the call that actually runs the
+    // `call_once` body to completion successfully. All other paths (cached
+    // outcome from a prior call, or a failure recorded in this call) leave
+    // it `false` and either return `Ok(false)` (duplicate success) or a
+    // cloned `Err(_)` from `INIT_OTLP_RESULT`.
     let mut performed = false;
-    let mut init_err: Option<OtlpInitError> = None;
     INIT_OTLP.call_once(|| {
-        let endpoint = std::env::var(otlp_env_var)
-            .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
-            .unwrap_or_else(|_| "http://localhost:4317".to_string());
-
-        // Build OTLP exporter (tonic-grpc).
-        let exporter_result = opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(&endpoint)
-            .build();
-        let exporter = match exporter_result {
-            Ok(e) => e,
-            Err(e) => {
-                init_err = Some(OtlpInitError::Exporter(format!("{e:?}")));
-                return;
-            }
-        };
-
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_batch_exporter(exporter)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name("tensor-wasm")
-                    .build(),
-            )
-            .build();
-        let tracer = provider.tracer("tensor-wasm");
-        opentelemetry::global::set_tracer_provider(provider);
-
-        // Install the W3C Trace Context propagator alongside the tracer
-        // provider so any embedder using `init_with_otlp` from a non-API
-        // entry point (CLI, bench harness) still extracts inbound
-        // `traceparent` headers when it sets up its own HTTP surface.
-        // The API gateway separately calls
-        // `tensor_wasm_api::install_w3c_propagator` from
-        // `build_router_with_audit`; both calls converge on the same
-        // global via OpenTelemetry's `set_text_map_propagator`, which is
-        // last-writer-wins but safe to call repeatedly with the same
-        // propagator type.
-        opentelemetry::global::set_text_map_propagator(
-            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-        );
-
-        let filter = build_filter(level);
-        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-        let registry = tracing_subscriber::registry().with(filter).with(otel_layer);
-        let try_init_result = if json {
-            registry.with(fmt::layer().json()).try_init()
-        } else {
-            registry.with(fmt::layer().compact()).try_init()
-        };
-        // If `try_init` failed it means *something else* in the process won
-        // the race to set the global subscriber between our `INIT.is_completed()`
-        // check above and now. Surface that as `AlreadyInitialized` so the
-        // caller sees a consistent failure mode.
-        if try_init_result.is_err() {
-            init_err = Some(OtlpInitError::AlreadyInitialized);
-            return;
-        }
-        performed = true;
+        let outcome = run_otlp_init(level, json, otlp_env_var);
+        performed = outcome.is_ok();
+        // Record the verbatim outcome so subsequent callers see the same
+        // result instead of `Ok(false)` masking a real failure.
+        let _ = INIT_OTLP_RESULT.set(outcome);
     });
 
-    if let Some(e) = init_err {
-        return Err(e);
+    if performed {
+        return Ok(true);
     }
-    Ok(performed)
+
+    // Either this is a repeat caller (the closure above did nothing) or the
+    // closure ran but recorded an `Err`. In both cases replay the cached
+    // outcome. `INIT_OTLP_RESULT` is guaranteed populated once `call_once`
+    // has returned, but defensively fall back to `Ok(false)` if it isn't
+    // (unreachable in practice — the closure always calls `set` exactly
+    // once before returning).
+    match INIT_OTLP_RESULT.get() {
+        Some(Ok(())) => Ok(false),
+        Some(Err(e)) => Err(e.clone()),
+        None => Ok(false),
+    }
+}
+
+/// Body of [`init_with_otlp`], lifted out so the `call_once` closure can
+/// short-circuit via `?` and so the ordering between
+/// `tracing_subscriber::try_init` and the OpenTelemetry global mutations is
+/// obvious.
+///
+/// **Ordering invariant (the M5 TOCTOU fix):** we install the tracing
+/// subscriber via `try_init` *before* calling
+/// `opentelemetry::global::set_tracer_provider` or
+/// `set_text_map_propagator`. The OpenTelemetry globals are
+/// last-writer-wins and have no `try_*` variant, so once they are mutated
+/// there is no way to roll them back. If we wrote them first and then
+/// `try_init` failed (because another subscriber raced in between the
+/// `INIT.is_completed()` check at the top of `init_with_otlp` and the
+/// `try_init` call here), the caller would see `Err(AlreadyInitialized)`
+/// while the OTel globals had been silently replaced with a freshly-built
+/// provider that nothing was reading from. By doing `try_init` first we
+/// guarantee that on the error path the OTel globals are untouched and the
+/// freshly-built `SdkTracerProvider` is dropped.
+#[cfg(feature = "otlp")]
+fn run_otlp_init(level: LogLevel, json: bool, otlp_env_var: &str) -> Result<(), OtlpInitError> {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_otlp::WithExportConfig;
+    use tracing_subscriber::{fmt, prelude::*};
+
+    let endpoint = std::env::var(otlp_env_var)
+        .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
+        .unwrap_or_else(|_| "http://localhost:4317".to_string());
+
+    // Build OTLP exporter (tonic-grpc).
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(&endpoint)
+        .build()
+        .map_err(|e| OtlpInitError::Exporter(format!("{e:?}")))?;
+
+    // Build the provider and derive a tracer. Crucially, neither
+    // `SdkTracerProvider::builder().build()` nor `provider.tracer(...)`
+    // mutates OpenTelemetry global state — they're plain constructors. The
+    // global mutation (`set_tracer_provider`) is deferred until *after*
+    // `try_init` succeeds so a failed `try_init` leaves the OTel globals
+    // untouched.
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name("tensor-wasm")
+                .build(),
+        )
+        .build();
+    let tracer = provider.tracer("tensor-wasm");
+
+    // Attempt `try_init` FIRST. This is the operation with the most
+    // failure modes (another subscriber may have raced in between the
+    // outer `INIT.is_completed()` check and now), so any error here must
+    // happen *before* we touch any OpenTelemetry global.
+    let filter = build_filter(level);
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let registry = tracing_subscriber::registry().with(filter).with(otel_layer);
+    let try_init_result = if json {
+        registry.with(fmt::layer().json()).try_init()
+    } else {
+        registry.with(fmt::layer().compact()).try_init()
+    };
+    // If `try_init` failed it means *something else* in the process won
+    // the race to set the global subscriber between our
+    // `INIT.is_completed()` check at the top of `init_with_otlp` and now.
+    // Surface that as `AlreadyInitialized`. Because we have NOT yet
+    // touched the OTel globals, dropping `provider` here is sufficient
+    // cleanup — no roll-back required.
+    if try_init_result.is_err() {
+        drop(provider);
+        return Err(OtlpInitError::AlreadyInitialized);
+    }
+
+    // `try_init` succeeded: we own the global tracing subscriber. Now —
+    // and only now — install the OTel globals. Both are last-writer-wins
+    // and infallible.
+    opentelemetry::global::set_tracer_provider(provider);
+
+    // Install the W3C Trace Context propagator alongside the tracer
+    // provider so any embedder using `init_with_otlp` from a non-API
+    // entry point (CLI, bench harness) still extracts inbound
+    // `traceparent` headers when it sets up its own HTTP surface.
+    // The API gateway separately calls
+    // `tensor_wasm_api::install_w3c_propagator` from
+    // `build_router_with_audit`; both calls converge on the same
+    // global via OpenTelemetry's `set_text_map_propagator`, which is
+    // last-writer-wins but safe to call repeatedly with the same
+    // propagator type.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    Ok(())
 }
 
 /// Errors from [`init_with_otlp`].
+///
+/// `Clone` is implemented so the first call's outcome can be cached in
+/// [`INIT_OTLP_RESULT`] and replayed verbatim to every subsequent caller.
+/// Without that, repeat callers would silently see `Ok(false)` even when
+/// the original initialisation had failed.
 #[cfg(feature = "otlp")]
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum OtlpInitError {
     /// The OTLP exporter could not be built.
     #[error("OTLP exporter build failed: {0}")]
