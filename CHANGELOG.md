@@ -36,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must explicitly call `capture_legacy()` or disable the
   `artifact-backing` default feature.
 
+### Changed
+- jit: T30 — DiskCache now layers v2 envelope over tensor-wasm-artifacts DiskArtifactStore (streaming HMAC + zstd); public API unchanged.
+
 ### Security
 - `tensor-wasm-snapshot` (T9): tighten `limits::MAX_INPUT_BYTES` from
   4 GiB to 1 GiB. The pre-T9 expression

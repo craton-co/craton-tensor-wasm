@@ -32,6 +32,9 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
+use tensor_wasm_artifacts::{
+    ArtifactError, ArtifactStore, ContentHash, DiskArtifactStore,
+};
 use tensor_wasm_core::types::TenantId;
 use zeroize::Zeroizing;
 
@@ -865,33 +868,75 @@ impl Drop for DiskCacheConfig {
     }
 }
 
-/// Disk-backed L2 cache. Wraps a directory of `*.ptxbin` files, each of
-/// which holds a fixed-format header, the PTX bytes, and an HMAC-keyed
-/// BLAKE3 trailer that covers everything before it.
+/// Disk-backed L2 cache.
 ///
-/// ## V2 file format (little-endian, current writer)
+/// ## T30 layering (current)
+///
+/// Stores each kernel as two cooperating on-disk artefacts under
+/// [`DiskCacheConfig::dir`]:
+///
+/// 1. A *sidecar* file at [`Self::path_for`] (`*.ptxbin`) containing a
+///    fixed-size record that maps the [`CacheKey`] to the
+///    [`ContentHash`] of the underlying blob (16-byte magic
+///    [`SIDECAR_MAGIC_V1`] + 32-byte content hash).
+/// 2. A *blob* file under the
+///    [`tensor_wasm_artifacts::DiskArtifactStore`] layout
+///    (`*.<key-fp>.bin`) holding the streaming-encoded HMAC-SHA256 +
+///    zstd envelope around the V2 kernel-manifest framing.
+///
+/// The V2 kernel-manifest framing (16-byte `TWJIT-KRNL-v2\0\0\0` magic
+/// + length-prefixed body: blueprint, sm_version, grid_x, block_x,
+/// ptx_len, ptx bytes) is built ABOVE the artifact store: a `put` first
+/// serialises the kernel into a V2 envelope `Vec<u8>`, then hands that
+/// to [`DiskArtifactStore::put`] which streams it through an
+/// HMAC-tee + zstd encoder onto disk. A `get` reverses the layering:
+/// look up the sidecar to get the [`ContentHash`], call
+/// [`DiskArtifactStore::get`] which streaming-verifies the outer HMAC
+/// + decompresses, then parse the inner V2 envelope to recover the
+/// kernel.
+///
+/// ## Why two files
+///
+/// [`DiskArtifactStore`] is content-addressed: lookups go through a
+/// [`ContentHash`] derived from the payload bytes, not through a caller
+/// key. The kernel cache needs lookups by tenant-scoped [`CacheKey`],
+/// so the sidecar maps `CacheKey -> ContentHash` while the blob owns
+/// the bytes. This preserves the streaming HMAC + zstd properties of
+/// the store (T22) without baking the cache-key shape into the store
+/// itself. Filenames stay partitioned by HMAC-key fingerprint on both
+/// sides — the sidecar via `path_for`'s `{key_prefix}-…` prefix, the
+/// blob via [`DiskArtifactStore`]'s own `{hash}.{key_fp}.bin` shape —
+/// so two stores in the same directory under different keys cannot
+/// race on the same path.
+///
+/// ## V2 envelope (current writer, body inside the artifact store)
+///
 /// ```text
 /// [0..16)   magic = "TWJIT-KRNL-v2\0\0"
-/// [16..24)  blueprint fingerprint (u64)
-/// [24..28)  sm_version (u32)
-/// [28..32)  launch_geometry.grid_x (u32)
-/// [32..36)  launch_geometry.block_x (u32)
-/// [36..44)  ptx length (u64)
+/// [16..24)  blueprint fingerprint (u64 LE)
+/// [24..28)  sm_version (u32 LE)
+/// [28..32)  launch_geometry.grid_x (u32 LE)
+/// [32..36)  launch_geometry.block_x (u32 LE)
+/// [36..44)  ptx length (u64 LE)
 /// [44..44+ptx_len)  PTX text (UTF-8, NOT null-terminated)
-/// [44+ptx_len..44+ptx_len+32)  BLAKE3-keyed hash over bytes [0..44+ptx_len)
 /// ```
 ///
-/// ## V1 file format (read-only legacy compatibility)
-/// V1 files (magic `"TWJIT-KRNL-v1\0\0\0"`) are still readable but treated
-/// as a miss with a `cache.l2.miss.legacy_magic` info log so the L1 path
-/// will re-emit, re-HMAC, and rewrite as V2 on the next put. V1 lacked the
-/// `launch_geometry` field; the original reconstructor defaulted it to
-/// `(0, 0)` which silently lost the `ptx_emit`-populated hint on every L2
-/// hit. Bumping the magic forces fresh emission of all stale entries.
+/// The HMAC trailer that pre-T30 V2 sat at the end of the file is gone
+/// from this layer — the artifact store provides streaming HMAC over
+/// the entire envelope (T22), so a second per-envelope MAC would be
+/// redundant.
 ///
-/// The fingerprint and sm_version are repeated in the header (also
-/// present in the filename's hash-derived stem) so a load can detect a
-/// renamed file early without paying the HMAC cost.
+/// ## V1 magic (read-only)
+///
+/// Pre-T30 V1/V2 files (magic `"TWJIT-KRNL-v1\0\0\0"` or
+/// `"TWJIT-KRNL-v2\0\0\0"` at offset 0 of a `.ptxbin` file written by
+/// the legacy raw-file writer) sit at a different path shape than the
+/// new T30 sidecar and are silently invisible to the new reader: they
+/// no longer occupy the post-T30 sidecar path, so a fresh `get` of
+/// the corresponding key returns a clean miss and the next `put` rewrites
+/// the entry as `(sidecar, blob)` under the unified store. This matches
+/// the `cache.l2.miss.legacy_magic` behaviour of pre-T30 V1 detection
+/// without any decoder support for the legacy raw layout.
 struct DiskCache {
     /// Directory the cache writes to. Cloned out of the supplied
     /// [`DiskCacheConfig`] so we can drop the original config (and its
@@ -899,29 +944,44 @@ struct DiskCache {
     /// copy below as the long-lived owner.
     dir: PathBuf,
     /// 32-byte HMAC-keyed-BLAKE3 key, wiped on drop. `Zeroizing` Derefs
-    /// to `[u8; 32]` so the existing `&self.hmac_key[..]` and
-    /// `blake3::keyed_hash(&self.hmac_key, …)` call sites work
-    /// unchanged after going through `&*self.hmac_key`.
+    /// to `[u8; 32]` so existing `&self.hmac_key[..]`-style call sites
+    /// keep compiling. The artifact store holds an independent copy
+    /// (also zeroising) — the duplication is intentional so the
+    /// sidecar's path-prefix fingerprint and the store's own
+    /// per-blob path-prefix fingerprint agree byte-for-byte without
+    /// either side reaching into the other's private field.
     hmac_key: Zeroizing<[u8; 32]>,
+    /// Underlying streaming content-addressed signed blob store.
+    /// Holds the v2-envelope-wrapped kernel payloads. Wrapped in an
+    /// `Arc` so the disk cache is cheaply clonable — `KernelCache`
+    /// already holds the cache behind `Arc<DiskCache>`, this is the
+    /// only field whose backend benefits from sharing.
+    store: Arc<DiskArtifactStore>,
 }
 
-/// V1 magic (legacy on-disk records). Read-only: treated as a miss so the
-/// next put rewrites the entry under [`DISK_CACHE_MAGIC_V2`]. See
-/// `cache.l2.miss.legacy_magic` info log.
-const DISK_CACHE_MAGIC_V1: &[u8; 16] = b"TWJIT-KRNL-v1\0\0\0";
-/// V2 magic (current writer). Adds 8 bytes of `launch_geometry` (grid_x,
-/// block_x) immediately after `sm_version` so L2 hits no longer drop the
-/// emit-time hint that the dispatch path consumes.
+/// V2 magic for the inner kernel-manifest envelope wrapped inside each
+/// artifact-store blob. Unchanged across the T30 migration so cross-
+/// version compat is preserved: an older reader extracting this body
+/// from any future archive can still parse it.
 const DISK_CACHE_MAGIC_V2: &[u8; 16] = b"TWJIT-KRNL-v2\0\0\0";
 /// V2 header: magic + fingerprint + sm_version + grid_x + block_x + ptx_len.
 const DISK_CACHE_HEADER_LEN_V2: usize = 16 + 8 + 4 + 4 + 4 + 8;
-const DISK_CACHE_HMAC_LEN: usize = 32;
+
+/// 16-byte sidecar magic. Stamped at the head of every `*.ptxbin`
+/// sidecar so the reader can tell a T30 sidecar apart from any legacy
+/// pre-T30 raw-V2 file that happens to live under the same filename
+/// scheme. Pre-T30 files start with `TWJIT-KRNL-v2\0\0\0`; T30 sidecars
+/// start with this distinct magic, so a stale legacy file is treated
+/// as a miss and the next `put` overwrites it.
+const SIDECAR_MAGIC_V1: &[u8; 16] = b"TWJIT-IDX-v1\0\0\0\0";
+/// Sidecar total length: 16-byte magic + 32-byte BLAKE3 content hash.
+const SIDECAR_LEN_V1: usize = 16 + 32;
 
 impl DiskCache {
     fn new(mut cfg: DiskCacheConfig) -> Self {
         // Move the key bytes into a `Zeroizing` newtype so the long-lived
         // copy is wiped on `DiskCache::drop`. We cannot partially move
-        // fields out of `cfg` directly because `DiskCacheConfig` now
+        // fields out of `cfg` directly because `DiskCacheConfig`
         // implements `Drop` (jit S-3 T13) — the language forbids
         // partial moves out of a `Drop` type. Instead we `mem::take`
         // each field, leaving the source struct in a default-valued
@@ -929,9 +989,16 @@ impl DiskCache {
         // already-defaulted) `hmac_key` array a second time.
         let dir = std::mem::take(&mut cfg.dir);
         let key_bytes = std::mem::take(&mut cfg.hmac_key);
+        // The artifact store gets its own copy of the same key so its
+        // streaming HMAC matches the one the sidecar's path-prefix
+        // fingerprint will agree with. Both copies are wrapped in
+        // `Zeroizing` (the artifact store wraps internally) so neither
+        // construction-time bytes linger after drop.
+        let store = Arc::new(DiskArtifactStore::new(dir.clone(), key_bytes));
         Self {
             dir,
             hmac_key: Zeroizing::new(key_bytes),
+            store,
         }
     }
 
@@ -1001,15 +1068,15 @@ impl DiskCache {
             .join(format!("{key_prefix_hex}-{cache_key_hex}.ptxbin"))
     }
 
-    /// Write a kernel to disk under an HMAC-keyed integrity tag.
-    fn put(&self, key: &CacheKey, kernel: &CachedKernel) -> std::io::Result<()> {
-        use std::io::Write;
-        std::fs::create_dir_all(&self.dir)?;
+    /// Encode a kernel into the inner V2 envelope (the same byte layout
+    /// pre-T30 used at the head of every `.ptxbin` file, minus the
+    /// per-envelope HMAC trailer — the streaming HMAC is now the
+    /// artifact store's job). The result is what gets handed to
+    /// [`DiskArtifactStore::put`].
+    fn encode_v2_envelope(key: &CacheKey, kernel: &CachedKernel) -> Vec<u8> {
         let ptx_bytes = kernel.ptx.text.as_bytes();
         let (grid_x, block_x) = kernel.ptx.launch_geometry;
-        let mut buf = Vec::with_capacity(
-            DISK_CACHE_HEADER_LEN_V2 + ptx_bytes.len() + DISK_CACHE_HMAC_LEN,
-        );
+        let mut buf = Vec::with_capacity(DISK_CACHE_HEADER_LEN_V2 + ptx_bytes.len());
         buf.extend_from_slice(DISK_CACHE_MAGIC_V2);
         buf.extend_from_slice(&key.blueprint.to_le_bytes());
         buf.extend_from_slice(&key.sm_version.to_le_bytes());
@@ -1020,129 +1087,164 @@ impl DiskCache {
         buf.extend_from_slice(&block_x.to_le_bytes());
         buf.extend_from_slice(&(ptx_bytes.len() as u64).to_le_bytes());
         buf.extend_from_slice(ptx_bytes);
-        // HMAC-keyed BLAKE3 over everything written so far. Uses blake3's
-        // built-in keyed mode rather than HMAC-SHA256 so we don't pull
-        // the `hmac` + `sha2` deps into this crate just for the disk
-        // cache; the security argument is identical (BLAKE3-keyed is a
-        // strong MAC).
-        // `blake3::keyed_hash` takes `&[u8; 32]`. `Zeroizing` implements
-        // `Deref<Target=[u8; 32]>` so Rust's deref-coercion lowers
-        // `&Zeroizing<[u8; 32]>` to `&[u8; 32]` at the call site.
-        let tag = blake3::keyed_hash(&self.hmac_key, &buf);
-        buf.extend_from_slice(tag.as_bytes());
-        // Atomic write: create the temp file in the same directory, then
-        // rename onto the final path so a partial write never leaves a
-        // half-formed entry that a concurrent reader could trip over.
-        let final_path = self.path_for(key);
-        let tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
-        tmp.as_file().write_all(&buf)?;
-        tmp.persist(&final_path)
+        buf
+    }
+
+    /// Write a kernel via the layered `(sidecar -> blob)` representation:
+    ///
+    /// 1. Build the inner V2 envelope `Vec<u8>` (cross-version-compat
+    ///    format, T12-aligned).
+    /// 2. Hand the envelope bytes to [`DiskArtifactStore::put`] which
+    ///    streams HMAC + zstd onto disk under a content-addressed path
+    ///    and returns the [`ContentHash`] of the envelope.
+    /// 3. Write a small sidecar at [`Self::path_for`] mapping the
+    ///    [`CacheKey`] to that [`ContentHash`] via an atomic temp-then-
+    ///    rename, so a partial write never strands a half-formed
+    ///    sidecar that a concurrent reader might trip over.
+    ///
+    /// The artifact store inherits T22's streaming property: the
+    /// envelope's bytes are not re-buffered into another `Vec` before
+    /// HMAC + zstd — the store's `put` tees through a `MacWriter` /
+    /// zstd encoder pipeline straight to the file. The only buffered
+    /// allocation here is the v2 envelope itself, which is bounded by
+    /// the kernel's PTX size and lives just long enough to be consumed
+    /// by `store.put`.
+    fn put(&self, key: &CacheKey, kernel: &CachedKernel) -> std::io::Result<()> {
+        use std::io::Write;
+        std::fs::create_dir_all(&self.dir)?;
+        // Step 1: build the inner V2 envelope (no per-envelope MAC —
+        // the artifact store's HMAC covers it transitively).
+        let envelope = Self::encode_v2_envelope(key, kernel);
+        // Step 2: stream the envelope through the artifact store. The
+        // store handles atomic temp-then-rename of the blob itself.
+        let hash = self.store.put(&envelope).map_err(|e| {
+            // Wrap as `io::Error` so the existing `Result<(), io::Error>`
+            // signature of `DiskCache::put` (and the warn-level log path
+            // in `KernelCache::put`) stays unchanged.
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?;
+        // Step 3: stamp the sidecar atomically. The sidecar is small
+        // (48 bytes) and lives at a path derived from the cache key, so
+        // the lookup side only needs one read to find the content
+        // hash and one more (through the artifact store) to fetch the
+        // verified envelope bytes.
+        let mut sidecar = Vec::with_capacity(SIDECAR_LEN_V1);
+        sidecar.extend_from_slice(SIDECAR_MAGIC_V1);
+        sidecar.extend_from_slice(&hash.0);
+        debug_assert_eq!(sidecar.len(), SIDECAR_LEN_V1);
+        let sidecar_path = self.path_for(key);
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
+        tmp.as_file_mut().write_all(&sidecar)?;
+        tmp.persist(&sidecar_path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         Ok(())
     }
 
     /// Read and verify a kernel from disk. Returns `Ok(None)` on a
-    /// genuine miss (file does not exist), `Err` on I/O failure, and
-    /// `Ok(None)` (with a warn-level log) on an HMAC mismatch — the
-    /// loader treats integrity failures as "no such entry" so a poisoned
-    /// file behaves identically to a fresh cache.
+    /// genuine miss (sidecar does not exist), `Err` on I/O failure,
+    /// and `Ok(None)` (with a warn-level log) on any integrity failure
+    /// — magic mismatch on the sidecar, blob lookup failure,
+    /// artifact-store HMAC mismatch, or envelope header mismatch. The
+    /// loader treats every integrity failure as "no such entry" so a
+    /// poisoned file behaves identically to a fresh cache.
     fn get(&self, key: &CacheKey) -> std::io::Result<Option<CachedKernel>> {
-        let path = self.path_for(key);
-        let bytes = match std::fs::read(&path) {
+        // ---- Sidecar lookup. ----
+        let sidecar_path = self.path_for(key);
+        let sidecar = match std::fs::read(&sidecar_path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        // Magic-dispatch on the first 16 bytes. V2 is the current writer
-        // format; V1 is read-only legacy that we treat as a miss so the
-        // L1-driven re-emission rewrites the file under V2 (and finally
-        // persists `launch_geometry`).
-        if bytes.len() < 16 {
+        if sidecar.len() != SIDECAR_LEN_V1 {
             tracing::warn!(
                 target: "tensor_wasm_jit::cache",
-                file = %path.display(),
-                len = bytes.len(),
-                "disk-cache entry too short for magic; treating as miss"
+                file = %sidecar_path.display(),
+                len = sidecar.len(),
+                "disk-cache sidecar wrong length; treating as miss"
             );
             return Ok(None);
         }
-        let magic = &bytes[..16];
-        if magic == DISK_CACHE_MAGIC_V1 {
-            // Legacy format: pre-`launch_geometry` persistence. Don't try
-            // to read the old layout — bumping the magic means every
-            // process restart starts re-emitting fresh V2 entries so we
-            // also stop returning the buggy (0, 0) default.
+        if &sidecar[..16] != SIDECAR_MAGIC_V1 {
+            // Either a legacy pre-T30 raw-V2 record sitting at the same
+            // path (TWJIT-KRNL-v2 magic) or unrelated garbage. Either
+            // way the new reader does not understand it — treat as a
+            // miss so the next `put` rewrites it under the T30 layout.
             tracing::info!(
                 target: "tensor_wasm_jit::cache",
-                file = %path.display(),
-                "cache.l2.miss.legacy_magic: V1 record, will be rewritten as V2 on next put"
+                file = %sidecar_path.display(),
+                "cache.l2.miss.legacy_or_unknown_magic: sidecar will be rewritten on next put"
             );
             return Ok(None);
         }
-        if magic != DISK_CACHE_MAGIC_V2 {
-            tracing::warn!(
-                target: "tensor_wasm_jit::cache",
-                file = %path.display(),
-                "disk-cache magic mismatch; treating as miss"
-            );
-            return Ok(None);
-        }
-        if bytes.len() < DISK_CACHE_HEADER_LEN_V2 + DISK_CACHE_HMAC_LEN {
-            tracing::warn!(
-                target: "tensor_wasm_jit::cache",
-                file = %path.display(),
-                len = bytes.len(),
-                "disk-cache V2 entry too short; treating as miss"
-            );
-            return Ok(None);
-        }
-        let hmac_start = bytes.len() - DISK_CACHE_HMAC_LEN;
-        let (prefix, tag_bytes) = bytes.split_at(hmac_start);
-        let expected = blake3::keyed_hash(&self.hmac_key, prefix);
-        // Constant-time HMAC compare. The stdlib `==` / `PartialEq` impl on
-        // `[u8; N]` and `&[u8]` short-circuits on the first mismatch — a
-        // classic timing oracle that lets an attacker recover a forged MAC
-        // byte-by-byte by measuring how far the comparison got before
-        // rejecting. `subtle::ConstantTimeEq::ct_eq` always inspects every
-        // byte, so the time to reject a forgery does not leak how many
-        // leading bytes were correct.
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(&sidecar[16..48]);
+        let content_hash = ContentHash(hash_bytes);
+
+        // ---- Streaming-verified blob fetch via the artifact store. ----
         //
-        // `tag_bytes` is a `&[u8]` of length `DISK_CACHE_HMAC_LEN` by
-        // construction (we sliced exactly the last `DISK_CACHE_HMAC_LEN`
-        // bytes), but a hostile on-disk truncation could in principle hand
-        // us a shorter slice. Length is structural metadata (the size of
-        // the file), not secret content, so a non-secret length check up
-        // front is safe — and `ct_eq` itself requires equal-length inputs
-        // to be meaningful, since it would otherwise return `0` without
-        // looking at any bytes.
-        use subtle::ConstantTimeEq;
-        let length_ok = tag_bytes.len() == DISK_CACHE_HMAC_LEN;
-        let mac_ok = length_ok && bool::from(expected.as_bytes().ct_eq(tag_bytes));
-        if !mac_ok {
+        // The store handles HMAC-SHA256 verification (constant-time),
+        // zstd decompression with a [`MAX_DECOMPRESSED_LEN`] cap, and
+        // content-hash defence-in-depth. Any failure (NotFound,
+        // BadHmac, HashMismatch, …) collapses to a miss here, mirroring
+        // the pre-T30 reader's "log + return Ok(None)" convention so
+        // the call site's `cache.misses_total` counter still ticks
+        // correctly on integrity rejection.
+        let envelope = match self.store.get(&content_hash) {
+            Ok(bytes) => bytes,
+            Err(ArtifactError::NotFound(_)) => {
+                tracing::warn!(
+                    target: "tensor_wasm_jit::cache",
+                    file = %sidecar_path.display(),
+                    "disk-cache sidecar references missing artifact blob; treating as miss"
+                );
+                return Ok(None);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "tensor_wasm_jit::cache",
+                    file = %sidecar_path.display(),
+                    error = %e,
+                    "disk-cache artifact-store read failed; treating as miss"
+                );
+                return Ok(None);
+            }
+        };
+
+        // ---- Parse the inner V2 envelope. ----
+        if envelope.len() < DISK_CACHE_HEADER_LEN_V2 {
             tracing::warn!(
                 target: "tensor_wasm_jit::cache",
-                file = %path.display(),
-                "disk-cache HMAC mismatch; treating as miss \
-                 (possible tampering or stale key)"
+                file = %sidecar_path.display(),
+                len = envelope.len(),
+                "disk-cache V2 envelope too short; treating as miss"
             );
             return Ok(None);
         }
-        // Header integrity is implied by the HMAC, but cross-check
-        // fingerprint and sm_version against the requested key as
-        // defence-in-depth — a file under the right path that holds a
-        // mismatching header means the path-hash collided (impossible
-        // with 128 bits of BLAKE3) OR an operator copied the file
-        // manually; treat as miss either way.
+        if &envelope[..16] != DISK_CACHE_MAGIC_V2 {
+            tracing::warn!(
+                target: "tensor_wasm_jit::cache",
+                file = %sidecar_path.display(),
+                "disk-cache V2 envelope magic mismatch; treating as miss"
+            );
+            return Ok(None);
+        }
+        // Header integrity is implied by the artifact store's HMAC, but
+        // cross-check fingerprint and sm_version against the requested
+        // key as defence-in-depth — a sidecar that points at a foreign
+        // blob (e.g. someone hand-edited the sidecar's content hash)
+        // would still survive the store's MAC because each blob carries
+        // its own self-consistent envelope; only this final check
+        // refuses the mismatch.
         let mut bp_bytes = [0u8; 8];
-        bp_bytes.copy_from_slice(&prefix[16..24]);
+        bp_bytes.copy_from_slice(&envelope[16..24]);
         let mut sm_bytes = [0u8; 4];
-        sm_bytes.copy_from_slice(&prefix[24..28]);
+        sm_bytes.copy_from_slice(&envelope[24..28]);
         let mut grid_x_bytes = [0u8; 4];
-        grid_x_bytes.copy_from_slice(&prefix[28..32]);
+        grid_x_bytes.copy_from_slice(&envelope[28..32]);
         let mut block_x_bytes = [0u8; 4];
-        block_x_bytes.copy_from_slice(&prefix[32..36]);
+        block_x_bytes.copy_from_slice(&envelope[32..36]);
         let mut len_bytes = [0u8; 8];
-        len_bytes.copy_from_slice(&prefix[36..44]);
+        len_bytes.copy_from_slice(&envelope[36..44]);
         let fingerprint_on_disk = u64::from_le_bytes(bp_bytes);
         let sm_version_on_disk = u32::from_le_bytes(sm_bytes);
         let grid_x_on_disk = u32::from_le_bytes(grid_x_bytes);
@@ -1151,27 +1253,27 @@ impl DiskCache {
         if fingerprint_on_disk != key.blueprint || sm_version_on_disk != key.sm_version {
             tracing::warn!(
                 target: "tensor_wasm_jit::cache",
-                file = %path.display(),
-                "disk-cache header key mismatch; treating as miss"
+                file = %sidecar_path.display(),
+                "disk-cache V2 envelope header key mismatch; treating as miss"
             );
             return Ok(None);
         }
         let ptx_start = DISK_CACHE_HEADER_LEN_V2;
         let ptx_end = ptx_start.saturating_add(ptx_len_on_disk);
-        if ptx_end > prefix.len() {
+        if ptx_end > envelope.len() {
             tracing::warn!(
                 target: "tensor_wasm_jit::cache",
-                file = %path.display(),
-                "disk-cache declared ptx_len overruns file; treating as miss"
+                file = %sidecar_path.display(),
+                "disk-cache declared ptx_len overruns envelope; treating as miss"
             );
             return Ok(None);
         }
-        let ptx_text = match std::str::from_utf8(&prefix[ptx_start..ptx_end]) {
+        let ptx_text = match std::str::from_utf8(&envelope[ptx_start..ptx_end]) {
             Ok(s) => s.to_string(),
             Err(_) => {
                 tracing::warn!(
                     target: "tensor_wasm_jit::cache",
-                    file = %path.display(),
+                    file = %sidecar_path.display(),
                     "disk-cache PTX bytes are not valid UTF-8; treating as miss"
                 );
                 return Ok(None);
