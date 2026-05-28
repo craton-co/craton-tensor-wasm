@@ -232,6 +232,93 @@ paths:
         "429":
           $ref: "#/components/responses/RateLimited"
 
+  /functions/{id}/invoke-stream:
+    post:
+      tags: [invoke]
+      summary: Invoke a function and stream the response (SSE or chunked).
+      description: |
+        Streaming counterpart of `/functions/{id}/invoke`. The response
+        shape is selected from the request's `Accept` header:
+
+        * `Accept: text/event-stream` — Server-Sent Events. Each chunk
+          the guest emits via the `wasi:tensor/host.emit-chunk` host
+          function is rendered as one `data:` line. Stream terminates
+          with an `event: end` frame.
+        * Otherwise — `Content-Type: application/octet-stream`,
+          `Transfer-Encoding: chunked`. Each guest chunk is forwarded
+          verbatim as one HTTP chunk frame.
+
+        ### v0.3.7 scaffold
+
+        The route is mounted and stable in v0.3.7 but does not yet
+        drive the executor through a streaming invocation path. The
+        scaffold returns a single `event: scaffold` frame with
+        `{"status":"not_yet_wired"}` then closes the stream. Mid-
+        execution streaming wiring lands in v0.4 alongside the
+        `tensor_wasm_wasi_gpu::StreamingContext` hookup on
+        `InstanceState`. The wire shape (URL, method, response
+        framing, status codes) will not change between v0.3.7 and
+        v0.4 — see `docs/STREAMING.md`.
+      operationId: invokeFunctionStream
+      parameters:
+        - $ref: "#/components/parameters/FunctionId"
+        - $ref: "#/components/parameters/TenantHeader"
+        - name: Accept
+          in: header
+          required: false
+          description: |
+            Set to `text/event-stream` to receive SSE framing. Any
+            other value (or absence) selects the
+            `application/octet-stream` chunked-transfer branch.
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              description: |
+                Arbitrary JSON payload, same shape as the synchronous
+                invoke endpoint. The v0.x executor ignores the value.
+      responses:
+        "200":
+          description: |
+            Streaming response. The body framing depends on the
+            negotiated content type — see the operation summary.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Server-Sent Events stream. Each emitted chunk is
+                  one `data:` frame; the stream ends with an
+                  `event: end` frame.
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+                description: |
+                  Raw chunked-transfer bytes — one HTTP chunk per
+                  guest-emitted chunk.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
   /jobs/{id}:
     get:
       tags: [jobs]
