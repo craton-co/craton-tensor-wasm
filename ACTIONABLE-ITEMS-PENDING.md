@@ -346,19 +346,34 @@ each item live in
 
 | # | Title | Tier | ETA | Owner | Status |
 |---|---|---|---|---|---|
-| 1 | [Typed multi-value guest export ABI](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🔵 not started |
-| 2 | [Streaming HTTP `invoke` responses](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🔵 not started |
-| 3 | [Signed kernel registry](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🔵 not started |
-| 4 | [Cooperative deadlines via WASI yield](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🔵 not started |
-| 5 | [Pre-instantiated instance pool](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🔵 not started |
-| 6 | [Differential JIT correctness oracle](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🔵 not started |
+| 1 | [Typed multi-value guest export ABI](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🟡 scaffold landed |
+| 2 | [Streaming HTTP `invoke` responses](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🟡 scaffold landed |
+| 3 | [Signed kernel registry](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🟡 scaffold landed |
+| 4 | [Cooperative deadlines via WASI yield](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🟡 scaffold landed |
+| 5 | [Pre-instantiated instance pool](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🟡 scaffold landed |
+| 6 | [Differential JIT correctness oracle](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🟡 scaffold landed |
 | 7 | [Pliron-based auto-offload pipeline](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🔵 not started |
-| 8 | [Per-tenant GPU memory quotas via `cuMemPool`](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🔵 not started |
-| 9 | [Unified content-addressed signed artifact store](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🔵 not started |
-| 10 | [OpenAI-compatible inference gateway shim](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🔵 not started |
+| 8 | [Per-tenant GPU memory quotas via `cuMemPool`](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🟡 scaffold landed |
+| 9 | [Unified content-addressed signed artifact store](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🟡 scaffold landed |
+| 10 | [OpenAI-compatible inference gateway shim](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🟡 scaffold landed |
 | 11 | [WASI-NN compatibility layer](docs/PATH-TO-V1.md#post-v036-strategic-features) | Speculative / R&D | TBD | TBD | 🔵 not started |
 | 12 | [Direct guest-side GPU dispatch via SPIR-V](docs/PATH-TO-V1.md#post-v036-strategic-features) | Speculative / R&D | TBD | TBD | 🔵 not started |
 | 13 | [Distributed dispatch sidecar over QUIC](docs/PATH-TO-V1.md#post-v036-strategic-features) | Speculative / R&D | TBD | TBD | 🔵 not started |
+
+Status legend for this table (distinct from the per-item legend at the
+top of this file — that one tracks external blockers, this one tracks
+in-tree implementation progress):
+
+- 🔵 **not started** — no code on disk yet; spec/design may exist in `docs/`.
+- 🟡 **scaffold landed** — surface-area-stable Rust types + tests
+  shipped in v0.3.7 behind the owning crate, with the production wire
+  (HTTP route, on-disk store, scheduler integration) deferred to v0.4.
+  Each item's row in [`docs/PATH-TO-V1.md#post-v036-strategic-features`](docs/PATH-TO-V1.md#post-v036-strategic-features)
+  carries a **Status (v0.3.7)** line pointing at the scaffold file and
+  the v0.4 deliverable.
+- 🟢 **wired** — production path landed end-to-end; the v0.4 deliverable
+  in the PATH-TO-V1 entry is closed. (Reserved for future use; no item
+  has reached this state as of v0.3.7.)
 
 Top priority for the v0.5-beta external-deploy gate is **#10
 (OpenAI-compatible inference gateway shim)**; see PATH-TO-V1 for

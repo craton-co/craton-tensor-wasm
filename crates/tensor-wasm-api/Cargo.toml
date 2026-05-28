@@ -79,6 +79,18 @@ tracing-opentelemetry = { workspace = true }
 uuid.workspace = true
 wasmparser.workspace = true
 
+[features]
+default = []
+# Signed kernel registry HTTP surface (B6.4 — roadmap feature #3 server
+# side). When enabled, the api crate compiles the `kernels` module and
+# wires `POST/GET /kernels` + `GET /kernels/{name}/{version}` into the
+# router. The feature gates the optional `tensor-wasm-jit` dep (which
+# itself enables its own `kernel-registry` sub-feature for the manifest
+# verification + InMemoryRegistry impl) so the default build is unaffected
+# — operators that don't need the registry endpoints keep the lean dep
+# graph. See `docs/KERNEL-REGISTRY.md` for the rollout plan.
+kernel-registry-api = ["dep:tensor-wasm-jit"]
+
 [dev-dependencies]
 # futures: now declared as a regular [dependencies] entry above for the
 # streaming `/invoke-stream` handler. The dev-dependency block keeps no

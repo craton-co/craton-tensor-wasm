@@ -107,6 +107,16 @@ own formats today. The v0.4 follow-up does the actual fold:
    bespoke v3 trailer. The on-disk magic changes; the v2 / v3 reader
    stays in the crate as a legacy decoder so existing operator
    snapshots can be migrated in place via a one-shot tool.
+   - **Snapshot migration: opt-in via feature `artifact-backing` as
+     of v0.3.8.** `SnapshotWriter::capture_to_artifact_store` and
+     `SnapshotReader::restore_from_artifact_store` route through this
+     crate's `DiskArtifactStore` when the consuming crate enables
+     the feature. The default `SnapshotWriter::capture` /
+     `SnapshotReader::restore` still emit and parse the inline v2/v3
+     envelope byte-for-byte unchanged — v0.4 will flip that default
+     once operator snapshot tooling has caught up. See
+     [`crates/tensor-wasm-snapshot/FORMAT.md`](../crates/tensor-wasm-snapshot/FORMAT.md#artifact-store-backing-opt-in-v038)
+     for the new methods.
 3. **CLI surface.** A new `tensor-wasm artifact list|get|verify`
    command goes against the unified directory layout, so operators
    have one inspection command instead of two.

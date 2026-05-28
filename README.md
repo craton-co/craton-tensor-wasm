@@ -122,6 +122,31 @@ Operational capabilities that ship on by default (no feature flag):
 | `build_info` metric | always on | W4.9. Version, git commit, enabled features as labels. |
 | OpenAI-compatible inference gateway shim (`/v1/completions`, `/v1/chat/completions`) | always on | B4.9 scaffold returning 501; v0.4 wires translation. See [`docs/OPENAI-COMPAT.md`](docs/OPENAI-COMPAT.md). |
 
+### v0.3.7 scaffolds
+
+Eight of the thirteen post-v0.3.6 strategic features landed as v0.3.7
+scaffolds — surface-area-stable Rust types + tests + design docs, with
+the production wire deferred to v0.4. Operators can build against the
+Rust + CLI surface today; the HTTP route / on-disk store / scheduler
+integration ships in v0.4. Each row links to the spec doc with the
+v0.4 deliverable.
+
+| Scaffold | Owning crate | Spec doc |
+|---|---|---|
+| Typed multi-value guest args | `tensor-wasm-exec` | [`docs/PATH-TO-V1.md#1-typed-multi-value-guest-export-abi`](docs/PATH-TO-V1.md#post-v036-strategic-features) |
+| Streaming `/invoke-stream` (SSE / chunked) | `tensor-wasm-wasi-gpu` + `tensor-wasm-api` | [`docs/STREAMING.md`](docs/STREAMING.md) |
+| Signed kernel registry (`KernelManifest`) | `tensor-wasm-jit` | [`docs/KERNEL-REGISTRY.md`](docs/KERNEL-REGISTRY.md) |
+| Cooperative WASI yield (`wasi:scheduler/host@0.1.0`) | `tensor-wasm-wasi-gpu` | [`docs/COOPERATIVE-YIELD.md`](docs/COOPERATIVE-YIELD.md) |
+| Pre-instantiated instance pool | `tensor-wasm-exec` | [`docs/INSTANCE-POOL.md`](docs/INSTANCE-POOL.md) |
+| Differential JIT correctness oracle | `tensor-wasm-jit` | [`docs/DIFFERENTIAL-ORACLE.md`](docs/DIFFERENTIAL-ORACLE.md) |
+| Per-tenant GPU memory quotas | `tensor-wasm-tenant` | [`docs/GPU-QUOTAS.md`](docs/GPU-QUOTAS.md) |
+| Unified content-addressed artifact store | `tensor-wasm-artifacts` | [`docs/ARTIFACT-STORE.md`](docs/ARTIFACT-STORE.md) |
+
+The full v0.3.7 landings list is in
+[`CHANGELOG.md`](CHANGELOG.md#037---2026-05-28); v0.4 deliverables are
+tracked in
+[`ACTIONABLE-ITEMS-PENDING.md`](ACTIONABLE-ITEMS-PENDING.md#v04-feature-roadmap-added-2026-05-28).
+
 Full taxonomy: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## GPU requirements

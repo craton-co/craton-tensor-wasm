@@ -600,6 +600,11 @@ not calendar time.
 - **Cost:** ~2 weeks.
 - **Risk:** Low. The Wasmtime side already supports it; the work is
   plumbing and a JSON ↔ `Val` codec with clear failure modes.
+- **Status (v0.3.7):** Scaffold landed. `WasmArg` enum + JSON codec +
+  `TensorWasmExecutor::call_export_with_args` shipped in
+  [`crates/tensor-wasm-exec/src/executor.rs`](../crates/tensor-wasm-exec/src/executor.rs).
+  v0.4 deliverable: CLI `--args` flag + HTTP `invoke` body field wired
+  through to the executor.
 
 #### 2. Streaming HTTP `invoke` responses
 
@@ -612,6 +617,12 @@ not calendar time.
 - **Cost:** ~3 weeks.
 - **Risk:** Low–medium. Backpressure, cancellation, and per-tenant
   fair scheduling on the streaming path each need design notes.
+- **Status (v0.3.7):** Scaffold landed. Host-side `emit_chunk` linker
+  surface + per-invocation `StreamingContext` in
+  [`crates/tensor-wasm-wasi-gpu/src/streaming.rs`](../crates/tensor-wasm-wasi-gpu/src/streaming.rs);
+  protocol guide in [`docs/STREAMING.md`](STREAMING.md). v0.4
+  deliverable: HTTP `/invoke-stream` route with SSE/chunked-transfer
+  encoding wired into the router (B7.1 is the in-flight follow-up).
 
 #### 3. Signed kernel registry
 
@@ -625,6 +636,13 @@ not calendar time.
 - **Cost:** ~3 weeks.
 - **Risk:** Low. The signing primitives, HMAC trailer format, and
   on-disk layout already exist from the snapshot and JIT L2 work.
+- **Status (v0.3.7):** Scaffold landed. HMAC-SHA256 `KernelManifest`
+  records + `InMemoryRegistry` in
+  [`crates/tensor-wasm-jit/src/registry.rs`](../crates/tensor-wasm-jit/src/registry.rs);
+  full design in [`docs/KERNEL-REGISTRY.md`](KERNEL-REGISTRY.md). CLI
+  surface (`tensor-wasm kernel publish|list|verify`) is staged but
+  exits `FEATURE_NOT_EXPOSED` until v0.4. v0.4 deliverable:
+  on-disk registry + server-side `/kernels` route.
 
 #### 4. Cooperative deadlines via WASI yield
 
@@ -640,6 +658,13 @@ not calendar time.
 - **Cost:** ~1 week.
 - **Risk:** Low. The fallback (uncooperative guests) is the status
   quo, so this is a strict improvement when adopted.
+- **Status (v0.3.7):** Scaffold landed. `SchedulerContext` +
+  `wasi:scheduler/host@0.1.0` linker surface +
+  CONTINUE/DEADLINE-NEAR/DEADLINE-ELAPSED return codes in
+  [`crates/tensor-wasm-wasi-gpu/src/scheduler.rs`](../crates/tensor-wasm-wasi-gpu/src/scheduler.rs).
+  v0.4 deliverable: integrate the deadline signal with the
+  back-pressure semaphore so the scheduler tightens budgets under
+  MPS contention.
 
 #### 5. Pre-instantiated instance pool
 
@@ -652,6 +677,14 @@ not calendar time.
 - **Cost:** ~2 weeks.
 - **Risk:** Medium. Pool sizing, eviction, and pinned-resource
   accounting interact with the GPU memory quota work (#8).
+- **Status (v0.3.7):** Scaffold landed. `InstancePool` +
+  `InstancePoolConfig` surface in
+  [`crates/tensor-wasm-exec/src/instance_pool.rs`](../crates/tensor-wasm-exec/src/instance_pool.rs);
+  design + reset-on-return contract in
+  [`docs/INSTANCE-POOL.md`](INSTANCE-POOL.md). v0.4 deliverable: wire
+  the pool through the executor's `invoke` path and account
+  pinned-resource consumption against the per-tenant GPU memory cap
+  (#8).
 
 ### Strategic medium-term (v0.5–v1.0)
 
@@ -667,6 +700,12 @@ not calendar time.
 - **Risk:** Medium. Floating-point determinism across CPU and GPU
   paths requires care; some kernels will need an explicit tolerance
   policy with a documented rationale.
+- **Status (v0.3.7):** Scaffold landed. `DifferentialOracle` API in
+  [`crates/tensor-wasm-jit/src/differential.rs`](../crates/tensor-wasm-jit/src/differential.rs)
+  + spec / tolerance policy in
+  [`docs/DIFFERENTIAL-ORACLE.md`](DIFFERENTIAL-ORACLE.md). v0.4
+  deliverable: proptest harness driving the oracle against every
+  blueprint + a per-kernel tolerance table.
 
 #### 7. Pliron-based auto-offload pipeline
 
@@ -680,6 +719,10 @@ not calendar time.
 - **Risk:** High. Pliron is still maturing; lowering quality on real
   Wasm workloads is unproven. Worth the bet because the alternative
   is shipping a permanent allow-list of kernels.
+- **Status:** not started. The O3 mapping-table scaffold lives in
+  `crates/tensor-wasm-jit/src/pliron_dialect.rs` but the actual
+  lowering pass is blocked on cuda-oxide v0.2 (see RFC 0001 and the
+  D3 cutover runbook).
 
 #### 8. Per-tenant GPU memory quotas via `cuMemPool`
 
@@ -691,6 +734,15 @@ not calendar time.
 - **Cost:** ~4 weeks.
 - **Risk:** Medium. Older driver / minimum-CUDA requirements need to
   be enforced and documented in the support matrix.
+- **Status (v0.3.7):** Scaffold landed.
+  `TenantContextBuilder::with_gpu_memory_bytes_cap` +
+  `consume_gpu_bytes` / `release_gpu_bytes` in
+  [`crates/tensor-wasm-tenant/src/context.rs`](../crates/tensor-wasm-tenant/src/context.rs);
+  full design in [`docs/GPU-QUOTAS.md`](GPU-QUOTAS.md). v0.4
+  deliverable: pin the cap to `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)`
+  so a tenant cannot bypass the cap by calling the driver directly
+  (gated on the cust → cudarc / cuda-oxide migration per Open
+  decision #1).
 
 #### 9. Unified content-addressed signed artifact store
 
@@ -702,13 +754,14 @@ not calendar time.
 - **Cost:** ~3 weeks.
 - **Risk:** Low. The two stores already converged in format; this is
   collapsing the abstraction, not reinventing it.
-- **Status:** v0.3.7 scaffold landed — trait + in-memory impl +
-  fully-implemented disk impl in
-  [`crates/tensor-wasm-artifacts`](../crates/tensor-wasm-artifacts).
-  Design and v0.4 convergence plan in
-  [`docs/ARTIFACT-STORE.md`](ARTIFACT-STORE.md). JIT cache and
-  snapshot store still use their own formats today; migration of
-  each consumer onto the unified envelope is the v0.4 follow-up.
+- **Status (v0.3.7):** Scaffold landed. `ArtifactStore` trait +
+  `InMemoryArtifactStore` + fully-implemented `DiskArtifactStore`
+  (HMAC-SHA256 trailer) in
+  [`crates/tensor-wasm-artifacts`](../crates/tensor-wasm-artifacts);
+  design + v0.4 convergence plan in
+  [`docs/ARTIFACT-STORE.md`](ARTIFACT-STORE.md). v0.4 deliverable:
+  migrate JIT L2 cache and snapshot store onto the unified envelope
+  (they still use their own formats today).
 
 #### 10. OpenAI-compatible inference gateway shim
 
@@ -723,6 +776,14 @@ not calendar time.
 - **Risk:** Low. The spec is stable, the translation is mechanical,
   and #2 (streaming responses) is the hard prerequisite — once that
   ships, this is almost free.
+- **Status (v0.3.7):** Scaffold landed. `/v1/completions` and
+  `/v1/chat/completions` routes mounted on the router with an
+  OpenAPI spec and a route allowlist; handlers return
+  `501 openai_not_yet_wired` until the translation layer ships. See
+  [`crates/tensor-wasm-api/src/openai.rs`](../crates/tensor-wasm-api/src/openai.rs)
+  and [`docs/OPENAI-COMPAT.md`](OPENAI-COMPAT.md). v0.4 deliverable:
+  wire the request translator into the internal `invoke` protocol
+  (depends on #2 streaming).
 
 ### Speculative / R&D
 
@@ -737,6 +798,7 @@ not calendar time.
 - **Risk:** High. The WASI-NN spec is still moving; building against
   a moving target risks landing a layer that ages out before the
   audience materializes.
+- **Status:** not started.
 
 #### 12. Direct guest-side GPU dispatch via SPIR-V
 
@@ -749,6 +811,7 @@ not calendar time.
 - **Risk:** Very high. Conflicts with the current anti-goal; security
   model for guest-issued PTX is open; SPIR-V → PTX lowering is its
   own multi-engineer project.
+- **Status:** not started.
 
 #### 13. Distributed dispatch sidecar over QUIC
 
@@ -760,6 +823,7 @@ not calendar time.
 - **Cost:** 2–3 months.
 - **Risk:** Medium–high. Failure modes, tenancy boundaries across
   hosts, and operator UX all need design work before any code.
+- **Status:** not started.
 
 ---
 

@@ -62,10 +62,13 @@ pub enum Command {
     },
     /// Publish, list, or verify entries in the signed kernel registry.
     ///
-    /// Roadmap feature #3, v0.3.7 scaffold — every subcommand exits
-    /// with code 3 (`FEATURE_NOT_EXPOSED`) until the server-side
-    /// `/kernels` route lands in v0.4. See `docs/KERNEL-REGISTRY.md`
-    /// for the manifest schema, signing envelope, and rollout plan.
+    /// Roadmap feature #3. The B6.4 milestone wired the server-side
+    /// `/kernels` HTTP route, so `publish` and `list` now perform real
+    /// HTTP calls against a TensorWasm server built with the
+    /// `kernel-registry-api` feature; `verify` is local-only and
+    /// re-signs an on-disk manifest under the supplied key. See
+    /// `docs/KERNEL-REGISTRY.md` for the manifest schema, signing
+    /// envelope, and operator deployment guide.
     Kernel {
         /// Kernel sub-action.
         #[command(subcommand)]

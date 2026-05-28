@@ -641,9 +641,13 @@ impl KernelCache {
             Arc::new(emitted),
             CompiledHandle::default(),
         );
-        // Best-effort L1 promote; ignore put errors (the entry was valid
-        // from the registry, the put rejection would be the wrong path).
-        let _ = self.put(*key, cached.clone());
+        // Best-effort L1 promote; `put` is infallible-by-design (any
+        // integrity-mismatch case logs + drops the entry rather than
+        // returning an error), so there is nothing to propagate even if
+        // the registry-derived `cached` were somehow rejected — the
+        // caller still gets the verified `Arc<CachedKernel>` from this
+        // call, the next call simply pays another L3 round-trip.
+        self.put(*key, cached.clone());
         Some(Arc::new(cached))
     }
 

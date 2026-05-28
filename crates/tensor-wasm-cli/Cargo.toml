@@ -37,6 +37,27 @@ tensor-wasm-exec = { workspace = true }
 # crate's router in-process so the README quickstart `tensor-wasm serve
 # --addr 0.0.0.0:8080` works without an external binary.
 tensor-wasm-api = { workspace = true }
+# tensor-wasm-jit: pulled in for the `tensor-wasm kernel` subcommands so
+# the CLI can build a signed `KernelManifest` locally (BLAKE3 digest +
+# HMAC-SHA256 signature over the canonical envelope) before POSTing it
+# to the server. The `kernel-registry` feature gates the registry module
+# itself. The dep is unconditional here (no Cargo feature) because the
+# kernel subcommands are always compiled into the CLI surface — the
+# v0.3.7 scaffold returned exit 3 from a stub, and B6.4 replaces that
+# stub with real HTTP calls; either way the CLI is the user-facing
+# surface for the feature.
+tensor-wasm-jit = { workspace = true, features = ["kernel-registry"] }
+# blake3: computes the PTX digest the CLI bakes into the manifest. The
+# `tensor-wasm-jit` crate uses blake3 transitively but does not re-export
+# it; we declare the dep here against the workspace pin so the CLI does
+# not lock in a different minor version of the hash.
+blake3.workspace = true
+# subtle: constant-time signature comparison in `kernel verify`. The
+# `tensor-wasm-jit` registry path uses the same primitive for its
+# server-side HMAC compare, but does NOT re-export it; declaring the
+# dep here matches the version pin already used by the api crate
+# (constant-time bearer-token comparator) so cargo can de-duplicate.
+subtle = "2"
 # `serve` binds the router via `axum::serve`; declare the dep explicitly
 # so we can reference it directly rather than relying on transitives.
 axum.workspace = true

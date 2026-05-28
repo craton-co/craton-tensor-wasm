@@ -614,6 +614,159 @@ impl SnapshotReader {
         }
         Ok(())
     }
+
+    /// Restore a [`Snapshot`] previously written via
+    /// [`crate::writer::SnapshotWriter::capture_to_artifact_store`].
+    ///
+    /// The artifact store owns the outer envelope (magic, BLAKE3 content
+    /// hash, zstd compression, HMAC-SHA256 trailer, key-fingerprinted
+    /// filename); this method just bincode-decodes the payload bytes
+    /// returned by [`tensor_wasm_artifacts::DiskArtifactStore::get`] and
+    /// re-applies the per-blob size caps and CRC32 cross-check that the
+    /// legacy [`SnapshotReader::restore`] path runs.
+    ///
+    /// Validation order:
+    /// 1. Artifact store performs its own authentication (magic, version,
+    ///    HMAC, content-hash) — a tampered or wrong-key blob returns an
+    ///    error here, mapped to `TensorWasmError::Serialization`.
+    /// 2. The decoded byte payload is run through bincode with the same
+    ///    static [`limits::MAX_TOTAL_PAYLOAD_BYTES`] allocator ceiling
+    ///    the legacy path uses, so a malicious length-prefix inside the
+    ///    bincode payload cannot drive a runaway allocation.
+    /// 3. The inner magic and version are checked, the three byte blobs
+    ///    are validated against their per-blob caps, and the CRC32 and
+    ///    `metadata.total_uncompressed_bytes` cross-checks run exactly
+    ///    as on the legacy path. These checks are defence-in-depth on
+    ///    top of the artifact store's own integrity guarantees: a writer
+    ///    bug that produced a Snapshot with a stale CRC32 should still
+    ///    be rejected even though the artifact store happily authenticated
+    ///    the payload.
+    ///
+    /// The reader's `max_decompressed`, `hmac_key`, and `require_signature`
+    /// fields are intentionally **not** consulted on this path — the
+    /// artifact store owns those concerns. Callers that want
+    /// operator-tunable HMAC keys for snapshots should construct the
+    /// [`tensor_wasm_artifacts::DiskArtifactStore`] with the appropriate
+    /// key.
+    #[cfg(feature = "artifact-backing")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "artifact-backing")))]
+    #[instrument(skip(self, store), fields(content_hash = %hash))]
+    pub fn restore_from_artifact_store(
+        &self,
+        store: &tensor_wasm_artifacts::DiskArtifactStore,
+        hash: &tensor_wasm_artifacts::ContentHash,
+    ) -> Result<Snapshot> {
+        let bytes = store.get(hash).map_err(|e| {
+            // Forward the artifact store's `Display` output through the
+            // generic Serialization variant — `ArtifactError` is not part
+            // of the `TensorWasmError` enum, and the messages are already
+            // operator-facing (no key bytes leak).
+            TensorWasmError::Serialization(
+                format!("artifact store get: {e}").into(),
+            )
+        })?;
+
+        // Static allocator ceiling for bincode, identical to the legacy
+        // restore path. The artifact store already bounds memory by its
+        // own decompression cap, but this gate catches any in-payload
+        // length-prefix abuse before the backing buffer is touched.
+        let cfg = bincode::config::legacy()
+            .with_limit::<{ crate::writer::limits::MAX_TOTAL_PAYLOAD_BYTES }>();
+        let (snapshot, _read): (Snapshot, usize) =
+            bincode::serde::decode_from_slice(bytes.as_slice(), cfg).map_err(|e| {
+                TensorWasmError::Serialization(format!("bincode decode: {e}").into())
+            })?;
+
+        if snapshot.magic != SNAPSHOT_MAGIC {
+            return Err(TensorWasmError::Serialization(
+                format!(
+                    "snapshot magic mismatch: expected {:#X}, got {:#X}",
+                    SNAPSHOT_MAGIC, snapshot.magic,
+                )
+                .into(),
+            ));
+        }
+
+        // The artifact-backed write path emits the v2 inner discriminant
+        // (the outer envelope already supplies authentication). Accept v2
+        // and v3 here for forward compatibility — a future writer might
+        // route signed inner payloads through the same envelope without
+        // bumping the wire format.
+        if snapshot.version != SNAPSHOT_VERSION_V2 && snapshot.version != SNAPSHOT_VERSION_V3 {
+            return Err(TensorWasmError::Serialization(
+                format!(
+                    "snapshot version mismatch: expected {} or {}, got {}",
+                    SNAPSHOT_VERSION_V2, SNAPSHOT_VERSION_V3, snapshot.version,
+                )
+                .into(),
+            ));
+        }
+
+        check_blob_size(
+            "wasm_memory",
+            snapshot.wasm_memory.len(),
+            limits::MAX_WASM_MEMORY_BYTES,
+        )?;
+        check_blob_size(
+            "gpu_memory",
+            snapshot.gpu_memory.len(),
+            limits::MAX_GPU_MEMORY_BYTES,
+        )?;
+        check_blob_size(
+            "registers",
+            snapshot.registers.len(),
+            limits::MAX_REGISTERS_BYTES,
+        )?;
+
+        let expected = payload_crc32(
+            &snapshot.wasm_memory,
+            &snapshot.gpu_memory,
+            &snapshot.registers,
+        );
+        if snapshot.crc32 != expected {
+            return Err(TensorWasmError::Serialization(
+                format!(
+                    "snapshot crc32 mismatch: expected {:#010X}, got {:#010X}",
+                    expected, snapshot.crc32,
+                )
+                .into(),
+            ));
+        }
+
+        let actual_total = snapshot
+            .wasm_memory
+            .len()
+            .checked_add(snapshot.gpu_memory.len())
+            .and_then(|s| s.checked_add(snapshot.registers.len()))
+            .ok_or_else(|| {
+                TensorWasmError::Serialization(
+                    "snapshot blob length sum overflowed usize".into(),
+                )
+            })?;
+        if (actual_total as u64) != snapshot.metadata.total_uncompressed_bytes {
+            return Err(TensorWasmError::Serialization(
+                format!(
+                    "snapshot metadata.total_uncompressed_bytes mismatch: \
+                     expected {} (wasm_memory={} + gpu_memory={} + registers={}), got {}",
+                    actual_total,
+                    snapshot.wasm_memory.len(),
+                    snapshot.gpu_memory.len(),
+                    snapshot.registers.len(),
+                    snapshot.metadata.total_uncompressed_bytes,
+                )
+                .into(),
+            ));
+        }
+
+        debug!(
+            wasm = snapshot.wasm_memory.len(),
+            gpu = snapshot.gpu_memory.len(),
+            regs = snapshot.registers.len(),
+            version = snapshot.version,
+            "snapshot restored from artifact store",
+        );
+        Ok(snapshot)
+    }
 }
 
 /// In-memory representation of a snapshot whose `gpu_memory` blob has been

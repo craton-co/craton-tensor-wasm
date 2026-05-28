@@ -585,6 +585,77 @@ impl SnapshotWriter {
         );
         Ok(compressed)
     }
+
+    /// Write the snapshot via [`tensor_wasm_artifacts::DiskArtifactStore`]
+    /// rather than the inline v2/v3 envelope.
+    ///
+    /// The bincode-encoded [`Snapshot`] (NOT zstd-wrapped — the artifact
+    /// store handles compression and HMAC itself) is handed to
+    /// [`tensor_wasm_artifacts::DiskArtifactStore::put`], which wraps it in
+    /// the unified envelope:
+    ///
+    /// ```text
+    /// twasm-artifact01 || version(4) || blake3(payload) || zstd(payload) || hmac_sha256(prefix)
+    /// ```
+    ///
+    /// This is the **v0.4 convergence path**. Today's invocation continues
+    /// to use the inline envelope when this method is not called — the
+    /// existing [`SnapshotWriter::capture`] is byte-for-byte unchanged so
+    /// snapshots already on disk under any previous v0.3.x build remain
+    /// readable through [`crate::reader::SnapshotReader::restore`].
+    ///
+    /// The writer's `zstd_level` and `hmac_key` fields are intentionally
+    /// **not** consulted on this path: the artifact store owns its own
+    /// compression level and HMAC key (passed in at construction time).
+    /// Callers that want operator-tunable HMAC keys for snapshots can
+    /// continue to use [`SnapshotWriter::capture`] under the v3 envelope
+    /// until the v0.4 default cutover.
+    ///
+    /// Returns the [`tensor_wasm_artifacts::ContentHash`] under which the
+    /// snapshot was stored. Pair it with
+    /// [`crate::reader::SnapshotReader::restore_from_artifact_store`] to
+    /// read the snapshot back.
+    #[cfg(feature = "artifact-backing")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "artifact-backing")))]
+    #[instrument(skip(self, state, store), fields(
+        tenant = %state.tenant_id,
+        instance = %state.instance_id,
+    ))]
+    pub fn capture_to_artifact_store(
+        &self,
+        state: InstanceState<'_>,
+        store: &tensor_wasm_artifacts::DiskArtifactStore,
+    ) -> Result<tensor_wasm_artifacts::ContentHash> {
+        // Build the bincode-encoded Snapshot (NOT zstd-wrapped) — the
+        // artifact store handles compression itself. The size caps from
+        // `build_snapshot`'s `build_metadata` call still apply, so an
+        // oversized capture is rejected here before bincode runs.
+        let snapshot = self.build_snapshot(state)?;
+        let bytes = bincode::serde::encode_to_vec(&snapshot, bincode::config::legacy())
+            .map_err(|e| {
+                TensorWasmError::Serialization(format!("bincode encode: {e}").into())
+            })?;
+        let total_uncompressed_bytes = snapshot.metadata.total_uncompressed_bytes;
+        let hash = store.put(&bytes).map_err(|e| {
+            // `ArtifactError` is not part of the `TensorWasmError` enum
+            // (it lives in a leaf crate that does not depend on
+            // `tensor-wasm-core`), so we surface its `Display`
+            // representation through the generic Serialization variant.
+            // The artifact store's error messages are already
+            // operator-facing (no key bytes, no secret material) so the
+            // forward is safe.
+            TensorWasmError::Serialization(
+                format!("artifact store put: {e}").into(),
+            )
+        })?;
+        debug!(
+            uncompressed = total_uncompressed_bytes,
+            encoded = bytes.len(),
+            content_hash = %hash,
+            "snapshot captured to artifact store",
+        );
+        Ok(hash)
+    }
 }
 
 #[cfg(test)]

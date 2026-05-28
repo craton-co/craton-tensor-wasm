@@ -109,7 +109,10 @@ everything else in this section is a deeper cut into one subsystem.
 | [AUTO-OFFLOAD.md](AUTO-OFFLOAD.md) | — | User-facing reference for the auto-offload pipeline: which Wasm patterns the detector recognises, which it rejects, and how to enable it. |
 | [CUDARC-SPIKE.md](CUDARC-SPIKE.md) | W1.2 | The `cust` → `cudarc` migration spike record: version chosen, API mapping table, known gaps, and the recommended cutover plan. |
 | [COLD-START.md](COLD-START.md) | — | The five-component additive model for cold-start latency on a TensorWasm node and the operator levers that affect each component. |
-| [INSTANCE-POOL.md](INSTANCE-POOL.md) | — | Roadmap feature #5 (pre-instantiated instance pool): scaffold status, configuration knobs, the v0.4 implementation plan, and the reset-on-return contract. |
+| [INSTANCE-POOL.md](INSTANCE-POOL.md) | B5.8 | Roadmap feature #5 (pre-instantiated instance pool): scaffold status, configuration knobs, the v0.4 implementation plan, and the reset-on-return contract. |
+| [KERNEL-REGISTRY.md](KERNEL-REGISTRY.md) | B6.3 | Roadmap feature #3 (signed kernel registry): HMAC-SHA256 `KernelManifest` records, `InMemoryRegistry` scaffold, and the v0.4 server-wire + on-disk store deliverable. |
+| [DIFFERENTIAL-ORACLE.md](DIFFERENTIAL-ORACLE.md) | B5.9 | Roadmap feature #6 (differential JIT correctness oracle): bit-identity assertion contract between the Wasmtime CPU path and the JIT PTX path, plus the per-kernel tolerance policy. |
+| [ARTIFACT-STORE.md](ARTIFACT-STORE.md) | B6.6 | Roadmap feature #9 (unified content-addressed signed artifact store): the `tensor-wasm-artifacts` trait surface, on-disk envelope, and the v0.4 convergence plan for the JIT L2 cache + snapshot store. |
 | [glossary.md](glossary.md) | — | Short paragraph definitions of recurring CUDA, Wasm, and TensorWasm-internal terms (UVM, MPS, MIG, PTX, WMMA, BLAKE3 fingerprint, deopt guard, dispatch future, etc.). |
 
 ## API surface
@@ -126,6 +129,8 @@ for humans; the per-release rustdoc + OpenAPI bundle described in
 | [../crates/tensor-wasm-api/API.md](../crates/tensor-wasm-api/API.md) | — | Hand-written REST reference for every endpoint the `tensor-wasm-api` gateway serves, with request/response examples for each route. |
 | [API-REFERENCE.md](API-REFERENCE.md) | W4.8 | Publication-policy for the per-release rustdoc + OpenAPI archive: what is in it, what is not, the URL contract, and the workflow that produces it. |
 | [AUDIT-LOG.md](AUDIT-LOG.md) | W2.2 | Wire-format schema, sink configuration, rotation guidance, and stable-string contract for the structured audit log emitted on state-mutating routes. |
+| [STREAMING.md](STREAMING.md) | B6.1 | Roadmap feature #2 (streaming HTTP `invoke` responses): the `wasi:tensor/host.emit-chunk` host-fn contract, the SSE / chunked-transfer wire shape, and the v0.4 route-wiring deliverable. |
+| [OPENAI-COMPAT.md](OPENAI-COMPAT.md) | B4.9 / B5.6 | Roadmap feature #10 (OpenAI-compatible inference gateway shim): the `/v1/completions` and `/v1/chat/completions` route surface, the v0.3.5 scaffold returning `501 openai_not_yet_wired`, and the v0.4 translation-layer deliverable. |
 | [deployment/mtls.md](deployment/mtls.md) | W2.8 | Two production deployment shapes — self-terminated rustls and reverse-proxy fronting — with a recommended path for the v0.4 binary that still binds plaintext. |
 
 ## Performance and benchmarking
@@ -184,6 +189,9 @@ surface.
 | [UPGRADE.md](UPGRADE.md) | W3.3 | Operator-facing fleet upgrade playbook describing the opinionated sequence for rolling a running TensorWasm deployment from one release to another. |
 | [BACKUP-RESTORE.md](BACKUP-RESTORE.md) | W3.7 | What a production TensorWasm deployment must back up, the tested strategies, the restore paths, and the validation procedure that confirms a backup is good. |
 | [OBSERVABILITY.md](OBSERVABILITY.md) | — | The `tracing` span schema, the optional OTLP exporter stack, and how to wire a local collector for development. |
+| [CONFIG.md](CONFIG.md) | B2.9 | Single-source reference for every environment variable consumed by `tensor-wasm`, grouped by crate, with default + type + effect columns. |
+| [GPU-QUOTAS.md](GPU-QUOTAS.md) | B6.5 | Roadmap feature #8 (per-tenant GPU memory quotas): the v0.3.7 in-process counter scaffold, the `TenantContextBuilder` surface, and the v0.4 `cuMemPool` driver-level enforcement plan. |
+| [COOPERATIVE-YIELD.md](COOPERATIVE-YIELD.md) | B6.4 | Roadmap feature #4 (cooperative deadlines via WASI yield): the `wasi:scheduler/host@0.1.0` protocol, the CONTINUE / DEADLINE-NEAR / DEADLINE-ELAPSED return codes, and the embedder wiring snippet. |
 
 ## Security
 
@@ -197,6 +205,8 @@ end to end before a real CVE arrives. Reports go to
 |---|---|---|
 | [../SECURITY.md](../SECURITY.md) | W3.5 (backport policy), M8.5 (snapshot HMAC) | TensorWasm's threat model, isolation strategy summary, the optional snapshot HMAC authentication (cross-linked to [the v2 → v3 migration](SNAPSHOT-COMPATIBILITY.md#v2--v3-migration-signed-snapshots)), and the backport policy that decides which security fixes land on which release branches. |
 | [SECURITY-AUDIT.md](SECURITY-AUDIT.md) | — | The v0.1 security-audit findings: methodology (manual walk + `cargo-fuzz`), per-asset verdict, and the follow-up tracking for partially-mitigated items. |
+| [TESTING.md](TESTING.md) | B2.9 | Testing conventions across the workspace: unit/integration/CUDA/fuzz layers, the `#[ignore]` policy for hardware-gated tests, and the CI matrix that runs them. |
+| [FUZZING.md](FUZZING.md) | B2.9 | The `fuzz/` directory layout, per-target corpora, the nightly + weekly cron schedule, and the v0.5 24-hour gate that determines when a target counts as "covered". |
 | [runbooks/cve-disclosure-dry-run.md](runbooks/cve-disclosure-dry-run.md) | W5.5 | Manual procedure for rehearsing the CVE disclosure pipeline end-to-end on a test repository before a real CVE arrives. |
 
 ## Governance and supply chain
@@ -217,6 +227,7 @@ mechanism that produces every other change that touches them.
 | [SBOM.md](SBOM.md) | W4.3 | What the CycloneDX SBOM shipped with every release contains, what it does not contain, how to regenerate it locally, and the maintainer contract. |
 | [REPRODUCIBLE-BUILDS.md](REPRODUCIBLE-BUILDS.md) | W3.6 | Recipe for two independent builds of the same release tag producing bit-identical sha256 digests on Linux x86_64 with the pinned toolchain. |
 | [WASMTIME-UPGRADE.md](WASMTIME-UPGRADE.md) | W2.9 | Cadence policy for Wasmtime version bumps: quarterly minor bumps, major bumps case-by-case, plus the per-bump maintainer checklist. |
+| [RELEASE.md](RELEASE.md) | B2.9 | Release-engineering runbook: tag preconditions, the per-release CHANGELOG / SBOM / cosign step sequence, and the `@craton-co/release` ownership contract. |
 | [../CHANGELOG.md](../CHANGELOG.md) | W3.1 | Keep-a-Changelog log of every notable change, grouped by semver release; the `[Unreleased]` section tracks the v0.2–v0.4 wave work staged on `main`. |
 | [MIGRATION-v0-to-v1.md](MIGRATION-v0-to-v1.md) | W3.2 | Operational checklist a v0.x deployment follows to land on v1.0 cleanly, populated continuously between v0.1 and v1.0. |
 | [PATH-TO-V1.md](PATH-TO-V1.md) | — | The proposed five-milestone roadmap from the current v0.1.0 preview to a v1.0 production release, with explicit anti-goals and open decisions. |

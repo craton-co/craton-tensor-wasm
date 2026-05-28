@@ -137,6 +137,15 @@ pub struct AppState {
     pub metrics: Arc<TensorWasmMetrics>,
     /// Wasm executor driving the synchronous `/invoke` path.
     pub executor: Arc<TensorWasmExecutor>,
+    /// Optional kernel registry (B6.4 / roadmap feature #3). `None` when
+    /// `TENSOR_WASM_API_KERNEL_HMAC_KEY` is unset; the `/kernels` routes
+    /// return `503 kernel_registry_not_configured` in that case so
+    /// client tools can detect feature availability without inspecting
+    /// the URL surface. Only compiled when the `kernel-registry-api`
+    /// feature is enabled — the default build keeps the lean dep graph.
+    #[cfg(feature = "kernel-registry-api")]
+    pub kernel_registry:
+        Option<Arc<dyn tensor_wasm_jit::registry::KernelRegistry>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -152,6 +161,13 @@ impl AppState {
     /// Build the inner struct (without the outer `Arc`). Returns
     /// [`TensorWasmError::WasmCompile`] if `TensorWasmEngine::new` fails — typically a
     /// fatal host misconfiguration (unsupported wasmtime strategy, etc.).
+    ///
+    /// When the `kernel-registry-api` feature is enabled, also reads
+    /// `TENSOR_WASM_API_KERNEL_HMAC_KEY` (64-hex chars / 32 bytes) and
+    /// constructs an `InMemoryRegistry` keyed off it. An unset env var
+    /// leaves `kernel_registry` at `None` so the `/kernels` routes
+    /// return `503` rather than silently accepting publishes under a
+    /// zero key.
     fn try_build() -> Result<Self, TensorWasmError> {
         let metrics = Arc::new(TensorWasmMetrics::new());
         let engine = Arc::new(
@@ -163,6 +179,8 @@ impl AppState {
             jobs: Arc::new(DashMap::new()),
             metrics,
             executor,
+            #[cfg(feature = "kernel-registry-api")]
+            kernel_registry: build_kernel_registry_from_env(),
         })
     }
 
@@ -196,6 +214,117 @@ impl AppState {
         self.executor = Arc::new(TensorWasmExecutor::with_metrics(engine, (*metrics).clone()));
         self.metrics = metrics;
         self
+    }
+
+    /// Install an explicit kernel registry, bypassing the env-var
+    /// initialisation in [`Self::try_build`].
+    ///
+    /// Test-only convenience so integration tests can drive `/kernels`
+    /// without poisoning the process environment with a hex-encoded
+    /// HMAC key. `#[doc(hidden)]` because production code should always
+    /// flow through `try_build`'s env-var read.
+    #[doc(hidden)]
+    #[cfg(feature = "kernel-registry-api")]
+    pub fn with_kernel_registry(
+        mut self,
+        registry: Arc<dyn tensor_wasm_jit::registry::KernelRegistry>,
+    ) -> Self {
+        self.kernel_registry = Some(registry);
+        self
+    }
+}
+
+/// Read `TENSOR_WASM_API_KERNEL_HMAC_KEY` and build an
+/// `Arc<dyn KernelRegistry>` from it.
+///
+/// Returns `None` when the variable is unset / empty, and also when the
+/// value is malformed (not 64 hex chars). Malformed values are logged
+/// at `warn` so an operator who typoed a key sees a startup signal — we
+/// deliberately do NOT panic, because the gateway should still come up
+/// and serve the non-kernel routes; the `/kernels` endpoints will then
+/// return `503 kernel_registry_not_configured` and clients can correct
+/// the deploy without a full restart loop.
+///
+/// The behaviour mirrors `AppConfig::from_env` for the snapshot HMAC key
+/// (see `crate::config`) except that the snapshot path returns a hard
+/// error: the kernel registry is a non-critical add-on whereas a snapshot
+/// signing key misconfiguration would silently downgrade integrity.
+#[cfg(feature = "kernel-registry-api")]
+fn build_kernel_registry_from_env(
+) -> Option<Arc<dyn tensor_wasm_jit::registry::KernelRegistry>> {
+    /// Environment variable carrying the hex-encoded 32-byte HMAC-SHA256
+    /// key the kernel registry uses to verify inbound manifests.
+    const ENV_KERNEL_HMAC_KEY: &str = "TENSOR_WASM_API_KERNEL_HMAC_KEY";
+
+    let raw = match std::env::var(ENV_KERNEL_HMAC_KEY) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() != 64 {
+        tracing::warn!(
+            target: "tensor_wasm_api::routes",
+            var = ENV_KERNEL_HMAC_KEY,
+            actual_len = trimmed.len(),
+            "kernel registry HMAC key must be exactly 64 hex characters; \
+             leaving registry unconfigured (the /kernels routes will return \
+             503 kernel_registry_not_configured)",
+        );
+        return None;
+    }
+    let mut key = [0u8; 32];
+    for (i, slot) in key.iter_mut().enumerate() {
+        let bytes = trimmed.as_bytes();
+        let hi = match hex_nibble_local(bytes[i * 2]) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    target: "tensor_wasm_api::routes",
+                    var = ENV_KERNEL_HMAC_KEY,
+                    "kernel registry HMAC key contains non-hex characters; \
+                     leaving registry unconfigured",
+                );
+                return None;
+            }
+        };
+        let lo = match hex_nibble_local(bytes[i * 2 + 1]) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    target: "tensor_wasm_api::routes",
+                    var = ENV_KERNEL_HMAC_KEY,
+                    "kernel registry HMAC key contains non-hex characters; \
+                     leaving registry unconfigured",
+                );
+                return None;
+            }
+        };
+        *slot = (hi << 4) | lo;
+    }
+    tracing::info!(
+        target: "tensor_wasm_api::routes",
+        "kernel registry HMAC key configured (64 chars hex); /kernels routes live",
+    );
+    Some(Arc::new(tensor_wasm_jit::registry::InMemoryRegistry::new(
+        key,
+    )))
+}
+
+/// Local hex-nibble decoder for the kernel registry env-var path. We do
+/// NOT route this through `crate::config::parse_hex_key` because that
+/// helper returns a typed [`crate::config::ConfigError`] which the
+/// kernel-registry initialiser deliberately discards (it logs and
+/// degrades rather than failing startup).
+#[cfg(feature = "kernel-registry-api")]
+fn hex_nibble_local(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -284,6 +413,42 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             kind: "not_found".to_string(),
+            message: message.into(),
+        }
+    }
+
+    /// Construct a `409 Conflict` with the given `kind` and `message`.
+    ///
+    /// Used by the kernel registry's `POST /kernels` path to surface
+    /// `kind = "already_registered"` when a manifest with the same
+    /// `name@version` has already been published. The `(409, kind)`
+    /// pair is the documented contract for "the request is well-formed
+    /// but would violate a uniqueness invariant"; clients should NOT
+    /// retry without changing the request (no `Retry-After` header).
+    pub fn conflict(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            kind: kind.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Construct a `503 Service Unavailable` with the given `kind` and
+    /// `message`.
+    ///
+    /// Used by the kernel registry routes to surface
+    /// `kind = "kernel_registry_not_configured"` when the gateway is
+    /// running without `TENSOR_WASM_API_KERNEL_HMAC_KEY` set. Distinct
+    /// from `capacity_exhausted` (also 503) because the failure mode is
+    /// configuration, not load — a client should NOT retry, it should
+    /// surface the error to an operator who can flip the env knob.
+    pub fn service_unavailable(
+        kind: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            kind: kind.into(),
             message: message.into(),
         }
     }

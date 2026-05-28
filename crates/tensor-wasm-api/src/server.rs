@@ -328,11 +328,44 @@ pub fn build_router_with_trusted_proxies(
         .layer(axum::middleware::from_fn(rate_limit))
         .layer(axum::middleware::from_fn(audit_log_middleware));
 
-    protected_router
+    // Kernel registry routes (B6.4 — roadmap feature #3 server-side).
+    // The endpoints are write-class (publish) and read-class (list /
+    // resolve), so we put them behind the same `WRITE_CONCURRENCY_LIMIT`
+    // budget the function-mutating endpoints use. Bearer auth still
+    // applies; tenant resolution does NOT because the kernel registry
+    // is operator-scope (one HMAC key across the deployment), not
+    // tenant-scope. Mounted alongside the openai router for the same
+    // reason: it would otherwise trip `tenant_scope`'s `missing_tenant`
+    // 400 on operator deploys without `X-TensorWasm-Tenant`.
+    //
+    // The routes are gated behind the `kernel-registry-api` feature so
+    // the default build keeps the dep graph lean. Operators flip
+    // `--features kernel-registry-api` plus set
+    // `TENSOR_WASM_API_KERNEL_HMAC_KEY` to enable them; when the env
+    // var is unset the handlers themselves return
+    // `503 kernel_registry_not_configured` (so adding the routes here
+    // is safe even without the secret configured).
+    #[cfg(feature = "kernel-registry-api")]
+    let kernel_router: Router<Arc<AppState>> = Router::new()
+        .route(
+            "/kernels",
+            post(crate::kernels::publish_kernel).get(crate::kernels::list_kernels),
+        )
+        .route(
+            "/kernels/:name/:version",
+            get(crate::kernels::resolve_kernel),
+        )
+        .layer(concurrency_limit_layer(WRITE_CONCURRENCY_LIMIT))
+        .layer(axum::middleware::from_fn(bearer_auth))
+        .layer(axum::middleware::from_fn(rate_limit))
+        .layer(axum::middleware::from_fn(audit_log_middleware));
+
+    let router = protected_router
         .merge(probe_router)
-        .merge(openai_router)
-        .layer(common_layers)
-        .with_state(state)
+        .merge(openai_router);
+    #[cfg(feature = "kernel-registry-api")]
+    let router = router.merge(kernel_router);
+    router.layer(common_layers).with_state(state)
 }
 
 /// Bind and serve the router on the given address.

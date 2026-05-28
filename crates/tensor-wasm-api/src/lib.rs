@@ -72,6 +72,8 @@
 pub mod audit;
 pub mod config;
 pub mod http_metrics;
+#[cfg(feature = "kernel-registry-api")]
+pub mod kernels;
 pub mod middleware;
 pub mod openai;
 pub mod rate_limit;

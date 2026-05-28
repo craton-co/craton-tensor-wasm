@@ -209,3 +209,92 @@ documents.
 A `version` mismatch (anything other than `2` or `3`) is a hard error;
 the reader does not attempt to migrate older snapshots in place. Re-
 capture from the live instance is the supported upgrade path.
+
+## Artifact-store backing (opt-in, v0.3.8+)
+
+The legacy v2 and v3 envelopes described above are unchanged and remain
+the default for `SnapshotWriter::capture` / `SnapshotReader::restore` —
+every snapshot already on disk continues to read and write byte-for-byte
+identically.
+
+Behind the `artifact-backing` cargo feature, the writer and reader gain
+two additional methods that route snapshots through the unified
+`tensor-wasm-artifacts::DiskArtifactStore` envelope instead of the
+inline zstd-and-trailer shape:
+
+```rust
+// Writer side (gated on the `artifact-backing` feature):
+let hash: tensor_wasm_artifacts::ContentHash =
+    writer.capture_to_artifact_store(state, &store)?;
+
+// Reader side (same feature):
+let snapshot: Snapshot =
+    reader.restore_from_artifact_store(&store, &hash)?;
+```
+
+### On-disk shape
+
+When a snapshot is captured through `capture_to_artifact_store`, the
+bytes the disk store writes are **not** the v2/v3 envelope — they are
+the artifact store's own envelope wrapping a bincode-encoded
+[`Snapshot`] payload (zstd compression and HMAC are owned by the
+artifact store, not by this crate):
+
+```
+twasm-artifact01(16) || version(4)=1 || blake3(payload)(32)
+                    || zstd(bincode(Snapshot))
+                    || hmac_sha256(prefix)(32)
+```
+
+The inner `Snapshot::version` field is `SNAPSHOT_VERSION_V2 = 2` (the
+outer envelope already supplies authentication, so the v3 trailer would
+be redundant). The reader still accepts an inner `version` of `2` or
+`3` for forward compatibility — a future writer might route signed
+inner payloads through the same outer envelope without bumping the
+wire format.
+
+### Behaviour differences from the inline envelope
+
+| Concern | Inline v2/v3 envelope | Artifact-store envelope |
+|---|---|---|
+| Magic | `0xBA11_5407` (4 bytes inside bincode) | `b"twasm-artifact01"` (16 bytes, outside) |
+| Compression | zstd, configurable via `SnapshotWriter::with_level` | zstd, owned by `DiskArtifactStore` (level 3, not yet operator-tunable) |
+| MAC | Optional HMAC-SHA256 trailer (v3) | Mandatory HMAC-SHA256 trailer |
+| MAC key source | `SnapshotWriter::with_hmac_sha256_key` | `DiskArtifactStore::new(_, key)` |
+| Content addressing | No (caller routes blobs externally) | Yes — `ContentHash = blake3(payload)` |
+| Atomic write | Up to the caller | `tempfile::persist` (built in) |
+| Key rotation | Operator-managed (rewrite-on-rotate) | Filename partitioned by `blake3(key)[..8]` (rotated-out keys appear as `NotFound`) |
+
+The `SnapshotWriter::zstd_level` and `SnapshotWriter::hmac_key` fields
+are **not** consulted by `capture_to_artifact_store` — the store owns
+those settings. Mirror the same on the reader: `max_decompressed`,
+`hmac_key`, and `require_signature` are not consulted by
+`restore_from_artifact_store`.
+
+### Validation order (reader)
+
+1. `DiskArtifactStore::get` validates magic, version, HMAC trailer (in
+   constant time), and the BLAKE3 content hash. A tampered, wrong-key,
+   or foreign-format blob is rejected here, before any snapshot-crate
+   code runs on the bytes.
+2. The returned bincode payload is decoded under
+   `bincode::config::legacy().with_limit::<MAX_TOTAL_PAYLOAD_BYTES>()`
+   — the same static allocator ceiling the legacy path uses, so a
+   tampered length prefix inside the bincode payload cannot drive a
+   runaway allocation.
+3. Inner magic, version (`2` or `3`), per-blob caps, CRC32, and
+   `metadata.total_uncompressed_bytes` are validated exactly as on the
+   legacy path. These are defence-in-depth on top of the artifact
+   store's own integrity guarantees: a writer bug that produced a
+   `Snapshot` with a stale CRC32 should still be rejected even though
+   the artifact store happily authenticated the payload.
+
+### v0.4 default-cutover plan
+
+v0.3.8 ships this path as **opt-in only** — minimum blast radius for
+operators with snapshot tooling already pinned to the v2/v3 envelope.
+v0.4 will flip the default of `SnapshotWriter::capture` /
+`SnapshotReader::restore` to the artifact-store envelope, and keep the
+inline v2/v3 path available as a legacy decoder for in-place migration
+of existing on-disk snapshots. See `docs/ARTIFACT-STORE.md` § "Convergence
+plan — v0.4" for the full rollout sequence.
