@@ -67,6 +67,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use tensor_wasm_core::types::{InstanceId, KernelId};
 use tracing::{info, info_span, warn, Instrument};
@@ -158,6 +159,21 @@ pub struct WasiCudaContext {
     /// the context across threads. Use [`Self::wasi_cuda_enabled`] /
     /// [`Self::enable_wasi_cuda`] / [`Self::disable_wasi_cuda`].
     pub(crate) wasi_cuda_enabled: AtomicBool,
+    /// Per-invocation absolute deadline (T36 — cooperative deadlines).
+    ///
+    /// When `Some`, the launch path constructs a deadline-aware
+    /// [`BackPressure`] clone via
+    /// [`BackPressure::with_deadline_hint`] so the acquire decision
+    /// agrees with the cooperative-yield verdict the guest sees from
+    /// `wasi:scheduler/host`. Lives behind a `Mutex` so the executor
+    /// can re-arm it at the top of each `call_export` without holding
+    /// an exclusive borrow on the context (host functions only
+    /// observe it through a borrow of `&self`).
+    ///
+    /// `None` means "no deadline configured" — the launch path falls
+    /// back to the historical `acquire_borrowed` behaviour and host
+    /// functions never reject on deadline grounds.
+    pub bp_deadline: Mutex<Option<Instant>>,
 }
 
 impl WasiCudaContext {
@@ -175,6 +191,7 @@ impl WasiCudaContext {
             back_pressure: Arc::new(BackPressure::new()),
             last_lowered_args: Mutex::new(Vec::new()),
             wasi_cuda_enabled: AtomicBool::new(false),
+            bp_deadline: Mutex::new(None),
         }
     }
 
@@ -192,12 +209,54 @@ impl WasiCudaContext {
             back_pressure: bp,
             last_lowered_args: Mutex::new(Vec::new()),
             wasi_cuda_enabled: AtomicBool::new(false),
+            bp_deadline: Mutex::new(None),
         }
     }
 
     /// Borrow the shared back-pressure handle for observability / sharing.
     pub fn back_pressure(&self) -> &Arc<BackPressure> {
         &self.back_pressure
+    }
+
+    /// Install a per-invocation absolute deadline that drives the
+    /// back-pressure rejection path (T36). The same `Instant` SHOULD
+    /// be installed on the matching
+    /// [`crate::scheduler::SchedulerContext`] via
+    /// [`crate::scheduler::SchedulerContext::set_bp_deadline_instant`]
+    /// so the guest's cooperative-yield verdicts agree with the
+    /// acquire-side decisions.
+    ///
+    /// Passing `None` clears the deadline; subsequent launches fall
+    /// back to the historical `acquire_borrowed` behaviour.
+    pub fn set_bp_deadline(&self, deadline: Option<Instant>) {
+        // Recover from a poisoned mutex rather than panicking — a
+        // previous panic during a launch should not brick the
+        // deadline-update path.
+        let mut guard = self
+            .bp_deadline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = deadline;
+    }
+
+    /// Read the currently-installed back-pressure deadline. Returns
+    /// `None` when no deadline is configured.
+    pub fn bp_deadline(&self) -> Option<Instant> {
+        *self
+            .bp_deadline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Build a deadline-aware [`BackPressure`] clone suitable for the
+    /// hot launch path. The returned value carries the per-instance
+    /// deadline installed via [`Self::set_bp_deadline`] (if any) but
+    /// shares the underlying semaphore Arc with every other clone
+    /// pulling from the same pool — so concurrency caps remain
+    /// process-wide while deadlines remain per-instance.
+    pub fn deadline_aware_back_pressure(&self) -> BackPressure {
+        let bp = (*self.back_pressure).clone();
+        bp.with_deadline_hint(self.bp_deadline())
     }
 
     /// Grant this context the wasi-cuda capability. Without this call the
@@ -915,7 +974,13 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
     // the saturation error rather than hanging the wasm fiber forever.
     // Any other cap behaves as before: the await suspends until a permit
     // is released by a finishing dispatch.
-    let bp = caller.data().wasi_cuda().back_pressure.clone();
+    // T36: build a deadline-aware BackPressure clone so the acquire
+    // path can refuse new permits when the per-invocation deadline is
+    // near or elapsed. The underlying semaphore Arc is shared across
+    // every per-instance clone, so cap enforcement remains
+    // process-wide; only the deadline is per-instance. Without an
+    // installed deadline this collapses to the pre-T36 behaviour.
+    let bp = caller.data().wasi_cuda().deadline_aware_back_pressure();
     let _permit = bp.acquire_borrowed().await?;
 
     // Resolve argv now, after the permit has been acquired. Pointer args

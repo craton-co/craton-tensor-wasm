@@ -15,6 +15,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, SemaphorePermit, Semaphore};
 
@@ -25,10 +26,92 @@ use crate::abi::AbiError;
 /// at startup to match the deployed hardware in S17.
 pub const DEFAULT_MAX_CONCURRENT_GPU_OPS: usize = 256;
 
+/// Window before the configured deadline during which the back-pressure
+/// path tightens: new acquires are rejected with
+/// [`BackPressureError::DeadlineNear`] so the in-flight cohort can
+/// drain without being further saturated by fresh launches. Picked at
+/// 50 ms — five default epoch ticks — which empirically lets a
+/// per-tile loop wind down (typical tile completion ≤ a few ms)
+/// without surrendering useful budget on the common path.
+///
+/// Kept distinct from the scheduler's own
+/// [`crate::scheduler::SUGGESTED_YIELD_THRESHOLD_MS`] (10 ms): that
+/// threshold biases the cooperative yield code; this one biases
+/// resource admission. The wider window for back-pressure gives the
+/// scheduler an additional 40 ms safety margin to land a STOP code
+/// before any new in-flight work is permitted.
+pub const DEADLINE_NEAR_WINDOW: Duration = Duration::from_millis(50);
+
+/// Errors returned by the deadline-aware back-pressure acquire path.
+///
+/// Distinct from [`AbiError`] so callers that want to discriminate
+/// "saturated forever" from "saturated because the per-instance
+/// deadline is approaching" can do so without having to inspect the
+/// surrounding context. Conversions to [`AbiError`] (for back-compat
+/// with the existing host-function return path) collapse both
+/// deadline variants onto [`AbiError::QuotaExceeded`] — the guest sees
+/// the same "no permits available" signal it already handles, and the
+/// richer variant survives in logs / metrics that bind directly to
+/// `BackPressureError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackPressureError {
+    /// The semaphore is saturated and (for the cap-0 sentinel) will
+    /// never release a permit. Equivalent to the historical
+    /// [`AbiError::QuotaExceeded`] surface — kept under that name so
+    /// the conversion path is unambiguous.
+    Saturated,
+    /// The configured per-invocation deadline is within
+    /// [`DEADLINE_NEAR_WINDOW`] of elapsing. In-flight permits are
+    /// allowed to complete; new acquires are refused so the cohort
+    /// drains under bounded budget.
+    DeadlineNear,
+    /// The configured per-invocation deadline has already elapsed.
+    /// All future acquires (including pending awaiters that have not
+    /// yet observed a permit) are rejected.
+    DeadlineElapsed,
+}
+
+impl BackPressureError {
+    /// Stable, human-readable name (used for log fields).
+    pub fn name(self) -> &'static str {
+        match self {
+            BackPressureError::Saturated => "saturated",
+            BackPressureError::DeadlineNear => "deadline_near",
+            BackPressureError::DeadlineElapsed => "deadline_elapsed",
+        }
+    }
+}
+
+impl From<BackPressureError> for AbiError {
+    fn from(e: BackPressureError) -> Self {
+        // Collapse onto QuotaExceeded — the wire shape every existing
+        // guest already knows. The richer variant survives in
+        // structured logs / metrics that bind directly to
+        // `BackPressureError`.
+        match e {
+            BackPressureError::Saturated
+            | BackPressureError::DeadlineNear
+            | BackPressureError::DeadlineElapsed => AbiError::QuotaExceeded,
+        }
+    }
+}
+
 /// A back-pressure semaphore plus a live-counter for observability.
+///
+/// The semaphore itself lives behind an `Arc<BackPressureInner>` so
+/// multiple `BackPressure` clones share the same permit pool — this is
+/// what makes the cap process-wide rather than per-instance. The
+/// optional per-call deadline lives **on the clone** (not inside the
+/// `Arc`) so two instances pulling from the same shared pool can each
+/// carry their own deadline without racing on a shared `Mutex`.
 #[derive(Clone)]
 pub struct BackPressure {
     inner: Arc<BackPressureInner>,
+    /// Per-clone deadline used by the deadline-aware acquire path.
+    /// `None` means "no deadline configured" — the acquire path
+    /// behaves exactly as before. Installed via
+    /// [`BackPressure::with_deadline_hint`].
+    deadline: Option<Instant>,
 }
 
 struct BackPressureInner {
@@ -51,7 +134,69 @@ impl BackPressure {
                 active: AtomicUsize::new(0),
                 max_concurrent,
             }),
+            deadline: None,
         }
+    }
+
+    /// Attach a per-invocation deadline to this `BackPressure` clone.
+    ///
+    /// The deadline is consulted on every acquire (both `acquire` and
+    /// `acquire_borrowed`):
+    ///
+    /// - If `Instant::now() >= deadline`, the acquire returns
+    ///   [`BackPressureError::DeadlineElapsed`] without awaiting.
+    /// - If `Instant::now() >= deadline - DEADLINE_NEAR_WINDOW`, the
+    ///   acquire returns [`BackPressureError::DeadlineNear`] — the
+    ///   in-flight cohort is permitted to complete but no new permits
+    ///   are issued.
+    /// - Otherwise the acquire behaves exactly as before (`None`
+    ///   deadline = unchanged behaviour).
+    ///
+    /// Builder method: consumes `self` and returns a new clone with
+    /// the deadline installed. The underlying semaphore is shared via
+    /// `Arc` so two clones that pull from the same pool can each
+    /// carry their own deadline. Passing `None` is the documented
+    /// "no deadline" knob — equivalent to a fresh `BackPressure`
+    /// constructed via [`BackPressure::with_cap`].
+    ///
+    /// See [`crate::scheduler::SchedulerContext`] for the matching
+    /// cooperative-yield query path: the executor builds both from
+    /// the same `Instant` so the guest's `yield()` verdicts and the
+    /// host's acquire decisions agree on when the deadline trips.
+    pub fn with_deadline_hint(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// Borrow the per-clone deadline, if any. Mirrors
+    /// [`BackPressure::with_deadline_hint`] — useful for tests and
+    /// observability paths that want to confirm the executor wired the
+    /// deadline through.
+    pub fn deadline_hint(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Inspect the per-clone deadline and classify the current state.
+    /// Returns `Ok(())` when the acquire path should proceed,
+    /// `Err(DeadlineNear)` when in-flight may complete but new
+    /// acquires are refused, and `Err(DeadlineElapsed)` when all
+    /// acquires must be refused.
+    fn check_deadline(&self) -> Result<(), BackPressureError> {
+        let Some(d) = self.deadline else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        if now >= d {
+            return Err(BackPressureError::DeadlineElapsed);
+        }
+        // `d.checked_duration_since(now)` is positive here (now < d);
+        // the remaining-window comparison reads more naturally that
+        // way than juggling Instant arithmetic.
+        let remaining = d.saturating_duration_since(now);
+        if remaining <= DEADLINE_NEAR_WINDOW {
+            return Err(BackPressureError::DeadlineNear);
+        }
+        Ok(())
     }
 
     /// Acquire one permit, awaiting back-pressure if necessary.
@@ -61,6 +206,16 @@ impl BackPressure {
     /// future fan-out path). Each call clones the inner `Arc<Semaphore>`.
     /// On the non-spawning production hot path, prefer
     /// [`BackPressure::acquire_borrowed`] which avoids that clone.
+    ///
+    /// Deadline-hint-unaware: this method returns an unconditional
+    /// permit and never refuses on deadline grounds. Callers that
+    /// need the deadline-aware rejection path must use
+    /// [`BackPressure::try_acquire_with_deadline`] or
+    /// [`BackPressure::acquire_borrowed`]; this method is kept on the
+    /// pre-deadline surface for tests / benches that pre-date the
+    /// deadline plumbing and would otherwise need a typed-error
+    /// rewrite. (The production `launch_impl_async` path uses
+    /// `acquire_borrowed`, which DOES honour the deadline.)
     pub async fn acquire(&self) -> DispatchPermit {
         let permit = self
             .inner
@@ -74,6 +229,75 @@ impl BackPressure {
             permit: Some(permit),
             counter: self.inner.clone(),
         }
+    }
+
+    /// Deadline-aware counterpart to [`BackPressure::acquire`] that
+    /// returns the typed [`BackPressureError`] on rejection.
+    ///
+    /// On the no-deadline path this behaves exactly like
+    /// [`BackPressure::acquire`] but with the typed error surface.
+    /// When a deadline is configured (via
+    /// [`BackPressure::with_deadline_hint`]):
+    ///
+    /// - Past the deadline: returns `Err(DeadlineElapsed)`.
+    /// - Within `DEADLINE_NEAR_WINDOW` of the deadline: returns
+    ///   `Err(DeadlineNear)` — in-flight acquires already issued are
+    ///   not affected (they hold their permits to completion); only
+    ///   *new* acquires are refused, allowing the cohort to drain.
+    /// - More than `DEADLINE_NEAR_WINDOW` away: behaves as
+    ///   [`BackPressure::acquire`] (awaits a permit).
+    pub async fn acquire_with_deadline(&self) -> Result<DispatchPermit, BackPressureError> {
+        // Pre-await deadline check: if we already know the acquire
+        // must be refused, do so without entering the semaphore
+        // queue. The post-await re-check below handles the case
+        // where the deadline trips WHILE waiting.
+        self.check_deadline()?;
+        let permit_fut = self.inner.semaphore.clone().acquire_owned();
+        // Wait for either the permit or the deadline — whichever
+        // fires first. Without a deadline configured we just await
+        // the permit directly.
+        let permit = if let Some(d) = self.deadline {
+            tokio::select! {
+                p = permit_fut => p.expect("semaphore closed unexpectedly"),
+                _ = tokio::time::sleep_until(d.into()) => {
+                    return Err(BackPressureError::DeadlineElapsed);
+                }
+            }
+        } else {
+            permit_fut.await.expect("semaphore closed unexpectedly")
+        };
+        // Re-check after the await: the deadline may have entered
+        // the NEAR window or even elapsed while we were queued for
+        // a permit. Drop the just-acquired permit on rejection so
+        // a queued cohort behind us still sees a fair release.
+        if let Err(e) = self.check_deadline() {
+            drop(permit);
+            return Err(e);
+        }
+        self.inner.active.fetch_add(1, Ordering::Relaxed);
+        Ok(DispatchPermit {
+            permit: Some(permit),
+            counter: self.inner.clone(),
+        })
+    }
+
+    /// Non-blocking variant of [`BackPressure::acquire_with_deadline`].
+    /// Returns `Err(Saturated)` when no permit is immediately
+    /// available *and* the deadline does not pre-empt the saturation
+    /// path with a more specific code.
+    pub fn try_acquire_with_deadline(&self) -> Result<DispatchPermit, BackPressureError> {
+        self.check_deadline()?;
+        let permit = self
+            .inner
+            .semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| BackPressureError::Saturated)?;
+        self.inner.active.fetch_add(1, Ordering::Relaxed);
+        Ok(DispatchPermit {
+            permit: Some(permit),
+            counter: self.inner.clone(),
+        })
     }
 
     /// Acquire one permit, awaiting back-pressure if necessary.
@@ -98,6 +322,15 @@ impl BackPressure {
     /// async acquire (permits will eventually return as in-flight
     /// dispatches drop their permits).
     pub async fn acquire_borrowed(&self) -> Result<BorrowedDispatchPermit<'_>, AbiError> {
+        // Pre-await deadline check (T36 — cooperative deadlines).
+        // If the per-invocation deadline says the acquire must be
+        // refused, bail out *before* even probing the semaphore: a
+        // guest hammering `launch` past its deadline must not be
+        // able to drain in-flight permits by racing the rejection
+        // check.
+        if let Err(e) = self.check_deadline() {
+            return Err(e.into());
+        }
         // Fast path / saturated-cap-0 guard: try a synchronous acquire
         // first. On success we skip the async machinery entirely; on
         // failure we check whether the cap is the cap-0 sentinel and, if
@@ -115,12 +348,32 @@ impl BackPressure {
             // back-pressure signal instead.
             return Err(AbiError::QuotaExceeded);
         }
-        let permit = self
-            .inner
-            .semaphore
-            .acquire()
-            .await
-            .expect("semaphore closed unexpectedly");
+        // Race the semaphore acquire against the deadline (when
+        // configured). The first arm to resolve wins; the others are
+        // dropped. Without a deadline we just await the permit.
+        let permit = if let Some(d) = self.deadline {
+            tokio::select! {
+                p = self.inner.semaphore.acquire() => p.expect("semaphore closed unexpectedly"),
+                _ = tokio::time::sleep_until(d.into()) => {
+                    return Err(BackPressureError::DeadlineElapsed.into());
+                }
+            }
+        } else {
+            self.inner
+                .semaphore
+                .acquire()
+                .await
+                .expect("semaphore closed unexpectedly")
+        };
+        // Post-await re-check: the deadline may have crossed into
+        // the NEAR window (or elapsed) while we waited in the
+        // semaphore queue. Drop the freshly-acquired permit on
+        // rejection so a queued cohort behind us still sees fair
+        // release of the slot.
+        if let Err(e) = self.check_deadline() {
+            drop(permit);
+            return Err(e.into());
+        }
         self.inner.active.fetch_add(1, Ordering::Relaxed);
         Ok(BorrowedDispatchPermit {
             permit: Some(permit),
@@ -421,5 +674,119 @@ mod tests {
         let bp = BackPressure::new();
         assert_eq!(bp.max_concurrent(), DEFAULT_MAX_CONCURRENT_GPU_OPS);
         assert_eq!(bp.active(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // Deadline-aware tests (T36).
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn deadline_hint_round_trips() {
+        // The builder consumes self and returns a clone with the
+        // deadline installed; the underlying semaphore Arc is shared,
+        // so two clones can carry distinct deadlines while still
+        // contending on the same pool.
+        let bp = BackPressure::with_cap(4);
+        assert!(bp.deadline_hint().is_none());
+        let d = Instant::now() + Duration::from_secs(1);
+        let bp = bp.with_deadline_hint(Some(d));
+        assert_eq!(bp.deadline_hint(), Some(d));
+    }
+
+    #[tokio::test]
+    async fn acquire_borrowed_rejects_new_under_deadline_near() {
+        // Deadline 30 ms out, inside the 50 ms NEAR window from
+        // construction. The first acquire must be rejected with the
+        // DeadlineNear-mapped QuotaExceeded code.
+        let bp = BackPressure::with_cap(4)
+            .with_deadline_hint(Some(Instant::now() + Duration::from_millis(30)));
+        let err = bp
+            .acquire_borrowed()
+            .await
+            .expect_err("near-deadline acquire must be refused");
+        assert_eq!(err, AbiError::QuotaExceeded);
+        assert_eq!(bp.active(), 0);
+    }
+
+    #[tokio::test]
+    async fn acquire_borrowed_rejects_past_deadline() {
+        // Deadline in the past — every acquire is refused.
+        let bp = BackPressure::with_cap(4)
+            .with_deadline_hint(Some(Instant::now() - Duration::from_millis(5)));
+        let err = bp
+            .acquire_borrowed()
+            .await
+            .expect_err("elapsed deadline must refuse");
+        assert_eq!(err, AbiError::QuotaExceeded);
+    }
+
+    #[tokio::test]
+    async fn acquire_borrowed_passes_outside_near_window() {
+        // Deadline well outside the 50 ms NEAR window — the acquire
+        // proceeds as before.
+        let bp = BackPressure::with_cap(4)
+            .with_deadline_hint(Some(Instant::now() + Duration::from_secs(10)));
+        let permit = bp.acquire_borrowed().await.expect("permit");
+        assert_eq!(bp.active(), 1);
+        drop(permit);
+        assert_eq!(bp.active(), 0);
+    }
+
+    #[tokio::test]
+    async fn in_flight_completes_under_near_deadline() {
+        // Acquire BEFORE the deadline enters the NEAR window; then
+        // advance into the window. The in-flight permit is
+        // unaffected (its Drop releases as normal), but a NEW
+        // acquire is refused.
+        let bp = BackPressure::with_cap(4)
+            .with_deadline_hint(Some(Instant::now() + Duration::from_millis(80)));
+        let in_flight = bp.acquire_borrowed().await.expect("first permit");
+        assert_eq!(bp.active(), 1);
+        // Sleep into the NEAR window (80 ms - 50 ms = 30 ms, so
+        // 40 ms gets us safely inside).
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let err = bp
+            .acquire_borrowed()
+            .await
+            .expect_err("second acquire must be refused");
+        assert_eq!(err, AbiError::QuotaExceeded);
+        // The in-flight permit is still live.
+        assert_eq!(bp.active(), 1);
+        drop(in_flight);
+        assert_eq!(bp.active(), 0);
+    }
+
+    #[tokio::test]
+    async fn typed_acquire_with_deadline_surfaces_variants() {
+        // `acquire_with_deadline` keeps the typed `BackPressureError`
+        // surface (rather than collapsing to AbiError) so callers
+        // that want to distinguish the variants can.
+        let bp = BackPressure::with_cap(2)
+            .with_deadline_hint(Some(Instant::now() + Duration::from_millis(20)));
+        let err = bp
+            .acquire_with_deadline()
+            .await
+            .expect_err("near-deadline must refuse");
+        assert_eq!(err, BackPressureError::DeadlineNear);
+
+        let bp = BackPressure::with_cap(2)
+            .with_deadline_hint(Some(Instant::now() - Duration::from_millis(5)));
+        let err = bp
+            .acquire_with_deadline()
+            .await
+            .expect_err("elapsed-deadline must refuse");
+        assert_eq!(err, BackPressureError::DeadlineElapsed);
+    }
+
+    #[test]
+    fn backpressure_error_converts_to_abi_error() {
+        // All variants collapse to QuotaExceeded for back-compat
+        // with the existing host-function return path.
+        assert_eq!(AbiError::from(BackPressureError::Saturated), AbiError::QuotaExceeded);
+        assert_eq!(AbiError::from(BackPressureError::DeadlineNear), AbiError::QuotaExceeded);
+        assert_eq!(
+            AbiError::from(BackPressureError::DeadlineElapsed),
+            AbiError::QuotaExceeded
+        );
     }
 }

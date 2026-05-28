@@ -135,6 +135,13 @@ impl InstanceState {
     /// any plausible production deadline) so guests calling
     /// `wasi:scheduler/host.yield()` observe a non-zero return code
     /// when the deadline is approaching.
+    ///
+    /// T36: also seeds the scheduler's absolute `Instant` deadline
+    /// (`bp_deadline_instant`) to `[Self::deadline]`. With both fields
+    /// installed, the guest's `yield()` verdict is derived from the
+    /// same `Instant` that the back-pressure semaphore consults — so
+    /// the cooperative path and the resource-admission path agree
+    /// when the deadline trips.
     pub fn with_deadline_duration(mut self, d: Duration) -> Self {
         self.deadline_duration = Some(d);
         // Clamp to u32::MAX; a deadline larger than that is in
@@ -142,7 +149,16 @@ impl InstanceState {
         // within u32::MAX ms either, so the cooperative path can
         // honestly report u32::MAX too.
         let deadline_ms = u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
-        self.scheduler = SchedulerContext::new(Some(deadline_ms));
+        let mut sched = SchedulerContext::new(Some(deadline_ms));
+        // The absolute deadline is whatever `with_deadline` previously
+        // installed (if anything); we copy it onto the scheduler so
+        // `yield_now()` resolves from the same `Instant` that
+        // `BackPressure::with_deadline_hint` consumes. If
+        // `with_deadline` has not yet been called the field is `None`
+        // and the scheduler falls back to its legacy ms-based path
+        // until the executor re-arms us at the start of a call.
+        sched.set_bp_deadline_instant(self.deadline);
+        self.scheduler = sched;
         self
     }
 
@@ -159,8 +175,16 @@ impl InstanceState {
     /// start of each call so back-to-back invocations each see a
     /// fresh elapsed window (mirroring the per-call re-arm of
     /// [`Self::deadline`] and the wasmtime epoch deadline).
+    ///
+    /// T36: also re-installs the scheduler's absolute `Instant`
+    /// deadline so the guest's cooperative-yield verdicts agree with
+    /// the back-pressure semaphore's acquire decisions for THIS
+    /// call's window — not the previous one. Pulls the current
+    /// `Self::deadline` value so a fresh `call_export` (which
+    /// re-seeds `deadline = now + d` before calling this) gets the
+    /// up-to-date `Instant` propagated through.
     pub(crate) fn rearm_scheduler(&mut self) {
-        self.scheduler.rearm();
+        self.scheduler.rearm_with_instant(self.deadline);
     }
 
     /// Increment the kernel dispatch counter and return the new value.
@@ -314,5 +338,34 @@ mod tests {
         let s = InstanceState::new(TenantId(0), InstanceId(0))
             .with_deadline_duration(Duration::from_secs(60 * 60 * 24 * 365 * 100));
         assert_eq!(s.scheduler().deadline_ms(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn with_deadline_duration_propagates_instant_when_present() {
+        // T36: when both `with_deadline` (sets the absolute Instant)
+        // and `with_deadline_duration` are chained, the scheduler
+        // context picks up the same Instant for its BP-aligned query
+        // path so guests and BackPressure agree on the trip point.
+        let at = Instant::now() + Duration::from_millis(500);
+        let s = InstanceState::new(TenantId(0), InstanceId(0))
+            .with_deadline(at)
+            .with_deadline_duration(Duration::from_millis(500));
+        assert_eq!(s.scheduler().bp_deadline_instant(), Some(at));
+    }
+
+    #[test]
+    fn rearm_scheduler_updates_bp_deadline_instant() {
+        // T36: re-arming the scheduler at the start of a call
+        // installs the FRESH absolute Instant (so back-to-back calls
+        // observe distinct windows). Simulate the executor's per-call
+        // re-arm by overwriting `deadline` and confirming the
+        // scheduler tracks it.
+        let mut s = InstanceState::new(TenantId(0), InstanceId(0))
+            .with_deadline(Instant::now() + Duration::from_millis(100))
+            .with_deadline_duration(Duration::from_millis(100));
+        let next = Instant::now() + Duration::from_secs(5);
+        s.deadline = Some(next);
+        s.rearm_scheduler();
+        assert_eq!(s.scheduler().bp_deadline_instant(), Some(next));
     }
 }

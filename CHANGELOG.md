@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- tensor-wasm-wasi-gpu (T36): cooperative deadline ↔ back-pressure integration. The executor's per-invocation Instant deadline now drives both `SchedulerContext` query verdicts AND `BackPressure` acquire rejections (DEADLINE_NEAR_WINDOW = 50ms before deadline).
+
 ### Roadmap
 - 13 new strategic feature directions added under docs/PATH-TO-V1.md#post-v036-strategic-features; tracked in ACTIONABLE-ITEMS-PENDING.md.
 
