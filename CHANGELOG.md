@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `tensor-wasm-jit` (T35): `DiskRegistry` — disk-persisted kernel
+  registry backed by `tensor-wasm-artifacts::DiskArtifactStore`.
+  Restart-safe (the keymap is rebuilt from on-disk blobs on
+  `DiskRegistry::open`). Pagination on list via
+  `list_paginated(offset, limit)` with a 1000-entry cap. Optional
+  publisher allowlist via `with_publisher_allowlist(HashSet<String>)`
+  refuses publishes whose `manifest.publisher` is not in the configured
+  set even when the v2 signature verifies (operator-side authorization
+  layer over and above the T1 HTTP kernel-publish scope gate). The
+  HTTP gateway selects the disk backend when
+  `TENSOR_WASM_API_KERNEL_REGISTRY_DIR` is set; unset preserves the
+  historical in-memory backend for dev. `GET /kernels` accepts
+  `?offset=N&limit=M` query parameters (defaults 0 / 100; cap 1000).
+  See `docs/KERNEL-REGISTRY.md`.
+
 ### Security
 - `tensor-wasm-snapshot` (T9): tighten `limits::MAX_INPUT_BYTES` from
   4 GiB to 1 GiB. The pre-T9 expression

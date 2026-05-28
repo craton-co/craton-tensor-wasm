@@ -61,8 +61,10 @@
 //! | kind                                  | status | meaning                                                                   |
 //! |---------------------------------------|--------|---------------------------------------------------------------------------|
 //! | `kernel_registry_not_configured`      | 503    | `TENSOR_WASM_API_KERNEL_HMAC_KEY` is unset; routes are wired but disabled |
+//! | `kernel_registry_storage_error`       | 503    | T35: disk-backed registry I/O error during publish                        |
 //! | `kernel_publish_disabled_in_dev_mode` | 403    | `POST /kernels` rejected because the gateway is in dev mode (no tokens)   |
 //! | `kernel_publish_scope_required`       | 403    | Caller's bearer token is not in `TENSOR_WASM_API_KERNEL_PUBLISH_TOKENS`   |
+//! | `publisher_not_allowed`               | 403    | T35: `manifest.publisher` is not in the registry's publisher allowlist    |
 //! | `bad_signature`                       | 403    | HMAC verification under the configured key failed                         |
 //! | `digest_mismatch`                     | 400    | BLAKE3(`ptx_text`) does not match `manifest.digest`                       |
 //! | `already_registered`                  | 409    | A manifest with the same `name@version` is already present                |
@@ -72,7 +74,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -106,10 +108,36 @@ pub struct PublishKernelRequest {
 /// Response body for `GET /kernels`.
 #[derive(Debug, Serialize)]
 pub struct ListKernelsResponse {
-    /// All registered manifests, in unspecified order. PTX text is NOT
+    /// Page of registered manifests, in unspecified order. PTX text is NOT
     /// included — callers that need the kernel source must issue a
-    /// follow-up `GET /kernels/{name}/{version}`.
+    /// follow-up `GET /kernels/{name}/{version}`. The size of this page
+    /// is at most `limit` (clamped to 1000 server-side); a shorter page
+    /// indicates the end of the keyspace was reached.
     pub manifests: Vec<tensor_wasm_jit::registry::KernelManifest>,
+    /// Echo of the effective `offset` the handler used. Matches the
+    /// inbound query parameter, defaulting to 0.
+    pub offset: usize,
+    /// Echo of the effective `limit` the handler used (after clamping).
+    /// Matches the inbound query parameter, defaulting to 100, clamped
+    /// to 1000.
+    pub limit: usize,
+}
+
+/// Query parameters for `GET /kernels`.
+///
+/// Both fields are optional; defaults mirror the registry's pagination
+/// constants (`offset = 0`, `limit = 100`). `limit` is silently clamped
+/// to 1000 on the registry side so a caller asking for an unbounded
+/// page still receives a bounded response.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListKernelsQuery {
+    /// Index of the first manifest to return; defaults to 0.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Maximum number of manifests in the returned page; defaults to
+    /// 100. Server-side cap: 1000.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// Response body for `GET /kernels/{name}/{version}`.
@@ -214,6 +242,36 @@ pub async fn publish_kernel(
             tensor_wasm_jit::registry::RegistryError::AlreadyRegistered(_) => {
                 ApiError::conflict("already_registered", e.to_string())
             }
+            // T35: the disk-backed registry can additionally refuse a
+            // publish when the manifest's `publisher` field is not in
+            // the operator's configured allowlist. Surface as 403
+            // (authorization failure) — distinct from `bad_signature`
+            // (signature didn't verify under any key) and from
+            // `kernel_publish_scope_required` (the route-level scope
+            // gate from T1, which fires before we even reach the
+            // registry call).
+            tensor_wasm_jit::registry::RegistryError::PublisherNotAllowed(_) => {
+                ApiError::forbidden("publisher_not_allowed", e.to_string())
+            }
+            // T35: artifact-store I/O failure (disk full, permissions,
+            // tampered envelope, etc.). The store layer already
+            // logged the underlying cause; surface to the client as
+            // 503 so the operator's tooling can distinguish a
+            // transient backend failure from a malformed request.
+            // Storage failures during publish are non-retriable from
+            // the client's perspective without operator action — same
+            // posture as `kernel_registry_not_configured`.
+            tensor_wasm_jit::registry::RegistryError::Storage(_) => {
+                ApiError::service_unavailable("kernel_registry_storage_error", e.to_string())
+            }
+            // T35: bincode encode failure during publish. Should only
+            // fire on truly pathological input (it's the encode path
+            // for a manifest we just verified, so the bytes are well-
+            // formed). Map to 500 internal — there is no client action
+            // that resolves this.
+            tensor_wasm_jit::registry::RegistryError::Codec(_) => {
+                ApiError::internal(e.to_string())
+            }
             // Forward-compat catch-all: future RegistryError variants
             // (e.g. NotFound, which `publish` cannot actually produce
             // today) collapse to 400 invalid_request rather than masking
@@ -230,12 +288,18 @@ pub async fn publish_kernel(
     ))
 }
 
-/// `GET /kernels` — list registered manifests.
+/// `GET /kernels?offset=N&limit=M` — list registered manifests.
 ///
-/// Returns `200 OK` with `{manifests: [...]}`. PTX text is intentionally
-/// omitted; callers that need a kernel's source must resolve it
-/// individually so a tenant listing every manifest does not transfer
-/// hundreds of megabytes of source over the wire.
+/// Returns `200 OK` with `{manifests: [...], offset, limit}`. PTX text
+/// is intentionally omitted; callers that need a kernel's source must
+/// resolve it individually so a tenant listing every manifest does not
+/// transfer hundreds of megabytes of source over the wire.
+///
+/// `offset` defaults to 0, `limit` defaults to 100, and `limit` is
+/// silently clamped to 1000 server-side via
+/// [`tensor_wasm_jit::registry::DISK_REGISTRY_MAX_LIMIT`]. The response
+/// echoes the effective values so clients can drive the next-page
+/// request without a second round of math.
 ///
 /// Authorization: any authenticated tenant may list. The route sits
 /// under `bearer_auth` + `tenant_scope`, so an unauthenticated caller
@@ -246,6 +310,7 @@ pub async fn publish_kernel(
 pub async fn list_kernels(
     State(state): State<Arc<AppState>>,
     Extension(_tenant): Extension<TenantId>,
+    Query(query): Query<ListKernelsQuery>,
 ) -> Result<Json<ListKernelsResponse>, ApiError> {
     let registry = state
         .kernel_registry
@@ -256,8 +321,16 @@ pub async fn list_kernels(
                 "set TENSOR_WASM_API_KERNEL_HMAC_KEY to enable /kernels",
             )
         })?;
+    let offset = query.offset.unwrap_or(0);
+    let raw_limit = query
+        .limit
+        .unwrap_or(tensor_wasm_jit::registry::DISK_REGISTRY_DEFAULT_LIMIT);
+    let effective_limit =
+        raw_limit.min(tensor_wasm_jit::registry::DISK_REGISTRY_MAX_LIMIT);
     Ok(Json(ListKernelsResponse {
-        manifests: registry.list(),
+        manifests: registry.list_paginated(offset, effective_limit),
+        offset,
+        limit: effective_limit,
     }))
 }
 

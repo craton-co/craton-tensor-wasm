@@ -102,6 +102,19 @@ hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+# T35 (v0.4): `DiskRegistry` reuses the unified content-addressed signed
+# blob store from `tensor-wasm-artifacts` for persistence. The store
+# brings HMAC-SHA256 envelope, zstd compression, size caps, and atomic
+# rename-on-publish; the registry only contributes the
+# `(name, version, sm_version) -> ContentHash` keymap on top. Optional +
+# tied to the `kernel-registry` feature so the default jit build keeps
+# the lean dep graph the original B6.3 scaffold designed for.
+tensor-wasm-artifacts = { workspace = true, optional = true }
+# T35: bincode for `KernelManifest` ↔ on-disk blob serialization. v2 +
+# `serde` so we route through the existing `serde::{Serialize,
+# Deserialize}` derives on `KernelManifest` (same path the snapshot
+# crate uses for its v3 payload encoding).
+bincode = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true
@@ -166,6 +179,8 @@ kernel-registry = [
     "dep:sha2",
     "dep:serde",
     "dep:serde_json",
+    "dep:tensor-wasm-artifacts",
+    "dep:bincode",
 ]
 
 # Integration test that uses fixtures from `lowering_test_support`. We
