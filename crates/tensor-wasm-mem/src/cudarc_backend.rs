@@ -133,6 +133,33 @@ fn device_for(ordinal: u32) -> Result<Arc<CudaDevice>, UnifiedError> {
     }
 }
 
+/// Bind the device's primary context to the calling thread (mem M4).
+///
+/// CUDA's driver API maintains a *thread-local* current context. If a
+/// `CudarcUnifiedBuffer` is created on one thread and then `apply_advice`
+/// / `prefetch_to_device` / `prefetch_to_host` is invoked on a *different*
+/// thread (e.g. a tokio worker or a rayon worker that has never touched
+/// CUDA), the driver either returns `CUDA_ERROR_INVALID_CONTEXT` or — worse,
+/// for a multi-tenant host — silently uses whatever context the driver
+/// happened to leave current, potentially another tenant's device. Both
+/// outcomes are unacceptable; the latter is a tenancy bug.
+///
+/// `bind_to_thread` calls `cuCtxSetCurrent` against the cached primary
+/// context for this `CudaDevice`. It is idempotent on a thread that is
+/// already bound to the same context — the driver compares pointer
+/// identity, so the cost is a single TLS write on the steady state — so
+/// callers can invoke it unconditionally without a fast-path check.
+///
+/// Failure is surfaced as [`UnifiedError::Cuda`]; we deliberately do not
+/// fall through to the driver call, because every downstream `cuMem*`
+/// entry point would itself fail with `CUDA_ERROR_INVALID_CONTEXT` and
+/// the operator's first error message would be misleadingly downstream.
+fn ensure_context_bound(device: &Arc<CudaDevice>) -> Result<(), UnifiedError> {
+    device
+        .bind_to_thread()
+        .map_err(|e| UnifiedError::Cuda(format!("CudaDevice::bind_to_thread: {e:?}")))
+}
+
 /// A contiguous CUDA Unified Memory region allocated via `cudarc`.
 ///
 /// Mirrors [`crate::unified::UnifiedBuffer`]'s public surface. The pointer
@@ -280,7 +307,18 @@ impl CudarcUnifiedBuffer {
     ///
     /// Wraps `cuMemPrefetchAsync` on the device's null stream. Errors flow
     /// through as [`UnifiedError::Cuda`].
+    ///
+    /// # Thread safety (mem M4)
+    ///
+    /// Binds the primary context on the calling thread before issuing the
+    /// driver call. Each call is therefore safe to invoke from any thread
+    /// without prior `CudaDevice::bind_to_thread`; the cost of the bind on
+    /// an already-bound thread is a single TLS write.
     pub fn prefetch_to_device(&self) -> Result<(), UnifiedError> {
+        // mem M4: bind first so the driver dispatches against *this* buffer's
+        // primary context rather than whatever context the calling thread
+        // last touched (potentially another tenant's device, or unset).
+        ensure_context_bound(&self.device)?;
         // SAFETY: ptr/size are derived from a valid live allocation; passing
         // the null stream (handle 0) requests prefetch on the default stream.
         let res = unsafe {
@@ -303,11 +341,20 @@ impl CudarcUnifiedBuffer {
     /// Suggest the runtime migrate the buffer back to host memory.
     ///
     /// Wraps `cuMemPrefetchAsync` with `CU_DEVICE_CPU` as the destination.
+    ///
+    /// # Thread safety (mem M4)
+    ///
+    /// Binds the primary context on the calling thread before issuing the
+    /// driver call. Each call is therefore safe to invoke from any thread
+    /// without prior `CudaDevice::bind_to_thread`; the cost of the bind on
+    /// an already-bound thread is a single TLS write.
     pub fn prefetch_to_host(&self) -> Result<(), UnifiedError> {
         // `CU_DEVICE_CPU` is the sentinel for "host" in cuMemPrefetchAsync.
         // cudarc 0.13 does not export it as a named constant; CUDA defines it
         // as `-1`.
         const CU_DEVICE_CPU: i32 = -1;
+        // mem M4: bind first — see `prefetch_to_device` for the full rationale.
+        ensure_context_bound(&self.device)?;
         // SAFETY: see `prefetch_to_device`.
         let res = unsafe {
             cuda_sys::lib().cuMemPrefetchAsync(
@@ -395,7 +442,20 @@ impl Drop for CudarcUnifiedBuffer {
 ///
 /// Mirror of [`crate::advise::apply`] for the cudarc path. Returns
 /// [`UnifiedError::Cuda`] on failure.
+///
+/// # Thread safety (mem M4)
+///
+/// Binds the primary context on the calling thread before issuing the
+/// driver call. Each call is therefore safe to invoke from any thread
+/// without prior `CudaDevice::bind_to_thread`; the cost of the bind on
+/// an already-bound thread is a single TLS write. Prior to mem M4 this
+/// function would silently dispatch against whatever CUDA context the
+/// calling thread last touched — potentially another tenant's device,
+/// or no context at all (`CUDA_ERROR_INVALID_CONTEXT`).
 pub fn apply_advice(buffer: &CudarcUnifiedBuffer, advice: Advice) -> Result<(), UnifiedError> {
+    // mem M4: bind first so the driver dispatches against *this* buffer's
+    // primary context. See `ensure_context_bound` for the tenancy rationale.
+    ensure_context_bound(&buffer.device)?;
     let ptr = buffer.as_ptr() as cuda_sys::CUdeviceptr;
     let size = buffer.len();
     let (advice_kind, device) = match advice {
@@ -420,7 +480,8 @@ pub fn apply_advice(buffer: &CudarcUnifiedBuffer, advice: Advice) -> Result<(), 
             d.0 as i32,
         ),
     };
-    // SAFETY: ptr/size are derived from a valid live CudarcUnifiedBuffer.
+    // SAFETY: ptr/size are derived from a valid live CudarcUnifiedBuffer;
+    // the primary context was bound above (mem M4).
     let res = unsafe { cuda_sys::lib().cuMemAdvise(ptr, size, advice_kind, device) };
     if res == cuda_sys::cudaError_enum::CUDA_SUCCESS {
         Ok(())
