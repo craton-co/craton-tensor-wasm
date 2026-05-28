@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- tensor-wasm-cli + tensor-wasm-api + tensor-wasm-exec (T33): typed multi-value `--args` plumbed end-to-end. CLI `--args <JSON>` flag, HTTP `/invoke{,-async,-stream}` body `args: [...]` field, executor's `SpawnConfig::with_args` builder. JSON↔Val codec from v0.3.7 reused.
+
 ### Roadmap
 - 13 new strategic feature directions added under docs/PATH-TO-V1.md#post-v036-strategic-features; tracked in ACTIONABLE-ITEMS-PENDING.md.
 
