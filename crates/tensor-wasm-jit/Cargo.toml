@@ -22,6 +22,11 @@ cranelift-codegen.workspace = true
 dashmap.workspace = true
 lru.workspace = true
 parking_lot.workspace = true
+# Constant-time byte-slice equality for HMAC tag comparison in the on-disk
+# L2 kernel cache (jit S-3). The stdlib `==` on `[u8; N]` short-circuits on
+# the first mismatch, which is a timing oracle for MAC forgery; `subtle`'s
+# `ConstantTimeEq::ct_eq` runs in constant time over the full input.
+subtle = "2"
 # Atomic file writes for the on-disk L2 kernel cache (jit S-3 disk-
 # persistence layer). Reused from the workspace dep added by the snapshot
 # crate.

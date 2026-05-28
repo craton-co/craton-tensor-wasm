@@ -475,14 +475,14 @@ mod tests {
         // is a hit.
         cache.put(
             CacheKey::for_tenant(TenantId(0), fp, sm_version),
-            CachedKernel {
-                fingerprint: fp,
-                ptx: Arc::new(EmittedPtx {
+            CachedKernel::new(
+                fp,
+                Arc::new(EmittedPtx {
                     text: "// stub".into(),
                     launch_geometry: (1, 1),
                 }),
-                compiled: CompiledHandle::default(),
-            },
+                CompiledHandle::default(),
+            ),
         );
         cache
     }
@@ -653,14 +653,14 @@ mod tests {
         // alloc/free imports keyed off the same store payload.
         cache.put(
             CacheKey::for_tenant(TenantId(0), fp, DEFAULT_DISPATCH_SM_VERSION),
-            CachedKernel {
-                fingerprint: fp,
-                ptx: Arc::new(EmittedPtx {
+            CachedKernel::new(
+                fp,
+                Arc::new(EmittedPtx {
                     text: "// stub for e2e".into(),
                     launch_geometry: (1, 1),
                 }),
-                compiled: CompiledHandle::default(),
-            },
+                CompiledHandle::default(),
+            ),
         );
 
         // Build a custom linker with a dispatch that actually adds.

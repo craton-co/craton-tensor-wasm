@@ -127,11 +127,11 @@ fn bench_cache_hit_vs_miss(c: &mut Criterion) {
             KernelCache::new,
             |cache| {
                 let ptx = emit(&bp).expect("emit");
-                let entry = CachedKernel {
-                    fingerprint: bp.fingerprint(),
-                    ptx: Arc::new(ptx),
-                    compiled: CompiledHandle::default(),
-                };
+                let entry = CachedKernel::new(
+                    bp.fingerprint(),
+                    Arc::new(ptx),
+                    CompiledHandle::default(),
+                );
                 cache.put(key, entry);
                 criterion::black_box(cache.get(&key));
             },
@@ -141,11 +141,11 @@ fn bench_cache_hit_vs_miss(c: &mut Criterion) {
 
     // Warm: pre-populate; iter measures only the lookup.
     let warm_cache = KernelCache::with_capacity(16);
-    let warm_entry = CachedKernel {
-        fingerprint: bp.fingerprint(),
-        ptx: Arc::new(emit(&bp).expect("emit")),
-        compiled: CompiledHandle::default(),
-    };
+    let warm_entry = CachedKernel::new(
+        bp.fingerprint(),
+        Arc::new(emit(&bp).expect("emit")),
+        CompiledHandle::default(),
+    );
     warm_cache.put(key, warm_entry);
     group.bench_function("warm_hit", |b| {
         b.iter(|| {
