@@ -404,7 +404,7 @@ fn axum_to_openapi_path(p: &str) -> String {
     out
 }
 
-/// Drive the live router with each `(method, path)` in `EXPECTED_ROUTES`
+/// Drive the live router with each `(method, path)` in `expected_routes()`
 /// and assert it does NOT return `405 Method Not Allowed`. axum's
 /// router returns 405 when the request path matches a registered
 /// route but no handler is wired for the supplied verb; it returns
@@ -490,7 +490,23 @@ fn spec_file_exists_and_is_nonempty() {
 #[test]
 fn spec_paths_cover_router() {
     let yaml = read_spec();
-    let spec_paths = parse_spec_path_keys(&yaml);
+    // Kernel-registry routes are documented in the spec unconditionally
+    // but only mounted in the router when `kernel-registry-api` is on.
+    // When the feature is off, drop the `/kernels*` paths from the spec
+    // view so the parity assert reflects what the live router exposes.
+    // The feature-on branch keeps the spec verbatim so a stale entry
+    // (e.g. a removed kernel sub-route) still surfaces here.
+    let spec_paths: BTreeSet<String> = {
+        let all = parse_spec_path_keys(&yaml);
+        #[cfg(not(feature = "kernel-registry-api"))]
+        {
+            all.into_iter().filter(|p| !p.starts_with("/kernels")).collect()
+        }
+        #[cfg(feature = "kernel-registry-api")]
+        {
+            all
+        }
+    };
     let expected: BTreeSet<String> = expected_routes()
         .iter()
         .map(|(_, p)| p.to_string())
@@ -499,7 +515,7 @@ fn spec_paths_cover_router() {
         spec_paths, expected,
         "OpenAPI spec `paths:` keys do not match the live router. \
          Either add the missing entry to openapi/tensor-wasm-api.yaml \
-         or remove the stale route from EXPECTED_ROUTES (and the \
+         or remove the stale route from `expected_routes()` (and the \
          router in src/server.rs).",
     );
 }
@@ -508,10 +524,26 @@ fn spec_paths_cover_router() {
 fn spec_methods_match_router_methods() {
     let yaml = read_spec();
     let documented = parse_spec_path_methods(&yaml);
+    // Same kernel-registry filter as `spec_paths_cover_router`: drop
+    // `/kernels*` rows from the spec view when the feature is off, so
+    // the parity assert reflects what the live router exposes.
+    let documented: BTreeMap<String, BTreeSet<String>> = {
+        #[cfg(not(feature = "kernel-registry-api"))]
+        {
+            documented
+                .into_iter()
+                .filter(|(p, _)| !p.starts_with("/kernels"))
+                .collect()
+        }
+        #[cfg(feature = "kernel-registry-api")]
+        {
+            documented
+        }
+    };
 
-    // Roll EXPECTED_ROUTES into the same shape so we can compare maps.
+    // Roll `expected_routes()` into the same shape so we can compare maps.
     let mut expected: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (method, path) in EXPECTED_ROUTES {
+    for (method, path) in expected_routes() {
         expected
             .entry(path.to_string())
             .or_default()
@@ -622,13 +654,13 @@ fn create_function_request_round_trips_through_spec() {
 
 #[tokio::test]
 async fn router_routes_match_expected_set() {
-    // Drive each (method, path) in EXPECTED_ROUTES through the live
+    // Drive each (method, path) in expected_routes() through the live
     // router and assert it does not 404/405. Defends the parity
-    // between EXPECTED_ROUTES and the actual Router::new().route(...)
+    // between expected_routes() and the actual Router::new().route(...)
     // calls in src/server.rs: if a route is removed (or renamed)
     // without updating this list, the corresponding assertion below
     // fails loudly.
-    for (method, path) in EXPECTED_ROUTES {
+    for (method, path) in expected_routes() {
         assert_router_serves(method, path).await;
     }
 }
