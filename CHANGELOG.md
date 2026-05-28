@@ -7,7 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-05-28
+
+Scaffold wave for batches 5–7. Eight of the thirteen post-v0.3.6
+strategic features land as v0.3.7 scaffolds — surface-area-stable
+Rust types + tests + design docs, with the production wire (HTTP
+route, on-disk store, scheduler integration) deferred to v0.4 so
+design partners can target a stable Rust + CLI surface ahead of the
+parity port. The default workspace build is unchanged; every scaffold
+sits behind its owning crate's existing feature flag or is gated
+`FEATURE_NOT_EXPOSED` at the CLI surface.
+
+Per-item rationale, cost, and risk live in
+[`docs/PATH-TO-V1.md#post-v036-strategic-features`](docs/PATH-TO-V1.md#post-v036-strategic-features);
+the v0.4+ tracking table in
+[`ACTIONABLE-ITEMS-PENDING.md`](ACTIONABLE-ITEMS-PENDING.md#v04-feature-roadmap-added-2026-05-28)
+marks the eight rows below as 🟡 scaffold landed.
+
+A late-cycle wave of wire-up tasks (T30, T33–T41) closed several of
+the v0.3.7 scaffolds in-place: T37 wired the InstancePool through the
+invoke path, T34 made `/invoke-stream` carry real SSE frames through
+the `StreamingContext` host function, T41 wired the OpenAI gateway
+shim to internal invoke, T36 connected cooperative deadlines to
+back-pressure, T35 layered a disk-persisted kernel `DiskRegistry`
+over the artifact store, T40 flipped the default snapshot envelope
+to the artifact-store-backed v4, T30 layered the JIT DiskCache over
+the same artifact store, T38 added a proptest harness driving the
+`DifferentialOracle`, and T33 plumbed typed multi-value `--args`
+end-to-end through CLI / HTTP / `SpawnConfig`. T8/T9/T12 tightened
+the snapshot and kernel-registry security surfaces.
+
 ### Added
+- `tensor-wasm-mem` (T39): driver-level GPU memory cap via
+  `cuMemPool`. `TenantMemPool` now pins the cap via
+  `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)` at
+  pool creation and routes tenant allocations through
+  `cuMemAllocFromPoolAsync` (via the new
+  `UnifiedBuffer::new_in_tenant_pool`). Requires
+  `--features gpu-mem-pool` and CUDA 11.2+. The in-process counter
+  remains the primary accounting source; the driver pin is the
+  bypass-resistant second line of defence (closes the v0.3.7
+  "tenant obtained a raw CUDA driver handle" hole described in
+  [`docs/GPU-QUOTAS.md`](docs/GPU-QUOTAS.md) § "Security note"). See
+  [`crates/tensor-wasm-mem/src/cuda_mem_pool.rs`](crates/tensor-wasm-mem/src/cuda_mem_pool.rs).
+- `tensor-wasm-exec`: `WasmArg` enum + JSON ↔ `Val` codec +
+  `TensorWasmExecutor::call_export_with_args` for typed multi-value
+  guest exports (roadmap #1). See
+  [`crates/tensor-wasm-exec/src/executor.rs`](crates/tensor-wasm-exec/src/executor.rs).
+- `tensor-wasm-wasi-gpu`: `StreamingContext` +
+  `add_streaming_to_linker` + `wasi:tensor/host.emit-chunk` host
+  function for token-by-token output (roadmap #2). Protocol guide in
+  [`docs/STREAMING.md`](docs/STREAMING.md).
+- `tensor-wasm-jit`: HMAC-SHA256 `KernelManifest` records +
+  `InMemoryRegistry` for the signed kernel registry (roadmap #3). See
+  [`docs/KERNEL-REGISTRY.md`](docs/KERNEL-REGISTRY.md). CLI surface
+  (`tensor-wasm kernel publish|list|verify`) is staged but exits
+  `FEATURE_NOT_EXPOSED` until v0.4.
+- `tensor-wasm-wasi-gpu`: `SchedulerContext` + `wasi:scheduler/host@0.1.0`
+  cooperative-yield interface (roadmap #4). CONTINUE / DEADLINE-NEAR
+  / DEADLINE-ELAPSED return codes documented in
+  [`docs/COOPERATIVE-YIELD.md`](docs/COOPERATIVE-YIELD.md).
+- `tensor-wasm-exec`: `InstancePool` + `InstancePoolConfig` for
+  pre-instantiated instances per `(tenant, module)` tuple (roadmap #5).
+  Design + reset-on-return contract in
+  [`docs/INSTANCE-POOL.md`](docs/INSTANCE-POOL.md).
+- `tensor-wasm-jit`: `DifferentialOracle` for asserting bit-identity
+  between the Wasmtime CPU interpreter and the JIT PTX path (roadmap
+  #6). Tolerance policy in
+  [`docs/DIFFERENTIAL-ORACLE.md`](docs/DIFFERENTIAL-ORACLE.md).
+- `tensor-wasm-tenant`: `TenantContextBuilder::with_gpu_memory_bytes_cap`
+  + `consume_gpu_bytes` / `release_gpu_bytes` in-process accounting
+  for per-tenant GPU memory quotas (roadmap #8). Driver-level
+  `cuMemPool` pinning is the v0.4 deliverable per
+  [`docs/GPU-QUOTAS.md`](docs/GPU-QUOTAS.md).
+- `tensor-wasm-artifacts`: new crate with the `ArtifactStore` trait,
+  `InMemoryArtifactStore`, and a fully-implemented `DiskArtifactStore`
+  (HMAC-SHA256 trailer) for unified content-addressed signed
+  artifacts (roadmap #9). See
+  [`docs/ARTIFACT-STORE.md`](docs/ARTIFACT-STORE.md).
+- `tensor-wasm-api`: `/v1/completions` and `/v1/chat/completions`
+  OpenAI-compatible routes mounted on the router with an OpenAPI
+  spec and a route allowlist (roadmap #10). Handlers return
+  `501 openai_not_yet_wired` until the translation layer ships in
+  v0.4. See [`docs/OPENAI-COMPAT.md`](docs/OPENAI-COMPAT.md).
 - exec: T37 — InstancePool wired through invoke path; per-(tenant, module-hash) channel with pre-spawn and reset-on-return.
 - tensor-wasm-cli + tensor-wasm-api + tensor-wasm-exec (T33): typed multi-value `--args` plumbed end-to-end. CLI `--args <JSON>` flag, HTTP `/invoke{,-async,-stream}` body `args: [...]` field, executor's `SpawnConfig::with_args` builder. JSON↔Val codec from v0.3.7 reused.
 - tensor-wasm-api (T41): OpenAI gateway request translator wired through to the internal invoke protocol. Configurable model→function map via TENSOR_WASM_API_OPENAI_MODEL_MAP. Streaming via T34's `/invoke-stream` plumbing (data: ... \n\ndata: [DONE]). Closes the v0.3.7 `501 openai_not_yet_wired` scaffold.
@@ -29,6 +111,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `?offset=N&limit=M` query parameters (defaults 0 / 100; cap 1000).
   See `docs/KERNEL-REGISTRY.md`.
 
+### Changed
+- `docs/PATH-TO-V1.md`: every item in the post-v0.3.6 strategic
+  features table now carries a `Status (v0.3.7)` line pointing at the
+  scaffold file and the v0.4 deliverable.
+- `ACTIONABLE-ITEMS-PENDING.md`: v0.4+ feature roadmap table flipped
+  to 🟡 scaffold landed for the eight items above; new status legend
+  added.
+- `docs/INDEX.md`: cross-links added for the eight new scaffold-spec
+  docs and the B2.9 release-engineering docs.
+- `README.md`: new "v0.3.7 scaffolds" subsection under the feature
+  list pointing at each scaffold's spec doc.
+- jit: T30 — DiskCache now layers v2 envelope over tensor-wasm-artifacts DiskArtifactStore (streaming HMAC + zstd); public API unchanged.
+- workspace: version bump 0.3.6 → 0.3.7. T29.
+
 ### Changed (BREAKING for default writer behavior)
 - `tensor-wasm-snapshot` (T40): default snapshot envelope flipped from
   legacy v3 inline to DiskArtifactStore-backed v4. New writes use the
@@ -37,8 +133,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must explicitly call `capture_legacy()` or disable the
   `artifact-backing` default feature.
 
-### Changed
-- jit: T30 — DiskCache now layers v2 envelope over tensor-wasm-artifacts DiskArtifactStore (streaming HMAC + zstd); public API unchanged.
+### Deprecated
+- _(none in v0.3.7; deprecations land alongside the v0.4 wire-up of
+  each scaffold.)_
 
 ### Security
 - `tensor-wasm-snapshot` (T9): tighten `limits::MAX_INPUT_BYTES` from
@@ -109,93 +206,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Roadmap
 - 13 new strategic feature directions added under docs/PATH-TO-V1.md#post-v036-strategic-features; tracked in ACTIONABLE-ITEMS-PENDING.md.
-
-## [0.3.7] - 2026-05-28
-
-Scaffold wave for batches 5–7. Eight of the thirteen post-v0.3.6
-strategic features land as v0.3.7 scaffolds — surface-area-stable
-Rust types + tests + design docs, with the production wire (HTTP
-route, on-disk store, scheduler integration) deferred to v0.4 so
-design partners can target a stable Rust + CLI surface ahead of the
-parity port. The default workspace build is unchanged; every scaffold
-sits behind its owning crate's existing feature flag or is gated
-`FEATURE_NOT_EXPOSED` at the CLI surface.
-
-Per-item rationale, cost, and risk live in
-[`docs/PATH-TO-V1.md#post-v036-strategic-features`](docs/PATH-TO-V1.md#post-v036-strategic-features);
-the v0.4+ tracking table in
-[`ACTIONABLE-ITEMS-PENDING.md`](ACTIONABLE-ITEMS-PENDING.md#v04-feature-roadmap-added-2026-05-28)
-marks the eight rows below as 🟡 scaffold landed.
-
-### Added
-- `tensor-wasm-mem` (T39): driver-level GPU memory cap via
-  `cuMemPool`. `TenantMemPool` now pins the cap via
-  `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)` at
-  pool creation and routes tenant allocations through
-  `cuMemAllocFromPoolAsync` (via the new
-  `UnifiedBuffer::new_in_tenant_pool`). Requires
-  `--features gpu-mem-pool` and CUDA 11.2+. The in-process counter
-  remains the primary accounting source; the driver pin is the
-  bypass-resistant second line of defence (closes the v0.3.7
-  "tenant obtained a raw CUDA driver handle" hole described in
-  [`docs/GPU-QUOTAS.md`](docs/GPU-QUOTAS.md) § "Security note"). See
-  [`crates/tensor-wasm-mem/src/cuda_mem_pool.rs`](crates/tensor-wasm-mem/src/cuda_mem_pool.rs).
-- `tensor-wasm-exec`: `WasmArg` enum + JSON ↔ `Val` codec +
-  `TensorWasmExecutor::call_export_with_args` for typed multi-value
-  guest exports (roadmap #1). See
-  [`crates/tensor-wasm-exec/src/executor.rs`](crates/tensor-wasm-exec/src/executor.rs).
-- `tensor-wasm-wasi-gpu`: `StreamingContext` +
-  `add_streaming_to_linker` + `wasi:tensor/host.emit-chunk` host
-  function for token-by-token output (roadmap #2). Protocol guide in
-  [`docs/STREAMING.md`](docs/STREAMING.md).
-- `tensor-wasm-jit`: HMAC-SHA256 `KernelManifest` records +
-  `InMemoryRegistry` for the signed kernel registry (roadmap #3). See
-  [`docs/KERNEL-REGISTRY.md`](docs/KERNEL-REGISTRY.md). CLI surface
-  (`tensor-wasm kernel publish|list|verify`) is staged but exits
-  `FEATURE_NOT_EXPOSED` until v0.4.
-- `tensor-wasm-wasi-gpu`: `SchedulerContext` + `wasi:scheduler/host@0.1.0`
-  cooperative-yield interface (roadmap #4). CONTINUE / DEADLINE-NEAR
-  / DEADLINE-ELAPSED return codes documented in
-  [`docs/COOPERATIVE-YIELD.md`](docs/COOPERATIVE-YIELD.md).
-- `tensor-wasm-exec`: `InstancePool` + `InstancePoolConfig` for
-  pre-instantiated instances per `(tenant, module)` tuple (roadmap #5).
-  Design + reset-on-return contract in
-  [`docs/INSTANCE-POOL.md`](docs/INSTANCE-POOL.md).
-- `tensor-wasm-jit`: `DifferentialOracle` for asserting bit-identity
-  between the Wasmtime CPU interpreter and the JIT PTX path (roadmap
-  #6). Tolerance policy in
-  [`docs/DIFFERENTIAL-ORACLE.md`](docs/DIFFERENTIAL-ORACLE.md).
-- `tensor-wasm-tenant`: `TenantContextBuilder::with_gpu_memory_bytes_cap`
-  + `consume_gpu_bytes` / `release_gpu_bytes` in-process accounting
-  for per-tenant GPU memory quotas (roadmap #8). Driver-level
-  `cuMemPool` pinning is the v0.4 deliverable per
-  [`docs/GPU-QUOTAS.md`](docs/GPU-QUOTAS.md).
-- `tensor-wasm-artifacts`: new crate with the `ArtifactStore` trait,
-  `InMemoryArtifactStore`, and a fully-implemented `DiskArtifactStore`
-  (HMAC-SHA256 trailer) for unified content-addressed signed
-  artifacts (roadmap #9). See
-  [`docs/ARTIFACT-STORE.md`](docs/ARTIFACT-STORE.md).
-- `tensor-wasm-api`: `/v1/completions` and `/v1/chat/completions`
-  OpenAI-compatible routes mounted on the router with an OpenAPI
-  spec and a route allowlist (roadmap #10). Handlers return
-  `501 openai_not_yet_wired` until the translation layer ships in
-  v0.4. See [`docs/OPENAI-COMPAT.md`](docs/OPENAI-COMPAT.md).
-
-### Changed
-- `docs/PATH-TO-V1.md`: every item in the post-v0.3.6 strategic
-  features table now carries a `Status (v0.3.7)` line pointing at the
-  scaffold file and the v0.4 deliverable.
-- `ACTIONABLE-ITEMS-PENDING.md`: v0.4+ feature roadmap table flipped
-  to 🟡 scaffold landed for the eight items above; new status legend
-  added.
-- `docs/INDEX.md`: cross-links added for the eight new scaffold-spec
-  docs and the B2.9 release-engineering docs.
-- `README.md`: new "v0.3.7 scaffolds" subsection under the feature
-  list pointing at each scaffold's spec doc.
-
-### Deprecated
-- _(none in v0.3.7; deprecations land alongside the v0.4 wire-up of
-  each scaffold.)_
 
 ## [0.3.0] - 2026-05-25
 

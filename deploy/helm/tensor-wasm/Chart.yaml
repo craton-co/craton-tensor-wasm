@@ -16,7 +16,7 @@ version: 0.1.1
 
 # Application SemVer — tracks the tensor-wasm release the chart's default
 # image points at. Keep in sync with values.yaml's image.tag.
-appVersion: "0.3.6"
+appVersion: "0.3.7"
 
 kubeVersion: ">=1.23.0-0"
 

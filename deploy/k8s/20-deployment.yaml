@@ -7,8 +7,8 @@
 # replicaCount value for users who deploy behind a sticky load balancer
 # (caveat: each replica is independent — no cross-replica state).
 #
-# The image tag `0.3.6` is a placeholder. The ghcr.io/craton-co/* registry
-# is not yet provisioned (v0.3.6 era); see ../README.md for the build-and-push
+# The image tag `0.3.7` is a placeholder. The ghcr.io/craton-co/* registry
+# is not yet provisioned (v0.3.7 era); see ../README.md for the build-and-push
 # workflow you can run against your own registry until then.
 apiVersion: apps/v1
 kind: Deployment
@@ -18,7 +18,7 @@ metadata:
   labels:
     app.kubernetes.io/name: tensor-wasm
     app.kubernetes.io/component: api
-    app.kubernetes.io/version: "0.3.6"
+    app.kubernetes.io/version: "0.3.7"
 spec:
   # Single-replica reference. See module-level comment.
   replicas: 1
@@ -36,7 +36,7 @@ spec:
       labels:
         app.kubernetes.io/name: tensor-wasm
         app.kubernetes.io/component: api
-        app.kubernetes.io/version: "0.3.6"
+        app.kubernetes.io/version: "0.3.7"
       annotations:
         # Plain-Prometheus (non-operator) scrape annotations. Harmless if the
         # cluster uses Prometheus Operator instead; that path uses the
@@ -62,10 +62,10 @@ spec:
           # different image tags. Plain YAML has no templating, so swap
           # the tag manually here. Conventional variants:
           #
-          #   ghcr.io/craton-co/tensor-wasm:0.3.6              # default; no suffix
-          #   ghcr.io/craton-co/tensor-wasm:0.3.6-cust         # legacy default (EOL upstream)
-          #   ghcr.io/craton-co/tensor-wasm:0.3.6-cudarc       # W1.2 spike; v0.3.x recommended-stable
-          #   ghcr.io/craton-co/tensor-wasm:0.3.6-cuda-oxide   # v0.5 target; alpha today
+          #   ghcr.io/craton-co/tensor-wasm:0.3.7              # default; no suffix
+          #   ghcr.io/craton-co/tensor-wasm:0.3.7-cust         # legacy default (EOL upstream)
+          #   ghcr.io/craton-co/tensor-wasm:0.3.7-cudarc       # W1.2 spike; v0.3.x recommended-stable
+          #   ghcr.io/craton-co/tensor-wasm:0.3.7-cuda-oxide   # v0.5 target; alpha today
           #
           # See ../README.md "Backend selection" for the trade-off and
           # rfcs/0001-cuda-oxide-integration.md "Feature-flag layout"
@@ -75,7 +75,7 @@ spec:
           # ../helm/tensor-wasm/ and the Nomad specs at ../nomad/ both
           # expose this as a values toggle / Nomad variable; the plain
           # YAML path leaves the swap to the operator.
-          image: ghcr.io/craton-co/tensor-wasm:0.3.6
+          image: ghcr.io/craton-co/tensor-wasm:0.3.7
           imagePullPolicy: IfNotPresent
           args:
             - "serve"

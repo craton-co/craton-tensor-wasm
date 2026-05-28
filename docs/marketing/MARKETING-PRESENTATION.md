@@ -7,7 +7,7 @@
 
 Slide-style pitch deck for technical evaluators (CTOs, platform leads, SREs).
 Every numeric claim and every "we have X" line links to a commit, a test, or
-a doc — no aspirational marketing. Cross-checked against the `v0.3.6` release
+a doc — no aspirational marketing. Cross-checked against the `v0.3.7` release
 tag.
 
 To present: pipe through [marp](https://marp.app/), or read as plain markdown.
@@ -25,7 +25,7 @@ by CUDA, and shipped as Apache-2.0 source.
 - Talk to the GPU through a typed `wasi:cuda` host interface
 - Multi-tenant by construction; one process serves many tenants
 - HTTP API + CLI + structured audit log + OpenTelemetry trace propagation
-- 92 commits, 6 tagged releases (`v0.3.1` → `v0.3.6`), 0 audit problems open
+- 92 commits, 7 tagged releases (`v0.3.1` → `v0.3.7`), 0 audit problems open
 
 <!-- Speaker note: the audience is somebody evaluating whether to deploy this
 in a real production stack. Not a VC pitch. Lead with what's shippable. -->
@@ -277,14 +277,14 @@ and the RFP goes to firms.
 **Q: Is this production-ready?**
 A: For v1.0-grade production at the SLA published in `docs/SLO.md`: not
 yet. v0.5-beta is the first beta the design-partner program runs against.
-For staging / pilot / internal-tooling: yes, today, at v0.3.6. The CUDA
+For staging / pilot / internal-tooling: yes, today, at v0.3.7. The CUDA
 path runs end-to-end on real hardware; the HTTP API has 0 audit problems
 open; the test suite has 70 passing batches and 0 failures.
 
 **Q: How does this compare to Wasmtime?**
 A: We **wrap** Wasmtime 25.x. We are not a fork. See `docs/WASMTIME-FORK.md`.
 Pure CPU execution is within 5% of upstream Wasmtime per the dimension-1
-hyperfine comparison (statistically tied at v0.3.6). Everything else — GPU,
+hyperfine comparison (statistically tied at v0.3.7). Everything else — GPU,
 multi-tenancy, snapshot, HTTP gateway, observability — is layered on top
 and additive.
 
@@ -322,7 +322,7 @@ A: Two real ones:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  CRATON TENSORWASM v0.3.6                                        │
+│  CRATON TENSORWASM v0.3.7                                        │
 │  GPU-accelerated serverless WebAssembly runtime, in Rust         │
 │                                                                  │
 │  PROVEN ON REAL SILICON:                                         │
@@ -378,6 +378,6 @@ Everything pitched above has a doc behind it:
 
 ---
 
-_Status: written against the v0.3.6 release tag (2026-05-27). Re-validate
+_Status: written against the v0.3.7 release tag (2026-05-28). Re-validate
 all numeric claims when re-publishing — `bench-results/*.json` is the
 authoritative source._

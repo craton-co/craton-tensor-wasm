@@ -4,8 +4,8 @@ Plain-YAML reference deployment for self-managed installs. For templated
 installs use the Helm chart at `../helm/tensor-wasm/` instead.
 
 > **Image tag is a placeholder.** The manifests pin
-> `ghcr.io/craton-co/tensor-wasm:0.3.6`. The `ghcr.io/craton-co/*`
-> registry is not yet provisioned (v0.3.6 era of the project). Until it
+> `ghcr.io/craton-co/tensor-wasm:0.3.7`. The `ghcr.io/craton-co/*`
+> registry is not yet provisioned (v0.3.7 era of the project). Until it
 > exists you must build and push the image yourself from the Dockerfile at
 > `../../docker/tensor-wasm-api.Dockerfile` and adjust the `image:` field
 > in `20-deployment.yaml` to point at your registry.
@@ -186,7 +186,7 @@ out. Before uncommenting them, the cluster needs:
       `kubectl label node <node> nvidia.com/gpu.present=true`.
 - [ ] **A GPU-enabled tensor-wasm image** built with the `unified-memory`
       / `cuda` feature set. The default image at
-      `ghcr.io/craton-co/tensor-wasm:0.3.6` is host-only and will
+      `ghcr.io/craton-co/tensor-wasm:0.3.7` is host-only and will
       treat the GPU as unavailable.
 - [ ] **Compute capability matches the image's `CUDA_ARCH`.** Set
       `CUDA_ARCH` in `10-configmap.yaml` to the node's SM level
