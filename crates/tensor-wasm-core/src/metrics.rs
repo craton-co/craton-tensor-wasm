@@ -480,19 +480,6 @@ pub struct TenantLabels {
 }
 
 impl TenantLabels {
-    /// Construct a [`TenantLabels`] from a tenant-id rendering. Accepts
-    /// any value convertible into `Cow<'static, str>` so callers can
-    /// pass a `String` (owned) or a `&'static str` (borrowed) without
-    /// re-wrapping. Exists so callers do not have to name every field
-    /// of a `#[non_exhaustive]` struct directly.
-    pub fn new(tenant_id: impl Into<Cow<'static, str>>) -> Self {
-        Self {
-            tenant_id: tenant_id.into(),
-        }
-    }
-}
-
-impl TenantLabels {
     /// Construct labels from any string-like tenant id rendering.
     ///
     /// Accepts `&'static str`, `String`, or `Cow<'static, str>` so
@@ -504,7 +491,7 @@ impl TenantLabels {
     /// guarantees the `T#<u64>` rendering dashboards depend on.
     pub fn new(tenant_id: impl Into<Cow<'static, str>>) -> Self {
         Self {
-            tenant_id: tenant_id.into().into_owned(),
+            tenant_id: tenant_id.into(),
         }
     }
 
