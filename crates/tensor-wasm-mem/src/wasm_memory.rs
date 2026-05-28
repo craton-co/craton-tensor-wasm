@@ -512,6 +512,16 @@ unsafe impl MemoryCreator for TensorWasmMemoryCreator {
                     // holds the slab alive for the lifetime of the returned
                     // `PooledLinearMemory`, and the bump allocator never hands
                     // the same byte range to another allocation.
+                    //
+                    // Pool slabs that ever served a [`PooledLinearMemory`] are single-shot
+                    // for the lifetime of the pool: `PoolAllocation` drop guards are
+                    // intentionally leaked here to keep the bump pointer monotonic across
+                    // the entire pool lifetime. Operators wanting per-tenant resets should
+                    // build a per-tenant [`UnifiedMemoryPool`] instance.
+                    //
+                    // See [`UnifiedMemoryPool`] doc-comment for the rationale and
+                    // `crates/tensor-wasm-mem/tests/pool_teardown_contract.rs` for the
+                    // pinned behaviour.
                     std::mem::forget(alloc);
                     return Ok(Box::new(PooledLinearMemory {
                         pool_keepalive: Arc::clone(pool),
