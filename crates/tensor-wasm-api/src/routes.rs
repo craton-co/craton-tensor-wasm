@@ -155,6 +155,11 @@ pub struct AppState {
     #[cfg(feature = "kernel-registry-api")]
     pub kernel_registry:
         Option<Arc<dyn tensor_wasm_jit::registry::KernelRegistry>>,
+    /// OpenAI `model → FunctionId` resolution map (T41). Read from
+    /// `TENSOR_WASM_API_OPENAI_MODEL_MAP` at startup; empty map means
+    /// every OpenAI request returns `404 model_not_found`. See
+    /// [`crate::openai_translator`] for the env-var grammar.
+    pub openai_model_map: crate::openai_translator::ModelMap,
 }
 
 impl std::fmt::Debug for AppState {
@@ -190,7 +195,19 @@ impl AppState {
             executor,
             #[cfg(feature = "kernel-registry-api")]
             kernel_registry: build_kernel_registry_from_env(),
+            openai_model_map: crate::openai_translator::model_map_from_env(),
         })
+    }
+
+    /// Install an explicit OpenAI model map, bypassing the env-var
+    /// initialisation in [`Self::try_build`].
+    ///
+    /// Test-only convenience so integration tests can drive the OpenAI
+    /// shim without poisoning the process environment.
+    #[doc(hidden)]
+    pub fn with_openai_model_map(mut self, map: crate::openai_translator::ModelMap) -> Self {
+        self.openai_model_map = map;
+        self
     }
 
     /// Fallible constructor. Returns a [`TensorWasmError`] if the underlying

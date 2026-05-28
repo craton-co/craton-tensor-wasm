@@ -1,8 +1,10 @@
 # OpenAI-compatible inference gateway
 
-**Status:** v0.3.5 ships the **scaffold** (this document). The wiring step
-that translates between OpenAI requests and the native invoke pipeline
-lands in v0.4 — see `docs/PATH-TO-V1.md` for the milestone exit criteria.
+**Status:** v0.4 wiring landed (T41). The handlers translate OpenAI
+requests through to the internal invoke pipeline via a configurable
+`model → function_uuid` map. The v0.3.5 scaffold's `501
+openai_not_yet_wired` shell is gone; the URL surface, request shapes,
+and error-envelope contract the scaffold committed to are preserved.
 
 The TensorWasm API gateway exposes two OpenAI-compatible inference
 routes alongside its native `/functions/{id}/invoke` surface, so that
@@ -12,10 +14,10 @@ modification.
 
 ## Route surface
 
-| Method | Path                    | Status today | v0.4 behaviour                                   |
-| ------ | ----------------------- | ------------ | ------------------------------------------------ |
-| POST   | `/v1/completions`       | `501` scaffold | Resolve `model` → function, marshal `prompt`     |
-| POST   | `/v1/chat/completions`  | `501` scaffold | Resolve `model` → function, marshal `messages`   |
+| Method | Path                    | Status today (v0.4)                                                                 |
+| ------ | ----------------------- | ----------------------------------------------------------------------------------- |
+| POST   | `/v1/completions`       | Wired (T41). Resolve `model` → function, marshal `prompt`, stream / buffer reply.   |
+| POST   | `/v1/chat/completions`  | Wired (T41). Resolve `model` → function, marshal `messages`, stream / buffer reply. |
 
 Both routes accept the request shapes documented in the OpenAI REST
 reference:
@@ -31,50 +33,121 @@ The Rust mirrors of those shapes live in
 
 ## Scope
 
-The scaffold's job is to commit three things to the public contract:
+The v0.4 wire-up preserves the three commitments the v0.3.5 scaffold
+locked in:
 
-1. **The URL surface.** Clients can begin integrating against the
-   gateway URL today; the v0.4 wiring step will not move the routes.
+1. **The URL surface.** `POST /v1/completions` and `POST
+   /v1/chat/completions`, exactly as documented in the scaffold.
 2. **The request shape.** Every documented OpenAI field is accepted
-   (`#[serde(default)]`); the v0.4 wiring step may add semantic
-   validation but will not reject any field the scaffold accepts.
+   (`#[serde(default)]`); v0.4 added semantic validation for the
+   `model` field (404 on miss) but does not reject any field the
+   scaffold accepted.
 3. **The error envelope.** OpenAI SDKs parse the four-field
    `{ "message", "type", "param", "code" }` body verbatim and will not
    look at the gateway's native `{ "kind", "message" }` shell. The
-   scaffold returns the OpenAI shape from the start so SDK error
-   paths exercise the same code today and after v0.4.
+   wire-up keeps the OpenAI envelope on every error path that v0.4
+   reaches.
 
-The scaffold does **not** validate semantics (model existence,
-`max_tokens` upper bounds, etc.) — those land in v0.4.
+T41-specific behaviour:
+
+* `model_not_found` is returned with HTTP 404 and `param: "model"`
+  whenever `req.model` is not present in the operator-configured
+  model map (see *Operator configuration* below).
+* Token-count fields in `usage` are zeros — v0.4 does not wire a
+  tokenizer. v0.5 lands a real counter.
+* Streaming is plumbed through the same `StreamingContext` the T34
+  `/invoke-stream` route uses; one OpenAI `data: { ... }` SSE frame
+  per emitted chunk + terminal `data: [DONE]\n\n`.
+
+## Operator configuration
+
+Wire-up the gateway to OpenAI clients by setting the
+`TENSOR_WASM_API_OPENAI_MODEL_MAP` environment variable to a
+comma-separated list of `model_id:function_uuid` pairs.
+
+```bash
+export TENSOR_WASM_API_OPENAI_MODEL_MAP='gpt-3.5-turbo:00000000-0000-4000-8000-000000000001,gpt-4:00000000-0000-4000-8000-000000000002'
+```
+
+Each `model_id` is the string OpenAI SDKs put in the `model` field;
+each `function_uuid` is a UUID returned by `POST /functions` at deploy
+time. Empty / unset means "no models configured" — every OpenAI
+request fails with `404 model_not_found`. The map is read once at
+startup; restart the gateway to pick up new aliases.
+
+A YAML config-file alternative is on the v0.5 roadmap; the env var is
+the only supported mechanism in v0.4.
 
 ## Wire-format examples
 
-### Scaffold response (today)
+### Non-streaming completions (T41)
 
 ```http
 POST /v1/completions HTTP/1.1
 Authorization: Bearer my-token
 Content-Type: application/json
 
-{ "model": "tensor-wasm-llama", "prompt": "Hello" }
+{ "model": "gpt-3.5-turbo", "prompt": "Hello", "stream": false }
 
-HTTP/1.1 501 Not Implemented
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "id": "cmpl-<uuid>",
+  "object": "text_completion",
+  "created": 1748469000,
+  "model": "gpt-3.5-turbo",
+  "choices": [
+    {
+      "text": "Hello, world!",
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null
+    }
+  ],
+  "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+}
+```
+
+### Streaming chat completions (T41)
+
+```http
+POST /v1/chat/completions HTTP/1.1
+Authorization: Bearer my-token
+Content-Type: application/json
+
+{ "model": "gpt-4", "messages": [{"role":"user","content":"Hi"}], "stream": true }
+
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1748469000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"H"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1748469000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"i"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1748469000,"model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+```
+
+### Unknown model (T41)
+
+```http
+HTTP/1.1 404 Not Found
 Content-Type: application/json
 
 {
   "error": {
-    "message": "OpenAI-compatible /v1/completions endpoint is a scaffold; …",
-    "type": "not_implemented",
-    "param": null,
-    "code": "openai_not_yet_wired"
+    "message": "model `gpt-unknown` is not configured in TENSOR_WASM_API_OPENAI_MODEL_MAP; ask your operator to add a `gpt-unknown:<function_uuid>` entry",
+    "type": "invalid_request_error",
+    "param": "model",
+    "code": "model_not_found"
   }
 }
 ```
 
-Clients should branch on `error.code == "openai_not_yet_wired"`, not on
-the human-readable `message`.
-
-### Malformed body (today)
+### Malformed body
 
 ```http
 HTTP/1.1 400 Bad Request
@@ -90,25 +163,58 @@ Content-Type: application/json
 }
 ```
 
-## v0.4 implementation plan
+## v0.4 wiring (T41, landed)
 
-The wiring step lands on top of this scaffold in four chunks:
+T41 closed the four chunks the scaffold reserved:
 
-1. **`model` → function resolution.** A new env-driven allowlist
-   (`TENSOR_WASM_OPENAI_MODEL_ALIASES=gpt-3.5-turbo=<uuid>,…`) maps
-   each OpenAI model identifier to a deployed `FunctionRecord`.
-   Unknown models return `404` with the OpenAI envelope (`type:
-   "model_not_found"`).
-2. **Tenant inference.** Tenant scope comes from the bearer token's
-   `:tenant=` clause (see `crates/tensor-wasm-api/src/token_scope.rs`).
-   A wildcard token routes to tenant 0 with a one-shot warning.
-3. **Argv marshalling.** The translator serialises the OpenAI request
-   into the wasm guest's `_start` argv as a single JSON blob. The guest
-   sees one `arg0` containing the prompt or messages array; v0.4
-   tightens this once a stable in-tree schema is published.
+1. **`model` → function resolution.** The
+   `TENSOR_WASM_API_OPENAI_MODEL_MAP` env var (format:
+   `model:uuid,model:uuid,...`) maps each OpenAI model identifier to a
+   deployed `FunctionRecord`. Unknown models return `404` with
+   `type: "invalid_request_error"`, `code: "model_not_found"`,
+   `param: "model"`. See
+   [`crates/tensor-wasm-api/src/openai_translator.rs`](../crates/tensor-wasm-api/src/openai_translator.rs).
+2. **Tenant inference.** The OpenAI routes ride the same
+   `tenant_scope` middleware T2 wired on the protected stack. Absent
+   `X-TensorWasm-Tenant` resolves to `TenantId(0)` under the default
+   policy; the bearer token's scope is then enforced via
+   `AuthContext::authorize_tenant` BEFORE any translator work.
+3. **Argv marshalling.** For v0.4 the translator passes an empty
+   args vector and calls the guest's `_start` (`() -> ()`) export.
+   Guests communicate the response by emitting bytes through the T34
+   `wasi:tensor/host.emit-chunk` host function; the handler drains the
+   matching receiver and surfaces every chunk as either a buffered
+   string (`stream: false`) or an OpenAI SSE delta frame
+   (`stream: true`). The prompt length is preserved on the
+   `TranslatedRequest` struct (`prompt_len_hint`) so a future revision
+   can promote it to a typed `i32` arg once the
+   host-pre-fills-guest-memory plumbing lands; v0.4 deliberately keeps
+   the export signature `_start() -> ()` so the existing WASI command
+   guests link cleanly.
 4. **SSE streaming.** When `stream: true`, the handler returns
-   `text/event-stream` and writes one OpenAI `data:` chunk per token
-   the guest emits via the `wasi:io/streams` host export.
+   `text/event-stream` and writes one OpenAI `data: { ... }` SSE frame
+   per emitted chunk, terminated by a `data: [DONE]\n\n` line. The
+   plumbing reuses T34's `StreamingContext::with_channel` +
+   `SpawnConfig::with_streaming` end-to-end.
+
+### Configuration knob
+
+Set `TENSOR_WASM_API_OPENAI_MODEL_MAP` to a comma-separated list of
+`model:function_uuid` pairs. Empty / unset means "no models
+configured" — every OpenAI request then surfaces 404 model_not_found.
+A YAML config-file alternative is deferred to v0.5.
+
+### Deferred to v0.5
+
+* **Tokenizer.** `usage.{prompt,completion,total}_tokens` ship as
+  zeros until a tokenizer lands. SDKs that compute billing from the
+  usage block will see zero; the field is present so the response
+  shape matches the OpenAI public contract.
+* **Multimodal content.** Image / audio parts inside a chat message's
+  `content` array are silently dropped — only text parts survive into
+  the assembled prompt.
+* **YAML config file.** The env var is the only supported map
+  configuration.
 
 ## Security note: token scoping
 

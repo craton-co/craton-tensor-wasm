@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- tensor-wasm-api (T41): OpenAI gateway request translator wired through to the internal invoke protocol. Configurable model→function map via TENSOR_WASM_API_OPENAI_MODEL_MAP. Streaming via T34's `/invoke-stream` plumbing (data: ... \n\ndata: [DONE]). Closes the v0.3.7 `501 openai_not_yet_wired` scaffold.
 - tensor-wasm-api (T34): /functions/{id}/invoke-stream now plumbed end-to-end through `StreamingContext`. Guest `wasi:tensor/host.emit-chunk` calls surface as SSE `event: chunk` frames. Honors T36 cooperative deadlines (DEADLINE-ELAPSED → final `event: error`). Replaces the 0.3.7 scaffold that emitted a single not_yet_wired frame.
 - tensor-wasm-jit (T38): proptest harness driving `DifferentialOracle` against matmul/vector_add/conv2d blueprints + per-kernel tolerance table. Host-only verdicts run end-to-end today; CUDA GPU verdicts marked `#[ignore]` pending S22 runner.
 - tensor-wasm-wasi-gpu (T36): cooperative deadline ↔ back-pressure integration. The executor's per-invocation Instant deadline now drives both `SchedulerContext` query verdicts AND `BackPressure` acquire rejections (DEADLINE_NEAR_WINDOW = 50ms before deadline).

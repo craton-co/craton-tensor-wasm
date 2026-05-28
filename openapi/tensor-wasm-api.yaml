@@ -48,6 +48,17 @@ tags:
     description: Async-job poll API
   - name: ops
     description: Operator-facing endpoints (health, metrics)
+  - name: openai-compat
+    description: |
+      OpenAI-compatible inference gateway (T41, v0.4). The two routes
+      under this tag accept the public OpenAI REST request shapes so
+      off-the-shelf SDKs (Python `openai`, Node `openai`, LangChain,
+      LlamaIndex, ...) can target the gateway URL without modification.
+      The handlers resolve the request's `model` field against an
+      env-configured `model -> function_uuid` map
+      (`TENSOR_WASM_API_OPENAI_MODEL_MAP`) and dispatch through the
+      shared executor. See `docs/OPENAI-COMPAT.md` for the wire
+      contract and the operator configuration knob.
 
 paths:
   /healthz:
@@ -317,6 +328,143 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/completions:
+    post:
+      tags: [openai-compat]
+      summary: OpenAI-compatible text completions (T41 wired)
+      description: |
+        Accepts the public OpenAI `POST /v1/completions` request shape
+        and dispatches to the deployed function the gateway operator
+        has aliased to the requested `model` (via
+        `TENSOR_WASM_API_OPENAI_MODEL_MAP`). Returns the standard OpenAI
+        `text_completion` envelope on success, or
+        `404 model_not_found` when the model alias is unknown.
+
+        When `stream: true`, returns `text/event-stream` with one
+        `data: { ... }` SSE frame per emitted chunk and a terminal
+        `data: [DONE]\n\n` line.
+
+        The `X-TensorWasm-Tenant` header is not honoured on this
+        route, because OpenAI SDKs never send it. Tenant resolution
+        comes from the bearer token's scope (see
+        `docs/OPENAI-COMPAT.md`).
+      operationId: openaiCompletions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompletionsRequest"
+      responses:
+        "200":
+          description: Completion result (or SSE stream when `stream:true`).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompletionsResponse"
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE stream. Each guest chunk lands as one `data: { ... }`
+                  frame whose JSON carries the OpenAI delta shape; the
+                  stream terminates with a literal `data: [DONE]\n\n` line.
+        "400":
+          description: Malformed request body (OpenAI envelope).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenAiError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: |
+            The requested `model` is not configured in the gateway's
+            `TENSOR_WASM_API_OPENAI_MODEL_MAP`. Carries OpenAI envelope
+            `code: "model_not_found"`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenAiError"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/chat/completions:
+    post:
+      tags: [openai-compat]
+      summary: OpenAI-compatible chat completions (T41 wired)
+      description: |
+        Accepts the public OpenAI `POST /v1/chat/completions` request
+        shape (system / user / assistant `messages` array) and
+        dispatches to the function the operator has aliased to the
+        requested `model`. The `messages` array is concatenated into a
+        single role-tagged prompt string before dispatch (`system:
+        ...\nuser: ...\nassistant:`).
+
+        Returns the standard OpenAI `chat.completion` envelope on
+        success, or `404 model_not_found` when the alias is unknown.
+        Streaming framing matches `/v1/completions`, except the JSON
+        delta uses the chat shape (`choices[0].delta.content`) and the
+        object kind is `chat.completion.chunk`.
+      operationId: openaiChatCompletions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionsRequest"
+      responses:
+        "200":
+          description: Chat completion (or SSE stream when `stream:true`).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionsResponse"
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE stream. Each guest chunk lands as one `data: { ... }`
+                  frame whose JSON carries the OpenAI chat delta shape; the
+                  stream terminates with a literal `data: [DONE]\n\n` line.
+        "400":
+          description: Malformed request body (OpenAI envelope).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenAiError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: |
+            The requested `model` is not configured in the gateway's
+            `TENSOR_WASM_API_OPENAI_MODEL_MAP`. Carries OpenAI envelope
+            `code: "model_not_found"`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenAiError"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "429":
@@ -663,3 +811,222 @@ components:
           $ref: "#/components/schemas/ApiErrorBody"
       required: [error]
       additionalProperties: false
+
+    # ---- OpenAI-compatible request / response shapes (T41) ---------------
+    CompletionsRequest:
+      type: object
+      description: |
+        Body of `POST /v1/completions`. Mirrors the public OpenAI
+        completions REST contract; every field is optional at the wire
+        layer so SDKs that omit knobs still parse cleanly.
+      properties:
+        model:
+          type: string
+          description: |
+            Model identifier. The gateway operator pre-aliases this to
+            a deployed function UUID via
+            `TENSOR_WASM_API_OPENAI_MODEL_MAP`. Unknown ids surface as
+            `404 model_not_found`.
+        prompt:
+          description: |
+            Prompt text. Accepts either a single string or an array of
+            strings; arrays are joined with newlines before dispatch.
+        max_tokens:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+        stream:
+          type: boolean
+          description: |
+            When true the response is `text/event-stream` with one
+            `data: { ... }` SSE frame per emitted chunk and a terminal
+            `data: [DONE]\n\n` line.
+        echo:
+          type: boolean
+        n:
+          type: integer
+          minimum: 1
+        user:
+          type: string
+      additionalProperties: true
+    ChatMessage:
+      type: object
+      description: One entry in the `messages` array of `POST /v1/chat/completions`.
+      properties:
+        role:
+          type: string
+          description: One of `system`, `user`, `assistant`, `tool`.
+        content:
+          description: |
+            Message content. Either a plain string or an array of
+            content parts (multimodal). For v0.4 only text parts are
+            consumed; image / audio parts are silently dropped.
+        name:
+          type: string
+      additionalProperties: true
+    ChatCompletionsRequest:
+      type: object
+      description: |
+        Body of `POST /v1/chat/completions`. Mirrors the public OpenAI
+        chat-completions REST contract.
+      properties:
+        model:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+        max_tokens:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+        stream:
+          type: boolean
+        n:
+          type: integer
+          minimum: 1
+        tools:
+          description: |
+            OpenAI tool-calling array. Accepted on the wire for forward
+            compatibility but not yet honoured; v0.5 wires.
+        user:
+          type: string
+      additionalProperties: true
+    CompletionsChoice:
+      type: object
+      description: |
+        One entry in the `choices` array of a non-streaming
+        `/v1/completions` response.
+      properties:
+        text:
+          type: string
+        index:
+          type: integer
+          minimum: 0
+        finish_reason:
+          type: string
+          enum: [stop, length, content_filter, null]
+          nullable: true
+        logprobs:
+          nullable: true
+      required: [text, index]
+    ChatCompletionsChoice:
+      type: object
+      description: |
+        One entry in the `choices` array of a non-streaming
+        `/v1/chat/completions` response.
+      properties:
+        index:
+          type: integer
+          minimum: 0
+        message:
+          type: object
+          properties:
+            role:
+              type: string
+              enum: [assistant]
+            content:
+              type: string
+          required: [role, content]
+        finish_reason:
+          type: string
+          enum: [stop, length, content_filter, null]
+          nullable: true
+      required: [index, message]
+    CompletionsUsage:
+      type: object
+      description: |
+        Token-count block. v0.4 ships zeros across the board because
+        the gateway does not yet wire a tokenizer; v0.5 lands a real
+        counter (see `docs/OPENAI-COMPAT.md`).
+      properties:
+        prompt_tokens:
+          type: integer
+          minimum: 0
+        completion_tokens:
+          type: integer
+          minimum: 0
+        total_tokens:
+          type: integer
+          minimum: 0
+      required: [prompt_tokens, completion_tokens, total_tokens]
+    CompletionsResponse:
+      type: object
+      description: |
+        Non-streaming `/v1/completions` response. The `object` field
+        carries the literal `"text_completion"`.
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: [text_completion]
+        created:
+          type: integer
+          format: int64
+          description: Unix seconds at which the response was generated.
+        model:
+          type: string
+          description: Echoes the request's `model` field.
+        choices:
+          type: array
+          items:
+            $ref: "#/components/schemas/CompletionsChoice"
+        usage:
+          $ref: "#/components/schemas/CompletionsUsage"
+      required: [id, object, created, model, choices, usage]
+    ChatCompletionsResponse:
+      type: object
+      description: |
+        Non-streaming `/v1/chat/completions` response. The `object`
+        field carries the literal `"chat.completion"`.
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: [chat.completion]
+        created:
+          type: integer
+          format: int64
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatCompletionsChoice"
+        usage:
+          $ref: "#/components/schemas/CompletionsUsage"
+      required: [id, object, created, model, choices, usage]
+    OpenAiErrorBody:
+      type: object
+      description: |
+        Inner body of the OpenAI error envelope. The four-field shape
+        (`message`, `type`, `param`, `code`) is what off-the-shelf
+        OpenAI SDKs parse; this is distinct from the gateway's native
+        `ApiErrorBody`.
+      properties:
+        message:
+          type: string
+        type:
+          type: string
+          description: OpenAI-conventional error category.
+        param:
+          type: string
+          nullable: true
+        code:
+          type: string
+          nullable: true
+      required: [message, type]
+    OpenAiError:
+      type: object
+      description: |
+        Top-level OpenAI error envelope. `code: "model_not_found"`
+        surfaces with status `404`; `code: "openai_invalid_request"`
+        with `400`; `type: "server_error"` with `500`.
+      properties:
+        error:
+          $ref: "#/components/schemas/OpenAiErrorBody"
+      required: [error]
