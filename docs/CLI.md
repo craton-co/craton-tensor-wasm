@@ -24,15 +24,31 @@ Run a Wasm module locally against an in-process `TensorWasmEngine`.
 
 - `<file.wasm>`: path to the module to execute. Must exist and be readable.
 - `--export <name>`: function to invoke. Defaults to `main`.
-- `--args <json>`: arguments to forward to the guest, encoded as a JSON array. Validated for shape only — the current executor invokes `() -> ()` exports, so values are ignored until S20 widens the call signature.
+- `--args <json>`: arguments to forward to the guest, encoded as a JSON array. Each element is converted to the closest-fitting wasm value type before being passed to `call_export_with_args`:
 
-Example:
+  | JSON literal | Wasm value type |
+  |---|---|
+  | integer in `i32` range (e.g. `1`, `-2147483648`) | `i32` |
+  | integer outside `i32` range (e.g. `2147483648`) | `i64` |
+  | non-integer numeric (e.g. `2.5`) | `f64` |
+  | anything else (string, array, null) | rejected with a parse error |
+
+  The export's declared signature must accept the resulting parameter types or wasmtime returns an error. `f32` cannot be selected from a JSON literal unambiguously; build a Wasm wrapper that demotes from `f64` if you need 32-bit floats from the CLI.
+
+Examples:
 
 ```bash
-tensor-wasm run tests/wasm-fixtures/vector_add.wasm --export add --args '[1.0, 2.0]'
+# Legacy () -> () export — prints `ok`.
+tensor-wasm run tests/wasm-fixtures/noop.wasm --export noop
+
+# (i32, i32) -> i32 adder — prints `3`.
+tensor-wasm run tests/wasm-fixtures/adder.wasm --export add --args '[1, 2]'
+
+# (f64) -> f64 doubler — prints `3.0`.
+tensor-wasm run tests/wasm-fixtures/doubler.wasm --export double --args '[1.5]'
 ```
 
-On success the command prints `ok`. On failure the chained-cause stack is written to stderr and the process exits non-zero. This subcommand exercises the same compile-and-spawn path that `tensor-wasm-api`'s `POST /functions/{id}/invoke` handler uses, so local runs are a faithful reproduction of server behaviour for the supported signatures.
+On success the command prints the export's result list. An empty result list (the `() -> ()` case) collapses to the literal `ok` for stable scripting; a single-element result unwraps to the scalar (so a `-> i32` adder prints `3`, not `[3]`); multi-element results print as a JSON array. On failure the chained-cause stack is written to stderr and the process exits non-zero. This subcommand exercises the same compile-and-spawn path that `tensor-wasm-api`'s `POST /functions/{id}/invoke` handler uses, so local runs are a faithful reproduction of server behaviour.
 
 ### `tensor-wasm deploy <file.wasm> --server <url>`
 
@@ -49,9 +65,9 @@ Call a deployed function by id.
 
 - `<id>`: the function identifier returned by an earlier `tensor-wasm deploy`.
 - `--server <url>`: base URL of the target TensorWasm server.
-- `--args <json>`: arguments forwarded to the function as a JSON array.
+- `--args <json>`: arguments forwarded to the function as a JSON array. Element-to-`WasmArg` conversion follows the same rules as `tensor-wasm run --args` above — integers fitting `i32` become `i32`, larger integers become `i64`, fractional numerics become `f64`.
 
-The subcommand issues a `POST /functions/{id}/invoke` against the server with the JSON body `{"export": "...", "args": [...]}` and prints the decoded response to stdout. Non-2xx responses surface as non-zero exits with the error body forwarded to stderr.
+The subcommand issues a `POST /functions/{id}/invoke` against the server with the JSON body `{"export": "...", "args": [...]}` and prints the decoded response to stdout. The server now actually threads `args` into the executor's `call_export_with_args` path; the result list comes back as the response `result` field (or the literal string `"ok"` for empty-result `() -> ()` exports). Non-2xx responses surface as non-zero exits with the error body forwarded to stderr.
 
 ### `tensor-wasm bench <file.wasm> --export <name> [--n <iters>]`
 

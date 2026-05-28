@@ -77,6 +77,28 @@ The resulting `.wasm` exports `add` and `run`. The host invokes them by name wit
 
 Pointers (`*const f32`, `*mut f32`) are **guest-relative offsets** into the Wasm linear memory — they're plain `i32` values at the ABI level. TensorWasm's host translates them transparently.
 
+### 3.1 Typed exports — what the host accepts and returns
+
+Exports invoked through `tensor-wasm run --args …`, the CLI's `tensor-wasm invoke` subcommand, and the HTTP API's `POST /functions/{id}/invoke` endpoint share a single argument-marshalling contract. The executor exposes four argument types and the matching four result types:
+
+| Wasm parameter type | JSON input shape | Rust signature example |
+|---|---|---|
+| `i32` | integer literal in `[i32::MIN, i32::MAX]` | `fn add(a: i32, b: i32) -> i32` |
+| `i64` | integer literal outside `i32` range | `fn big(n: i64) -> i64` |
+| `f32` | *not selectable from JSON* — wrap from `f64` if needed | `fn demote(x: f64) -> f32` |
+| `f64` | non-integer numeric literal | `fn scale(x: f64) -> f64` |
+
+The conversion rules are deterministic:
+
+- `1`, `2`, `42`, `-1` → `i32`. Anything that fits in 32 signed bits never escalates.
+- `2147483648`, `9999999999` → `i64`. Use this for wider counters or pointers from 64-bit guests.
+- `1.5`, `3.14`, `1e10` → `f64`. JSON has no way to distinguish "f32" from "f64" literals, so the host always picks `f64`. If your export's signature is `(f32) -> ...`, the dynamic call rejects with a type mismatch.
+- Strings, arrays, `null`, booleans → rejected as `invalid_args` (`400` on the HTTP path, non-zero exit on the CLI).
+
+Result lists are mapped back to JSON symmetrically: `i32`/`i64` → JSON integer, `f32`/`f64` → JSON number. An export returning `()` produces an empty JSON array, which the CLI prints as the literal `ok`.
+
+If you need to call a function with arguments the JSON shape cannot represent — `f32` parameters, `v128` SIMD values, references — write a thin wrapper export in your guest that takes JSON-representable arguments and demotes / packs them on entry. The executor side is intentionally narrow so the wire contract stays predictable.
+
 ## 4. Using wasi-cuda for explicit GPU kernels
 
 When you've written a CUDA kernel by hand and compiled it to PTX, you can launch it from your Wasm guest using the `wasi:cuda/host@0.2.0` import surface.

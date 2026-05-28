@@ -163,11 +163,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              description: |
-                Arbitrary JSON payload threaded through as the invocation
-                argument. The v0.x executor ignores the value; the field
-                is reserved for future use.
+              $ref: "#/components/schemas/InvokeRequest"
       responses:
         "200":
           description: Invocation complete
@@ -210,10 +206,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              description: |
-                Arbitrary JSON payload, same shape as the synchronous
-                invoke endpoint.
+              $ref: "#/components/schemas/InvokeRequest"
       responses:
         "202":
           description: Job accepted
@@ -461,16 +454,53 @@ components:
           $ref: "#/components/schemas/FunctionId"
       required: [id]
       additionalProperties: false
+    InvokeRequest:
+      type: object
+      description: |
+        Body of POST /functions/{id}/invoke (and the async sibling).
+        Both fields are optional — an empty body or `{}` is the canonical
+        no-args case, matching the pre-args wire contract. Unknown
+        top-level fields are ignored for forward compatibility; malformed
+        JSON surfaces as 400 invalid_json.
+      properties:
+        export:
+          type: string
+          nullable: true
+          description: |
+            Optional export-name override. When omitted (or null), the
+            server tries `_start` first and falls back to `main`, matching
+            the WASI command convention.
+        args:
+          type: array
+          default: []
+          description: |
+            Argument list forwarded to the executor's `call_export_with_args`
+            path. Each element is converted to the closest-fitting wasm value
+            type: integers in [-2^31, 2^31) become i32, larger integers become
+            i64, non-integer numerics become f64. Strings / arrays / null /
+            booleans are rejected as 400 invalid_args. f32 cannot be selected
+            from JSON unambiguously — write a guest wrapper that demotes from
+            f64 if you need it.
+          items:
+            oneOf:
+              - type: integer
+                format: int64
+              - type: number
+                format: double
+      additionalProperties: false
     InvokeResult:
       type: object
       properties:
         function_id:
           $ref: "#/components/schemas/FunctionId"
         result:
-          type: string
           description: |
-            Stable string-shaped invocation result. Will widen to the
-            executor's JSON return value once that surface lands.
+            Invocation result. For exports returning `()` this collapses
+            to the literal string `"ok"` (legacy back-compat envelope).
+            For exports with a non-empty result list this is a JSON
+            array of return values — one element per wasm result slot,
+            with i32/i64 rendered as JSON integers and f32/f64 as JSON
+            numbers.
       required: [function_id, result]
       additionalProperties: false
     InvokeAsyncResponse:
@@ -519,6 +549,7 @@ components:
             - invalid_name
             - invalid_base64
             - invalid_wasm
+            - invalid_args
             - missing_export
             - missing_tenant
             - unauthorized

@@ -36,7 +36,7 @@ use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::metrics::TensorWasmMetrics;
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::TensorWasmEngine;
-use tensor_wasm_exec::executor::{TensorWasmExecutor, ExecError, SpawnConfig};
+use tensor_wasm_exec::executor::{ExecError, SpawnConfig, TensorWasmExecutor, WasmArg};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use dashmap::DashMap;
@@ -456,6 +456,32 @@ pub struct CreateFunctionResponse {
     pub id: Uuid,
 }
 
+/// Body of `POST /functions/{id}/invoke` and `POST /functions/{id}/invoke-async`.
+///
+/// Both fields are optional so callers that just want the default `_start`
+/// → `main` fallback can omit them entirely (an empty `{}` body remains
+/// valid). When `args` is supplied each element is converted into a
+/// [`WasmArg`] via [`WasmArg::from_json`] before being threaded into
+/// [`TensorWasmExecutor::call_export_with_args`].
+///
+/// `#[serde(default)]` plus `deny_unknown_fields = false` (the default)
+/// keeps the schema forward-compatible: adding new optional fields later
+/// will not break clients that send the legacy `{}` body, and clients
+/// sending arbitrary extra fields are tolerated rather than rejected with
+/// 400.
+#[derive(Debug, Default, Deserialize)]
+pub struct InvokeRequest {
+    /// Optional export name override. When `None`, the handler tries
+    /// `_start` first and falls back to `main`, matching the historical
+    /// behaviour for WASI command modules.
+    #[serde(default)]
+    pub export: Option<String>,
+    /// Optional JSON-array argument list. Each element is parsed into a
+    /// [`WasmArg`]; non-numeric elements surface as `400 invalid_args`.
+    #[serde(default)]
+    pub args: Vec<serde_json::Value>,
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -609,16 +635,43 @@ pub async fn delete_function(
     }
 }
 
-/// Drive the spawn → call(`_start`|`main`) → terminate flow against the
-/// supplied bytes/tenant. Shared by the synchronous and async invoke paths
-/// so any future fix (telemetry, retries, etc.) lands in one place.
+/// Parse a JSON-array argument list into the executor's [`WasmArg`] form.
+///
+/// Surfaces a `400 invalid_args` envelope on the first element that fails
+/// conversion. The envelope's `message` includes the array index and the
+/// offending value so a caller debugging a malformed payload can pinpoint
+/// the problem without trial-and-error.
+fn parse_invoke_args(raw: &[serde_json::Value]) -> Result<Vec<WasmArg>, ApiError> {
+    raw.iter()
+        .enumerate()
+        .map(|(i, v)| {
+            WasmArg::from_json(v).map_err(|msg| {
+                ApiError::bad_request(
+                    "invalid_args",
+                    format!("args[{i}]: {msg} (value: {v})"),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Drive the spawn → call(`_start`|`main`|custom) → terminate flow against
+/// the supplied bytes/tenant. Shared by the synchronous and async invoke
+/// paths so any future fix (telemetry, retries, etc.) lands in one place.
+///
+/// When `export_override` is `Some`, that export is invoked directly with
+/// no fallback — the caller asked for a specific function, so a missing
+/// export surfaces as the usual `400 missing_export`. When `None`, the
+/// legacy WASI-command discovery applies: try `_start`, then `main`.
 #[tracing::instrument(
     name = "invoke.run",
-    skip(executor, wasm_bytes),
+    skip(executor, wasm_bytes, args),
     fields(
         tenant = %tenant,
         function_id = %function_id,
         wasm_bytes_len = wasm_bytes.len(),
+        export = tracing::field::Empty,
+        args_len = args.len(),
     ),
 )]
 async fn run_invoke(
@@ -626,62 +679,127 @@ async fn run_invoke(
     wasm_bytes: &[u8],
     tenant: TenantId,
     function_id: Uuid,
+    export_override: Option<&str>,
+    args: &[WasmArg],
 ) -> ApiResult<serde_json::Value> {
     let cfg = SpawnConfig::for_tenant(tenant).with_deadline(INVOKE_DEFAULT_DEADLINE);
     let instance_id = executor.spawn_instance(cfg, wasm_bytes).await?;
 
-    // Try `_start` (WASI command convention) first, then `main`. Anything
-    // other than `MissingExport` from the first attempt bubbles up directly;
-    // a missing `_start` falls through to `main`. If neither exists the
-    // `MissingExport` from the second attempt is returned (mapped to 400).
-    //
-    // api S-20 / exec orphan-instance: use `call_export_then_terminate` so
-    // the instance is cleaned up even if our future is dropped mid-await
+    // api S-20 / exec orphan-instance: use `call_export_with_args_then_terminate`
+    // so the instance is cleaned up even if our future is dropped mid-await
     // (e.g. by tower's `TimeoutLayer`). The previous `call_export` +
     // explicit `terminate` flow leaked the registry entry into
     // `instances` on outer cancellation, holding the wasmtime `Store`
     // and counting against `max_instances` until process restart.
-    let call_result = match executor.call_export_then_terminate(instance_id, "_start").await {
-        Ok(()) => Ok(()),
-        Err(ExecError::MissingExport(_)) => {
-            // `_start` was missing AND the instance was already terminated
-            // by the first guard. Re-spawn to try `main` — slightly more
-            // expensive than the old "reuse the instance" flow but only
-            // when `_start` is genuinely absent, and keeps the auto-
-            // terminate invariant intact.
-            let cfg = SpawnConfig::for_tenant(tenant).with_deadline(INVOKE_DEFAULT_DEADLINE);
-            let retry_id = executor.spawn_instance(cfg, wasm_bytes).await?;
-            executor.call_export_then_terminate(retry_id, "main").await
+    let result_value: serde_json::Value = if let Some(name) = export_override {
+        tracing::Span::current().record("export", tracing::field::display(name));
+        executor
+            .call_export_with_args_then_terminate(instance_id, name, args)
+            .await?
+    } else {
+        // Try `_start` (WASI command convention) first, then `main`. Anything
+        // other than `MissingExport` from the first attempt bubbles up directly;
+        // a missing `_start` falls through to `main`. If neither exists the
+        // `MissingExport` from the second attempt is returned (mapped to 400).
+        tracing::Span::current().record("export", tracing::field::display("_start|main"));
+        match executor
+            .call_export_with_args_then_terminate(instance_id, "_start", args)
+            .await
+        {
+            Ok(v) => v,
+            Err(ExecError::MissingExport(_)) => {
+                // `_start` was missing AND the instance was already terminated
+                // by the first guard. Re-spawn to try `main` — slightly more
+                // expensive than the old "reuse the instance" flow but only
+                // when `_start` is genuinely absent, and keeps the auto-
+                // terminate invariant intact.
+                let cfg =
+                    SpawnConfig::for_tenant(tenant).with_deadline(INVOKE_DEFAULT_DEADLINE);
+                let retry_id = executor.spawn_instance(cfg, wasm_bytes).await?;
+                executor
+                    .call_export_with_args_then_terminate(retry_id, "main", args)
+                    .await?
+            }
+            Err(other) => return Err(other.into()),
         }
-        Err(other) => Err(other),
     };
 
-    call_result?;
+    // For back-compat with the historical `{ "result": "ok" }` envelope,
+    // collapse an empty result array to the string `"ok"`. Non-empty
+    // result lists pass through verbatim so callers consuming an `(i32,
+    // i32) -> i32` adder see the JSON array shape.
+    let payload_result = match &result_value {
+        serde_json::Value::Array(items) if items.is_empty() => {
+            serde_json::Value::String("ok".to_string())
+        }
+        _ => result_value,
+    };
 
     Ok(serde_json::json!({
         "function_id": function_id.to_string(),
-        "result": "ok",
+        "result": payload_result,
     }))
+}
+
+/// Extract an [`InvokeRequest`] from the inbound HTTP body, treating an
+/// absent / empty body as the default (no export override, no args).
+///
+/// `/invoke` historically accepted no body (api S-31); now that argument
+/// passing is wired through we accept a body but keep the empty-body path
+/// cheap — an empty payload short-circuits before the JSON allocator is
+/// touched, mirroring the previous behaviour.
+async fn read_invoke_request(
+    payload: Result<Json<InvokeRequest>, JsonRejection>,
+) -> ApiResult<InvokeRequest> {
+    match payload {
+        Ok(Json(req)) => Ok(req),
+        Err(rej) => {
+            // Two soft-failure cases get rewritten as the all-defaults
+            // request so the legacy "fire-and-forget with no body" wire
+            // contract still works:
+            //
+            //  * `415 Unsupported Media Type` — body present but
+            //    `content-type` missing or wrong. The pre-args /invoke
+            //    accepted any body shape (it never parsed it); we keep
+            //    that surface working by treating it as defaults.
+            //  * empty inbound bytes (any rejection whose
+            //    `body_text()` is empty) — `curl -X POST /invoke`
+            //    with no `-d` body falls in here. Matches the
+            //    pre-args silent-no-op behaviour.
+            //
+            // Every other rejection — `400` (parse error, type error,
+            // missing required field) and `413` (body too large) — is
+            // forwarded through the existing `From<JsonRejection>`
+            // mapping so the canonical envelope kicks in.
+            if rej.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE
+                || rej.body_text().trim().is_empty()
+            {
+                Ok(InvokeRequest::default())
+            } else {
+                Err(rej.into())
+            }
+        }
+    }
 }
 
 /// `POST /functions/{id}/invoke` — synchronous invocation.
 ///
 /// Looks up the function's stored Wasm bytes, spawns a fresh instance via
-/// the shared [`TensorWasmExecutor`] with a 30-second deadline, calls `_start`
-/// (falling back to `main`), then terminates the instance. Returns the
-/// `function_id` and a string `result` on success; structured `ApiError`
+/// the shared [`TensorWasmExecutor`] with a 30-second deadline, calls the
+/// requested `export` (defaulting to `_start` → `main` discovery) with the
+/// supplied `args`, then terminates the instance. Returns the
+/// `function_id` and a JSON `result` on success; structured `ApiError`
 /// otherwise.
 ///
 /// The tenant id is sourced from the `X-TensorWasm-Tenant` middleware
 /// extension; absent it defaults to `TenantId(0)`.
 ///
-/// Body parsing intentionally omitted (api S-31): /invoke currently
-/// accepts no per-call arguments; the body will be re-added with a strict
-/// schema when argument passing lands. Until then, accepting any body
-/// would be a wasted-CPU DoS surface.
+/// Body schema is [`InvokeRequest`] (both fields optional). An empty body
+/// is treated as the all-defaults case for client compatibility with the
+/// pre-args wire contract.
 #[tracing::instrument(
     name = "http.invoke_function",
-    skip(state, auth),
+    skip(state, auth, payload),
     fields(
         function_id = %id,
         tenant = tracing::field::Empty,
@@ -692,6 +810,7 @@ pub async fn invoke_function(
     Path(id): Path<Uuid>,
     tenant: Option<Extension<TenantId>>,
     auth: Option<Extension<crate::rate_limit::AuthContext>>,
+    payload: Result<Json<InvokeRequest>, JsonRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
     tracing::Span::current().record("tenant", tracing::field::display(tenant));
@@ -703,6 +822,9 @@ pub async fn invoke_function(
         ctx.authorize_tenant(tenant)?;
     }
 
+    let req = read_invoke_request(payload).await?;
+    let args = parse_invoke_args(&req.args)?;
+
     // Snapshot the Wasm bytes under the DashMap shard lock, then drop the
     // guard before we hit any `.await`. `Arc::clone` is a single refcount
     // bump regardless of payload size.
@@ -711,7 +833,15 @@ pub async fn invoke_function(
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
 
-    let value = run_invoke(&state.executor, &wasm_bytes, tenant, id).await?;
+    let value = run_invoke(
+        &state.executor,
+        &wasm_bytes,
+        tenant,
+        id,
+        req.export.as_deref(),
+        &args,
+    )
+    .await?;
     Ok(Json(value))
 }
 
@@ -779,13 +909,13 @@ impl Drop for JobsActiveGuard {
 /// `Failed` (with `{kind, message}`) on conclusion. Callers poll via
 /// `GET /jobs/{id}`.
 ///
-/// Body parsing intentionally omitted (api S-31): /invoke currently
-/// accepts no per-call arguments; the body will be re-added with a strict
-/// schema when argument passing lands. Until then, accepting any body
-/// would be a wasted-CPU DoS surface.
+/// Body schema mirrors [`invoke_function`]: optional `export` /
+/// `args` ([`InvokeRequest`]). The body is parsed synchronously before
+/// the Tokio task spawn so `400 invalid_args` surfaces synchronously
+/// (rather than as a `JobStatus::Failed` poll result).
 #[tracing::instrument(
     name = "http.invoke_function_async",
-    skip(state, auth),
+    skip(state, auth, payload),
     fields(
         function_id = %id,
         tenant = tracing::field::Empty,
@@ -797,12 +927,16 @@ pub async fn invoke_function_async(
     Path(id): Path<Uuid>,
     tenant: Option<Extension<TenantId>>,
     auth: Option<Extension<crate::rate_limit::AuthContext>>,
+    payload: Result<Json<InvokeRequest>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
     tracing::Span::current().record("tenant", tracing::field::display(tenant));
     if let Some(Extension(ctx)) = auth.as_ref() {
         ctx.authorize_tenant(tenant)?;
     }
+    let req = read_invoke_request(payload).await?;
+    let args = parse_invoke_args(&req.args)?;
+    let export_override = req.export;
     let wasm_bytes = match state.functions.get(&id) {
         Some(entry) => Arc::clone(&entry.value().wasm_bytes),
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
@@ -861,7 +995,15 @@ pub async fn invoke_function_async(
                 // [`test_hooks`] for the rationale.
                 test_hooks::maybe_panic_for_test();
 
-                let outcome = run_invoke(&executor, &wasm_bytes, tenant, id).await;
+                let outcome = run_invoke(
+                    &executor,
+                    &wasm_bytes,
+                    tenant,
+                    id,
+                    export_override.as_deref(),
+                    &args,
+                )
+                .await;
                 if let Some(mut entry) = jobs.get_mut(&job_id) {
                     match outcome {
                         Ok(value) => {
