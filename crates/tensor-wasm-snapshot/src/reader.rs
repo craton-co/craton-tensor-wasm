@@ -22,14 +22,11 @@ use tensor_wasm_core::error::{TensorWasmError, Result};
 use tracing::{debug, instrument};
 
 use crate::format::{SNAPSHOT_VERSION_V2, SNAPSHOT_VERSION_V3};
-use crate::writer::{
-    check_blob_size, limits, payload_crc32, Snapshot, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
-};
+use crate::writer::{check_blob_size, limits, payload_crc32, Snapshot, SNAPSHOT_MAGIC};
 
 #[cfg(feature = "signed-snapshots")]
 use crate::format::{
-    SignatureKind, HMAC_SHA256_SIG_LEN, SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN,
-    V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN,
+    SignatureKind, SIGNATURE_TRAILER_LEN, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN,
 };
 #[cfg(feature = "artifact-backing")]
 use tensor_wasm_artifacts::ArtifactStore;
@@ -340,7 +337,7 @@ impl SnapshotReader {
             // `verify_v3_trailer`, which already rejects unknown kinds
             // with a descriptive error and so doubles as the
             // forward-compatibility hook for future variants.
-            &bytes[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN] == &V3_TRAILER_MAGIC
+            bytes[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN] == V3_TRAILER_MAGIC
         };
         #[cfg(not(feature = "signed-snapshots"))]
         let is_v3 = false;
@@ -734,7 +731,7 @@ impl SnapshotReader {
         // for defence in depth (a future refactor that hoists detection
         // upstream must not be able to skip authentication).
         let magic_bytes = &trailer[..V3_TRAILER_MAGIC_LEN];
-        if magic_bytes != &V3_TRAILER_MAGIC {
+        if magic_bytes != V3_TRAILER_MAGIC {
             return Err(TensorWasmError::Serialization(
                 "snapshot v3 trailer magic mismatch".into(),
             ));
@@ -1195,7 +1192,9 @@ pub fn restore_to_gpu(bytes: &[u8], device_index: u32) -> Result<RestoredOnGpu> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writer::{InstanceState, SnapshotWriter};
+    use crate::writer::{InstanceState, SnapshotWriter, SNAPSHOT_VERSION};
+    #[cfg(feature = "signed-snapshots")]
+    use crate::format::{HMAC_SHA256_SIG_LEN, SIGNATURE_KIND_HMAC_SHA256};
     use tensor_wasm_core::types::{InstanceId, TenantId};
 
     #[test]
