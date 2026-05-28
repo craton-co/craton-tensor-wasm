@@ -3453,6 +3453,7 @@ dependencies = [
  "futures",
  "http-body-util",
  "hyper",
+ "ipnet",
  "opentelemetry",
  "opentelemetry_sdk",
  "serde",

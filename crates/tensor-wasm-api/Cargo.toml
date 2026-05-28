@@ -23,6 +23,14 @@ tensor-wasm-exec = { workspace = true }
 base64 = "0.22"
 dashmap.workspace = true
 hyper.workspace = true
+# ipnet: parse the `TENSOR_WASM_API_TRUSTED_XFCC_PROXIES` allowlist as a list
+# of IPv4/IPv6 IPs or CIDR ranges so the audit middleware only consults the
+# `X-Forwarded-Client-Cert` header when the immediate TCP peer is a configured
+# proxy. See `crate::audit::TrustedProxies` and the threat-model comment on
+# `crate::audit::extract_client_cert_subject_gated`. Pinned to the workspace's
+# 2.x minor range; no workspace-level entry because this is the only crate
+# that needs it today.
+ipnet = "2"
 opentelemetry = { workspace = true }
 # opentelemetry_sdk: needed only for `TraceContextPropagator` so the gateway
 # can install the W3C propagator on startup and have the trace context
