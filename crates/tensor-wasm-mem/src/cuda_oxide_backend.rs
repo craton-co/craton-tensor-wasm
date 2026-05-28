@@ -429,42 +429,67 @@ mod host_backend {
         FREE_FAILURES.load(Ordering::Relaxed)
     }
 
-    /// Process-wide cached `Arc<CudaContext>` for device 0.
+    /// Process-wide per-ordinal cache of `Arc<CudaContext>`.
     ///
-    /// `cuda_core::CudaContext::new(0)` retains the device-0 primary
-    /// context. Keeping a single `Arc<CudaContext>` alive across
-    /// allocations avoids re-running `cuDevicePrimaryCtxRetain` on every
-    /// [`CudaOxideUnifiedBuffer::allocate`] call. The W4.x tenant-aware
-    /// context cache will route through `tensor-wasm-tenant` instead;
-    /// this `OnceLock` is the W4.1 placeholder.
-    static DEFAULT_CONTEXT: OnceLock<Arc<CudaContext>> = OnceLock::new();
+    /// Caching per-ordinal `Arc<CudaContext>` prevents the
+    /// failed-construction race that would otherwise release another
+    /// tenant's primary context.
+    ///
+    /// Audit T26 background. `cuda_core::CudaContext::new(ordinal)`
+    /// retains the primary context for the requested device; dropping
+    /// the last `Arc<CudaContext>` calls `cuDevicePrimaryCtxRelease`,
+    /// which invalidates *every* managed pointer on that device process-
+    /// wide. Before this cache, only ordinal 0 was memoised; any non-zero
+    /// ordinal allocation re-ran `CudaContext::new(ordinal)`. If that
+    /// construction failed downstream before the new `Arc` was wired
+    /// into a surviving `CudaOxideUnifiedBuffer`, the freshly-built
+    /// `Arc` would drop and release the primary context — silently
+    /// breaking every *other* tenant's managed pointers on the same
+    /// device. The per-ordinal cache converts that into a single
+    /// "build once, retain for the process lifetime" guarantee.
+    ///
+    /// Mirrors the cudarc-backend's `DEVICE_CACHE` so a side-by-side
+    /// comparison of the two backends differs only in the underlying
+    /// driver-call shape, never in the caching strategy.
+    static CONTEXT_CACHE: OnceLock<Mutex<std::collections::HashMap<u32, Arc<CudaContext>>>> =
+        OnceLock::new();
+
+    fn context_cache() -> &'static Mutex<std::collections::HashMap<u32, Arc<CudaContext>>> {
+        CONTEXT_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+    }
 
     /// Lazily fetch (or construct) the cached cuda-oxide context for
     /// device ordinal `ordinal`.
     ///
-    /// Mirrors the cudarc-backend's `device_for` so a side-by-side
-    /// comparison of the two backends differs only in the underlying
-    /// driver call shape, never in the caching strategy.
+    /// Caching per-ordinal `Arc<CudaContext>` prevents the
+    /// failed-construction race that would otherwise release another
+    /// tenant's primary context — see [`CONTEXT_CACHE`] for the audit
+    /// background. The first call for a given ordinal runs
+    /// `CudaContext::new(ordinal)` and inserts the resulting
+    /// `Arc<CudaContext>`; every subsequent call returns a fresh clone
+    /// of the cached `Arc`, so no transient holder ever owns the last
+    /// strong-count reference.
     fn context_for(ordinal: u32) -> Result<Arc<CudaContext>, UnifiedError> {
-        if ordinal == 0 {
-            // `get_or_try_init` only invokes the initialiser when this
-            // thread actually wins the install race, so the new
-            // `Arc<CudaContext>` is never dropped *after* a winner has
-            // been installed. Dropping a losing `Arc<CudaContext>` would
-            // call `cuDevicePrimaryCtxRelease` on the still-held primary
-            // context — invalidating every managed pointer in the
-            // process. Same audit-note pattern as cudarc_backend.rs.
-            let installed = DEFAULT_CONTEXT
-                .get_or_try_init(|| {
-                    CudaContext::new(0).map_err(|e| {
-                        UnifiedError::Cuda(format!("CudaContext::new(0): {e:?}"))
-                    })
-                })?;
-            Ok(installed.clone())
-        } else {
-            CudaContext::new(ordinal as usize)
-                .map_err(|e| UnifiedError::Cuda(format!("CudaContext::new({ordinal}): {e:?}")))
+        // Hot path: probe under the mutex; if present, hand out a clone
+        // and release the lock immediately.
+        {
+            let cache = context_cache().lock();
+            if let Some(cached) = cache.get(&ordinal) {
+                return Ok(Arc::clone(cached));
+            }
         }
+
+        // Cold path: build outside the lock so a slow `CudaContext::new`
+        // does not block other-ordinal probes. If another thread wins
+        // the install race, we drop the duplicate `Arc<CudaContext>` we
+        // built ourselves — safe because the *winning* `Arc` is now
+        // pinned in the cache, so the primary context never sees its
+        // strong-count fall to zero.
+        let fresh = CudaContext::new(ordinal as usize)
+            .map_err(|e| UnifiedError::Cuda(format!("CudaContext::new({ordinal}): {e:?}")))?;
+        let mut cache = context_cache().lock();
+        let canonical = cache.entry(ordinal).or_insert(fresh);
+        Ok(Arc::clone(canonical))
     }
 
     /// A contiguous CUDA Unified Memory region allocated via cuda-oxide.

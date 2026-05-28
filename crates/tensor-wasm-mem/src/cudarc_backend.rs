@@ -97,40 +97,80 @@ pub fn leaked_cuda_allocations() -> Vec<u64> {
     leaked_set().lock().iter().copied().collect()
 }
 
-/// Process-wide cached `CudaDevice` for device 0.
+/// Process-wide per-ordinal cache of `Arc<CudaDevice>`.
 ///
-/// cudarc holds the primary context inside the [`CudaDevice`]; keeping a
-/// single `Arc<CudaDevice>` alive across allocations avoids re-running
-/// `cuDevicePrimaryCtxRetain` on every [`CudarcUnifiedBuffer::new`] call.
-/// Real call sites will route through the tenant-aware context cache once
-/// the spike graduates — see `docs/CUDARC-SPIKE.md`.
-static DEFAULT_DEVICE: OnceLock<Arc<CudaDevice>> = OnceLock::new();
+/// Caching per-ordinal `Arc<CudaDevice>` prevents the failed-construction
+/// race that would otherwise release another tenant's primary context.
+///
+/// Audit T26 background. cudarc holds the device's primary context inside
+/// the [`CudaDevice`] Arc — dropping the last `Arc<CudaDevice>` calls
+/// `cuDevicePrimaryCtxRelease`, which invalidates *every* outstanding
+/// managed pointer on that device process-wide. Before this cache, only
+/// ordinal 0 was memoised; any non-zero ordinal allocation re-ran
+/// `CudaDevice::new(ordinal)`. If that construction subsequently failed
+/// downstream (e.g. before the new `Arc<CudaDevice>` was wired into a
+/// surviving `CudarcUnifiedBuffer`), the freshly-built `Arc` would drop
+/// and release the primary context — silently breaking every *other*
+/// tenant's allocations on the same device. Keeping a per-ordinal cache
+/// converts that into a single "build once, retain for the process
+/// lifetime" guarantee: subsequent allocations clone the cached `Arc`, so
+/// no transient holder ever owns the last reference.
+///
+/// The cache is populated lazily by [`device_for`] under a single-shot
+/// `OnceLock`-initialised mutex. Real call sites will route through the
+/// tenant-aware context cache once the spike graduates — see
+/// `docs/CUDARC-SPIKE.md`.
+static DEVICE_CACHE: OnceLock<Mutex<std::collections::HashMap<u32, Arc<CudaDevice>>>> =
+    OnceLock::new();
+
+fn device_cache() -> &'static Mutex<std::collections::HashMap<u32, Arc<CudaDevice>>> {
+    DEVICE_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
 
 /// Lazily construct (or fetch) the cached cudarc device for ordinal `ordinal`.
 ///
-/// The spike caches device 0 only; any other ordinal triggers a fresh
-/// `CudaDevice::new` call and is not cached. A future revision will replace
-/// this with a per-ordinal cache when more than one GPU enters the test
-/// matrix.
+/// Caching per-ordinal `Arc<CudaDevice>` prevents the failed-construction
+/// race that would otherwise release another tenant's primary context.
+///
+/// The first call for a given ordinal runs `CudaDevice::new(ordinal)`
+/// under the cache mutex, inserts the resulting `Arc<CudaDevice>` keyed by
+/// ordinal, and returns a clone. Every subsequent call for the same
+/// ordinal returns a fresh clone of the cached `Arc` — the cache holds a
+/// process-lifetime reference so the primary context never drops to zero
+/// strong-count, which is exactly the keep-alive guarantee that protects
+/// other tenants' managed pointers.
 fn device_for(ordinal: u32) -> Result<Arc<CudaDevice>, UnifiedError> {
-    if ordinal == 0 {
-        // `get_or_try_init` only invokes the initialiser when this thread
-        // actually wins the install race, so the new `Arc<CudaDevice>` is
-        // never dropped *after* a winner has been installed. Dropping a
-        // losing `Arc<CudaDevice>` would call `cuDevicePrimaryCtxRelease`
-        // on the still-held primary context — invalidating every managed
-        // pointer in the process. See the audit note attached to this
-        // function's history.
-        let installed = DEFAULT_DEVICE
-            .get_or_try_init(|| {
-                CudaDevice::new(0)
-                    .map_err(|e| UnifiedError::Cuda(format!("CudaDevice::new(0): {e:?}")))
-            })?;
-        Ok(installed.clone())
-    } else {
-        CudaDevice::new(ordinal as usize)
-            .map_err(|e| UnifiedError::Cuda(format!("CudaDevice::new({ordinal}): {e:?}")))
+    // Hot path: probe under the mutex; if present, hand out a clone and
+    // release the lock immediately. The `Arc::clone` cost is one atomic
+    // increment so the lock window is bounded by a hash lookup.
+    {
+        let cache = device_cache().lock();
+        if let Some(cached) = cache.get(&ordinal) {
+            return Ok(Arc::clone(cached));
+        }
     }
+
+    // Cold path: build outside the lock so a slow `CudaDevice::new` does
+    // not block other-ordinal probes. `CudaDevice::new` already returns an
+    // `Arc<CudaDevice>` — cudarc's API hands us a refcounted handle to the
+    // freshly-retained primary context.
+    //
+    // If another thread wins the race and inserts first, we drop the
+    // duplicate `Arc<CudaDevice>` we built ourselves — that drop is safe
+    // because the *winning* `Arc` is now pinned in the cache (its
+    // strong-count is at least 1), so the primary context is not
+    // released. This is the failed-construction race the cache exists to
+    // close: only a transient holder that **also** loses the install race
+    // would drop the last `Arc`, and we arrange for the install-race
+    // winner to always be inside the cache.
+    let fresh = CudaDevice::new(ordinal as usize)
+        .map_err(|e| UnifiedError::Cuda(format!("CudaDevice::new({ordinal}): {e:?}")))?;
+    // Re-lock and insert-if-absent. Returning the *cached* value (which
+    // may be ours OR a winner's) ensures the caller always sees the
+    // single canonical handle for this ordinal.
+    let mut cache = device_cache().lock();
+    let canonical = cache.entry(ordinal).or_insert(fresh);
+    Ok(Arc::clone(canonical))
 }
 
 /// Bind the device's primary context to the calling thread (mem M4).
@@ -231,8 +271,9 @@ impl CudarcUnifiedBuffer {
         // ensures the primary context is current on this thread.
         // cudarc 0.13.x exposes CUDA driver functions as methods on a Lib
         // struct, accessed via cudarc::driver::sys::lib(). Free-function
-        // imports like cust uses are not available; CudaDevice::new above
-        // primed the OnceLock so this lib() call cannot panic.
+        // imports like cust uses are not available; `device_for(ordinal)`
+        // above (T26 per-ordinal cache) ran `CudaDevice::new` which primed
+        // the driver lib, so this `lib()` call cannot panic.
         let res = unsafe {
             cuda_sys::lib().cuMemAllocManaged(
                 &mut raw as *mut cuda_sys::CUdeviceptr,
@@ -594,5 +635,30 @@ mod tests {
         assert_eq!(b.len(), 64);
         b.as_mut_slice().copy_from_slice(&[0xAB; 64]);
         assert!(b.as_slice().iter().all(|&v| v == 0xAB));
+    }
+
+    /// Audit T26: two `device_for(0)` calls must return clones of the same
+    /// underlying `Arc<CudaDevice>`. Pointer equality on the inner
+    /// `CudaDevice` payload proves the cache is wired and no transient
+    /// holder ever owned the last `Arc` strong-count.
+    ///
+    /// Gated `#[ignore]` because the cache lookup itself unavoidably calls
+    /// `CudaDevice::new` on first miss, which `dlopen`s `libcuda` — that
+    /// is not available on host-only CI. A host with a CUDA driver runs
+    /// this test under `cargo test --features cudarc-backend -- --ignored`.
+    #[test]
+    #[ignore = "requires CUDA hardware"]
+    fn device_cache_returns_same_arc_for_same_ordinal() {
+        let a = device_for(0).expect("first device_for(0)");
+        let b = device_for(0).expect("second device_for(0)");
+        // `Arc::as_ptr` returns the address of the shared payload — equal
+        // iff `a` and `b` clone the same `Arc`.
+        assert_eq!(
+            Arc::as_ptr(&a),
+            Arc::as_ptr(&b),
+            "device_for(0) must return clones of the cached Arc — \
+             a fresh `CudaDevice::new` on every call would re-arm the \
+             failed-construction race the T26 cache exists to close"
+        );
     }
 }
