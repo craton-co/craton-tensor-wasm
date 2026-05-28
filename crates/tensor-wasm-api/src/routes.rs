@@ -1387,11 +1387,10 @@ fn accept_wants_sse(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .map(|s| {
+        .is_some_and(|s| {
             s.split(',')
                 .any(|part| part.trim().to_ascii_lowercase().starts_with(SSE_MIME))
         })
-        .unwrap_or(false)
 }
 
 /// Channel buffer size for the gateway-side

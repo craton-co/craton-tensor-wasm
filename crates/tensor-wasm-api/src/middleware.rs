@@ -216,7 +216,7 @@ impl TrustedHosts {
             return true;
         }
         let host_lc = host.trim().to_ascii_lowercase();
-        if self.0.iter().any(|allowed| allowed == &host_lc) {
+        if self.0.contains(&host_lc) {
             return true;
         }
         // Default-port strip: only apply when no allowlist entry carries
@@ -510,7 +510,7 @@ pub fn cors_layer(cfg: &CorsConfig) -> CorsLayer {
     // Cover every method the gateway routes use: `GET` (healthz, metrics,
     // job poll), `POST` (deploy, invoke, invoke-async), and `DELETE`
     // (function tear-down).
-    let allowed_methods = vec![Method::GET, Method::POST, Method::DELETE];
+    let allowed_methods = [Method::GET, Method::POST, Method::DELETE];
     let base = CorsLayer::new()
         .allow_methods(allowed_methods)
         .allow_headers(
@@ -679,9 +679,7 @@ pub struct TenantConfig {
 impl TenantConfig {
     /// Load policy from `$TENSOR_WASM_API_REQUIRE_TENANT` (`"1"` = required).
     pub fn from_env() -> Self {
-        let require_header = std::env::var(ENV_REQUIRE_TENANT)
-            .map(|v| v.trim() == "1")
-            .unwrap_or(false);
+        let require_header = std::env::var(ENV_REQUIRE_TENANT).is_ok_and(|v| v.trim() == "1");
         Self { require_header }
     }
 }

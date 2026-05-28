@@ -579,10 +579,7 @@ async fn run_buffered(
         let cfg = SpawnConfig::for_tenant(tenant)
             .with_deadline(OPENAI_INVOKE_DEADLINE)
             .with_streaming(streaming);
-        let instance_id = match executor.spawn_instance(cfg, &wasm_bytes).await {
-            Ok(id) => id,
-            Err(e) => return Err(e),
-        };
+        let instance_id = executor.spawn_instance(cfg, &wasm_bytes).await?;
         executor
             .call_export_with_args_then_terminate(instance_id, "_start", &args)
             .await
@@ -993,7 +990,7 @@ mod tests {
             inner.get("type").and_then(|x| x.as_str()),
             Some("not_implemented"),
         );
-        assert!(inner.get("param").map(|x| x.is_null()).unwrap_or(false));
+        assert!(inner.get("param").is_some_and(|x| x.is_null()));
         assert_eq!(
             inner.get("code").and_then(|x| x.as_str()),
             Some("openai_not_yet_wired"),

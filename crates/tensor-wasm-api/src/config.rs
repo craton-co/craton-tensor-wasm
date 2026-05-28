@@ -384,12 +384,12 @@ mod tests {
 
     #[test]
     fn parse_bool_accepts_case_insensitive() {
-        assert_eq!(parse_bool("true").unwrap(), true);
-        assert_eq!(parse_bool("TRUE").unwrap(), true);
-        assert_eq!(parse_bool("True").unwrap(), true);
-        assert_eq!(parse_bool("false").unwrap(), false);
-        assert_eq!(parse_bool("FALSE").unwrap(), false);
-        assert_eq!(parse_bool("").unwrap(), false);
+        assert!(parse_bool("true").unwrap());
+        assert!(parse_bool("TRUE").unwrap());
+        assert!(parse_bool("True").unwrap());
+        assert!(!parse_bool("false").unwrap());
+        assert!(!parse_bool("FALSE").unwrap());
+        assert!(!parse_bool("").unwrap());
     }
 
     #[test]

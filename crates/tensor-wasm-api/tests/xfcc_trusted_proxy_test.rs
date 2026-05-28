@@ -162,7 +162,7 @@ async fn xfcc_from_untrusted_peer_is_dropped() {
     // never reaches the audit stream.
     let subj = v.get("client_cert_subject");
     assert!(
-        subj.map(Value::is_null).unwrap_or(true),
+        subj.is_none_or(Value::is_null),
         "untrusted peer's XFCC must be dropped; got {subj:?}",
     );
 }

@@ -579,8 +579,8 @@ impl RateLimiter {
             .as_deref_mut()
             .map(|s| refill_and_decide(s, token_burst, token_qps, now));
 
-        let per_tenant_admit = per_tenant_decision.as_ref().map_or(true, |d| d.admittable);
-        let token_admit = token_decision.as_ref().map_or(true, |d| d.admittable);
+        let per_tenant_admit = per_tenant_decision.as_ref().is_none_or(|d| d.admittable);
+        let token_admit = token_decision.as_ref().is_none_or(|d| d.admittable);
 
         if per_tenant_admit && token_admit {
             if let Some(state) = per_tenant_guard.as_deref_mut() {
