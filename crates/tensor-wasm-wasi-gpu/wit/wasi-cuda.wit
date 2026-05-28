@@ -86,7 +86,6 @@ interface host {
   /// Exceeding any cap returns `quota-exceeded`.
   load-ptx: func(ptx: list<u8>, entry: string) -> result<kernel-id, abi-error>;
 
-<<<<<<< HEAD
   /// Launch a previously-loaded kernel.
   ///
   /// Grid and block dimensions must be positive and obey the hardware

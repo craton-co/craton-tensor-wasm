@@ -241,6 +241,46 @@ mod tests {
         );
     }
 
+    /// Guard against stray git merge-conflict markers in the in-crate WIT
+    /// contract.
+    ///
+    /// `wit/wasi-cuda.wit` ships inside the published crate tarball and is
+    /// consumed verbatim by external `wit-bindgen` users — any leftover
+    /// `<<<<<<<` / `=======` / `>>>>>>>` line will break those downstream
+    /// builds long before this crate's own host tests notice. The original
+    /// `module_version_matches_wit_package_decl` test only inspects the
+    /// `package` line, so a marker further down the file slips through.
+    ///
+    /// We use byte-pattern substrings rather than full marker strings (e.g.
+    /// `"<<<<<<< HEAD"`) so the test catches markers regardless of which
+    /// branch label git chose. The markers themselves are constructed via
+    /// `str::repeat` so this test file is safe to include in any future
+    /// merge — the literal source here never contains seven of any conflict
+    /// character in a row.
+    #[test]
+    fn wit_file_has_no_merge_conflict_markers() {
+        const WIT: &str = include_str!("../wit/wasi-cuda.wit");
+        let ours = "<".repeat(7);
+        let sep = "=".repeat(7);
+        let theirs = ">".repeat(7);
+        for (label, marker) in [
+            ("ours (<<<<<<<)", ours.as_str()),
+            ("separator (=======)", sep.as_str()),
+            ("theirs (>>>>>>>)", theirs.as_str()),
+        ] {
+            for (lineno, line) in WIT.lines().enumerate() {
+                assert!(
+                    !line.contains(marker),
+                    "wit/wasi-cuda.wit contains an unresolved git merge \
+                     conflict marker {label} on line {} — resolve it before \
+                     publishing or downstream `wit-bindgen` consumers will \
+                     fail to parse the contract. Offending line: {line:?}",
+                    lineno + 1,
+                );
+            }
+        }
+    }
+
     #[test]
     fn dimension_caps_are_plausible() {
         // Defensive sanity checks — bumping these accidentally would let
