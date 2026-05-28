@@ -1,12 +1,13 @@
 {
-  "openapi": "3.0.3",
+  "_comment": "Generated from openapi/tensor-wasm-api.yaml. Do NOT edit by hand -- edit the YAML and re-export this JSON (see scripts/regen-openapi-json.{sh,ps1}). The openapi_json_yaml_sync regression test enforces path-key parity at CI time.",
+  "openapi": "3.1.0",
   "info": {
     "title": "TensorWasm HTTP API",
-    "description": "REST surface of a Craton TensorWasm serverless Wasm node. Prose documentation, error semantics, and the full middleware stack live in crates/tensor-wasm-api/API.md. NOTE: This file is a hand-ported 3.0 mirror of the canonical 3.1 spec at openapi/tensor-wasm-api.yaml and is kept for tooling that does not yet parse 3.1.",
-    "version": "0.3.5",
+    "description": "REST surface of a Craton TensorWasm serverless Wasm node. Prose documentation, error semantics, and the full middleware stack live in crates/tensor-wasm-api/API.md.\n",
+    "version": "0.1.0",
     "license": {
       "name": "Apache-2.0",
-      "url": "https://www.apache.org/licenses/LICENSE-2.0"
+      "identifier": "Apache-2.0"
     },
     "contact": {
       "name": "Craton Software Company",
@@ -17,7 +18,9 @@
   "servers": [
     { "url": "http://localhost:8080", "description": "Local development server" }
   ],
-  "security": [{ "BearerAuth": [] }],
+  "security": [
+    { "BearerAuth": [] }
+  ],
   "tags": [
     { "name": "lifecycle", "description": "Function deploy / delete" },
     { "name": "invoke", "description": "Synchronous and asynchronous invocations" },
@@ -60,7 +63,9 @@
               "X-Trace-Id": { "$ref": "#/components/headers/XTraceId" }
             },
             "content": {
-              "text/plain": { "schema": { "type": "string" } }
+              "text/plain": {
+                "schema": { "type": "string" }
+              }
             }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },
@@ -208,6 +213,66 @@
         }
       }
     },
+    "/functions/{id}/invoke-stream": {
+      "post": {
+        "tags": ["invoke"],
+        "summary": "Invoke a function and stream the response (SSE or chunked).",
+        "description": "Streaming counterpart of `/functions/{id}/invoke`. The response\nshape is selected from the request's `Accept` header:\n\n* `Accept: text/event-stream` -- Server-Sent Events. Each chunk\n  the guest emits via the `wasi:tensor/host.emit-chunk` host\n  function is rendered as one `data:` line. Stream terminates\n  with an `event: end` frame.\n* Otherwise -- `Content-Type: application/octet-stream`,\n  `Transfer-Encoding: chunked`. Each guest chunk is forwarded\n  verbatim as one HTTP chunk frame.\n\n### v0.3.7 scaffold\n\nThe route is mounted and stable in v0.3.7 but does not yet\ndrive the executor through a streaming invocation path. The\nscaffold returns a single `event: scaffold` frame with\n`{\"status\":\"not_yet_wired\"}` then closes the stream. Mid-\nexecution streaming wiring lands in v0.4 alongside the\n`tensor_wasm_wasi_gpu::StreamingContext` hookup on\n`InstanceState`. The wire shape (URL, method, response\nframing, status codes) will not change between v0.3.7 and\nv0.4 -- see `docs/STREAMING.md`.\n",
+        "operationId": "invokeFunctionStream",
+        "parameters": [
+          { "$ref": "#/components/parameters/FunctionId" },
+          { "$ref": "#/components/parameters/TenantHeader" },
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": false,
+            "description": "Set to `text/event-stream` to receive SSE framing. Any\nother value (or absence) selects the\n`application/octet-stream` chunked-transfer branch.\n",
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "Arbitrary JSON payload, same shape as the synchronous\ninvoke endpoint. The v0.x executor ignores the value.\n"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Streaming response. The body framing depends on the\nnegotiated content type -- see the operation summary.\n",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/XRequestId" },
+              "X-Trace-Id": { "$ref": "#/components/headers/XTraceId" }
+            },
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "Server-Sent Events stream. Each emitted chunk is\none `data:` frame; the stream ends with an\n`event: end` frame.\n"
+                }
+              },
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary",
+                  "description": "Raw chunked-transfer bytes -- one HTTP chunk per\nguest-emitted chunk.\n"
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
     "/jobs/{id}": {
       "get": {
         "tags": ["jobs"],
@@ -246,7 +311,7 @@
       "BearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Bearer token from the TENSOR_WASM_API_TOKENS allowlist. Each entry may carry a `:tenant=...` clause restricting the token to a subset of tenants; see API.md `Per-tenant scopes`. An empty allowlist puts the gateway in dev mode (auth disabled)."
+        "description": "Bearer token from the TENSOR_WASM_API_TOKENS allowlist. Each\nentry may carry a `:tenant=...` clause restricting the token to\na subset of tenants; see API.md `Per-tenant scopes`. An empty\nallowlist puts the gateway in dev mode (auth disabled).\n"
       }
     },
     "parameters": {
@@ -261,21 +326,21 @@
         "name": "X-TensorWasm-Tenant",
         "in": "header",
         "required": false,
-        "description": "Tenant scope (u64). Defaults to 0 if absent. Mandatory when the gateway runs with `TENSOR_WASM_API_REQUIRE_TENANT=1`.",
+        "description": "Tenant scope (u64). Defaults to 0 if absent. Mandatory when the\ngateway runs with `TENSOR_WASM_API_REQUIRE_TENANT=1`.\n",
         "schema": { "type": "integer", "format": "int64", "minimum": 0 }
       }
     },
     "headers": {
       "XRequestId": {
-        "description": "Per-request UUID stamped by the audit middleware. Operators can correlate audit records, structured logs, and trace events by this id.",
+        "description": "Per-request UUID stamped by the audit middleware. Operators can\ncorrelate audit records, structured logs, and trace events by\nthis id.\n",
         "schema": { "type": "string", "format": "uuid" }
       },
       "XTraceId": {
-        "description": "W3C `trace-id` (32 lowercase hex chars) of the current span. Empty string if no trace context is active.",
+        "description": "W3C `trace-id` (32 lowercase hex chars) of the current span.\nEmpty string if no trace context is active.\n",
         "schema": { "type": "string" }
       },
       "RetryAfter": {
-        "description": "Per RFC 9110 §10.2.3, integer seconds until the next request is likely to succeed. Always at least 1.",
+        "description": "Per RFC 9110 §10.2.3, integer seconds until the next request is\nlikely to succeed. Always at least 1.\n",
         "schema": { "type": "integer", "minimum": 1 }
       }
     },
@@ -329,14 +394,14 @@
         }
       },
       "PayloadTooLarge": {
-        "description": "Request body exceeded the 64 MiB cap enforced by `RequestBodyLimitLayer`. Often rendered as a bare 413 with no body when the limit is hit during streaming.",
+        "description": "Request body exceeded the 64 MiB cap enforced by axum's\n`DefaultBodyLimit::max`. Often rendered as a bare 413 with no\nbody when the limit is hit during streaming.\n",
         "headers": {
           "X-Request-Id": { "$ref": "#/components/headers/XRequestId" },
           "X-Trace-Id": { "$ref": "#/components/headers/XTraceId" }
         }
       },
       "RateLimited": {
-        "description": "Per-token QPS + burst exceeded. The `Retry-After` header carries the wait in integer seconds (RFC 9110 §10.2.3).",
+        "description": "Per-token QPS + burst exceeded. The `Retry-After` header carries\nthe wait in integer seconds (RFC 9110 §10.2.3).\n",
         "headers": {
           "X-Request-Id": { "$ref": "#/components/headers/XRequestId" },
           "X-Trace-Id": { "$ref": "#/components/headers/XTraceId" },
@@ -394,7 +459,7 @@
       },
       "CreateFunctionRequest": {
         "type": "object",
-        "description": "Body of `POST /functions`. Mirrors the `tensor_wasm_api::routes::CreateFunctionRequest` Rust struct.",
+        "description": "Body of `POST /functions`. Mirrors the\n`tensor_wasm_api::routes::CreateFunctionRequest` Rust struct.\n",
         "properties": {
           "name": {
             "type": "string",
@@ -404,7 +469,7 @@
           "wasm_b64": {
             "type": "string",
             "minLength": 12,
-            "description": "Base64-encoded Wasm module bytes (standard alphabet, padded). Decoded value must validate as a complete Wasm module via `wasmparser::validate`."
+            "description": "Base64-encoded Wasm module bytes (standard alphabet,\npadded). Decoded value must validate as a complete Wasm\nmodule via `wasmparser::validate`.\n"
           }
         },
         "required": ["name", "wasm_b64"],
@@ -420,23 +485,23 @@
       },
       "InvokeRequest": {
         "type": "object",
-        "description": "Body of POST /functions/{id}/invoke (and the async sibling). Both fields are optional — an empty body or `{}` is the canonical no-args case, matching the pre-args wire contract. Unknown top-level fields are ignored for forward compatibility; malformed JSON surfaces as 400 invalid_json.",
+        "description": "Body of POST /functions/{id}/invoke (and the async sibling).\nBoth fields are optional -- an empty body or `{}` is the canonical\nno-args case, matching the pre-args wire contract. Unknown\ntop-level fields are ignored for forward compatibility; malformed\nJSON surfaces as 400 invalid_json.\n",
         "properties": {
           "export": {
             "type": "string",
             "nullable": true,
-            "description": "Optional export-name override. When omitted (or null), the server tries `_start` first and falls back to `main`, matching the WASI command convention."
+            "description": "Optional export-name override. When omitted (or null), the\nserver tries `_start` first and falls back to `main`, matching\nthe WASI command convention.\n"
           },
           "args": {
             "type": "array",
-            "description": "Argument list forwarded to the executor's `call_export_with_args` path. Each element is converted to the closest-fitting wasm value type: integers in [-2^31, 2^31) become i32, larger integers become i64, non-integer numerics become f64. Strings / arrays / null / booleans are rejected as 400 invalid_args. f32 cannot be selected from JSON unambiguously — write a guest wrapper that demotes from f64 if you need it.",
+            "default": [],
+            "description": "Argument list forwarded to the executor's `call_export_with_args`\npath. Each element is converted to the closest-fitting wasm value\ntype: integers in [-2^31, 2^31) become i32, larger integers become\ni64, non-integer numerics become f64. Strings / arrays / null /\nbooleans are rejected as 400 invalid_args. f32 cannot be selected\nfrom JSON unambiguously -- write a guest wrapper that demotes from\nf64 if you need it.\n",
             "items": {
               "oneOf": [
                 { "type": "integer", "format": "int64" },
                 { "type": "number", "format": "double" }
               ]
-            },
-            "default": []
+            }
           }
         },
         "additionalProperties": false
@@ -446,7 +511,7 @@
         "properties": {
           "function_id": { "$ref": "#/components/schemas/FunctionId" },
           "result": {
-            "description": "Invocation result. For exports returning `()` this collapses to the literal string `\"ok\"` (legacy back-compat envelope). For exports with a non-empty result list this is a JSON array of return values — one element per wasm result slot, with i32/i64 rendered as JSON integers and f32/f64 as JSON numbers."
+            "description": "Invocation result. For exports returning `()` this collapses\nto the literal string `\"ok\"` (legacy back-compat envelope).\nFor exports with a non-empty result list this is a JSON\narray of return values -- one element per wasm result slot,\nwith i32/i64 rendered as JSON integers and f32/f64 as JSON\nnumbers.\n"
           }
         },
         "required": ["function_id", "result"],
@@ -463,7 +528,7 @@
       "JobStatus": {
         "type": "string",
         "enum": ["pending", "completed", "failed"],
-        "description": "Lifecycle state of an async invocation. `pending` jobs have no result yet; `completed` and `failed` jobs carry a `result` payload (the InvokeResult shape and the ApiErrorBody shape, respectively)."
+        "description": "Lifecycle state of an async invocation. `pending` jobs have no\nresult yet; `completed` and `failed` jobs carry a `result`\npayload (the InvokeResult shape and the ApiErrorBody shape,\nrespectively).\n"
       },
       "JobRecord": {
         "type": "object",
@@ -472,7 +537,7 @@
           "function_id": { "$ref": "#/components/schemas/FunctionId" },
           "status": { "$ref": "#/components/schemas/JobStatus" },
           "result": {
-            "description": "Present once `status` transitions out of `pending`. For `completed` jobs this is the InvokeResult JSON object; for `failed` jobs it is the ApiErrorBody JSON object."
+            "description": "Present once `status` transitions out of `pending`. For\n`completed` jobs this is the InvokeResult JSON object;\nfor `failed` jobs it is the ApiErrorBody JSON object.\n"
           },
           "created_unix_ms": { "type": "integer", "format": "int64", "minimum": 0 }
         },
