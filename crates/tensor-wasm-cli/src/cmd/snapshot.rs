@@ -312,18 +312,26 @@ async fn save(
         }
     }
     let parent = output.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+    let tmp = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("creating tempfile in {}", parent.display()))?;
+    // perf T24: wrap the tempfile in a BufWriter so each ~16-64 KiB chunk
+    // delivered by `bytes_stream()` doesn't translate into a syscall. At a
+    // 64 KiB buffer the syscall count drops ~4-16x for a 256 MiB cap. The
+    // cap accounting below still uses `chunk.len()` (the bytes we *accepted*
+    // for writing), which is unchanged — the BufWriter only batches the
+    // actual `write(2)` calls; it does not alter how many bytes flow
+    // through it.
     let mut received: u64 = 0;
     use futures::StreamExt;
-    use std::io::Write;
+    use std::io::{BufWriter, Write};
+    let mut writer = BufWriter::with_capacity(64 * 1024, tmp);
     let mut stream = resp.bytes_stream();
     while let Some(chunk_res) = stream.next().await {
         let chunk = chunk_res
             .with_context(|| format!("streaming snapshot body from {url}"))?;
         received = received.saturating_add(chunk.len() as u64);
         if received > cap {
-            drop(tmp); // discard the temp file
+            drop(writer); // discard the temp file (BufWriter drops the inner NamedTempFile)
             return Err(anyhow::anyhow!(
                 "server streamed > {} bytes; refusing to write more than {} bytes to disk \
                  (lower with --max-restore-bytes; the hard ceiling is {} bytes)",
@@ -332,9 +340,25 @@ async fn save(
                 MAX_RESTORE_BYTES_CEILING
             ));
         }
-        tmp.write_all(&chunk)
+        writer
+            .write_all(&chunk)
             .with_context(|| format!("writing snapshot chunk to tempfile"))?;
     }
+    // Critical: flush the BufWriter before unwrapping so any buffered tail
+    // bytes hit the tempfile. We then call `into_inner()` to recover the
+    // NamedTempFile for `persist`. `into_inner` itself also flushes, so we
+    // surface either flush error via the same anyhow path — never unwrap.
+    writer
+        .flush()
+        .with_context(|| "flushing snapshot tempfile buffer".to_string())?;
+    let tmp = writer.into_inner().map_err(|e| {
+        // `IntoInnerError::into_error()` consumes the wrapper and yields the
+        // underlying `io::Error` from the implicit flush — surface it to the
+        // caller so a disk-full or perms problem doesn't silently corrupt
+        // the persisted snapshot.
+        anyhow::Error::new(e.into_error())
+            .context("flushing snapshot tempfile buffer on close")
+    })?;
     tmp.persist(output)
         .map_err(|e| anyhow::anyhow!("renaming tempfile to {}: {}", output.display(), e))?;
 
