@@ -408,6 +408,46 @@ v1.x, nightly bumps that don't break user code are patch releases.
 
 ---
 
+## Post-v0.3.6 strategic features
+
+These are scoped items the v0.3.6 → v0.5 window opens up. None of them
+block v0.5-beta exit on their own, but each closes a specific
+"audit-bait" objection the external auditor is likely to raise. Items
+are listed in expected scaffold-land order; the cross-link points at
+the in-tree spec doc where the scaffold landed first.
+
+1. **Kernel ABI freeze + versioning policy** — stable `.ptxbin`
+   container with explicit ABI version byte; covered by the cache
+   integrity tests today, formalised post-v0.3.6.
+2. **Snapshot replay-protection cross-version matrix** — v0.3.6
+   landed the per-snapshot nonce + tenant-scoped epoch fields. v0.4
+   adds the end-to-end matrix that exercises the policy across
+   N-1 / N / N+1 minor versions.
+3. **Tenant-quota fairness model formalisation** — the back-pressure
+   semaphore is the current implementation; the formalised model
+   (proportional-share or weighted fair queueing) lands as an RFC.
+4. **MPS production-readiness checklist** — the feature flag exists;
+   the checklist that says "ship MPS as default at v1.0 or stay
+   behind the flag" lands here.
+5. **WASI-GPU surface lock** — freeze the host-fn signatures so
+   third-party guests can ship against v0.5-beta without breakage.
+6. **Differential JIT correctness oracle** — runs every
+   `auto_offload` candidate on both the Wasmtime CPU interpreter and
+   the JIT PTX path and asserts bit-identity. Lowest-cost,
+   highest-credibility security item on the v0.5 pre-audit
+   checklist. Scaffold lives in
+   [`crates/tensor-wasm-jit/src/differential.rs`](../crates/tensor-wasm-jit/src/differential.rs);
+   spec doc at [`docs/DIFFERENTIAL-ORACLE.md`](DIFFERENTIAL-ORACLE.md).
+7. **Reproducible-build attestation** — SLSA Level 3 ambition;
+   pre-staged by [`docs/REPRODUCIBLE-BUILDS.md`](REPRODUCIBLE-BUILDS.md)
+   and the W4.3 SBOM workflow.
+
+Items 1-5 and 7 are tracked elsewhere in this document or in their own
+spec docs; item 6 is new in v0.3.6 and is cross-linked from
+[`docs/DIFFERENTIAL-ORACLE.md`](DIFFERENTIAL-ORACLE.md).
+
+---
+
 ## Risk register
 
 Risks that could push v1.0 right or force a milestone re-cut.

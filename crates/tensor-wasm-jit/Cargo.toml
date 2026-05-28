@@ -122,6 +122,14 @@ pliron-llvm-backend = ["cuda-oxide-backend", "dep:pliron-llvm"]
 # `required-features` block below. No extra dependencies.
 test-utils = []
 
+# differential-oracle gates the `differential` module — the roadmap
+# feature #6 ("differential JIT correctness oracle") scaffold. v0.3.6
+# only compiles the harness types; the v0.4 wiring against the
+# self-hosted CUDA runner brings the real two-path runner. See
+# `docs/DIFFERENTIAL-ORACLE.md` for the implementation plan and the
+# Post-v0.3.6 strategic features section in `docs/PATH-TO-V1.md`.
+differential-oracle = []
+
 # Integration test that uses fixtures from `lowering_test_support`. We
 # pin the feature set here so the test only runs when both
 # `cuda-oxide-backend` (which gates all wave-2 lowering modules) AND
@@ -133,6 +141,7 @@ test-utils = []
 name = "lowering_e2e"
 path = "tests/lowering_e2e.rs"
 required-features = ["cuda-oxide-backend", "test-utils"]
+>>>>>>> worktree-agent-aedf8067409d5a3dd
 
 [package.metadata.docs.rs]
 all-features = true

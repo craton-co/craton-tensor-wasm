@@ -25,6 +25,15 @@ pub mod ir;
 pub mod ptx_emit;
 pub mod rewrite;
 
+// Differential JIT correctness oracle (roadmap feature #6). The
+// scaffold lives behind its own feature flag because v0.4 will wire it
+// against the self-hosted CUDA runner; the default host build does not
+// need to compile the harness. The module is also compiled under
+// `cfg(test)` so in-crate unit tests can reach it without flipping
+// the feature.
+#[cfg(any(test, feature = "differential-oracle"))]
+pub mod differential;
+
 #[doc(hidden)]
 #[cfg(feature = "cuda-oxide-backend")]
 pub mod pliron_dialect;
