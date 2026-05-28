@@ -78,6 +78,59 @@ pub const ENV_REQUIRE_TENANT: &str = "TENSOR_WASM_API_REQUIRE_TENANT";
 /// Name of the header used to scope a request to a tenant.
 pub const HEADER_TENANT: &str = "X-TensorWasm-Tenant";
 
+/// Environment variable that, when set, restricts the set of `Host` header
+/// values the server will accept. Comma-separated list of authority strings
+/// (e.g. `api.example.com,api2.example.com:8443`). Unset = accept any
+/// `Host`, which is the previous behaviour but is unsafe behind a layered
+/// proxy that may pass arbitrary `Host` values through.
+///
+/// Closes api S-30 (lack of Host validation). The check rejects requests
+/// whose `Host` is not in the allowlist with `400 Bad Request`.
+pub const ENV_TRUSTED_HOSTS: &str = "TENSOR_WASM_API_TRUSTED_HOSTS";
+
+/// Snapshot of the trusted-hosts allowlist parsed from
+/// [`ENV_TRUSTED_HOSTS`]. Empty (default) = accept any host.
+fn trusted_hosts() -> Vec<String> {
+    static ONCE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| match std::env::var(ENV_TRUSTED_HOSTS) {
+        Ok(raw) => raw
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    })
+    .clone()
+}
+
+/// Middleware: reject requests whose `Host` header is not in the
+/// [`ENV_TRUSTED_HOSTS`] allowlist. No-op when the allowlist is empty.
+///
+/// Closes api S-30. Should be layered AFTER trace/CORS (so the response is
+/// still observable) but BEFORE bearer_auth (so an attacker probing for
+/// valid hosts cannot also probe for valid tokens). The probe router
+/// inherits this gate too; operators with split-Host probes can simply
+/// omit the env var.
+pub async fn host_validate(req: Request, next: Next) -> Response {
+    let allow = trusted_hosts();
+    if allow.is_empty() {
+        return next.run(req).await;
+    }
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_ascii_lowercase());
+    match host {
+        Some(h) if allow.iter().any(|allowed| allowed == &h) => next.run(req).await,
+        _ => envelope(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "Host header missing or not in TENSOR_WASM_API_TRUSTED_HOSTS allowlist",
+        ),
+    }
+}
+
 /// Build a per-request timeout layer.
 ///
 /// Requests that exceed `d` are aborted with `408 Request Timeout`.

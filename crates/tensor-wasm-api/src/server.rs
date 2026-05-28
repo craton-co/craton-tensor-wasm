@@ -14,8 +14,8 @@ use tower::ServiceBuilder;
 use crate::audit::{audit_log_middleware, AuditConfig};
 use crate::http_metrics::{http_metrics_middleware, HttpMetricsLayerConfig, RouteAllowList};
 use crate::middleware::{
-    bearer_auth, body_limit_layer, concurrency_limit_layer, cors_layer, tenant_scope,
-    INVOKE_CONCURRENCY_LIMIT, PROBE_CONCURRENCY_LIMIT, READ_CONCURRENCY_LIMIT,
+    bearer_auth, body_limit_layer, concurrency_limit_layer, cors_layer, host_validate,
+    tenant_scope, INVOKE_CONCURRENCY_LIMIT, PROBE_CONCURRENCY_LIMIT, READ_CONCURRENCY_LIMIT,
     WRITE_CONCURRENCY_LIMIT,
     timeout_layer, trace_layer_with_propagation, AuthConfig, CorsConfig, TenantConfig,
     MAX_REQUEST_BODY_BYTES,
@@ -164,6 +164,12 @@ pub fn build_router_with_audit(
         // `API.md`: `Authorization`, `Content-Type`, `X-TensorWasm-Tenant`,
         // and `Traceparent`; methods `GET`, `POST`, `DELETE`.
         .layer(cors_layer(&cors))
+        // api S-30: reject requests whose Host header isn't in the
+        // operator-configured allowlist (TENSOR_WASM_API_TRUSTED_HOSTS).
+        // Default (env unset) is permissive — the previous behaviour —
+        // because most local-dev deployments don't set the env var.
+        // Production behind a layered proxy should set the allowlist.
+        .layer(axum::middleware::from_fn(host_validate))
         .layer(body_limit_layer(MAX_REQUEST_BODY_BYTES))
         .layer(timeout_layer(Duration::from_secs(30)))
         // NOTE (api S-26): the global ConcurrencyLimit(64) is removed.
