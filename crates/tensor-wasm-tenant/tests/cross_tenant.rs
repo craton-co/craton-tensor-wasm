@@ -28,7 +28,7 @@ fn make_ctx(id: u64, quota: u64) -> TenantContext {
 
 #[test]
 fn distinct_tenants_have_independent_quotas() {
-    let reg = TenantRegistry::new();
+    let (reg, _cap) = TenantRegistry::new();
     let a: Arc<TenantContext> = reg.register(make_ctx(1, 4096)).unwrap();
     let b: Arc<TenantContext> = reg.register(make_ctx(2, 8192)).unwrap();
 
