@@ -72,10 +72,22 @@ pub const MAX_FUNCTION_NAME_BYTES: usize = 256;
 /// API never echoes raw module bytes back to callers. The storage type is
 /// `Arc<[u8]>` so concurrent invocations share a single allocation rather
 /// than cloning the bytes on every spawn.
+///
+/// `tenant_id` records the owning tenant of the record as resolved at deploy
+/// time from the `X-TensorWasm-Tenant` extension. The invoke / delete handlers
+/// gate every operation on it: a caller addressing tenant *B* (via either the
+/// bearer-token scope or the request header) may not touch a record whose
+/// `tenant_id` is *A*, even if both checks would otherwise pass against the
+/// caller's scope. See B1.9 follow-up: this closes the cross-tenant
+/// authz hole where wildcard-scoped tokens from a different tenant could
+/// invoke or delete another tenant's function.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionRecord {
     /// Server-assigned identifier.
     pub id: Uuid,
+    /// Owning tenant, set at deploy time. Used by invoke / delete to gate
+    /// cross-tenant access — see struct-level doc.
+    pub tenant_id: TenantId,
     /// Tenant-supplied display name.
     pub name: String,
     /// Decoded Wasm bytes, refcounted. Not serialised — see struct-level doc.
@@ -543,15 +555,40 @@ async fn decode_wasm_b64(wasm_b64: String) -> Result<Vec<u8>, ApiError> {
 /// Decodes the supplied base64, runs full `wasmparser` validation, and stores
 /// the bytes refcounted via `Arc<[u8]>` so concurrent invocations do not
 /// reallocate. Returns `400 invalid_wasm` if validation fails.
+///
+/// The bound tenant is sourced from the `X-TensorWasm-Tenant` middleware
+/// extension (defaulting to `TenantId(0)` if absent) and authorised against
+/// the caller's bearer scope via [`AuthContext::authorize_tenant`] BEFORE the
+/// record is inserted. Returns `403 tenant_scope_denied` when the caller's
+/// scope does not cover the bound tenant — closes B1.9 hole where a
+/// tenant-scoped token could deploy under a different tenant via the header.
+/// The resolved [`TenantId`] is also written to the new record so subsequent
+/// invoke / delete operations can gate on the resource owner.
 #[tracing::instrument(
     name = "http.create_function",
-    skip(state, payload),
-    fields(function_id = tracing::field::Empty),
+    skip(state, payload, auth),
+    fields(
+        function_id = tracing::field::Empty,
+        tenant = tracing::field::Empty,
+    ),
 )]
 pub async fn create_function(
     State(state): State<Arc<AppState>>,
+    tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<crate::rate_limit::AuthContext>>,
     payload: Result<Json<CreateFunctionRequest>, JsonRejection>,
 ) -> ApiResult<Json<CreateFunctionResponse>> {
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    tracing::Span::current().record("tenant", tracing::field::display(tenant));
+    // Tenant-scope check: reject before doing any per-tenant work (base64
+    // decode, wasm validation, in-memory insertion). Absent AuthContext only
+    // happens in configurations that bypass `bearer_auth` entirely (e.g.
+    // ad-hoc test routers); we degrade to dev-mode wildcard there. Same
+    // pattern as `invoke_function` below.
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        ctx.authorize_tenant(tenant)?;
+    }
+
     let Json(req) = payload?;
     validate_function_name(&req.name)?;
     let bytes = decode_wasm_b64(req.wasm_b64).await?;
@@ -592,6 +629,7 @@ pub async fn create_function(
         id,
         FunctionRecord {
             id,
+            tenant_id: tenant,
             name: req.name,
             wasm_bytes: Arc::from(bytes),
             created_unix_ms: now_unix_ms(),
@@ -603,12 +641,59 @@ pub async fn create_function(
 /// `DELETE /functions/{id}` — remove a deployed function.
 ///
 /// Returns `204 No Content` on success and `404 Not Found` if the id is
-/// unknown.
-#[tracing::instrument(name = "http.delete_function", skip(state), fields(function_id = %id))]
+/// unknown. Performs a two-layer authorization check (B1.9 follow-up:
+/// closes the cross-tenant delete hole):
+///
+/// 1. **Token-scope layer.** The caller's bearer-token scope must cover the
+///    tenant supplied in `X-TensorWasm-Tenant`, enforced by
+///    [`AuthContext::authorize_tenant`] before the registry is consulted.
+///    Returns `403 tenant_scope_denied`.
+/// 2. **Resource layer.** Even if the caller has a wildcard scope, the
+///    function's stored `tenant_id` must equal the request's bound tenant.
+///    Otherwise tenant *B* with a wildcard token could delete tenant *A*'s
+///    record by passing `X-TensorWasm-Tenant: B`. Mismatch yields
+///    `403 tenant_scope_denied` with a distinct message; same envelope
+///    shape as `get_job`'s analogue from the B1.9 fix.
+#[tracing::instrument(
+    name = "http.delete_function",
+    skip(state, auth),
+    fields(
+        function_id = %id,
+        tenant = tracing::field::Empty,
+    ),
+)]
 pub async fn delete_function(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
+    tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<crate::rate_limit::AuthContext>>,
 ) -> ApiResult<StatusCode> {
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    tracing::Span::current().record("tenant", tracing::field::display(tenant));
+    // Token-scope layer: rejected before any registry lookup so a caller
+    // outside scope cannot probe id existence via the `404 vs 403` split.
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        ctx.authorize_tenant(tenant)?;
+    }
+
+    // Resource layer: look up under the shard lock, verify the record's
+    // tenant matches, then `remove`. We do the lookup first (rather than
+    // `remove` + reinsert on mismatch) so a 403 never has a side effect on
+    // the registry.
+    let owner = match state.functions.get(&id) {
+        Some(entry) => entry.value().tenant_id,
+        None => return Err(ApiError::not_found(format!("function {id} not found"))),
+    };
+    if owner != tenant {
+        return Err(ApiError::forbidden(
+            "tenant_scope_denied",
+            format!("function {id} is not owned by tenant {}", tenant.0),
+        ));
+    }
+
+    // `remove` re-acquires the shard lock; an interleaving delete from
+    // another request could race us. Either we win and return 204, or the
+    // other request won and we surface a 404 — both are correct outcomes.
     if state.functions.remove(&id).is_some() {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -710,13 +795,27 @@ pub async fn invoke_function(
         ctx.authorize_tenant(tenant)?;
     }
 
-    // Snapshot the Wasm bytes under the DashMap shard lock, then drop the
-    // guard before we hit any `.await`. `Arc::clone` is a single refcount
-    // bump regardless of payload size.
-    let wasm_bytes = match state.functions.get(&id) {
-        Some(entry) => Arc::clone(&entry.value().wasm_bytes),
+    // Snapshot the Wasm bytes AND the owning tenant under the DashMap shard
+    // lock, then drop the guard before we hit any `.await`. `Arc::clone` is
+    // a single refcount bump regardless of payload size.
+    let (wasm_bytes, owner) = match state.functions.get(&id) {
+        Some(entry) => {
+            let rec = entry.value();
+            (Arc::clone(&rec.wasm_bytes), rec.tenant_id)
+        }
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
+    // Resource-layer authz: even if the caller's bearer scope admits the
+    // bound tenant (token-scope check above), the *function* must actually
+    // belong to that tenant. Without this guard, a wildcard-scoped caller
+    // from tenant B could invoke tenant A's function by passing
+    // `X-TensorWasm-Tenant: B`. B1.9 follow-up.
+    if owner != tenant {
+        return Err(ApiError::forbidden(
+            "tenant_scope_denied",
+            format!("function {id} is not owned by tenant {}", tenant.0),
+        ));
+    }
 
     let value = run_invoke(&state.executor, &wasm_bytes, tenant, id).await?;
     Ok(Json(value))
@@ -810,10 +909,22 @@ pub async fn invoke_function_async(
     if let Some(Extension(ctx)) = auth.as_ref() {
         ctx.authorize_tenant(tenant)?;
     }
-    let wasm_bytes = match state.functions.get(&id) {
-        Some(entry) => Arc::clone(&entry.value().wasm_bytes),
+    let (wasm_bytes, owner) = match state.functions.get(&id) {
+        Some(entry) => {
+            let rec = entry.value();
+            (Arc::clone(&rec.wasm_bytes), rec.tenant_id)
+        }
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
+    // Resource-layer authz: see `invoke_function` for the rationale. B1.9
+    // follow-up — wildcard-scoped callers from a different tenant must not
+    // be able to spawn async invocations on someone else's function.
+    if owner != tenant {
+        return Err(ApiError::forbidden(
+            "tenant_scope_denied",
+            format!("function {id} is not owned by tenant {}", tenant.0),
+        ));
+    }
 
     let job_id = Uuid::new_v4();
     tracing::Span::current().record("job_id", tracing::field::display(job_id));
@@ -1090,12 +1201,17 @@ mod tests {
     fn function_record_skips_wasm_bytes_on_wire() {
         let rec = FunctionRecord {
             id: Uuid::nil(),
+            tenant_id: TenantId(0),
             name: "n".to_string(),
             wasm_bytes: Arc::from(vec![1u8, 2, 3]),
             created_unix_ms: 0,
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert!(v.get("wasm_bytes").is_none(), "wasm_bytes leaked: {v}");
+        // tenant_id is part of the wire form (mirrors JobRecord.tenant_id
+        // from B1.9). Pin its presence so any future struct-refactor that
+        // strips it from the serialised shape trips this test.
+        assert!(v.get("tenant_id").is_some(), "tenant_id missing: {v}");
     }
 
     #[tokio::test]
