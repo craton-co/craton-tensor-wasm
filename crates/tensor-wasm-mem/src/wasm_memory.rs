@@ -579,7 +579,7 @@ unsafe impl MemoryCreator for TensorWasmMemoryCreator {
                     //
                     // # One-shot teardown contract
                     //
-                    // Pool slabs that ever served a `PooledLinearMemory` are
+                    // Pool slabs that ever served a [`PooledLinearMemory`] are
                     // single-shot for the lifetime of the pool, because
                     // `PoolAllocation` drop guards are intentionally leaked
                     // here to keep the bump pointer monotonic. The
@@ -591,7 +591,8 @@ unsafe impl MemoryCreator for TensorWasmMemoryCreator {
                     // should use a per-tenant `UnifiedMemoryPool` instance
                     // (one pool per tenant, drop the pool when the tenant
                     // departs) rather than expecting reuse-with-reset on a
-                    // shared pool.
+                    // shared pool. See `tests/pool_teardown_contract.rs` for
+                    // the pinned behaviour.
                     std::mem::forget(alloc);
                     return Ok(Box::new(PooledLinearMemory {
                         pool_keepalive: Arc::clone(pool),

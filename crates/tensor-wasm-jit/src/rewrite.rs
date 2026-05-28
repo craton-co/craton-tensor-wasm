@@ -206,9 +206,60 @@ struct DecodedFuncType {
     results: Vec<wasmparser::ValType>,
 }
 
+/// Per-function pre-pass state. Captures everything we need from the
+/// sequential parse pass so that the heavy `lower_block` + `emit` work can
+/// be deferred to a single data-parallel pass after parsing finishes.
+///
+/// The fields are public-to-this-module only; the parallel emit closure
+/// reads them by value (it owns its slot via `into_par_iter`).
+struct PreFuncInfo {
+    /// Type index in the original module — copied straight into the
+    /// final `FuncInfo` slot.
+    type_index: u32,
+    /// Detector verdict for the body. Determines whether the parallel
+    /// emit pass does any work for this slot.
+    verdict: DetectorVerdict,
+    /// Op count walked (for diagnostics) — copied straight into the
+    /// final `FuncInfo`.
+    op_count: usize,
+    /// Function index in the *global* (post-import) function index space,
+    /// used only for diagnostics in info/debug logs.
+    func_index_in_global_space: u32,
+    /// Trip-count guess: `Some(128)` if the body contained a `Loop`,
+    /// otherwise `None`. Fed verbatim into the `BlockIR` passed to
+    /// `lower_block`.
+    trip_guess: Option<u64>,
+    /// The detector op stream — needed both for the `BlockIR::new` that
+    /// feeds `lower_block` and (already-walked) for `classify`. We carry
+    /// the full stream here even though `classify` ran during the parse
+    /// pass, because the parallel emit needs to re-filter it down to the
+    /// `{V128*, Load, Store}` taxonomy that `lower_block` accepts.
+    detector_ops: Vec<Op>,
+    /// Did the surrounding module have at least one memory? Captured at
+    /// parse time so the parallel emit closure can short-circuit on
+    /// memory-less modules without needing access to the analyser's
+    /// mutable state. The trampoline reads / writes memory 0 — without it
+    /// the swap would emit invalid wasm.
+    has_memory: bool,
+    /// Did the function's signature pass the supported-primitives gate?
+    /// Resolved during the parse pass against the (then-complete) types
+    /// table. Captured here so the parallel emit closure stays purely
+    /// functional over its slot.
+    signature_ok: bool,
+}
+
 /// Pre-pass: walk the module, build the type table, count function imports,
-/// classify each defined function, lower → emit for offload candidates, and
-/// pre-populate the cache.
+/// classify each defined function, then run lower→emit for offload
+/// candidates in parallel via `rayon`, and pre-populate the cache.
+///
+/// **Order preservation**: the rewriter downstream assumes
+/// `func_infos[i]` corresponds to the *i*-th `CodeSectionEntry`. To honour
+/// this without serialising the heavy emit work, we collect
+/// `PreFuncInfo` slots in sequential parse order, run lower+emit through
+/// `into_par_iter().enumerate()`, and re-sort by index before reducing
+/// into `func_infos`. `cache.put` is internally lock-free
+/// (`dashmap` + `parking_lot::Mutex` only on eviction), so the parallel
+/// pass also commits to the cache without a final serial fold.
 fn analyse(
     wasm: &[u8],
     opts: &RewriteOptions,
@@ -217,7 +268,7 @@ fn analyse(
     let mut types: Vec<Option<DecodedFuncType>> = Vec::new();
     let mut function_type_indices: Vec<u32> = Vec::new();
     let mut num_function_imports: u32 = 0;
-    let mut func_infos: Vec<FuncInfo> = Vec::new();
+    let mut pre_infos: Vec<PreFuncInfo> = Vec::new();
     let mut defined_function_cursor: usize = 0;
     // The trampoline reads / writes memory 0 via `i32.store` etc. — if the
     // input module has no memory section the trampoline body won't validate
@@ -301,133 +352,33 @@ fn analyse(
                 // misleads the detector into approving cold straight-line
                 // code.
                 let trip_guess = if saw_loop { Some(128) } else { None };
-                let block = BlockIR::new(
+                let classify_block = BlockIR::new(
                     format!("func{func_index_in_global_space}"),
                     detector_ops.clone(),
                     trip_guess,
                 );
-                let verdict = classify(&block, &opts.detector);
+                let verdict = classify(&classify_block, &opts.detector);
                 let op_count = detector_ops.len();
-                let mut fingerprint = None;
-                if matches!(verdict, DetectorVerdict::Offload) {
-                    // Also gate on supported parameter/result types: if the
-                    // function uses v128 or reftypes in its signature, skip
-                    // the trampoline.
-                    let signature_ok = types
-                        .get(type_index as usize)
-                        .and_then(|t| t.as_ref())
-                        .map(|t| {
-                            t.params.iter().all(is_supported_primitive)
-                                && t.results.iter().all(is_supported_primitive)
-                        })
-                        .unwrap_or(false);
-                    if !has_memory {
-                        debug!(
-                            target: "tensor_wasm_jit::rewrite",
-                            function = func_index_in_global_space,
-                            "offload candidate rejected: module has no memory for trampoline marshalling"
-                        );
-                    } else if !signature_ok {
-                        debug!(
-                            target: "tensor_wasm_jit::rewrite",
-                            function = func_index_in_global_space,
-                            "offload candidate rejected: unsupported parameter/result type"
-                        );
-                    } else {
-                        // The lowering pass refuses anything outside the
-                        // {V128*, Load, Store} taxonomy. Filter the full op
-                        // stream down to those before handing it off so the
-                        // analyser doesn't trip on local.get / br / call
-                        // noise that the detector already weighed.
-                        let lower_block_input = BlockIR::new(
-                            block.name.clone(),
-                            detector_ops
-                                .iter()
-                                .copied()
-                                .filter(|o| {
-                                    matches!(
-                                        o,
-                                        Op::V128Add
-                                            | Op::V128Mul
-                                            | Op::V128Fma
-                                            | Op::Load
-                                            | Op::Store
-                                    )
-                                })
-                                .collect(),
-                            block.loop_trip_count,
-                        );
-                        match lower_block(&lower_block_input) {
-                            Ok(blueprint) => match emit(&blueprint) {
-                                Ok(ptx) => {
-                                    let fp = blueprint.fingerprint();
-                                    // Rewrite-time pre-population: the
-                                    // rewriter runs at module-load with no
-                                    // tenant context yet, so pre-populated
-                                    // entries land under the placeholder
-                                    // `TenantId(0)`. The runtime dispatch
-                                    // (which knows the real tenant) will
-                                    // miss this entry and re-emit on first
-                                    // call — that's the safe default until
-                                    // the rewriter is plumbed with the
-                                    // owning tenant. See `CacheKey` docs
-                                    // for the cross-tenant confused-deputy
-                                    // primitive this prevents.
-                                    let key = CacheKey::for_tenant(
-                                        TenantId(0),
-                                        fp,
-                                        opts.sm_version,
-                                    );
-                                    cache.put(
-                                        key,
-                                        CachedKernel::new(
-                                            fp,
-                                            Arc::new(ptx),
-                                            CompiledHandle::default(),
-                                        ),
-                                    );
-                                    fingerprint = Some(fp);
-                                    info!(
-                                        target: "tensor_wasm_jit::rewrite",
-                                        function = func_index_in_global_space,
-                                        op_count,
-                                        fingerprint = fp,
-                                        "pre-populated kernel cache for offload candidate"
-                                    );
-                                }
-                                Err(e) => {
-                                    // Emission refused (e.g. MatMul not yet
-                                    // implemented) — keep this function on the
-                                    // CPU path. This is the deopt-at-rewrite
-                                    // signal at the emit stage.
-                                    debug!(
-                                        target: "tensor_wasm_jit::rewrite",
-                                        function = func_index_in_global_space,
-                                        op_count,
-                                        reason = %e,
-                                        "offload candidate rejected by PTX emitter"
-                                    );
-                                }
-                            },
-                            Err(e) => {
-                                // Lowering refused — keep this function on the
-                                // CPU path. This is the deopt-at-rewrite signal.
-                                debug!(
-                                    target: "tensor_wasm_jit::rewrite",
-                                    function = func_index_in_global_space,
-                                    op_count,
-                                    reason = %e,
-                                    "offload candidate rejected by lowering"
-                                );
-                            }
-                        }
-                    }
-                }
-                func_infos.push(FuncInfo {
+                // Signature check is parse-time pure: it only reads
+                // `types[type_index]`. Captured here so the parallel emit
+                // closure stays free of references to the analyser state.
+                let signature_ok = types
+                    .get(type_index as usize)
+                    .and_then(|t| t.as_ref())
+                    .map(|t| {
+                        t.params.iter().all(is_supported_primitive)
+                            && t.results.iter().all(is_supported_primitive)
+                    })
+                    .unwrap_or(false);
+                pre_infos.push(PreFuncInfo {
                     type_index,
                     verdict,
-                    fingerprint,
                     op_count,
+                    func_index_in_global_space,
+                    trip_guess,
+                    detector_ops,
+                    has_memory,
+                    signature_ok,
                 });
                 defined_function_cursor += 1;
             }
@@ -435,11 +386,155 @@ fn analyse(
         }
     }
 
+    // Parallel pass: lower + emit each offload candidate. We deliberately
+    // `into_par_iter` (consumes `pre_infos`) so each closure invocation owns
+    // its `detector_ops` `Vec` and we avoid any borrow-checker fights with
+    // the captured slot data. `enumerate()` preserves the slot index so the
+    // collected results re-sort into the parse-time order the rewriter's
+    // downstream walk expects (`func_infos[i] ↔ CodeSectionEntry[i]`).
+    //
+    // `cache.put` is internally thread-safe (dashmap is the hot path; the
+    // LRU mutex is contended only on capacity eviction). We therefore call
+    // it from inside the parallel closure rather than collecting kernels
+    // and looping serially — the synthesis cost dominates and the cache
+    // commit is cheap.
+    //
+    // Each iteration produces `(slot_index, FuncInfo)`; we re-collect into
+    // a `Vec` and sort by `slot_index` so the final assignment to
+    // `func_infos` is in source order. Sorting `N` `(u32, FuncInfo)` tuples
+    // is `O(N log N)` and trivially dominated by the parallel emit work.
+    let n_slots = pre_infos.len();
+    let mut indexed: Vec<(usize, FuncInfo)> = pre_infos
+        .into_par_iter()
+        .enumerate()
+        .map(|(idx, pre)| {
+            let fingerprint = emit_for_slot(&pre, opts, cache);
+            (
+                idx,
+                FuncInfo {
+                    type_index: pre.type_index,
+                    verdict: pre.verdict,
+                    fingerprint,
+                    op_count: pre.op_count,
+                },
+            )
+        })
+        .collect();
+    indexed.sort_by_key(|(idx, _)| *idx);
+    debug_assert_eq!(
+        indexed.len(),
+        n_slots,
+        "rayon emit pass returned a different number of slots than it consumed"
+    );
+    let func_infos: Vec<FuncInfo> = indexed.into_iter().map(|(_, fi)| fi).collect();
+
     Ok(AnalyseOutcome {
         types,
         num_function_imports,
         func_infos,
     })
+}
+
+/// Per-slot lower + emit work. Pure over its inputs except for the
+/// pre-populating `cache.put` (which is internally synchronised). Returns
+/// the blueprint fingerprint on success, `None` on any rejection — the
+/// rejection reasons are logged at the same severities as the previous
+/// inline emit path, so existing log-scraping continues to work.
+fn emit_for_slot(
+    pre: &PreFuncInfo,
+    opts: &RewriteOptions,
+    cache: &KernelCache,
+) -> Option<u64> {
+    if !matches!(pre.verdict, DetectorVerdict::Offload) {
+        return None;
+    }
+    if !pre.has_memory {
+        debug!(
+            target: "tensor_wasm_jit::rewrite",
+            function = pre.func_index_in_global_space,
+            "offload candidate rejected: module has no memory for trampoline marshalling"
+        );
+        return None;
+    }
+    if !pre.signature_ok {
+        debug!(
+            target: "tensor_wasm_jit::rewrite",
+            function = pre.func_index_in_global_space,
+            "offload candidate rejected: unsupported parameter/result type"
+        );
+        return None;
+    }
+    // The lowering pass refuses anything outside the {V128*, Load, Store}
+    // taxonomy. Filter the full op stream down to those before handing it
+    // off so the analyser doesn't trip on local.get / br / call noise that
+    // the detector already weighed.
+    let lower_block_input = BlockIR::new(
+        format!("func{}", pre.func_index_in_global_space),
+        pre.detector_ops
+            .iter()
+            .copied()
+            .filter(|o| {
+                matches!(
+                    o,
+                    Op::V128Add | Op::V128Mul | Op::V128Fma | Op::Load | Op::Store
+                )
+            })
+            .collect(),
+        pre.trip_guess,
+    );
+    match lower_block(&lower_block_input) {
+        Ok(blueprint) => match emit(&blueprint) {
+            Ok(ptx) => {
+                let fp = blueprint.fingerprint();
+                // Rewrite-time pre-population: the rewriter runs at
+                // module-load with no tenant context yet, so pre-populated
+                // entries land under the placeholder `TenantId(0)`. The
+                // runtime dispatch (which knows the real tenant) will miss
+                // this entry and re-emit on first call — that's the safe
+                // default until the rewriter is plumbed with the owning
+                // tenant. See `CacheKey` docs for the cross-tenant
+                // confused-deputy primitive this prevents.
+                let key = CacheKey::for_tenant(TenantId(0), fp, opts.sm_version);
+                cache.put(
+                    key,
+                    CachedKernel::new(fp, Arc::new(ptx), CompiledHandle::default()),
+                );
+                info!(
+                    target: "tensor_wasm_jit::rewrite",
+                    function = pre.func_index_in_global_space,
+                    op_count = pre.op_count,
+                    fingerprint = fp,
+                    "pre-populated kernel cache for offload candidate"
+                );
+                Some(fp)
+            }
+            Err(e) => {
+                // Emission refused (e.g. MatMul not yet implemented) — keep
+                // this function on the CPU path. This is the deopt-at-rewrite
+                // signal at the emit stage.
+                debug!(
+                    target: "tensor_wasm_jit::rewrite",
+                    function = pre.func_index_in_global_space,
+                    op_count = pre.op_count,
+                    reason = %e,
+                    "offload candidate rejected by PTX emitter"
+                );
+                None
+            }
+        },
+        Err(e) => {
+            // Lowering refused — keep this function on the CPU path. This
+            // is the deopt-at-rewrite signal.
+            debug!(
+                target: "tensor_wasm_jit::rewrite",
+                function = pre.func_index_in_global_space,
+                op_count = pre.op_count,
+                reason = %e,
+                "offload candidate rejected by lowering"
+            );
+            None
+        }
+    }
 }
 
 struct AnalyseOutcome {

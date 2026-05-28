@@ -141,7 +141,6 @@ differential-oracle = []
 name = "lowering_e2e"
 path = "tests/lowering_e2e.rs"
 required-features = ["cuda-oxide-backend", "test-utils"]
->>>>>>> worktree-agent-aedf8067409d5a3dd
 
 [package.metadata.docs.rs]
 all-features = true

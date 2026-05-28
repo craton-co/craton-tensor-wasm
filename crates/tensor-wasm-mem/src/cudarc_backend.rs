@@ -50,7 +50,7 @@ use cudarc::driver::CudaDevice;
 use parking_lot::Mutex;
 
 use crate::advise::Advice;
-use crate::unified::{DeviceId, UnifiedError};
+use crate::unified::{DeviceId, UnifiedBacking, UnifiedError, UvmAdvice};
 
 /// Process-wide counter of `cuMemFree_v2` failures observed in
 /// [`CudarcUnifiedBuffer::drop`]. Lock-free fast-path counter for alerting
@@ -381,6 +381,77 @@ impl fmt::Debug for CudarcUnifiedBuffer {
             .field("size", &self.size)
             .field("device_id", &self.device_id)
             .finish()
+    }
+}
+
+impl UnifiedBacking for CudarcUnifiedBuffer {
+    fn len(&self) -> usize {
+        CudarcUnifiedBuffer::len(self)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        CudarcUnifiedBuffer::as_slice(self)
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        CudarcUnifiedBuffer::as_mut_slice(self)
+    }
+
+    fn apply_advice(&self, hint: UvmAdvice) -> Result<(), UnifiedError> {
+        // Translate the trait-facing `UvmAdvice` to the cudarc path's
+        // internal `Advice` enum. `UvmAdvice::UnsetReadMostly` has no
+        // matching variant on the cudarc path today, so surface it as
+        // `NotSupported` rather than papering over the gap with a
+        // silent no-op.
+        let advice = match hint {
+            UvmAdvice::SetReadMostly => Advice::ReadMostly,
+            UvmAdvice::UnsetReadMostly => {
+                return Err(UnifiedError::NotSupported {
+                    feature: "apply_advice(UnsetReadMostly)",
+                    backing: "cudarc",
+                });
+            }
+            UvmAdvice::SetPreferredLocation(d) => Advice::PreferredLocation(DeviceId(d)),
+            UvmAdvice::UnsetPreferredLocation => Advice::UnsetPreferredLocation,
+            UvmAdvice::SetAccessedBy(d) => Advice::AccessedBy(DeviceId(d)),
+            UvmAdvice::UnsetAccessedBy(d) => Advice::UnsetAccessedBy(DeviceId(d)),
+        };
+        // Disambiguate against the trait method we are inside — the
+        // free function lives at module scope and the unqualified name
+        // resolution does pick it over the trait method here, but the
+        // fully-qualified path makes the intent explicit for readers.
+        self::apply_advice(self, advice)
+    }
+
+    fn prefetch_to_device(&self, device_ord: u32) -> Result<(), UnifiedError> {
+        // The existing `CudarcUnifiedBuffer::prefetch_to_device`
+        // inferred the ordinal from `self.device_id`. The trait
+        // signature carries an explicit ordinal so future plumbing can
+        // target a non-owning device; if the caller asks for the
+        // owning device we route to the existing implementation, and
+        // for any other ordinal we issue the driver call directly with
+        // the supplied target. The cached `device` is the buffer's
+        // owning context; `cuMemPrefetchAsync` accepts any valid
+        // device ordinal so this is safe as long as the primary
+        // context for the owning device is current (it is — we bind
+        // it via the inherent method on the owning-ordinal path).
+        if device_ord == self.device_id().0 {
+            CudarcUnifiedBuffer::prefetch_to_device(self)
+        } else {
+            // Cross-device prefetch via the inherent method needs a
+            // refactor (it currently hard-codes `self.device_id.0`).
+            // Surface as `NotSupported` so the v0.4 cutover can wire
+            // it explicitly rather than have us silently retarget an
+            // ordinal that may not even be online.
+            Err(UnifiedError::NotSupported {
+                feature: "prefetch_to_device(non-owning-ordinal)",
+                backing: "cudarc",
+            })
+        }
+    }
+
+    fn prefetch_to_host(&self) -> Result<(), UnifiedError> {
+        CudarcUnifiedBuffer::prefetch_to_host(self)
     }
 }
 

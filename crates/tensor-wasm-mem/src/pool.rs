@@ -21,6 +21,24 @@ use crate::unified::{DeviceId, UnifiedBuffer, UnifiedError};
 /// freed regions (callers maintain their own life cycle by dropping
 /// [`PoolAllocation`]s, which mark the bump pointer as logically released only
 /// in the *all-released-at-end* discipline used by ephemeral Wasm instances).
+///
+/// # Pool teardown contract
+///
+/// Slabs handed out as Wasm linear memory (via
+/// [`crate::wasm_memory::TensorWasmMemoryCreator`]) are *single-shot* for the
+/// lifetime of the pool: the `PoolAllocation` drop guard returned by
+/// [`Self::allocate`] is intentionally `std::mem::forget`-ed by the linear-
+/// memory creator, so the bump pointer never rewinds while pooled instances
+/// are live. This keeps the bump pointer monotonic across the pool's entire
+/// lifetime — there is no "reset between tenants" semantics.
+///
+/// Operators that need per-tenant resets should construct a fresh
+/// `UnifiedMemoryPool` instance per tenant rather than reusing one across
+/// tenancy boundaries. The pinned behaviour lives in
+/// `crates/tensor-wasm-mem/tests/pool_teardown_contract.rs` (to be added in
+/// the v0.4 cutover) and the call-site rationale is recorded inline above
+/// the `std::mem::forget(alloc)` line in
+/// [`crate::wasm_memory::TensorWasmMemoryCreator::new_memory`].
 pub struct UnifiedMemoryPool {
     slab: UnifiedBuffer,
     state: Mutex<PoolState>,

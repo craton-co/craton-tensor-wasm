@@ -44,6 +44,15 @@ name = "loom_consume_release"
 path = "tests/loom_consume_release.rs"
 required-features = ["loom"]
 
+# The strict-cap-binding test exercises foreign-cap refusal across two
+# `TenantRegistry` instances — it only compiles under the feature, which
+# turns the registry-token machinery on. Listed here so
+# `cargo test --features strict-cap-binding` picks it up by name.
+[[test]]
+name = "cap_binding_strict"
+path = "tests/cap_binding_strict.rs"
+required-features = ["strict-cap-binding"]
+
 [features]
 default = []
 mps = []

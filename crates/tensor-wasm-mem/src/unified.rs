@@ -68,6 +68,103 @@ pub enum UnifiedError {
         /// Hard cap enforced by the host (bytes).
         limit: u64,
     },
+    /// A [`UnifiedBacking`] method is not available on the active backing.
+    ///
+    /// Surfaced by trait methods (e.g. `prefetch_to_device` on the cudarc
+    /// stub or the `Box<[u8]>` host fallback) when the underlying backing
+    /// has no implementation. Carries the method name and the backing tag
+    /// so operator tooling and tests can match on the exact gap without
+    /// scraping driver error strings.
+    #[error("{feature:?} not supported by backing {backing:?}")]
+    NotSupported {
+        /// Stable identifier for the method that has no implementation
+        /// on this backing (e.g. `"prefetch_to_device"`).
+        feature: &'static str,
+        /// Stable identifier for the backing that lacks the feature
+        /// (e.g. `"cudarc-stub"`, `"host-box"`).
+        backing: &'static str,
+    },
+}
+
+/// Memory-residency hint passed through [`UnifiedBacking::apply_advice`].
+///
+/// Mirrors the `cuMemAdvise` flags already used by the three concrete
+/// backings ([`crate::advise::Advice`] on the cust path,
+/// [`crate::cudarc_backend::apply_advice`] on the cudarc path, and the
+/// `CudaOxideAdvice` enum on the cuda-oxide path). This trait-facing enum
+/// is declared in the common `unified` module so downstream code can
+/// target a single shape across every backing.
+///
+/// Variants intentionally hold a bare `u32` device ordinal rather than
+/// [`DeviceId`] so the enum has zero non-trivial dependencies and a
+/// future port (e.g. a Vulkan / ROCm backing) can implement
+/// [`UnifiedBacking`] without pulling the CUDA-tagged [`DeviceId`] into
+/// its interface.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UvmAdvice {
+    /// `CU_MEM_ADVISE_SET_READ_MOSTLY`. Pages are read by many devices
+    /// but rarely written; the runtime may duplicate them.
+    SetReadMostly,
+    /// `CU_MEM_ADVISE_UNSET_READ_MOSTLY`. Reverse the read-mostly hint.
+    UnsetReadMostly,
+    /// `CU_MEM_ADVISE_SET_PREFERRED_LOCATION` for the given device
+    /// ordinal — pages should live primarily on that device.
+    SetPreferredLocation(u32),
+    /// `CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION`. Reverse the preferred
+    /// location hint.
+    UnsetPreferredLocation,
+    /// `CU_MEM_ADVISE_SET_ACCESSED_BY` for the given device ordinal —
+    /// the device will access the region, so the runtime should map it
+    /// without migrating.
+    SetAccessedBy(u32),
+    /// `CU_MEM_ADVISE_UNSET_ACCESSED_BY` for the given device ordinal.
+    UnsetAccessedBy(u32),
+}
+
+/// Common surface for unified-memory backings (cust, cudarc, cuda-oxide).
+///
+/// The three concrete buffer types in this crate hand-mirror the same API.
+/// This trait pins the contract; v0.4 will migrate the concrete types to
+/// implement it and the public `UnifiedBuffer` may become an enum or a
+/// `Box<dyn UnifiedBacking>` shell. For v0.3.6 the trait is documentation-
+/// shaped: a wire-stable description of what every backing must support so
+/// downstream code (and future ports) can target it.
+///
+/// # Method semantics
+///
+/// Implementations that lack support for a particular driver call (the
+/// cudarc stub, the `Box<[u8]>` host fallback, or a port that simply
+/// has not wired the entry point yet) MUST return
+/// [`UnifiedError::NotSupported`] from the corresponding method rather
+/// than silently succeeding with a no-op. The legacy `UnifiedBuffer`
+/// path keeps its historical no-op behaviour for `prefetch_to_*` to
+/// preserve back-compat with v0.3 callers; that exemption is documented
+/// per-method below.
+pub trait UnifiedBacking: Send + Sync {
+    /// Number of bytes in this allocation.
+    fn len(&self) -> usize;
+
+    /// Borrow the host-visible slice. UVM means the bytes are accessible
+    /// to both host and device; reads after a device write may need a
+    /// `prefetch_to_host` first depending on the backing.
+    fn as_slice(&self) -> &[u8];
+
+    /// Mutably borrow the host-visible slice. See [`Self::as_slice`].
+    fn as_mut_slice(&mut self) -> &mut [u8];
+
+    /// Apply a CUDA `cuMemAdvise` hint. No-op on backings that don't
+    /// support it (host-only fallback returns `Ok(())`; the cudarc /
+    /// cuda-oxide stubs return [`UnifiedError::NotSupported`] until the
+    /// real wrapper lands).
+    fn apply_advice(&self, hint: UvmAdvice) -> Result<(), UnifiedError>;
+
+    /// Prefetch to a device. May be a no-op on backings without UVM
+    /// prefetch (documented per-backing).
+    fn prefetch_to_device(&self, device_ord: u32) -> Result<(), UnifiedError>;
+
+    /// Prefetch back to the host CPU.
+    fn prefetch_to_host(&self) -> Result<(), UnifiedError>;
 }
 
 /// Identifies a CUDA device. On non-CUDA hosts this is a free-form tag.
@@ -503,6 +600,87 @@ impl UnifiedBuffer {
     }
 }
 
+impl UnifiedBacking for UnifiedBuffer {
+    fn len(&self) -> usize {
+        UnifiedBuffer::len(self)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        UnifiedBuffer::as_slice(self)
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        UnifiedBuffer::as_mut_slice(self)
+    }
+
+    fn apply_advice(&self, hint: UvmAdvice) -> Result<(), UnifiedError> {
+        // The legacy `UnifiedBuffer` path delegates advice through the
+        // [`crate::advise`] module on cust builds; on other builds the
+        // module is a documented no-op (`Ok(())`). To stay back-compat
+        // with v0.3 we preserve that no-op shape rather than escalating
+        // to `NotSupported`. The cust path is the only one whose
+        // upstream `crate::advise::Advice` enum is wired to the real
+        // driver call today.
+        #[cfg(feature = "unified-memory")]
+        {
+            let advice = match hint {
+                UvmAdvice::SetReadMostly => crate::advise::Advice::ReadMostly,
+                UvmAdvice::UnsetReadMostly => {
+                    // The cust path's [`crate::advise::Advice`] enum has
+                    // no `UnsetReadMostly` variant yet (v0.3 never wired
+                    // it). Surface as `NotSupported` so callers can
+                    // detect the gap without scraping a driver error
+                    // string; the v0.4 cutover will add the variant.
+                    return Err(UnifiedError::NotSupported {
+                        feature: "apply_advice(UnsetReadMostly)",
+                        backing: "cust",
+                    });
+                }
+                UvmAdvice::SetPreferredLocation(d) => {
+                    crate::advise::Advice::PreferredLocation(DeviceId(d))
+                }
+                UvmAdvice::UnsetPreferredLocation => {
+                    crate::advise::Advice::UnsetPreferredLocation
+                }
+                UvmAdvice::SetAccessedBy(d) => {
+                    crate::advise::Advice::AccessedBy(DeviceId(d))
+                }
+                UvmAdvice::UnsetAccessedBy(d) => {
+                    crate::advise::Advice::UnsetAccessedBy(DeviceId(d))
+                }
+            };
+            crate::advise::apply(self, advice)
+        }
+        #[cfg(not(feature = "unified-memory"))]
+        {
+            // No-CUDA and cudarc-only paths: the legacy `UnifiedBuffer`
+            // hand-mirror returned `Ok(())` for advise calls (the
+            // `crate::advise::apply` function is itself a no-op here),
+            // so the trait surface keeps that contract for back-compat.
+            // Callers that want a hard error on a missing backing should
+            // use the per-backend types directly until v0.4 routes
+            // advice through `UnifiedBacking` everywhere.
+            let _ = hint;
+            Ok(())
+        }
+    }
+
+    fn prefetch_to_device(&self, device_ord: u32) -> Result<(), UnifiedError> {
+        // The legacy method signature on `UnifiedBuffer` takes no
+        // ordinal (the cust path infers it from the buffer's owning
+        // device). The trait surface accepts an ordinal so future
+        // backings can target a non-owning device; on the cust path we
+        // silently discard the argument to preserve v0.3 semantics
+        // (cust 0.3's safe surface cannot retarget mid-flight anyway).
+        let _ = device_ord;
+        UnifiedBuffer::prefetch_to_device(self)
+    }
+
+    fn prefetch_to_host(&self) -> Result<(), UnifiedError> {
+        UnifiedBuffer::prefetch_to_host(self)
+    }
+}
+
 impl fmt::Debug for UnifiedBuffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UnifiedBuffer")
@@ -542,6 +720,23 @@ impl From<UnifiedError> for tensor_wasm_core::error::TensorWasmError {
             UnifiedError::Cuda(msg) => tensor_wasm_core::error::TensorWasmError::CudaError(msg.into()),
             UnifiedError::TooLarge { requested, limit } => {
                 tensor_wasm_core::error::TensorWasmError::MemoryExhausted { requested, limit }
+            }
+            // `NotSupported` is the v0.3.6 B4.4 trait-surface error
+            // variant: a [`UnifiedBacking`] method that has no
+            // implementation on the active backing. We surface it as
+            // `Serialization` (a "the call shape is wrong for what's
+            // available" bucket) carrying the {feature, backing} pair
+            // so downstream logs preserve the gap shape. A future
+            // workspace error refactor may give this a first-class
+            // `BackendUnsupported` variant; for v0.3.6 we keep the
+            // mapping body-only.
+            UnifiedError::NotSupported { feature, backing } => {
+                tensor_wasm_core::error::TensorWasmError::Serialization(
+                    format!(
+                        "unified backing {backing:?} does not support feature {feature:?}"
+                    )
+                    .into(),
+                )
             }
         }
     }

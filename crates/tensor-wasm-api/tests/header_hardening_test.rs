@@ -348,3 +348,134 @@ async fn authorization_with_control_bytes_rejected() {
     let _ = Arc::new(());
     let _: HeaderName = axum::http::header::AUTHORIZATION;
 }
+
+// ---------------------------------------------------------------------------
+// `missing_tenant_when_required` — env-var path
+// ---------------------------------------------------------------------------
+//
+// The `invalid_tenant_header_distinct_from_missing` test above already
+// exercises the explicit-extension variant (`TenantConfig { require_header:
+// true }`). This test pins the env-var loader independently: with
+// `TENSOR_WASM_API_REQUIRE_TENANT=1` exported into the process,
+// `TenantConfig::from_env()` MUST resolve to the same `require_header = true`
+// shape and the absent-header path MUST still surface as
+// `400 missing_tenant`.
+//
+// We use `temp_env::with_var` rather than raw `std::env::set_var` because:
+//   * `std::env::set_var` is `unsafe` in Rust 2024 (race with concurrent
+//     reads of the process environment), and
+//   * `temp_env` serialises concurrent users behind an internal Mutex so a
+//     second test that mutates a different env var cannot race with this
+//     one inside the same test binary.
+//
+// Because `temp_env::with_var` provides a synchronous scope and the
+// request must drive through the async router, we build the router INSIDE
+// the closure (capturing `TenantConfig::from_env()` at the moment the env
+// var is live) and then block on the `oneshot` future with a dedicated
+// current-thread runtime. This avoids holding a `tokio::test`'s reactor
+// across the env-var mutation, which would otherwise let another async
+// task observe the modified env briefly.
+
+#[test]
+fn missing_tenant_when_required() {
+    temp_env::with_var(
+        "TENSOR_WASM_API_REQUIRE_TENANT",
+        Some("1"),
+        || {
+            // Capture the env-var-derived config at the moment the var is
+            // live. The loader trims the value and compares against "1";
+            // any other value would resolve `require_header = false`.
+            let cfg = TenantConfig::from_env();
+            assert!(
+                cfg.require_header,
+                "TENSOR_WASM_API_REQUIRE_TENANT=1 must yield require_header=true",
+            );
+
+            let router = tenant_router(cfg);
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/probe")
+                .body(Body::empty())
+                .unwrap();
+
+            // Drive the async oneshot on a private current-thread runtime
+            // so we do not need a `#[tokio::test]` attribute (which is
+            // incompatible with the synchronous `temp_env::with_var` scope).
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            let (status, body) = rt.block_on(async move {
+                let resp = router.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let body = body_json(resp.into_body()).await;
+                (status, body)
+            });
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                error_kind(&body),
+                Some("missing_tenant"),
+                "TENSOR_WASM_API_REQUIRE_TENANT=1 + absent header must surface as \
+                 missing_tenant: got {body}"
+            );
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `authorization_with_embedded_nul_rejected`
+// ---------------------------------------------------------------------------
+//
+// A NUL byte inside the `Authorization` value would truncate any
+// downstream C-string consumer (audit log writer, terminal log viewer)
+// and is forbidden by RFC 7230 §3.2.6. The `http` crate's
+// [`HeaderValue::from_bytes`] enforces this at construction time:
+// `is_valid(b)` requires `b >= 32 && b != 127 || b == b'\t'`, which
+// rejects 0x00. We pin the contract here so a future http-crate
+// relaxation (or a hand-rolled byte-source bypass) could not silently
+// re-open the NUL channel.
+//
+// The task spec phrases this as "use `HeaderValue::from_bytes` since the
+// standard `try_from` rejects it" — both gates in fact reject NUL, but
+// `from_bytes` is the surface most likely to be reached by an integration
+// caller that wants to test the byte-level rejection without an
+// intermediate `&str` (which would be impossible to construct for a
+// NUL-containing buffer in pure safe Rust anyway).
+
+#[test]
+fn authorization_with_embedded_nul_rejected() {
+    // The classic shape an attacker would attempt — a printable prefix
+    // ("Bearer abc") followed by a NUL and more bytes ("def") that a
+    // naive consumer might log past the NUL boundary.
+    let attack: &[u8] = b"Bearer abc\0def";
+    let result = HeaderValue::from_bytes(attack);
+    assert!(
+        result.is_err(),
+        "HeaderValue::from_bytes must reject embedded NUL; \
+         value {:?} unexpectedly parsed",
+        attack,
+    );
+
+    // Defence-in-depth complement: a NUL at the very end (after a
+    // tab separator) is also refused. Pins the boundary so a future
+    // narrowing of the validator that only checked "interior" bytes
+    // would still fail this test.
+    let trailing_nul: &[u8] = b"Bearer\tlegit\0";
+    assert!(
+        HeaderValue::from_bytes(trailing_nul).is_err(),
+        "HeaderValue::from_bytes must reject trailing NUL too; \
+         value {:?} unexpectedly parsed",
+        trailing_nul,
+    );
+
+    // And a NUL immediately after the scheme separator (no payload at
+    // all) — covers the smallest possible hostile input.
+    let bare_nul: &[u8] = b"Bearer \0";
+    assert!(
+        HeaderValue::from_bytes(bare_nul).is_err(),
+        "HeaderValue::from_bytes must reject a bare NUL payload; \
+         value {:?} unexpectedly parsed",
+        bare_nul,
+    );
+}

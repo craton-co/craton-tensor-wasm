@@ -38,10 +38,10 @@ async fn pool_with_zero_warm_falls_through_to_spawn() {
     let engine = Arc::new(engine);
     let exec = TensorWasmExecutor::new(engine);
 
-    let pool = InstancePool::new(InstancePoolConfig {
-        warm_instances_per_tuple: 0,
-        max_total_warm: 0,
-    });
+    let mut config = InstancePoolConfig::default();
+    config.warm_instances_per_tuple = 0;
+    config.max_total_warm = 0;
+    let pool = InstancePool::new(config);
 
     // With no warm instances configured, acquire must succeed via the
     // fall-through path (i.e. it just calls spawn_instance).

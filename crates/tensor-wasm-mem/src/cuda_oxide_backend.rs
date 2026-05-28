@@ -61,7 +61,7 @@ use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 
-use crate::unified::{DeviceId, UnifiedError};
+use crate::unified::{DeviceId, UnifiedBacking, UnifiedError, UvmAdvice};
 
 /// Process-global set of raw CUDA device-pointer values orphaned by a failed
 /// free on the cuda-oxide path. Mirrors
@@ -231,6 +231,46 @@ mod scaffold {
                 "CudaOxideUnifiedBuffer dropped, but no real free happened -- \
                  scaffold stub, see RFC 0001 v0.4 port",
             );
+        }
+    }
+
+    impl UnifiedBacking for CudaOxideUnifiedBuffer {
+        fn len(&self) -> usize {
+            CudaOxideUnifiedBuffer::len(self)
+        }
+
+        fn as_slice(&self) -> &[u8] {
+            // The scaffold has no real allocation (every `allocate`
+            // call returns `NOT_YET_WIRED`), so the byte view is
+            // always empty. This branch is effectively unreachable —
+            // no caller can hold a `&CudaOxideUnifiedBuffer` today
+            // because construction always errors out — but the trait
+            // requires a concrete return so we hand back a zero-length
+            // slice on a well-aligned dangling pointer. The host-
+            // backend variant below returns the real bytes.
+            &[]
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            // See `as_slice`: scaffold path is empty.
+            &mut []
+        }
+
+        fn apply_advice(&self, _hint: UvmAdvice) -> Result<(), UnifiedError> {
+            // Mirrors the free-function scaffold stub: every method
+            // that would touch the driver surfaces `NOT_YET_WIRED` so
+            // the v0.4 port has a single sentinel to grep for. Callers
+            // that branch on the trait surface still get a structured
+            // `UnifiedError::Cuda` and can match on the message.
+            Err(UnifiedError::Cuda(NOT_YET_WIRED.into()))
+        }
+
+        fn prefetch_to_device(&self, _device_ord: u32) -> Result<(), UnifiedError> {
+            Err(UnifiedError::Cuda(NOT_YET_WIRED.into()))
+        }
+
+        fn prefetch_to_host(&self) -> Result<(), UnifiedError> {
+            Err(UnifiedError::Cuda(NOT_YET_WIRED.into()))
         }
     }
 
@@ -588,6 +628,61 @@ mod host_backend {
                 .field("size", &self.size)
                 .field("device_id", &self.device_id)
                 .finish()
+        }
+    }
+
+    impl UnifiedBacking for CudaOxideUnifiedBuffer {
+        fn len(&self) -> usize {
+            CudaOxideUnifiedBuffer::len(self)
+        }
+
+        fn as_slice(&self) -> &[u8] {
+            CudaOxideUnifiedBuffer::as_slice(self)
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            CudaOxideUnifiedBuffer::as_mut_slice(self)
+        }
+
+        fn apply_advice(&self, hint: UvmAdvice) -> Result<(), UnifiedError> {
+            // Translate the trait-facing `UvmAdvice` to the host-
+            // backend's internal `CudaOxideAdvice`. `UnsetReadMostly`
+            // has no matching variant on this path either (matches the
+            // cust/cudarc surface), so surface as `NotSupported`.
+            let advice = match hint {
+                UvmAdvice::SetReadMostly => CudaOxideAdvice::ReadMostly,
+                UvmAdvice::UnsetReadMostly => {
+                    return Err(UnifiedError::NotSupported {
+                        feature: "apply_advice(UnsetReadMostly)",
+                        backing: "cuda-oxide",
+                    });
+                }
+                UvmAdvice::SetPreferredLocation(d) => {
+                    CudaOxideAdvice::PreferredLocation(DeviceId(d))
+                }
+                UvmAdvice::UnsetPreferredLocation => CudaOxideAdvice::UnsetPreferredLocation,
+                UvmAdvice::SetAccessedBy(d) => CudaOxideAdvice::AccessedBy(DeviceId(d)),
+                UvmAdvice::UnsetAccessedBy(d) => CudaOxideAdvice::UnsetAccessedBy(DeviceId(d)),
+            };
+            // Fully qualify against the local module so a reader is
+            // not left wondering whether `apply_advice` is the trait
+            // method we are inside or the free function declared in
+            // this `mod host_backend` block.
+            self::apply_advice(self, advice)
+        }
+
+        fn prefetch_to_device(&self, device_ord: u32) -> Result<(), UnifiedError> {
+            // The host-backend's `prefetch_async` already accepts a
+            // destination `DeviceId`, so trait dispatch is a 1:1
+            // forward. Use the supplied ordinal directly.
+            self::prefetch_async(self, DeviceId(device_ord))
+        }
+
+        fn prefetch_to_host(&self) -> Result<(), UnifiedError> {
+            // Host-backend uses `DeviceId(u32::MAX)` as the
+            // CU_DEVICE_CPU sentinel — see `prefetch_async` for the
+            // mapping rationale.
+            self::prefetch_async(self, DeviceId(u32::MAX))
         }
     }
 
