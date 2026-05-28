@@ -629,10 +629,20 @@ pub fn trace_layer_with_propagation() -> tower_http::trace::TraceLayer<
         // them in span attributes that flow to log sinks. Handlers that
         // legitimately need the query string read it from
         // `req.uri().query()` themselves under their own scrubbing.
+        //
+        // Both `path` and `method` flow through bounded sanitisers
+        // (`sanitize_path` / `normalize_method`) before reaching the
+        // span so that path-traversal probes (`/functions/../etc/passwd`)
+        // and CRLF-injection payloads (`/foo%0d%0aevil-header:%20yes`)
+        // can neither forge log lines nor smuggle terminal-escape
+        // sequences into operator dashboards. `traceparent` has its
+        // own dedicated sanitiser above.
+        let sanitised_path = sanitize_path(req.uri().path());
+        let normalised_method = normalize_method(req.method().as_str());
         let span = tracing::info_span!(
             "http.request",
-            method = %req.method(),
-            path = %req.uri().path(),
+            method = %normalised_method,
+            path = %sanitised_path,
             version = ?req.version(),
             traceparent = %sanitised_tp,
         );
@@ -719,6 +729,162 @@ fn sanitise_traceparent(raw: &str) -> std::borrow::Cow<'_, str> {
         out.push(ch);
     }
     Cow::Owned(out)
+}
+
+/// Maximum byte length that a request path is allowed to occupy in a
+/// tracing span attribute (see [`sanitize_path`]). Anything longer is
+/// truncated with a `…` suffix to keep operator log lines bounded and
+/// to deny a hostile client a cheap way to balloon every log record
+/// that touches their request.
+///
+/// 256 bytes comfortably accommodates every route template the API
+/// exposes today (the longest, `/functions/{id}/invoke-async`, is far
+/// under that even after path-parameter substitution) while still
+/// bounding the per-span attribute footprint to a constant. Bump only
+/// after auditing the dashboard layouts in `docs/OBSERVABILITY.md` —
+/// a wider value widens the log-line budget linearly.
+pub const MAX_PATH_LEN: usize = 256;
+
+/// Sentinel returned by [`normalize_method`] for any HTTP method that
+/// does not match the `[A-Z]{1,16}` shape. Keeping a fixed token rather
+/// than the original (filtered) value preserves grep/audit signatures
+/// across hostile inputs — every malformed method bucket maps to the
+/// same string.
+const METHOD_OTHER_SENTINEL: &str = "OTHER";
+
+/// Upper bound on the byte length of an accepted HTTP method name.
+/// Standard methods are at most 7 bytes (`OPTIONS`); 16 leaves room
+/// for legitimate WebDAV-style extensions (`MKCALENDAR`, `PROPPATCH`)
+/// while rejecting padding-style abuse.
+const METHOD_MAX_LEN: usize = 16;
+
+/// Render a request path as a bounded, log-safe string for use as a
+/// tracing span attribute.
+///
+/// The path is attacker-controlled (it flows out of the request URI
+/// after axum's routing layer), so we apply three defences:
+///
+/// 1. **Truncate to [`MAX_PATH_LEN`] bytes** with a `…` ellipsis
+///    suffix when the input is longer. Truncation lands on a UTF-8
+///    char boundary so we never emit invalid UTF-8 to the tracing
+///    layer. The ellipsis is one Unicode code point (`U+2026`, three
+///    UTF-8 bytes) so the returned `Cow::Owned` is at most
+///    `MAX_PATH_LEN + 3` bytes — the test in
+///    `tests/trace_sanitization_test.rs` asserts `MAX_PATH_LEN + 4`
+///    to give a one-byte margin against future ellipsis tweaks.
+/// 2. **Replace non-printable / non-ASCII bytes with `?`.** Anything
+///    outside `0x20..=0x7E` (printable ASCII) is collapsed to a
+///    single `?` so terminal-escape sequences cannot smuggle out of
+///    a log viewer and multi-byte UTF-8 sequences (e.g. `é` →
+///    `0xC3 0xA9`) cannot be reconstructed downstream.
+/// 3. **Strip CR / LF / NUL specifically.** The printable-byte filter
+///    above already catches these, but we apply the explicit strip as
+///    defence in depth: a future relaxation of the printable filter
+///    must NOT re-open the CRLF-injection channel (forging fake JSON
+///    log lines) or the NUL channel (terminating C-string consumers).
+///
+/// When the input is already a clean ASCII-printable string short
+/// enough to fit, we return [`Cow::Borrowed`] to avoid the allocation.
+pub fn sanitize_path(raw: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    // Fast path: already short, already printable ASCII, no
+    // CR/LF/NUL -> borrow. Walking once via `bytes().all` lets the
+    // compiler fuse the checks; we only allocate when something
+    // actually needs rewriting.
+    let is_clean = raw.len() <= MAX_PATH_LEN
+        && raw.bytes().all(|b| {
+            (0x20..=0x7E).contains(&b) && b != b'\r' && b != b'\n' && b != 0
+        });
+    if is_clean {
+        return Cow::Borrowed(raw);
+    }
+
+    // Slow path: build a filtered, clamped owned copy. Walk by char
+    // so truncation never lands mid-codepoint; replace anything
+    // outside printable ASCII with a literal `?` rather than dropping
+    // it, so a path like `/café` round-trips to `/caf??` (two bytes
+    // for `é` → two `?` substitutions) and the resulting attribute
+    // length is observable to operators rather than silently
+    // shrinking.
+    //
+    // We reserve `MAX_PATH_LEN` up front; the ellipsis (if any) is
+    // appended afterwards so the truncation check operates on the
+    // pre-ellipsis byte budget.
+    let mut out = String::with_capacity(raw.len().min(MAX_PATH_LEN));
+    let mut truncated = false;
+    for ch in raw.chars() {
+        // Defence 3: strip CR/LF/NUL explicitly even though the
+        // printable filter below would catch them. A future relaxation
+        // must not re-open the injection channel.
+        if ch == '\r' || ch == '\n' || ch == '\0' {
+            out.push('?');
+            if out.len() >= MAX_PATH_LEN {
+                truncated = true;
+                break;
+            }
+            continue;
+        }
+        let b = ch as u32;
+        let replacement = if (0x20..=0x7E).contains(&b) {
+            // Printable ASCII: keep the character as-is (it occupies
+            // one byte in UTF-8 by definition).
+            ch
+        } else {
+            // Non-printable or non-ASCII: collapse to `?`. This
+            // includes every byte of a multi-byte UTF-8 sequence
+            // because we iterate by `char`, not by byte, so each
+            // non-ASCII code point contributes exactly one `?` to
+            // the output regardless of how many bytes it occupies
+            // in the input.
+            '?'
+        };
+        let ch_len = replacement.len_utf8();
+        if out.len() + ch_len > MAX_PATH_LEN {
+            truncated = true;
+            break;
+        }
+        out.push(replacement);
+    }
+    if truncated {
+        // Append a single-code-point ellipsis (`…`, U+2026, 3 bytes
+        // in UTF-8) so the truncated value is visually distinguishable
+        // from a non-truncated one. Total length stays bounded at
+        // `MAX_PATH_LEN + 3` bytes — see the doc comment above.
+        out.push('…');
+    }
+    Cow::Owned(out)
+}
+
+/// Normalise an HTTP method name for use as a tracing span attribute.
+///
+/// Returns the input borrowed when it matches `[A-Z]{1,16}` exactly
+/// (every standard method — `GET`, `POST`, `PUT`, `PATCH`, `DELETE`,
+/// `HEAD`, `OPTIONS`, `TRACE`, `CONNECT` — passes through verbatim).
+/// Anything else — lowercase (`get`), mixed case (`Get`), control
+/// characters, non-ASCII, oversized padding — collapses to the
+/// [`METHOD_OTHER_SENTINEL`] (`"OTHER"`).
+///
+/// HTTP method names are far less risky than paths (hyper rejects
+/// most malformed values before they reach this layer) but we still
+/// normalise so that:
+///
+/// * dashboard label cardinality stays bounded (no per-request method
+///   variant exploding the metrics index),
+/// * a custom client cannot smuggle non-standard bytes into the
+///   `method` span field that the path sanitiser would have rejected.
+pub fn normalize_method(raw: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    let bytes = raw.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= METHOD_MAX_LEN
+        && bytes.iter().all(|b| b.is_ascii_uppercase());
+    if valid {
+        Cow::Borrowed(raw)
+    } else {
+        Cow::Owned(METHOD_OTHER_SENTINEL.to_string())
+    }
 }
 
 #[cfg(test)]
