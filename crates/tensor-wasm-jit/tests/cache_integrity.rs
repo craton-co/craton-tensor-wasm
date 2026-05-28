@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
 //! Regression tests for jit S-3: cache poisoning integrity check
 //! (in-memory tag) plus the on-disk L2 cache that closes the audit P-4
 //! follow-up.

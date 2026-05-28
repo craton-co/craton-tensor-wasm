@@ -143,6 +143,14 @@ pub struct CachedKernel {
     pub compiled: CompiledHandle,
     /// BLAKE3 over `ptx.text` (jit S-3). Recomputed and compared on every
     /// `get`. See the type-level doc for the threat model.
+    ///
+    /// `#[doc(hidden)]` because the only correct-by-construction path is
+    /// [`CachedKernel::new`]; downstream callers should not need to touch
+    /// the field directly. The field stays `pub` (rather than going
+    /// private with an accessor) so the existing forged-blob regression
+    /// tests can still hand-craft a `CachedKernel` with a deliberately
+    /// wrong hash and assert that `KernelCache::put` rejects it.
+    #[doc(hidden)]
     pub integrity_hash: [u8; 32],
 }
 
@@ -568,9 +576,26 @@ impl DiskCache {
         let hmac_start = bytes.len() - DISK_CACHE_HMAC_LEN;
         let (prefix, tag_bytes) = bytes.split_at(hmac_start);
         let expected = blake3::keyed_hash(&self.cfg.hmac_key, prefix);
-        // BLAKE3's `Hash::as_bytes` and comparison via `==` runs in
-        // constant time for fixed-size arrays per the stdlib.
-        if expected.as_bytes() != tag_bytes {
+        // Constant-time HMAC compare. The stdlib `==` / `PartialEq` impl on
+        // `[u8; N]` and `&[u8]` short-circuits on the first mismatch — a
+        // classic timing oracle that lets an attacker recover a forged MAC
+        // byte-by-byte by measuring how far the comparison got before
+        // rejecting. `subtle::ConstantTimeEq::ct_eq` always inspects every
+        // byte, so the time to reject a forgery does not leak how many
+        // leading bytes were correct.
+        //
+        // `tag_bytes` is a `&[u8]` of length `DISK_CACHE_HMAC_LEN` by
+        // construction (we sliced exactly the last `DISK_CACHE_HMAC_LEN`
+        // bytes), but a hostile on-disk truncation could in principle hand
+        // us a shorter slice. Length is structural metadata (the size of
+        // the file), not secret content, so a non-secret length check up
+        // front is safe — and `ct_eq` itself requires equal-length inputs
+        // to be meaningful, since it would otherwise return `0` without
+        // looking at any bytes.
+        use subtle::ConstantTimeEq;
+        let length_ok = tag_bytes.len() == DISK_CACHE_HMAC_LEN;
+        let mac_ok = length_ok && bool::from(expected.as_bytes().ct_eq(tag_bytes));
+        if !mac_ok {
             tracing::warn!(
                 target: "tensor_wasm_jit::cache",
                 file = %path.display(),
@@ -654,14 +679,17 @@ mod tests {
     use std::thread;
 
     fn dummy_kernel(fp: u64) -> CachedKernel {
-        CachedKernel {
-            fingerprint: fp,
-            ptx: Arc::new(EmittedPtx {
+        // Route through `CachedKernel::new` so `integrity_hash` matches the
+        // PTX text by construction; `KernelCache::put` rejects entries
+        // whose hash disagrees with the text (jit S-3).
+        CachedKernel::new(
+            fp,
+            Arc::new(EmittedPtx {
                 text: String::new(),
                 launch_geometry: (1, 1),
             }),
-            compiled: CompiledHandle::default(),
-        }
+            CompiledHandle::default(),
+        )
     }
 
     #[test]
@@ -734,11 +762,7 @@ mod tests {
         });
         cache.put(
             key,
-            CachedKernel {
-                fingerprint: bp.fingerprint(),
-                ptx: original.clone(),
-                compiled: CompiledHandle::default(),
-            },
+            CachedKernel::new(bp.fingerprint(), original.clone(), CompiledHandle::default()),
         );
         let hit = cache.get(&key).expect("cache hit");
         // The hit returns the same underlying allocation — no re-emit.

@@ -16,14 +16,17 @@ use tensor_wasm_jit::cache::{CacheKey, CachedKernel, CompiledHandle, KernelCache
 use tensor_wasm_jit::ptx_emit::EmittedPtx;
 
 fn dummy_kernel(fp: u64) -> CachedKernel {
-    CachedKernel {
-        fingerprint: fp,
-        ptx: Arc::new(EmittedPtx {
+    // Route through `CachedKernel::new` so the BLAKE3 `integrity_hash`
+    // matches the PTX text — `KernelCache::put` rejects mismatched
+    // entries (jit S-3).
+    CachedKernel::new(
+        fp,
+        Arc::new(EmittedPtx {
             text: format!("// tenant kernel fp={fp}"),
             launch_geometry: (1, 1),
         }),
-        compiled: CompiledHandle::default(),
-    }
+        CompiledHandle::default(),
+    )
 }
 
 #[test]

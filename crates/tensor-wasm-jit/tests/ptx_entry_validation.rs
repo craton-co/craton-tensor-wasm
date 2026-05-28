@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
 //! Regression tests for jit S-1 — PTX entry-name validation.
 //!
 //! `ptx_emit::emit_with` interpolates `blueprint.entry` into the PTX

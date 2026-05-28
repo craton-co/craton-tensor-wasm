@@ -65,11 +65,11 @@ fn pipeline_offload_path() {
     let key = CacheKey::for_tenant(tenant, blueprint.fingerprint(), 80);
     cache.put(
         key,
-        CachedKernel {
-            fingerprint: blueprint.fingerprint(),
-            ptx: std::sync::Arc::new(ptx),
-            compiled: CompiledHandle::default(),
-        },
+        CachedKernel::new(
+            blueprint.fingerprint(),
+            std::sync::Arc::new(ptx),
+            CompiledHandle::default(),
+        ),
     );
 
     // Cache hit on a second lookup with the same blueprint and tenant.
