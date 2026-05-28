@@ -1452,6 +1452,14 @@ mod tests {
     /// [`add_to_linker`] must short-circuit with `AbiError::NotAvailable`
     /// — even otherwise-valid calls. This prevents a guest from gaining
     /// CUDA access just by importing the module.
+    ///
+    /// Post-e4e30b6 the disabled-capability paths deliberately do NOT
+    /// `record_error`: a recorded message would (a) be readable by the
+    /// guest via `last_error_*` if the embedder ever flipped the
+    /// capability back on, turning the gate into a leak channel, and
+    /// (b) burn allocations + mutex traffic for a hostile guest that
+    /// hammers disabled calls. The `NotAvailable` return code is the
+    /// only signal; this test asserts that contract.
     #[tokio::test]
     async fn launch_without_capability_returns_not_available() {
         let mut config = wasmtime::Config::new();
@@ -1465,11 +1473,19 @@ mod tests {
         // `NotAvailable` from the no-CUDA branch *after* full validation;
         // with the capability disabled we expect `NotAvailable` directly
         // from the linker wrapper, *before* any validation work.
+        //
+        // We also import `last_error_len` and call it after the rejected
+        // launch: on a disabled-capability context that surface returns
+        // `AbiError::NotAvailable.code()` (the "surface unavailable on
+        // this instance" sentinel) — NOT a positive length, because no
+        // error must have been recorded.
         let wat = format!(
             r#"
             (module
-              (import "{m}" "{fn_name}"
+              (import "{m}" "{fn_launch}"
                 (func $launch (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+              (import "{m}" "{fn_last_err_len}"
+                (func $last_error_len (result i32)))
               (memory (export "memory") 1)
               (func (export "try_launch") (result i32)
                 (call $launch
@@ -1477,10 +1493,13 @@ mod tests {
                   (i32.const 1) (i32.const 1) (i32.const 1)
                   (i32.const 1) (i32.const 1) (i32.const 1)
                   (i32.const 0) (i32.const 0) (i32.const 0)))
+              (func (export "probe_last_error_len") (result i32)
+                (call $last_error_len))
             )
             "#,
             m = MODULE,
-            fn_name = FN_LAUNCH,
+            fn_launch = FN_LAUNCH,
+            fn_last_err_len = FN_LAST_ERROR_LEN,
         );
         let bytes = wat::parse_str(&wat).unwrap();
         let module = wasmtime::Module::new(&engine, &bytes).expect("compile");
@@ -1505,12 +1524,31 @@ mod tests {
             "ungranted wasi-cuda capability must surface as NotAvailable, \
              got {rc}"
         );
-        // The wrapper should have recorded an error explaining why the
-        // call was rejected — the guest can read it via last_error_*.
-        let last = store.data().wasi_cuda().last_error().unwrap_or_default();
+        // No error message must have been recorded — recording one would
+        // leak through last_error_* if the embedder ever flipped the
+        // capability back on (see the doc comment above and the rationale
+        // in host.rs lines 360-368 / 393-398 / 419-422 / 436-444 / 458-462).
         assert!(
-            last.contains("wasi-cuda capability not granted"),
-            "expected capability error message, got: {last}"
+            store.data().wasi_cuda().last_error().is_none(),
+            "disabled-capability path must NOT record_error, but found: {:?}",
+            store.data().wasi_cuda().last_error()
+        );
+        // Calling last_error_len through the real ABI surface on a
+        // disabled context returns `NotAvailable.code()` (i.e. -1) — the
+        // documented "this surface is unavailable on this instance"
+        // sentinel. Crucially this is NOT `0` (which would mean "no error
+        // on a gate-passing context") and NOT a positive length (which
+        // would mean an error was recorded, leaking the gate state).
+        let probe = instance
+            .get_typed_func::<(), i32>(&mut store, "probe_last_error_len")
+            .expect("typed func");
+        let len_rc = probe.call_async(&mut store, ()).await.expect("call");
+        assert_eq!(
+            len_rc,
+            AbiError::NotAvailable.code(),
+            "last_error_len on a disabled-capability context must return \
+             the NotAvailable sentinel ({}), got {len_rc}",
+            AbiError::NotAvailable.code()
         );
     }
 
