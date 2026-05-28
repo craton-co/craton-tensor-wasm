@@ -84,6 +84,12 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/functions/{id}/invoke"),
     ("POST", "/functions/{id}/invoke-async"),
     ("GET", "/jobs/{id}"),
+    // OpenAI-compat shim (B4.9). Scaffold routes that return 501 with
+    // the OpenAI-shape error envelope. See
+    // `crates/tensor-wasm-api/src/openai.rs` and
+    // `docs/OPENAI-COMPAT.md` for the rollout plan.
+    ("POST", "/v1/completions"),
+    ("POST", "/v1/chat/completions"),
 ];
 
 /// Build the live router exactly as `server::build_router` does, but

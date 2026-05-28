@@ -48,6 +48,14 @@ tags:
     description: Async-job poll API
   - name: ops
     description: Operator-facing endpoints (health, metrics)
+  - name: openai-compat
+    description: |
+      OpenAI-compatible inference gateway shim. The two routes under
+      this tag accept the public OpenAI request shapes so off-the-shelf
+      SDKs can target the gateway URL. v0.3.5 ships them as a scaffold
+      that returns `501 Not Implemented` with the OpenAI error envelope;
+      v0.4 wires `model` → deployed-function translation. See
+      `docs/OPENAI-COMPAT.md` for the rollout plan.
 
 paths:
   /healthz:
@@ -269,6 +277,97 @@ paths:
           $ref: "#/components/responses/NotFound"
         "429":
           $ref: "#/components/responses/RateLimited"
+
+  /v1/completions:
+    post:
+      tags: [openai-compat]
+      summary: OpenAI-compatible text completions (scaffold)
+      description: |
+        Scaffold; v0.4 wires translation. Accepts the public OpenAI
+        `POST /v1/completions` request shape so that off-the-shelf SDKs
+        (`openai`, `openai-node`, LangChain, …) deserialise without
+        modification. The v0.3.5 implementation returns `501 Not
+        Implemented` with the OpenAI-shape error envelope
+        (`OpenAiError`); v0.4 lands the actual `model` → deployed
+        function translation and streams tokens back as SSE
+        `data:` chunks.
+
+        Tenant scope is derived from the bearer token's `:tenant=...`
+        clause (see `BearerAuth`) — the `X-TensorWasm-Tenant` header is
+        NOT honoured on this route, because OpenAI SDKs never send it.
+        See `docs/OPENAI-COMPAT.md` for the rollout plan and
+        `crates/tensor-wasm-api/src/openai.rs` for the request types.
+      operationId: openaiCompletions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompletionsRequest"
+      responses:
+        "400":
+          description: Malformed request body (OpenAI envelope shape).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenAiError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "501":
+          description: |
+            Scaffold response. Envelope `error.code` is
+            `openai_not_yet_wired`; clients should branch on that code
+            rather than the human-readable `message`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenAiError"
+
+  /v1/chat/completions:
+    post:
+      tags: [openai-compat]
+      summary: OpenAI-compatible chat completions (scaffold)
+      description: |
+        Scaffold; v0.4 wires translation. Accepts the public OpenAI
+        `POST /v1/chat/completions` request shape (system / user /
+        assistant / tool message history). The v0.3.5 implementation
+        returns `501 Not Implemented` with the OpenAI-shape error
+        envelope; v0.4 lands model → function translation and SSE
+        streaming.
+
+        Tenant scope is derived from the bearer token's `:tenant=...`
+        clause (see `BearerAuth`) — the `X-TensorWasm-Tenant` header is
+        NOT honoured on this route, because OpenAI SDKs never send it.
+        See `docs/OPENAI-COMPAT.md` for the rollout plan.
+      operationId: openaiChatCompletions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionsRequest"
+      responses:
+        "400":
+          description: Malformed request body (OpenAI envelope shape).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenAiError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "501":
+          description: |
+            Scaffold response. Envelope `error.code` is
+            `openai_not_yet_wired`; clients should branch on that code
+            rather than the human-readable `message`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenAiError"
 
 components:
   securitySchemes:
@@ -542,3 +641,120 @@ components:
           $ref: "#/components/schemas/ApiErrorBody"
       required: [error]
       additionalProperties: false
+
+    CompletionsRequest:
+      type: object
+      description: |
+        Body of `POST /v1/completions`. Mirrors the public OpenAI
+        contract documented at
+        https://platform.openai.com/docs/api-reference/completions/create
+        so that off-the-shelf SDKs deserialise without modification.
+        Every field is optional at the wire layer; the v0.4 wiring step
+        will tighten required-ness once `model` resolves to a deployed
+        FunctionRecord. Mirrors `tensor_wasm_api::openai::CompletionsRequest`.
+      properties:
+        model:
+          type: string
+          description: Model identifier (resolved to a deployed function in v0.4).
+        prompt:
+          description: Prompt text (string) or array of strings (OpenAI batch shape).
+        max_tokens:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+        stream:
+          type: boolean
+        echo:
+          type: boolean
+        n:
+          type: integer
+          minimum: 1
+        user:
+          type: string
+
+    ChatMessage:
+      type: object
+      description: |
+        One entry in the `messages` array of
+        `POST /v1/chat/completions`. Mirrors the OpenAI message shape.
+      properties:
+        role:
+          type: string
+          description: One of `system`, `user`, `assistant`, `tool` (OpenAI shape).
+        content:
+          description: Message content (string or content-array for multimodal).
+        name:
+          type: string
+
+    ChatCompletionsRequest:
+      type: object
+      description: |
+        Body of `POST /v1/chat/completions`. Mirrors the public OpenAI
+        contract documented at
+        https://platform.openai.com/docs/api-reference/chat/create.
+        Mirrors `tensor_wasm_api::openai::ChatCompletionsRequest`.
+      properties:
+        model:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+        max_tokens:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+        stream:
+          type: boolean
+        n:
+          type: integer
+          minimum: 1
+        tools:
+          description: Optional tool-calling array (OpenAI tools surface; v0.4 wires).
+        user:
+          type: string
+
+    OpenAiErrorBody:
+      type: object
+      description: |
+        OpenAI-shape error body. Distinct from `ApiErrorBody` because
+        OpenAI SDKs parse the four-field shape verbatim and will not
+        look at the native envelope. Mirrors
+        `tensor_wasm_api::openai::OpenAiErrorBody`.
+      properties:
+        message:
+          type: string
+        type:
+          type: string
+          description: |
+            OpenAI-conventional error category. Known values include
+            `not_implemented` (scaffold 501) and `invalid_request_error`
+            (extractor 400). Other values may appear as the surface
+            grows; clients should treat the field as an open string.
+        param:
+          type: ["string", "null"]
+          description: Name of the offending request field, if any.
+        code:
+          type: ["string", "null"]
+          description: |
+            Stable machine-readable code that clients branch on. The
+            scaffold returns `openai_not_yet_wired`; the invalid-JSON
+            path returns `openai_invalid_request`.
+      required: [message, type]
+
+    OpenAiError:
+      type: object
+      description: |
+        Top-level OpenAI-shape error envelope: `{ "error": { ... } }`.
+        Returned by every error response on the `/v1/...` routes. See
+        `OpenAiErrorBody` for the inner shape.
+      properties:
+        error:
+          $ref: "#/components/schemas/OpenAiErrorBody"
+      required: [error]

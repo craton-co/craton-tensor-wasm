@@ -238,8 +238,48 @@ pub fn build_router_with_audit(
         // status code and any AuditOutcomeExt the handler stamped.
         .layer(axum::middleware::from_fn(audit_log_middleware));
 
+    // OpenAI-compat shim stack (B4.9). The two `/v1/...` routes accept
+    // off-the-shelf OpenAI SDK requests; those clients send
+    // `Authorization: Bearer <api_key>` but NEVER an `X-TensorWasm-Tenant`
+    // header, so the routes must be mounted OUTSIDE the `tenant_scope`
+    // middleware — the layer would otherwise reject every OpenAI request
+    // with `missing_tenant` 400. Tenant resolution comes from the bearer
+    // token's `TokenScope` instead (wired in v0.4); see
+    // `crates/tensor-wasm-api/src/openai.rs` and `docs/OPENAI-COMPAT.md`.
+    //
+    // Bearer auth, rate-limit, and audit still apply so an unauthenticated
+    // OpenAI client receives `401` (not `501`), and the v0.4 wiring step
+    // can rely on the same actor/tenant/audit pipeline as the native
+    // routes once tenant inference moves out of the header layer.
+    //
+    // Concurrency budget: share INVOKE_CONCURRENCY_LIMIT — the v0.4
+    // implementation will execute the same `TensorWasmExecutor` spawn path
+    // as native `/invoke`, so the budgets should track in lockstep. While
+    // the scaffold returns 501 in ~µs the cap is effectively a no-op.
+    // Explicit `Router::<Arc<AppState>>::new()` because neither OpenAI
+    // handler takes a `State` extractor (the scaffold has no AppState
+    // dependency yet), so the compiler cannot infer the state type from
+    // the handler signatures alone. The annotation lines the sub-router
+    // up with `protected_router` and `probe_router` for the outer
+    // `.merge(...)` call — without it `Router::merge` complains about
+    // mismatched state generics.
+    let openai_router: Router<Arc<AppState>> = Router::new()
+        .route(
+            "/v1/completions",
+            post(crate::openai::completions_handler),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(crate::openai::chat_completions_handler),
+        )
+        .layer(concurrency_limit_layer(INVOKE_CONCURRENCY_LIMIT))
+        .layer(axum::middleware::from_fn(bearer_auth))
+        .layer(axum::middleware::from_fn(rate_limit))
+        .layer(axum::middleware::from_fn(audit_log_middleware));
+
     protected_router
         .merge(probe_router)
+        .merge(openai_router)
         .layer(common_layers)
         .with_state(state)
 }

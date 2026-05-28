@@ -65,6 +65,7 @@ pub mod audit;
 pub mod config;
 pub mod http_metrics;
 pub mod middleware;
+pub mod openai;
 pub mod rate_limit;
 pub mod routes;
 pub mod server;
@@ -87,6 +88,9 @@ pub use http_metrics::{
 pub use middleware::{
     AuthConfig, CorsConfig, TenantConfig, ENV_API_TOKENS, ENV_CORS_ALLOWED_ORIGINS,
     ENV_REQUIRE_TENANT, HEADER_TENANT, MAX_REQUEST_BODY_BYTES,
+};
+pub use openai::{
+    ChatCompletionsRequest, ChatMessage, CompletionsRequest, OpenAiError, OpenAiErrorBody,
 };
 pub use rate_limit::{AuthContext, RateLimitConfig, RateLimiter, TokenId};
 pub use routes::{ApiError, AppState, FunctionRecord, JobRecord, JobStatus};

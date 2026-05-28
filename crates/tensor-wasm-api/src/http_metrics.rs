@@ -102,6 +102,12 @@ pub const DEFAULT_ROUTE_ALLOWLIST: &[&str] = &[
     "/functions/:id/invoke",
     "/functions/:id/invoke-async",
     "/jobs/:id",
+    // OpenAI-compat shim (B4.9). Scaffold routes that return 501 today
+    // and wire model → function translation in v0.4. See
+    // `crates/tensor-wasm-api/src/openai.rs` for the handlers and
+    // `docs/OPENAI-COMPAT.md` for the rollout plan.
+    "/v1/completions",
+    "/v1/chat/completions",
 ];
 
 /// Set of route templates that the metrics middleware is willing to emit as
