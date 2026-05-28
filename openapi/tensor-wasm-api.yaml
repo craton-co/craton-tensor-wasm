@@ -495,6 +495,16 @@ components:
           $ref: "#/components/schemas/JobId"
         function_id:
           $ref: "#/components/schemas/FunctionId"
+        tenant_id:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Tenant under which the job was dispatched. `GET /jobs/{id}`
+            returns `403 tenant_scope_denied` when the caller's
+            `X-TensorWasm-Tenant` header does not match this value, so a
+            token authorised for one tenant cannot read another tenant's
+            job results.
         status:
           $ref: "#/components/schemas/JobStatus"
         result:
@@ -506,7 +516,7 @@ components:
           type: integer
           format: int64
           minimum: 0
-      required: [id, function_id, status, created_unix_ms]
+      required: [id, function_id, tenant_id, status, created_unix_ms]
       additionalProperties: false
     ApiErrorBody:
       type: object
