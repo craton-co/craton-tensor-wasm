@@ -125,6 +125,10 @@ fn valid_hmac_over_corrupted_payload_still_reaches_bincode() {
 
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&KEY).expect("HMAC init");
     mac.update(&compressed_prefix);
+    // snapshot 1.1: the writer also authenticates the signature-kind byte
+    // so the verifier expects it in the HMAC input. Mirror here so the
+    // forged blob actually verifies and the test reaches the bincode path.
+    mac.update(&[SIGNATURE_KIND_HMAC_SHA256]);
     let sig = mac.finalize().into_bytes();
 
     let mut blob = compressed_prefix;
