@@ -493,7 +493,30 @@ pub fn build_kernel_param_storage(args: &[LoweredArg]) -> KernelParamStorage {
     // CUDA Unified Memory `host_ptr` doubles as a device address; for
     // non-UVM allocations the guest would have to call `cuMemAlloc`
     // separately (out of scope for v0.2 — see `docs/RISKS.md`).
-    let mut backing: Vec<u8> = Vec::new();
+    //
+    // PERF (T23): pre-size `backing` so a typical 8-arg kernel does not
+    // pay 2-3 reallocations as the Vec grows from cap 0. We walk `args`
+    // once to compute a safe upper bound on the post-padding size:
+    // each slot occupies at most `align-1` padding bytes (worst case)
+    // plus its native size. This over-counts the padding (the actual
+    // padding depends on running totals), but `into_boxed_slice` later
+    // drops the unused tail capacity so the over-allocation is purely
+    // a startup tax, paid once.
+    let estimated_cap: usize = args
+        .iter()
+        .map(|a| match a {
+            LoweredArg::I32(_) | LoweredArg::F32(_) | LoweredArg::U32(_) => {
+                std::mem::align_of::<u32>() - 1 + 4
+            }
+            LoweredArg::I64(_) | LoweredArg::F64(_) | LoweredArg::U64(_) => {
+                std::mem::align_of::<u64>() - 1 + 8
+            }
+            LoweredArg::Ptr { .. } => {
+                std::mem::align_of::<usize>() - 1 + std::mem::size_of::<usize>()
+            }
+        })
+        .sum();
+    let mut backing: Vec<u8> = Vec::with_capacity(estimated_cap);
     let mut offsets: Vec<usize> = Vec::with_capacity(args.len());
 
     /// Pad `backing.len()` up to the next multiple of `align`, then

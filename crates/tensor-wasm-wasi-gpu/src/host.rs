@@ -937,13 +937,24 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
     // malicious guest cannot trade a `MemoryFault` for the friendlier
     // tag-byte error.
     let lowered_args: Vec<LoweredArg> = if args_len > 0 {
-        let raw = read_bytes(caller, args_ptr, args_len)?;
+        // PERF (T23): skip the `read_bytes` Vec copy of the argv buffer.
+        // `parse_argv` already takes both inputs as `&[u8]`, so we can
+        // pass it slices directly into the caller's linear memory.
+        // `validate_launch_args` above has already verified that
+        // `args_ptr >= 0`, `args_len >= 0`, and `[args_ptr, args_ptr +
+        // args_len) ⊆ memory`, so the slicing below cannot panic. A
+        // single `mem.data(&caller)` borrow covers both the args region
+        // and the whole-memory bounds-check that pointer args inside
+        // `parse_argv` need.
         let mem = caller
             .get_export("memory")
             .and_then(|e| e.into_memory())
             .ok_or(AbiError::InvalidPointer)?;
         let mem_data = mem.data(&caller);
-        match parse_argv(&raw, mem_data) {
+        let start = args_ptr as usize;
+        let end = start + args_len as usize;
+        let argv_slice = &mem_data[start..end];
+        match parse_argv(argv_slice, mem_data) {
             Ok(v) => v,
             Err(e) => {
                 caller.data().wasi_cuda().record_error(format!(
