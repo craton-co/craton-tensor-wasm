@@ -76,8 +76,13 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let engine = Arc::new(TensorWasmEngine::new().context("constructing TensorWasmEngine")?);
     let executor = TensorWasmExecutor::new(engine);
 
+    // T33 (v0.4): the typed argument list is also attached to the
+    // SpawnConfig via `with_args` so the spawn config carries the args
+    // alongside the explicit `call_export_with_args` call below — matches
+    // the wiring the API gateway does in `run_invoke`.
+    let cfg = SpawnConfig::for_tenant(TenantId(1)).with_args(wasm_args.clone());
     let id = executor
-        .spawn_instance(SpawnConfig::for_tenant(TenantId(1)), &wasm)
+        .spawn_instance(cfg, &wasm)
         .await
         .context("spawning instance")?;
 

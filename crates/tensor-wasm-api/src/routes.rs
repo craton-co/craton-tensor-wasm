@@ -991,7 +991,15 @@ async fn run_invoke(
     export_override: Option<&str>,
     args: &[WasmArg],
 ) -> ApiResult<serde_json::Value> {
-    let cfg = SpawnConfig::for_tenant(tenant).with_deadline(INVOKE_DEFAULT_DEADLINE);
+    // T33 (v0.4): attach the typed argument list to the SpawnConfig as
+    // well as passing it explicitly to `call_export_with_args_then_terminate`.
+    // The `SpawnConfig::args` field is the canonical carrier for the upcoming
+    // call (see `SpawnConfig::args` doc) — wiring it here keeps the API surface
+    // honest even though the historical explicit-pass path remains for
+    // back-compat with embedders that drive multi-call flows.
+    let cfg = SpawnConfig::for_tenant(tenant)
+        .with_deadline(INVOKE_DEFAULT_DEADLINE)
+        .with_args(args.to_vec());
     let instance_id = executor.spawn_instance(cfg, wasm_bytes).await?;
 
     // api S-20 / exec orphan-instance: use `call_export_with_args_then_terminate`
@@ -1022,8 +1030,9 @@ async fn run_invoke(
                 // expensive than the old "reuse the instance" flow but only
                 // when `_start` is genuinely absent, and keeps the auto-
                 // terminate invariant intact.
-                let cfg =
-                    SpawnConfig::for_tenant(tenant).with_deadline(INVOKE_DEFAULT_DEADLINE);
+                let cfg = SpawnConfig::for_tenant(tenant)
+                    .with_deadline(INVOKE_DEFAULT_DEADLINE)
+                    .with_args(args.to_vec());
                 let retry_id = executor.spawn_instance(cfg, wasm_bytes).await?;
                 executor
                     .call_export_with_args_then_terminate(retry_id, "main", args)
