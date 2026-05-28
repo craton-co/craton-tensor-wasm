@@ -205,8 +205,8 @@ pub async fn http_metrics_middleware(req: Request, next: Next) -> Response {
     let route = route_label(&req, &cfg.routes);
     let method = req.method().as_str().to_string();
     let in_flight_labels = HttpInFlightLabels {
-        route: route.clone(),
-        method: method.clone(),
+        route: route.clone().into(),
+        method: method.clone().into(),
     };
 
     // `get_or_create_owned` returns an owned `Gauge` (cheap: `Gauge` wraps
@@ -240,9 +240,9 @@ pub async fn http_metrics_middleware(req: Request, next: Next) -> Response {
 
     let status = response.status().as_u16().to_string();
     let labels = HttpRequestLabels {
-        route,
-        method,
-        status,
+        route: route.into(),
+        method: method.into(),
+        status: status.into(),
     };
     cfg.metrics
         .http_requests_total()

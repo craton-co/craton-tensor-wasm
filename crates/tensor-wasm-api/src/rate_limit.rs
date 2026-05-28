@@ -712,7 +712,15 @@ pub async fn rate_limit(req: Request, next: Next) -> Response {
         // un-authed requests into the dev bucket so they still face the
         // configured cap. This should not happen in the production stack.
         .unwrap_or(TokenId::DEV);
-    match limiter.try_admit(token) {
+    // Per-tenant rate-limit (api S-25): the tenant_scope middleware sets
+    // a tenant extension on the request. Fall back to TenantId(0) for the
+    // unauthenticated / probe paths so they share a single bucket.
+    let tenant = req
+        .extensions()
+        .get::<tensor_wasm_core::types::TenantId>()
+        .copied()
+        .unwrap_or(tensor_wasm_core::types::TenantId(0));
+    match limiter.try_admit(token, tenant) {
         AdmitResult::Admit => next.run(req).await,
         AdmitResult::Reject { retry_after_secs } => rate_limited_response(retry_after_secs),
     }

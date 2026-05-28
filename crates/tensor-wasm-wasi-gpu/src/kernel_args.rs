@@ -163,11 +163,11 @@ pub enum LoweredArg {
         /// that need to observe the parsed argv take a pointer-free
         /// [`LoweredArgSnapshot`] via
         /// [`crate::host::WasiCudaContext::last_lowered_args`].
-        pub(crate) host_ptr: *const u8,
+        host_ptr: *const u8,
         /// Byte length the kernel will access.
-        pub len: u32,
+        len: u32,
         /// Original guest-memory offset (for logging / tests).
-        pub guest_offset: u32,
+        guest_offset: u32,
     },
 }
 
