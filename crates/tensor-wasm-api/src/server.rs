@@ -227,8 +227,8 @@ fn maybe_warn_host_validation_disabled() {
     if !tokens_set {
         return;
     }
-    let trusted_hosts_set = std::env::var(ENV_TRUSTED_HOSTS)
-        .is_ok_and(|v| !TrustedHosts::from_raw(&v).is_empty());
+    let trusted_hosts_set =
+        std::env::var(ENV_TRUSTED_HOSTS).is_ok_and(|v| !TrustedHosts::from_raw(&v).is_empty());
     if trusted_hosts_set {
         return;
     }
