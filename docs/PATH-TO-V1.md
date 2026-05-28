@@ -593,7 +593,10 @@ not calendar time.
 
 - **What:** Well-behaved guests offer suspend points via a new WASI
   yield host function; the scheduler uses these to keep tail latency
-  bounded under MPS contention.
+  bounded under MPS contention. Landed as the
+  `wasi:scheduler/host@0.1.0` interface — see
+  [COOPERATIVE-YIELD.md](COOPERATIVE-YIELD.md) for the protocol guide,
+  return-code semantics, and the embedder wiring snippet.
 - **Why:** Today a long-running guest under MPS contention blocks
   other tenants until preemption. Cooperative yields close the gap
   without paying full preemption cost.
@@ -662,6 +665,13 @@ not calendar time.
 - **Cost:** ~3 weeks.
 - **Risk:** Low. The two stores already converged in format; this is
   collapsing the abstraction, not reinventing it.
+- **Status:** v0.3.7 scaffold landed — trait + in-memory impl +
+  fully-implemented disk impl in
+  [`crates/tensor-wasm-artifacts`](../crates/tensor-wasm-artifacts).
+  Design and v0.4 convergence plan in
+  [`docs/ARTIFACT-STORE.md`](ARTIFACT-STORE.md). JIT cache and
+  snapshot store still use their own formats today; migration of
+  each consumer onto the unified envelope is the v0.4 follow-up.
 
 #### 10. OpenAI-compatible inference gateway shim
 

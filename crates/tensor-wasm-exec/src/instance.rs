@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tensor_wasm_core::types::{InstanceId, TenantId};
+use tensor_wasm_wasi_gpu::scheduler::SchedulerContext;
 
 use crate::executor::TensorWasmResourceLimiter;
 use crate::jit_dispatch::{ArenaState, JitArenaProvider};
@@ -67,6 +68,19 @@ pub struct InstanceState {
     /// the same [`wasmtime::Linker`] from polluting each other's bump
     /// cursor and LIFO stack — see [`JitArenaProvider`].
     pub(crate) jit_arena: ArenaState,
+    /// Per-instance cooperative-scheduler context backing the
+    /// `wasi:scheduler/host@0.1.0` host functions (roadmap feature #4).
+    ///
+    /// Re-armed at the start of each [`crate::executor::TensorWasmExecutor::call_export`]
+    /// alongside [`Self::deadline`] so back-to-back calls each get a
+    /// fresh `started_at` instant — without this the second call would
+    /// observe a deadline-elapsed reading immediately because the
+    /// elapsed wall-clock from the first call would still be charged.
+    ///
+    /// On spawns without a configured deadline, this is constructed
+    /// via [`SchedulerContext::unbounded`] and every `yield()` returns
+    /// `YIELD_CODE_CONTINUE`.
+    pub(crate) scheduler: SchedulerContext,
 }
 
 impl InstanceState {
@@ -87,6 +101,15 @@ impl InstanceState {
             gpu_bytes_allocated: AtomicU64::new(0),
             limiter: TensorWasmResourceLimiter::new(usize::MAX),
             jit_arena: ArenaState::default(),
+            // No deadline configured by default; spawns with a
+            // SpawnConfig::deadline overwrite this via
+            // `with_deadline_duration` so the SchedulerContext budget
+            // matches the wasmtime epoch deadline. Constructing the
+            // unbounded shape here means a guest that imports
+            // `wasi:scheduler/host` always gets a working surface
+            // — `yield()` is a no-op CONTINUE and
+            // `deadline-remaining-ms` returns u32::MAX.
+            scheduler: SchedulerContext::unbounded(),
         }
     }
 
@@ -106,9 +129,38 @@ impl InstanceState {
     /// Record the per-call deadline duration so subsequent calls can re-arm
     /// the wall-clock deadline (and matching wasmtime epoch ticks) instead
     /// of inheriting the elapsed window from spawn time.
+    ///
+    /// Also seeds the cooperative-scheduler context with the same
+    /// budget (clamped to `u32::MAX` ms ≈ 49 days, which is well above
+    /// any plausible production deadline) so guests calling
+    /// `wasi:scheduler/host.yield()` observe a non-zero return code
+    /// when the deadline is approaching.
     pub fn with_deadline_duration(mut self, d: Duration) -> Self {
         self.deadline_duration = Some(d);
+        // Clamp to u32::MAX; a deadline larger than that is in
+        // practice "unbounded" — the epoch interrupt would never fire
+        // within u32::MAX ms either, so the cooperative path can
+        // honestly report u32::MAX too.
+        let deadline_ms = u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
+        self.scheduler = SchedulerContext::new(Some(deadline_ms));
         self
+    }
+
+    /// Borrow the cooperative-scheduler context. Used by the
+    /// `wasi:scheduler/host` linker registration to plumb the
+    /// per-instance state into the `yield` and `deadline-remaining-ms`
+    /// host functions.
+    pub fn scheduler(&self) -> &SchedulerContext {
+        &self.scheduler
+    }
+
+    /// Re-arm the scheduler context's wall-clock origin. Called from
+    /// [`crate::executor::TensorWasmExecutor::call_export`] at the
+    /// start of each call so back-to-back invocations each see a
+    /// fresh elapsed window (mirroring the per-call re-arm of
+    /// [`Self::deadline`] and the wasmtime epoch deadline).
+    pub(crate) fn rearm_scheduler(&mut self) {
+        self.scheduler.rearm();
     }
 
     /// Increment the kernel dispatch counter and return the new value.

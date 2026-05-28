@@ -7,6 +7,7 @@ members = [
     "crates/tensor-wasm-wasi-gpu",
     "crates/tensor-wasm-jit",
     "crates/tensor-wasm-snapshot",
+    "crates/tensor-wasm-artifacts",
     "crates/tensor-wasm-tenant",
     "crates/tensor-wasm-api",
     "crates/tensor-wasm-cli",
@@ -37,6 +38,7 @@ tensor-wasm-exec = { path = "crates/tensor-wasm-exec", version = "0.3.6" }
 tensor-wasm-wasi-gpu = { path = "crates/tensor-wasm-wasi-gpu", version = "0.3.6" }
 tensor-wasm-jit = { path = "crates/tensor-wasm-jit", version = "0.3.6" }
 tensor-wasm-snapshot = { path = "crates/tensor-wasm-snapshot", version = "0.3.6" }
+tensor-wasm-artifacts = { path = "crates/tensor-wasm-artifacts", version = "0.3.6" }
 tensor-wasm-tenant = { path = "crates/tensor-wasm-tenant", version = "0.3.6" }
 tensor-wasm-api = { path = "crates/tensor-wasm-api", version = "0.3.6" }
 

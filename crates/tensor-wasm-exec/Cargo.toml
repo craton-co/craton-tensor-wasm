@@ -18,6 +18,7 @@ async-trait.workspace = true
 tensor-wasm-core = { workspace = true }
 tensor-wasm-jit = { workspace = true }
 tensor-wasm-mem = { workspace = true }
+tensor-wasm-wasi-gpu = { workspace = true }
 blake3.workspace = true
 dashmap.workspace = true
 futures.workspace = true

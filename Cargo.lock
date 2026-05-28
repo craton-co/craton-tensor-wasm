@@ -3338,6 +3338,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tensor-wasm-artifacts"
+version = "0.3.6"
+dependencies = [
+ "bincode",
+ "blake3",
+ "hmac",
+ "parking_lot",
+ "serde",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "zeroize",
+ "zstd",
+]
+
+[[package]]
 name = "tensor-wasm-bench"
 version = "0.3.6"
 dependencies = [
@@ -3420,6 +3438,7 @@ dependencies = [
  "tensor-wasm-core",
  "tensor-wasm-jit",
  "tensor-wasm-mem",
+ "tensor-wasm-wasi-gpu",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",

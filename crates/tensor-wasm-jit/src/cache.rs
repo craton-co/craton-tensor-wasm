@@ -26,6 +26,7 @@
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -92,6 +93,17 @@ impl CacheKey {
     /// config. Use this when the lookup must distinguish between
     /// PTX-version variants, target-architecture suffixes, or
     /// launch-bounds settings (jit S-2).
+    ///
+    /// Cost note: each call builds a fresh `blake3::Hasher` and finalises
+    /// over a handful of bytes. The amortised wall cost is ~µs on a
+    /// modern x86-64 box — negligible compared to a kernel dispatch but
+    /// non-zero on the hot path. Callers that resolve the same
+    /// `EmitConfig` for every lookup (the typical pattern: emit-config is
+    /// pinned at instance-spawn time) should hash it once at spawn and
+    /// reuse the [`CacheKey`] rather than re-deriving it for every
+    /// dispatch. The hasher itself is intentionally inline here (not
+    /// memoised) so the function stays pure and `Send`-friendly for the
+    /// rewriter's `rayon::par_iter` callers.
     pub fn for_tenant_with_emit_config(
         tenant_id: TenantId,
         blueprint: u64,
@@ -119,7 +131,84 @@ impl CacheKey {
 }
 
 /// Default cache capacity (kernels).
+///
+/// Memory-ceiling note: each entry holds an `Arc<EmittedPtx>` whose `text`
+/// is the emitted PTX string. Typical kernels emit ~5-15 KB of PTX (a
+/// vector-add lands around 2 KB; a small fused matmul around 12 KB), so at
+/// 256 entries the steady-state L1 footprint is on the order of ~2.5 MB
+/// (~10 KB PTX × 256) plus the per-entry `BLAKE3` hash (32 B) and the
+/// LRU policy queue (one `CacheKey` per entry, 24 B). Hostile or
+/// pathological blueprints could push individual entries into the
+/// multi-MB range — a deliberately unrolled blueprint emitting 10 MB of
+/// PTX would push the 256-slot cache to ~2.5 GB. Operators expecting
+/// adversarial workloads should clamp this via
+/// [`KernelCache::with_capacity`] (lower) and pair it with the on-disk
+/// L2 cache so cold lookups still hit a persisted path. The cache does
+/// NOT enforce a per-entry byte limit; the count cap is the only knob.
 pub const DEFAULT_CAPACITY: usize = 256;
+
+/// Construction-time configuration for [`KernelCache`].
+///
+/// Holds the small set of policy knobs the cache supports today: capacity
+/// (count cap) and whether to recompute the per-entry BLAKE3 integrity
+/// hash on every `get`. Future knobs (per-byte cap, eviction policy
+/// choice) will land here without breaking the existing
+/// [`KernelCache::with_capacity`] / [`KernelCache::with_disk_persistence`]
+/// shorthands — those construct an equivalent `KernelCacheConfig` under
+/// the hood.
+///
+/// Construct via [`KernelCacheConfig::default`] (which mirrors the
+/// historical defaults — capacity [`DEFAULT_CAPACITY`], verify-on-get
+/// `true`) and refine with the `with_*` builders, then hand the config
+/// to [`KernelCache::with_config`].
+#[derive(Clone, Debug)]
+pub struct KernelCacheConfig {
+    /// Soft maximum L1 entry count. Clamped to `>= 1` inside the cache.
+    pub capacity: usize,
+    /// When `true` (the default), [`KernelCache::get`] recomputes a
+    /// BLAKE3 over the cached `ptx.text` on every L1 hit and compares
+    /// the result against the entry's stored `integrity_hash` (jit S-3
+    /// in-mem poisoning defence). When `false`, the recompute is skipped
+    /// — the cache still refuses entries whose stored hash is all-zero
+    /// (the construction signal for "built without [`CachedKernel::new`]")
+    /// as defence-in-depth.
+    ///
+    /// The recompute costs ~10 µs over a typical multi-KB PTX blob;
+    /// skipping it shaves that off every L1 hit at the cost of widening
+    /// the in-memory poisoning window from "one `get` call" to "the
+    /// lifetime of the entry in L1". Operators on a high-QPS path with
+    /// multi-MB PTX where the recompute dominates can opt out, but the
+    /// safe default is verify-on-get.
+    pub verify_on_get: bool,
+}
+
+impl Default for KernelCacheConfig {
+    fn default() -> Self {
+        Self {
+            capacity: DEFAULT_CAPACITY,
+            verify_on_get: true,
+        }
+    }
+}
+
+impl KernelCacheConfig {
+    /// Override the L1 entry count cap. Clamped to `>= 1` at cache
+    /// construction time; values below 1 are silently raised.
+    #[must_use]
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity;
+        self
+    }
+
+    /// Toggle the per-`get` BLAKE3 recompute. Default `true`; setting
+    /// `false` is the high-QPS opt-out. See the field-level docs on
+    /// [`Self::verify_on_get`] for the threat-model trade-off.
+    #[must_use]
+    pub fn with_verify_on_get(mut self, on: bool) -> Self {
+        self.verify_on_get = on;
+        self
+    }
+}
 
 /// Cached PTX module entry.
 ///
@@ -212,8 +301,10 @@ pub struct KernelCache {
     /// fast, panic-safe contention. The value side is `()` — the real value
     /// lives in `storage`.
     lru: Arc<Mutex<LruCache<CacheKey, ()>>>,
-    /// Soft maximum entries before eviction kicks in.
-    capacity: usize,
+    /// Construction-time policy bag (capacity, verify-on-get). Held by
+    /// value (cheap to clone, `Copy`-ish payload) so the `get` hot path
+    /// can read `verify_on_get` without an extra `Arc` deref.
+    config: KernelCacheConfig,
     /// Optional L2 on-disk cache. When present (configured via
     /// [`KernelCache::with_disk_persistence`]), `put` writes each entry to
     /// disk under an HMAC-keyed integrity tag, and `get` falls through to
@@ -221,28 +312,43 @@ pub struct KernelCache {
     /// [`DiskCacheConfig`] for the threat model that motivates the design
     /// (jit S-3).
     disk: Option<Arc<DiskCache>>,
+    /// Cumulative count of `get` calls that skipped the BLAKE3 recompute
+    /// because [`KernelCacheConfig::verify_on_get`] was `false`.
+    /// Exposed via [`Self::verify_skipped_total`] so operators can wire
+    /// it to the Prometheus counter
+    /// `tensor_wasm_jit_cache_verify_skipped_total`. Wrapped in an `Arc`
+    /// so clones of `KernelCache` share the same counter (the storage
+    /// and LRU policy are likewise `Arc`-shared).
+    verify_skipped_total: Arc<AtomicU64>,
 }
 
 impl KernelCache {
     /// Construct with default capacity.
     pub fn new() -> Self {
-        Self::with_capacity(DEFAULT_CAPACITY)
+        Self::with_config(KernelCacheConfig::default())
     }
 
     /// Construct with explicit capacity. Anything below 1 is clamped to 1.
     pub fn with_capacity(cap: usize) -> Self {
-        let cap = cap.max(1);
+        Self::with_config(KernelCacheConfig::default().with_capacity(cap))
+    }
+
+    /// Construct from a full [`KernelCacheConfig`]. Anything below 1 in
+    /// `config.capacity` is clamped to 1.
+    pub fn with_config(mut config: KernelCacheConfig) -> Self {
+        config.capacity = config.capacity.max(1);
         // The eviction queue is sized to `cap` so the LRU crate's internal
         // bucket pre-allocation is bounded (sizing it to `usize::MAX` triggers
         // a hashbrown capacity-overflow panic). Storage eviction is still
         // driven from the `storage.len() > capacity` check in `put`; both
         // sides agree on the same `cap` so they stay in sync.
-        let nz = NonZeroUsize::new(cap).expect(">0 (clamped above)");
+        let nz = NonZeroUsize::new(config.capacity).expect(">0 (clamped above)");
         Self {
-            storage: Arc::new(DashMap::with_capacity(cap)),
+            storage: Arc::new(DashMap::with_capacity(config.capacity)),
             lru: Arc::new(Mutex::new(LruCache::new(nz))),
-            capacity: cap,
+            config,
             disk: None,
+            verify_skipped_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -329,9 +435,9 @@ impl KernelCache {
         // letting unrelated readers/writers contend on each pass. One
         // acquisition costs the same as one iteration's lock+unlock but
         // dispatches the whole burst in a single critical section.
-        if self.storage.len() > self.capacity {
+        if self.storage.len() > self.config.capacity {
             let mut lru = self.lru.lock();
-            while self.storage.len() > self.capacity {
+            while self.storage.len() > self.config.capacity {
                 match lru.pop_lru() {
                     Some((evict_key, ())) => {
                         self.storage.remove(&evict_key);
@@ -340,7 +446,7 @@ impl KernelCache {
                         tracing::error!(
                             target: "tensor_wasm_jit::cache",
                             storage_len = self.storage.len(),
-                            capacity = self.capacity,
+                            capacity = self.config.capacity,
                             "cache storage exceeds capacity but eviction queue is empty"
                         );
                         break;
@@ -371,16 +477,49 @@ impl KernelCache {
             // mutably) but failing closed costs ~µs over the public
             // PTX bytes and definitively closes the in-mem poisoning
             // path the audit flagged.
-            if !kernel.verify_integrity() {
-                tracing::error!(
-                    target: "tensor_wasm_jit::cache",
-                    fingerprint = kernel.fingerprint,
-                    tenant = key.tenant_id,
-                    "L1 cache entry failed integrity verification on get; \
-                     evicting and refusing to return it"
-                );
-                self.storage.remove(key);
-                return None;
+            //
+            // The recompute can be opted out of via
+            // [`KernelCacheConfig::verify_on_get`] for high-QPS callers
+            // where the ~10 µs BLAKE3 cost over multi-MB PTX dominates.
+            // Even on the opt-out path we keep a cheap defence-in-depth
+            // check: refuse entries whose `integrity_hash` is all-zero,
+            // because that is the signature of a `CachedKernel`
+            // constructed via the `#[doc(hidden)]` struct-literal path
+            // without [`CachedKernel::new`] having computed a real hash.
+            // A real BLAKE3 over any PTX text is overwhelmingly unlikely
+            // to collide with the zero hash (probability `2^-256`), so
+            // the rejection is unambiguous.
+            if self.config.verify_on_get {
+                if !kernel.verify_integrity() {
+                    tracing::error!(
+                        target: "tensor_wasm_jit::cache",
+                        fingerprint = kernel.fingerprint,
+                        tenant = key.tenant_id,
+                        "L1 cache entry failed integrity verification on get; \
+                         evicting and refusing to return it"
+                    );
+                    self.storage.remove(key);
+                    return None;
+                }
+            } else {
+                // Defence-in-depth on the opt-out path: reject the
+                // "constructed-without-`new`" signal (all-zero hash) so
+                // hand-crafted `CachedKernel`s with a zeroed hash cannot
+                // slip through. Counter increment records that the user
+                // chose to skip the full recompute on this hit.
+                self.verify_skipped_total.fetch_add(1, Ordering::Relaxed);
+                if kernel.integrity_hash == [0u8; 32] {
+                    tracing::error!(
+                        target: "tensor_wasm_jit::cache",
+                        fingerprint = kernel.fingerprint,
+                        tenant = key.tenant_id,
+                        "L1 cache entry has zero integrity_hash on verify-skip get; \
+                         likely a struct-literal CachedKernel built without \
+                         CachedKernel::new — evicting and refusing to return it"
+                    );
+                    self.storage.remove(key);
+                    return None;
+                }
             }
             return Some(kernel);
         }
@@ -438,7 +577,48 @@ impl KernelCache {
 
     /// Configured capacity.
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.config.capacity
+    }
+
+    /// Borrow the construction-time [`KernelCacheConfig`]. Useful for
+    /// tests and diagnostic endpoints that want to surface whether
+    /// `verify_on_get` is on for this cache instance.
+    pub fn config(&self) -> &KernelCacheConfig {
+        &self.config
+    }
+
+    /// Cumulative count of L1 `get` hits that skipped the BLAKE3
+    /// integrity recompute because [`KernelCacheConfig::verify_on_get`]
+    /// is `false`. Surface this on the Prometheus counter
+    /// `tensor_wasm_jit_cache_verify_skipped_total` so operators can see
+    /// how often the cache is trusting an L1 entry without re-hashing
+    /// the PTX. The counter is always present (returns `0` when
+    /// `verify_on_get` is on) so dashboards can scrape it unconditionally.
+    pub fn verify_skipped_total(&self) -> u64 {
+        self.verify_skipped_total.load(Ordering::Relaxed)
+    }
+
+    /// Test-only insert that skips the `put`-side integrity check.
+    ///
+    /// `put` rejects any `CachedKernel` whose stored `integrity_hash`
+    /// does not match a fresh BLAKE3 over its `ptx.text` (jit S-3).
+    /// That is the correct production behaviour, but the
+    /// `verify_on_get=false` regression test in
+    /// `tests/cache_verify_opt_out.rs` needs to install a hand-crafted
+    /// zero-hash entry to confirm the opt-out path still rejects it on
+    /// `get`. This entry-point exists for that test only — it is
+    /// `#[doc(hidden)]` (excluded from generated docs and rustdoc search)
+    /// and named with a `__test_only_` prefix to broadcast "do NOT call
+    /// this from production code". It is intentionally not behind a
+    /// `#[cfg(test)]` or feature gate because integration tests under
+    /// `crates/.../tests/` compile as external consumers of the library
+    /// and therefore cannot see `cfg(test)` items.
+    ///
+    /// Production code MUST go through [`Self::put`].
+    #[doc(hidden)]
+    pub fn __test_only_insert_unchecked(&self, key: CacheKey, kernel: CachedKernel) {
+        self.storage.insert(key, kernel);
+        let _ = self.lru.lock().push(key, ());
     }
 }
 

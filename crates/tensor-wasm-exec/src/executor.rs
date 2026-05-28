@@ -926,6 +926,15 @@ impl TensorWasmExecutor {
                 .store
                 .set_epoch_deadline(duration_to_epoch_ticks(d, tick));
         }
+        // Re-arm the cooperative-scheduler context's wall-clock origin
+        // in lockstep with the deadline above. Without this, a guest
+        // that calls `wasi:scheduler/host.yield()` on a back-to-back
+        // call would see the elapsed time from the *previous* call
+        // charged against its budget, and the first yield would
+        // immediately return STOP. The re-arm is a no-op for spawns
+        // without a configured deadline (the unbounded context
+        // ignores `started_at`).
+        guard.store.data_mut().rearm_scheduler();
         let deadline_at = guard.store.data().deadline;
         let configured_deadline_ms = configured_deadline
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
