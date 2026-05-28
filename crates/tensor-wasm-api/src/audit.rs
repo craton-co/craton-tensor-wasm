@@ -101,10 +101,13 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dashmap::DashSet;
+use ipnet::IpNet;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -628,12 +631,186 @@ pub(crate) fn default_actor() -> AuditActor {
 /// front of the gateway. See `docs/deployment/mtls.md` §4.4.
 pub const HEADER_XFCC: &str = "X-Forwarded-Client-Cert";
 
+/// Environment variable carrying a comma-separated allowlist of IPv4/IPv6
+/// addresses or CIDR ranges whose `X-Forwarded-Client-Cert` headers the
+/// audit middleware will trust. Empty / unset = **never trust XFCC** (the
+/// safe default — see [`TrustedProxies`]).
+///
+/// Example: `TENSOR_WASM_API_TRUSTED_XFCC_PROXIES=10.0.0.0/8,127.0.0.1,::1`.
+pub const ENV_TRUSTED_XFCC_PROXIES: &str = "TENSOR_WASM_API_TRUSTED_XFCC_PROXIES";
+
+/// Allowlist of reverse-proxy peer addresses whose `X-Forwarded-Client-Cert`
+/// headers the audit middleware will trust.
+///
+/// # Threat model
+///
+/// XFCC is a header an upstream Envoy / Istio sidecar sets after performing
+/// mTLS termination on behalf of the gateway. Because it is a plain HTTP
+/// header, anything that can open a TCP connection to the gateway can also
+/// *claim* a `Subject=...` value. If the gateway forwards that claim into
+/// the audit log unchecked, an attacker on the same L3 segment (or with
+/// access to a misconfigured ingress) can write arbitrary identities into
+/// the audit stream — defeating non-repudiation, poisoning downstream SIEM
+/// tooling, and providing cover for malicious activity attributed to a
+/// fabricated certificate Subject.
+///
+/// The mitigation is layered: only consult XFCC when the *immediate TCP
+/// peer* (the L4 source IP axum's listener observed via `ConnectInfo`) is
+/// in an operator-curated allowlist of proxies known to terminate mTLS.
+/// Everything else has its XFCC header silently dropped. The allowlist is
+/// empty by default so a fresh deployment cannot accidentally trust an
+/// attacker.
+///
+/// # Configuration
+///
+/// Operators populate the allowlist via [`ENV_TRUSTED_XFCC_PROXIES`]: a
+/// comma-separated list of IPv4 / IPv6 addresses (`127.0.0.1`, `::1`) or
+/// CIDR ranges (`10.0.0.0/8`, `fd00::/8`). Parse failures on individual
+/// entries are logged at `warn` and the entry is dropped; a fully empty
+/// list (the default) means *no peer is trusted*.
+///
+/// # Sharing
+///
+/// `Clone` is intentionally cheap: the inner CIDR list is small and the
+/// per-peer warn-dedup `DashSet` is wrapped in `Arc`, so cloning into each
+/// request's extensions does not duplicate state.
+#[derive(Debug, Clone, Default)]
+pub struct TrustedProxies {
+    /// Parsed allowlist. Empty means "trust nobody" (the safe default).
+    ranges: Arc<Vec<IpNet>>,
+    /// Set of peer IPs we have already warned about. Shared across requests
+    /// so the warn fires at most once per unique untrusted peer per
+    /// process — not per request — to avoid drowning operators in log
+    /// noise during a probe storm.
+    warned: Arc<DashSet<IpAddr>>,
+}
+
+impl TrustedProxies {
+    /// Construct an empty allowlist (the safe default — trusts nobody).
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Load from [`ENV_TRUSTED_XFCC_PROXIES`].
+    ///
+    /// Unset / empty → empty allowlist (no peer is trusted, every inbound
+    /// `X-Forwarded-Client-Cert` header is dropped). Malformed individual
+    /// entries are skipped with a startup `tracing::warn!` so a typo in
+    /// one entry does not poison the whole allowlist.
+    pub fn from_env() -> Self {
+        let raw = std::env::var(ENV_TRUSTED_XFCC_PROXIES).unwrap_or_default();
+        Self::parse(&raw)
+    }
+
+    /// Parse a comma-separated list of IPs / CIDR ranges into an allowlist.
+    ///
+    /// Bare IPs (`127.0.0.1`, `::1`) are normalised into `/32` (IPv4) or
+    /// `/128` (IPv6) host routes so the membership test is uniform across
+    /// shapes. Whitespace around individual entries is tolerated.
+    pub fn parse(s: &str) -> Self {
+        let mut ranges: Vec<IpNet> = Vec::new();
+        let mut had_any = false;
+        for entry in s.split(',') {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            had_any = true;
+            match trimmed.parse::<IpNet>() {
+                Ok(net) => ranges.push(net),
+                Err(_) => match trimmed.parse::<IpAddr>() {
+                    Ok(ip) => ranges.push(ip.into()),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "tensor_wasm_api::audit",
+                            env = ENV_TRUSTED_XFCC_PROXIES,
+                            entry = trimmed,
+                            error = %e,
+                            "ignored malformed XFCC trusted-proxy entry; \
+                             expected an IPv4/IPv6 address or CIDR range",
+                        );
+                    }
+                },
+            }
+        }
+        if had_any && ranges.is_empty() {
+            tracing::warn!(
+                target: "tensor_wasm_api::audit",
+                env = ENV_TRUSTED_XFCC_PROXIES,
+                "{} was set but no entries parsed; XFCC will be dropped \
+                 from every request",
+                ENV_TRUSTED_XFCC_PROXIES,
+            );
+        } else if ranges.is_empty() {
+            tracing::debug!(
+                target: "tensor_wasm_api::audit",
+                "{} unset; XFCC headers will be ignored from every peer \
+                 (set this to the IPs / CIDR ranges of your mTLS-terminating \
+                 proxies to enable XFCC ingestion)",
+                ENV_TRUSTED_XFCC_PROXIES,
+            );
+        } else {
+            tracing::info!(
+                target: "tensor_wasm_api::audit",
+                count = ranges.len(),
+                "XFCC trusted-proxy allowlist configured",
+            );
+        }
+        Self {
+            ranges: Arc::new(ranges),
+            warned: Arc::new(DashSet::new()),
+        }
+    }
+
+    /// `true` when no peer is trusted (the safe default). When this is
+    /// `true`, [`Self::contains`] returns `false` for every input.
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Membership test: is `ip` in any of the configured ranges?
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        self.ranges.iter().any(|net| net.contains(&ip))
+    }
+
+    /// Record a warn-level diagnostic exactly once per unique peer that
+    /// tried to send `X-Forwarded-Client-Cert` from outside the allowlist.
+    /// Subsequent requests from the same peer are silent. Returns `true`
+    /// if the warn was emitted (the peer was previously unseen).
+    pub fn warn_once_untrusted(&self, peer: IpAddr) -> bool {
+        if self.warned.insert(peer) {
+            tracing::warn!(
+                target: "tensor_wasm_api::audit",
+                env = ENV_TRUSTED_XFCC_PROXIES,
+                %peer,
+                "dropped X-Forwarded-Client-Cert from peer not in the \
+                 trusted-proxy allowlist — set {} if this peer is a known \
+                 mTLS-terminating proxy",
+                ENV_TRUSTED_XFCC_PROXIES,
+            );
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Recover the `Subject="..."` field from an Envoy-style XFCC header
 /// value. Returns the contents of the first matched `Subject="..."`
 /// component, unescaping doubled `\"` sequences. `None` if the header is
 /// absent or shaped unexpectedly — we deliberately do not surface a
 /// parse error to the audit record because XFCC is a best-effort
 /// optional field.
+///
+/// # Threat model
+///
+/// `X-Forwarded-Client-Cert` is a free-form HTTP header. Any TCP peer can
+/// claim an arbitrary `Subject=...` value, so this function must only be
+/// invoked when the *immediate TCP peer* has already been authenticated as
+/// a trusted reverse proxy. Callers in the audit pipeline route through
+/// [`extract_client_cert_subject_gated`] which performs that check; this
+/// raw parser is `pub(crate)` so unit tests of the parser shape can call
+/// it directly without round-tripping through axum extensions.
 pub(crate) fn extract_client_cert_subject(headers: &axum::http::HeaderMap) -> Option<String> {
     let raw = headers.get(HEADER_XFCC)?.to_str().ok()?;
     // XFCC components are `;`-separated; each component is `key=value`.
@@ -651,6 +828,58 @@ pub(crate) fn extract_client_cert_subject(headers: &axum::http::HeaderMap) -> Op
             };
             return Some(inner.replace("\\\"", "\""));
         }
+    }
+    None
+}
+
+/// XFCC-spoofing-resistant wrapper around [`extract_client_cert_subject`].
+///
+/// # Threat model
+///
+/// `X-Forwarded-Client-Cert` is intended as a "trust path" header: an
+/// upstream Envoy / Istio sidecar terminates mTLS, validates the client
+/// certificate, and forwards the validated `Subject` DN into the gateway
+/// via this header so the audit log can record the certificate identity
+/// alongside the bearer-token identity. The header carries **no
+/// cryptographic guarantee on its own** — anything able to open a TCP
+/// connection to the gateway can also set any header it likes. Operators
+/// that deploy the gateway directly (no mTLS proxy in front) would, prior
+/// to this gate, write attacker-supplied `Subject` values straight into
+/// the audit stream, breaking non-repudiation and providing cover for
+/// abuse attributed to a forged certificate.
+///
+/// The gate restores the trust path. Only when the *immediate TCP peer*
+/// (the L4 source axum observes via `ConnectInfo`) is in the
+/// operator-curated [`TrustedProxies`] allowlist do we consult the header.
+/// Every other peer has its XFCC dropped silently — with a one-shot
+/// `tracing::warn!` per unique peer to surface possible misconfigurations
+/// without flooding logs during a probe storm.
+///
+/// # Behaviour
+///
+/// * `peer_ip = None` (e.g. a test driving the router via `oneshot`, or a
+///   listener bound without `IntoMakeServiceWithConnectInfo`) → drop the
+///   header. We cannot validate the peer, so we cannot trust the claim.
+/// * `peer_ip = Some(ip)` and `trusted.contains(ip)` → parse the header
+///   as before.
+/// * `peer_ip = Some(ip)` and not trusted → drop the header. If the
+///   header was actually present, emit a one-shot warn for this peer.
+pub(crate) fn extract_client_cert_subject_gated(
+    headers: &axum::http::HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trusted: &TrustedProxies,
+) -> Option<String> {
+    let Some(ip) = peer_ip else {
+        // Unknown peer: cannot validate trust, drop the claim. We do not
+        // warn here because the absence of ConnectInfo is structural
+        // (test harness, embedded use) rather than indicative of attack.
+        return None;
+    };
+    if trusted.contains(ip) {
+        return extract_client_cert_subject(headers);
+    }
+    if headers.contains_key(HEADER_XFCC) {
+        trusted.warn_once_untrusted(ip);
     }
     None
 }
@@ -716,11 +945,24 @@ pub async fn audit_log_middleware(
         .unwrap_or_else(default_actor);
     let tenant_id = req.extensions().get::<TenantId>().copied();
     let function_id = parse_function_id_from_path(&path);
-    let client_cert_subject = extract_client_cert_subject(req.headers());
-    let peer_addr = req
+    // XFCC spoofing mitigation: only consult `X-Forwarded-Client-Cert`
+    // when the immediate TCP peer is in the operator-curated trusted-
+    // proxy allowlist. Missing extension → safe-default empty allowlist
+    // → drop the header. See `TrustedProxies` and
+    // `extract_client_cert_subject_gated` for the threat model.
+    let connect_info = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.to_string());
+        .map(|ci| ci.0);
+    let peer_ip = connect_info.map(|sa| sa.ip());
+    let trusted_proxies = req
+        .extensions()
+        .get::<TrustedProxies>()
+        .cloned()
+        .unwrap_or_default();
+    let client_cert_subject =
+        extract_client_cert_subject_gated(req.headers(), peer_ip, &trusted_proxies);
+    let peer_addr = connect_info.map(|sa| sa.to_string());
 
     let start = Instant::now();
     let response = next.run(req).await;
@@ -1042,5 +1284,115 @@ mod tests {
             axum::http::HeaderValue::from_static("Hash=abc123;URI=spiffe://acme.io/client"),
         );
         assert!(extract_client_cert_subject(&headers).is_none());
+    }
+
+    /// XFCC spoofing mitigation: an empty `TrustedProxies` allowlist
+    /// (the safe default) must drop the header regardless of how the
+    /// peer claims to be addressed.
+    #[test]
+    fn gated_extract_drops_xfcc_when_no_proxies_trusted() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            HEADER_XFCC,
+            axum::http::HeaderValue::from_static("Subject=\"CN=evil\""),
+        );
+        let trusted = TrustedProxies::empty();
+        let peer = Some(IpAddr::from([127, 0, 0, 1]));
+        assert!(extract_client_cert_subject_gated(&headers, peer, &trusted).is_none());
+    }
+
+    /// Gated extract honours XFCC when the peer is in the allowlist.
+    #[test]
+    fn gated_extract_honours_xfcc_from_trusted_peer() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            HEADER_XFCC,
+            axum::http::HeaderValue::from_static("Subject=\"CN=client-prod\""),
+        );
+        let trusted = TrustedProxies::parse("127.0.0.1");
+        let peer = Some(IpAddr::from([127, 0, 0, 1]));
+        let subj = extract_client_cert_subject_gated(&headers, peer, &trusted)
+            .expect("trusted peer's header is honoured");
+        assert_eq!(subj, "CN=client-prod");
+    }
+
+    /// Unknown peer (no `ConnectInfo`) must drop the header even with a
+    /// non-empty allowlist — we cannot validate trust, so we cannot
+    /// honour the claim.
+    #[test]
+    fn gated_extract_drops_xfcc_when_peer_unknown() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            HEADER_XFCC,
+            axum::http::HeaderValue::from_static("Subject=\"CN=anyone\""),
+        );
+        let trusted = TrustedProxies::parse("10.0.0.0/8");
+        assert!(extract_client_cert_subject_gated(&headers, None, &trusted).is_none());
+    }
+
+    /// CIDR membership for IPv4 — a peer inside `10.0.0.0/8` is trusted,
+    /// a peer outside is not.
+    #[test]
+    fn trusted_proxies_cidr_membership_v4() {
+        let t = TrustedProxies::parse("10.0.0.0/8");
+        assert!(t.contains(IpAddr::from([10, 5, 3, 7])));
+        assert!(t.contains(IpAddr::from([10, 0, 0, 0])));
+        assert!(t.contains(IpAddr::from([10, 255, 255, 255])));
+        assert!(!t.contains(IpAddr::from([192, 168, 1, 1])));
+        assert!(!t.contains(IpAddr::from([11, 0, 0, 0])));
+    }
+
+    /// CIDR membership for IPv6.
+    #[test]
+    fn trusted_proxies_cidr_membership_v6() {
+        let t = TrustedProxies::parse("fd00::/8");
+        let v6: IpAddr = "fd12::1".parse().unwrap();
+        assert!(t.contains(v6));
+        let outside: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(!t.contains(outside));
+    }
+
+    /// Bare IPs are normalised into host routes (/32 or /128).
+    #[test]
+    fn trusted_proxies_bare_ip_normalised_to_host_route() {
+        let t = TrustedProxies::parse("127.0.0.1, ::1");
+        assert!(t.contains(IpAddr::from([127, 0, 0, 1])));
+        assert!(!t.contains(IpAddr::from([127, 0, 0, 2])));
+        let v6: IpAddr = "::1".parse().unwrap();
+        assert!(t.contains(v6));
+    }
+
+    /// Empty input yields an empty allowlist that trusts nobody.
+    #[test]
+    fn trusted_proxies_empty_input_trusts_nobody() {
+        let t = TrustedProxies::parse("");
+        assert!(t.is_empty());
+        assert!(!t.contains(IpAddr::from([127, 0, 0, 1])));
+        let t = TrustedProxies::parse("   ,   ,   ");
+        assert!(t.is_empty());
+    }
+
+    /// Malformed entries are skipped but do not poison the rest of the
+    /// allowlist.
+    #[test]
+    fn trusted_proxies_malformed_entries_are_skipped() {
+        let t = TrustedProxies::parse("garbage,127.0.0.1,also-bad/99");
+        assert!(t.contains(IpAddr::from([127, 0, 0, 1])));
+        assert!(!t.contains(IpAddr::from([10, 0, 0, 1])));
+    }
+
+    /// The warn-dedup set fires at most once per unique peer.
+    #[test]
+    fn trusted_proxies_warn_once_dedup() {
+        let t = TrustedProxies::empty();
+        let peer = IpAddr::from([192, 168, 1, 1]);
+        assert!(t.warn_once_untrusted(peer), "first call emits the warn");
+        assert!(
+            !t.warn_once_untrusted(peer),
+            "second call from same peer is suppressed",
+        );
+        // A different peer still fires once.
+        let other = IpAddr::from([192, 168, 1, 2]);
+        assert!(t.warn_once_untrusted(other));
     }
 }

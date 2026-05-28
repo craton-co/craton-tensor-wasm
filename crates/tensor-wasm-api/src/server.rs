@@ -11,7 +11,7 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use tower::ServiceBuilder;
 
-use crate::audit::{audit_log_middleware, AuditConfig};
+use crate::audit::{audit_log_middleware, AuditConfig, TrustedProxies};
 use crate::http_metrics::{http_metrics_middleware, HttpMetricsLayerConfig, RouteAllowList};
 use crate::middleware::{
     bearer_auth, body_limit_layer, concurrency_limit_layer, cors_layer, host_validate,
@@ -116,6 +116,38 @@ pub fn build_router_with_audit(
     audit: AuditConfig,
     cors: CorsConfig,
 ) -> Router {
+    build_router_with_trusted_proxies(
+        state,
+        auth,
+        tenant,
+        limiter,
+        audit,
+        cors,
+        TrustedProxies::from_env(),
+    )
+}
+
+/// Build the router with full configuration *and* an explicit XFCC
+/// trusted-proxy allowlist.
+///
+/// Mirrors [`build_router_with_audit`] but lets the caller inject an
+/// explicit [`TrustedProxies`] instead of reading
+/// `TENSOR_WASM_API_TRUSTED_XFCC_PROXIES` from the ambient process
+/// environment. Integration tests that exercise the XFCC-gating path use
+/// this constructor so parallel tests do not race on a global env var.
+///
+/// See the module-level comment block on
+/// [`crate::audit::extract_client_cert_subject_gated`] for the threat
+/// model.
+pub fn build_router_with_trusted_proxies(
+    state: Arc<AppState>,
+    auth: AuthConfig,
+    tenant: TenantConfig,
+    limiter: RateLimiter,
+    audit: AuditConfig,
+    cors: CorsConfig,
+    trusted_proxies: TrustedProxies,
+) -> Router {
     // Wire the W3C Trace Context propagator globally. Idempotent across
     // calls; safe to invoke on every router rebuild (tests do that
     // routinely). Without this, the tower `trace_layer_with_propagation`
@@ -193,6 +225,13 @@ pub fn build_router_with_audit(
         .layer(axum::Extension(tenant))
         .layer(axum::Extension(limiter))
         .layer(axum::Extension(audit))
+        // XFCC spoofing mitigation: parsed allowlist of reverse-proxy peer
+        // addresses whose `X-Forwarded-Client-Cert` headers the audit
+        // middleware will trust. Empty / unset
+        // (`TENSOR_WASM_API_TRUSTED_XFCC_PROXIES`) = trust nobody, drop
+        // every inbound XFCC. See `crate::audit::TrustedProxies` and the
+        // threat-model comment on `extract_client_cert_subject_gated`.
+        .layer(axum::Extension(trusted_proxies))
         .layer(axum::Extension(http_metrics_cfg))
         // Metrics emission wraps every downstream layer (including
         // bearer_auth) so 401s, 429s, and handler responses all get
@@ -253,10 +292,21 @@ pub fn build_router_with_audit(
 }
 
 /// Bind and serve the router on the given address.
+///
+/// The listener is wrapped with
+/// [`axum::Router::into_make_service_with_connect_info`] so the audit
+/// middleware can recover the immediate TCP peer's `SocketAddr` from the
+/// request extensions. The XFCC trusted-proxy gate
+/// (`crate::audit::TrustedProxies`) depends on that peer information to
+/// decide whether to honour the `X-Forwarded-Client-Cert` header.
 pub async fn serve(state: Arc<AppState>, addr: SocketAddr) -> anyhow::Result<()> {
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(target: "tensor_wasm_api::server", %addr, "tensor-wasm-api listening");
-    axum::serve(listener, router).await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

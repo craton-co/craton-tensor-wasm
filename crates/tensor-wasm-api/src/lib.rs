@@ -41,6 +41,14 @@
 //!   emits a structured JSON record to the sink selected by
 //!   `TENSOR_WASM_API_AUDIT_LOG` (default: stdout). Read-only routes
 //!   emit nothing. See [`audit`] and `docs/AUDIT-LOG.md`.
+//! * **XFCC spoofing gate via `TENSOR_WASM_API_TRUSTED_XFCC_PROXIES`.**
+//!   Comma-separated allowlist of IPv4/IPv6 addresses or CIDR ranges
+//!   whose `X-Forwarded-Client-Cert` headers the audit middleware will
+//!   honour. Empty / unset = trust nobody (safe default — every inbound
+//!   XFCC is dropped). Deployments behind an mTLS-terminating proxy
+//!   should set this to the proxy's IP(s); operators not running an
+//!   XFCC-stripping proxy should leave it unset. See
+//!   [`audit::TrustedProxies`].
 //! * **Snapshot HMAC key (forward-looking).** When
 //!   `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` is set (64-char hex, 32 bytes)
 //!   the future `/snapshot/save` and `/snapshot/restore` routes will
@@ -74,7 +82,7 @@ pub mod trace_propagation;
 pub use audit::{
     audit_log_middleware, AuditAction, AuditActor, AuditActorKind, AuditConfig, AuditOutcome,
     AuditRecord, AuditResource, AuditSink, FileJsonSink, NoopSink, StdoutJsonSink,
-    TokenScopeView, ENV_AUDIT_LOG,
+    TokenScopeView, TrustedProxies, ENV_AUDIT_LOG, ENV_TRUSTED_XFCC_PROXIES, HEADER_XFCC,
 };
 pub use config::{
     AppConfig, ConfigError, HexParseReason, ENV_SNAPSHOT_HMAC_KEY,
@@ -95,7 +103,7 @@ pub use rate_limit::{
 pub use routes::{ApiError, AppState, FunctionRecord, JobRecord, JobStatus};
 pub use server::{
     build_router, build_router_with_audit, build_router_with_config,
-    build_router_with_full_config, serve,
+    build_router_with_full_config, build_router_with_trusted_proxies, serve,
 };
 pub use token_scope::{
     parse_token_entry, parse_tokens_env, ParsedTokens, ScopeParseError, TenantScope, TokenScope,
