@@ -429,6 +429,21 @@ impl From<ExecError> for ApiError {
                 kind: "capacity_exhausted".to_string(),
                 message: err.to_string(),
             },
+            // Per B3.2: adversarial Wasm bytes that exceed the pre-compile
+            // size cap. 413 mirrors the body-too-large family.
+            ExecError::ModuleTooLarge { .. } => ApiError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                kind: "module_too_large".to_string(),
+                message: err.to_string(),
+            },
+            // Per B3.2: spawn refused because the epoch ticker is down and
+            // a deadline-class bound would otherwise apply. 500 — the
+            // executor is mis-configured.
+            ExecError::EpochTickerNotRunning => ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                kind: "epoch_ticker_not_running".to_string(),
+                message: err.to_string(),
+            },
         }
     }
 }
