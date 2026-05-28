@@ -1,6 +1,9 @@
 # Signed kernel registry
 
-_Status: scaffold landed in v0.3.7. Server wire + on-disk store land in v0.4._
+_Status: scaffold landed in v0.3.7. Server wire landed in v0.3.7 (B7.5).
+Production server-side storage: LANDED in v0.3.7 (T35) — disk-persisted
+`DiskRegistry` backed by `tensor-wasm-artifacts::DiskArtifactStore`,
+restart-safe, paginated, with an optional publisher allowlist._
 
 Roadmap feature #3 (see [`PATH-TO-V1.md`](PATH-TO-V1.md#post-v036-strategic-features))
 gives operators a way to publish vetted PTX kernels — matmul, attention,
@@ -231,17 +234,49 @@ exit-code rationale.
 ## v0.4 rollout plan
 
 1. `POST /kernels` route on the API server, accepting a JSON manifest
-   plus the PTX bytes as `multipart/form-data`.
-2. On-disk store under `<data-dir>/kernels/<name>/<version>/` with the
-   manifest as `manifest.json` and the PTX as `kernel.ptx`. The same
-   atomic-rename pattern the snapshot writer uses.
+   plus the PTX bytes as `multipart/form-data`. **LANDED (B7.5).**
+2. On-disk store. **LANDED (T35)** via
+   `tensor-wasm-jit::registry::DiskRegistry`, backed by
+   `tensor-wasm-artifacts::DiskArtifactStore`. The store is
+   content-addressed (BLAKE3 of the bincode-encoded
+   `(KernelManifest, ptx_text)` blob), HMAC-SHA256-signed by the
+   artifact store's outer envelope, zstd-compressed, and atomic on
+   publish. An in-memory `(name, version, sm_version) → ContentHash`
+   keymap sits in front so resolves are O(1) lookups. The registry is
+   rebuilt from the on-disk blobs on `DiskRegistry::open`, so manifests
+   survive process restarts. The chosen env var is
+   `TENSOR_WASM_API_KERNEL_REGISTRY_DIR`; unset leaves the gateway on
+   the historical `InMemoryRegistry` (dev mode).
 3. `GET /kernels` and `GET /kernels/{name}/{version}` for the CLI's
-   `list` and the JIT cache resolver.
+   `list` and the JIT cache resolver. **LANDED (B7.5).** T35 added
+   `?offset=N&limit=M` pagination to the `GET /kernels` route, with
+   `limit` clamped to 1000 server-side; the response echoes the
+   effective `offset` and `limit` so clients can drive cursor-style
+   pagination without local math.
 4. CLI flips from exit-3 scaffold to the real flow. Smoke tests in
    `crates/tensor-wasm-cli/tests/cli_smoke.rs` change shape; the
    integration tests in
    `crates/tensor-wasm-jit/tests/kernel_registry_scaffold.rs` stay
-   untouched (they exercise the in-memory backend).
+   untouched (they exercise the in-memory backend). T35 adds
+   `disk_registry_restart.rs`,
+   `disk_registry_pagination.rs`, and
+   `disk_registry_publisher_allowlist.rs` to exercise the disk path.
+
+### Publisher allowlist (T35)
+
+`DiskRegistry` accepts an optional
+`publisher_allowlist: HashSet<String>` chained on after
+`DiskRegistry::open(...).with_publisher_allowlist(...)`. When set, the
+registry refuses `publish` if `manifest.publisher` is not in the set,
+even when the manifest's v2 signature otherwise verifies. This is a
+SEPARATE authorization layer over and above the T1 HTTP kernel-publish
+scope gate — the scope gate decides who can call `POST /kernels` at
+all, the allowlist decides which publisher identity the body can
+claim. Together they prevent a single signing-key holder from
+impersonating a peer publisher.
+
+When the allowlist is `None` (default) every signed publisher is
+accepted, matching today's permissive `InMemoryRegistry` behaviour.
 
 ## Related docs
 

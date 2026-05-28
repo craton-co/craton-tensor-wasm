@@ -253,6 +253,19 @@ impl AppState {
 /// return `503 kernel_registry_not_configured` and clients can correct
 /// the deploy without a full restart loop.
 ///
+/// ## T35: disk-backed registry selection
+///
+/// If `TENSOR_WASM_API_KERNEL_REGISTRY_DIR` is also set (and non-empty),
+/// the gateway constructs a [`tensor_wasm_jit::registry::DiskRegistry`]
+/// rooted at that path instead of the historical
+/// [`tensor_wasm_jit::registry::InMemoryRegistry`]. The disk-backed path
+/// survives process restarts; the in-memory path is now considered
+/// dev-only. An `open` failure on the disk path falls back to the
+/// in-memory registry and warns rather than dropping the routes
+/// entirely — operators who relied on the env-var contract still get a
+/// working `/kernels` surface; they just lose the persistence on
+/// restart until the disk-path issue is resolved.
+///
 /// The behaviour mirrors `AppConfig::from_env` for the snapshot HMAC key
 /// (see `crate::config`) except that the snapshot path returns a hard
 /// error: the kernel registry is a non-critical add-on whereas a snapshot
@@ -263,6 +276,9 @@ fn build_kernel_registry_from_env(
     /// Environment variable carrying the hex-encoded 32-byte HMAC-SHA256
     /// key the kernel registry uses to verify inbound manifests.
     const ENV_KERNEL_HMAC_KEY: &str = "TENSOR_WASM_API_KERNEL_HMAC_KEY";
+    /// T35: when set, the gateway uses a disk-persisted registry
+    /// rooted at this path. Unset = legacy in-memory registry.
+    const ENV_KERNEL_REGISTRY_DIR: &str = "TENSOR_WASM_API_KERNEL_REGISTRY_DIR";
 
     let raw = match std::env::var(ENV_KERNEL_HMAC_KEY) {
         Ok(s) => s,
@@ -312,9 +328,41 @@ fn build_kernel_registry_from_env(
         };
         *slot = (hi << 4) | lo;
     }
+
+    // T35: prefer the disk-backed registry when the env var points at a
+    // directory. A failed open warns and falls back to the in-memory
+    // backend rather than refusing to wire `/kernels` at all — the
+    // operator surface is the same on failure, just non-persistent.
+    if let Ok(dir_raw) = std::env::var(ENV_KERNEL_REGISTRY_DIR) {
+        let dir_trimmed = dir_raw.trim();
+        if !dir_trimmed.is_empty() {
+            let dir = std::path::PathBuf::from(dir_trimmed);
+            match tensor_wasm_jit::registry::DiskRegistry::open(dir.clone(), key) {
+                Ok(reg) => {
+                    tracing::info!(
+                        target: "tensor_wasm_api::routes",
+                        dir = %dir.display(),
+                        "kernel registry disk-backed (T35); /kernels routes live",
+                    );
+                    return Some(Arc::new(reg));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tensor_wasm_api::routes",
+                        dir = %dir.display(),
+                        error = %e,
+                        var = ENV_KERNEL_REGISTRY_DIR,
+                        "disk-backed kernel registry open failed; falling back \
+                         to in-memory registry (manifests will NOT survive restart)",
+                    );
+                }
+            }
+        }
+    }
+
     tracing::info!(
         target: "tensor_wasm_api::routes",
-        "kernel registry HMAC key configured (64 chars hex); /kernels routes live",
+        "kernel registry HMAC key configured (64 chars hex); /kernels routes live (in-memory)",
     );
     Some(Arc::new(tensor_wasm_jit::registry::InMemoryRegistry::new(
         key,
