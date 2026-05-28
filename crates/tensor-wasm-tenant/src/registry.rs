@@ -259,31 +259,63 @@ impl TenantRegistry {
         #[allow(unused_mut)] mut ctx: TenantContext,
     ) -> Result<(Arc<TenantContext>, TenantCapability), RegistryError> {
         let id = ctx.id();
-        // tenant 1.6 #9: refuse re-registration while an orphan Arc from a
-        // prior registration is still alive. Without this, an in-flight
-        // `consume_bytes_with_capability` on the orphan could commit to a
-        // dead counter while the new registration's counter stays at 0 —
-        // a per-tenant quota reset.
-        if let Some(tomb) = self.tombstones.get(&id) {
-            if tomb.value().strong_count() > 0 {
-                return Err(RegistryError::OrphanStillAlive(id));
-            }
-        }
-        // Orphan (if any) is gone; clear the tombstone so the slot is free.
-        self.tombstones.remove(&id);
-        // Under `strict-cap-binding` stamp the context with this
-        // registry's token *before* wrapping it in `Arc`, so the
-        // `check_capability` path can compare token identity at every
-        // `consume_bytes_with_capability` / `release_bytes_with_capability`
-        // call.
+        // T11 atomic orphan-check (tenant 1.6 #9):
+        //
+        // Acquire the `inner` shard write-guard FIRST via `entry(id)`. While
+        // we hold that guard, no other thread can transition the same `id`
+        // between `Vacant` and `Occupied`, which closes the TOCTOU window
+        // where two racers each observed a vacant slot + a dead tombstone
+        // and both proceeded to insert. The match-arms below run while the
+        // shard lock is held.
+        //
+        // On `Vacant`, we then consult `tombstones` via the *entry* API on
+        // the tombstone map. Holding the tombstone shard-guard for `id`
+        // for the duration of the strong-count read AND the subsequent
+        // tombstone removal closes a second race: a third party that holds
+        // a `Weak<TenantContext>` and races to `Weak::upgrade` cannot
+        // interleave their upgrade between our `strong_count()` check and
+        // our `tombstones.remove`. Either we see `strong_count > 0` and
+        // refuse, or we see `0` (no live Arc, and any extant Weak can no
+        // longer upgrade because the inner allocation has been dropped — a
+        // `Weak::upgrade` on a fully-dropped Arc returns `None`).
+        //
+        // Under `strict-cap-binding` we stamp the context with this
+        // registry's token *before* wrapping in `Arc` so `check_capability`
+        // can compare token identity on every quota-mutation call.
         #[cfg(feature = "strict-cap-binding")]
         {
             ctx.registry_token = Some(Arc::clone(&self.registry_token));
         }
-        let entry = self.inner.entry(id);
-        match entry {
-            dashmap::mapref::entry::Entry::Occupied(_) => Err(RegistryError::AlreadyRegistered(id)),
+        match self.inner.entry(id) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                Err(RegistryError::AlreadyRegistered(id))
+            }
             dashmap::mapref::entry::Entry::Vacant(slot) => {
+                // Hold the tombstone shard-guard for `id` across the
+                // strong-count check AND the tombstone removal so a racing
+                // `Weak::upgrade` cannot interleave between them.
+                match self.tombstones.entry(id) {
+                    dashmap::mapref::entry::Entry::Occupied(tomb) => {
+                        if tomb.get().strong_count() > 0 {
+                            // Orphan still alive — leave the tombstone in
+                            // place (do NOT remove it) and refuse the
+                            // re-registration. The orphan must drop
+                            // before another attempt can succeed.
+                            return Err(RegistryError::OrphanStillAlive(id));
+                        }
+                        // Tombstone's Weak is dead (the orphan Arc has been
+                        // fully dropped); remove it under the same guard so
+                        // a concurrent `Weak::upgrade` cannot observe a
+                        // resurrected strong_count between here and the
+                        // slot.insert below.
+                        tomb.remove();
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(_) => {
+                        // No tombstone — nothing to do; the vacant guard is
+                        // dropped here, releasing the tombstone shard lock
+                        // before we proceed to insert into `inner`.
+                    }
+                }
                 let arc = Arc::new(ctx);
                 slot.insert(Arc::clone(&arc));
                 #[cfg(feature = "strict-cap-binding")]
@@ -360,13 +392,35 @@ impl TenantRegistry {
             self.check_admin_cap(cap).ok()?;
         }
         let _ = cap;
-        let removed = self.inner.remove(&tenant_id).map(|(_, v)| v);
-        if let Some(ref arc) = removed {
-            // tenant 1.6 #9: track the orphan so a future re-register can
-            // refuse until the last strong ref is dropped.
-            self.tombstones.insert(tenant_id, Arc::downgrade(arc));
+        // T11 atomic tombstone-then-remove (tenant 1.6 #9):
+        //
+        // Take the `inner` shard write-guard FIRST via `entry(tenant_id)`.
+        // While we hold the Occupied guard, no concurrent registration of
+        // the same `tenant_id` can observe a vacant slot — so the previous
+        // race (registration window between `inner.remove` and
+        // `tombstones.insert` that let a racer succeed only for our
+        // subsequent `tombstones.insert` to clobber their slot with a stale
+        // Weak) is closed.
+        //
+        // Order: insert tombstone FIRST (still holding the Occupied entry),
+        // then `OccupiedEntry::remove` to drop the slot. A racer that
+        // acquires the inner shard guard immediately after we release it
+        // will see Vacant, then look up `tombstones` and find our freshly
+        // inserted Weak — at which point `strong_count > 0` iff the caller
+        // still holds the returned Arc, which is exactly the
+        // OrphanStillAlive case.
+        match self.inner.entry(tenant_id) {
+            dashmap::mapref::entry::Entry::Vacant(_) => None,
+            dashmap::mapref::entry::Entry::Occupied(occ) => {
+                let arc = Arc::clone(occ.get());
+                // Insert the tombstone BEFORE removing the inner entry so
+                // there is no window in which an `inner.entry(...)` racer
+                // sees Vacant AND `tombstones.get(...)` returns None.
+                self.tombstones.insert(tenant_id, Arc::downgrade(&arc));
+                let (_, removed) = occ.remove_entry();
+                Some(removed)
+            }
         }
-        removed
     }
 
     /// Prune dead orphan tombstones. Returns the number pruned.
@@ -443,10 +497,16 @@ impl TenantRegistry {
         cap: &RegistryAdminCapability,
     ) -> Result<Option<Arc<TenantContext>>, RegistryError> {
         self.check_admin_cap(cap)?;
-        let removed = self.inner.remove(&tenant_id).map(|(_, v)| v);
-        if let Some(ref arc) = removed {
-            self.tombstones.insert(tenant_id, Arc::downgrade(arc));
-        }
+        // T11 atomic tombstone-then-remove (see [`Self::unregister`]).
+        let removed = match self.inner.entry(tenant_id) {
+            dashmap::mapref::entry::Entry::Vacant(_) => None,
+            dashmap::mapref::entry::Entry::Occupied(occ) => {
+                let arc = Arc::clone(occ.get());
+                self.tombstones.insert(tenant_id, Arc::downgrade(&arc));
+                let (_, removed) = occ.remove_entry();
+                Some(removed)
+            }
+        };
         Ok(removed)
     }
 
@@ -645,5 +705,257 @@ mod tests {
             MpsDecision::Fallback
         };
         assert_eq!(TenantRegistry::mps_or_fallback(), expected);
+    }
+
+    // ----------------------------------------------------------------
+    // T11 multi-threaded race tests for atomic orphan-check on register
+    // and tombstone-then-remove on unregister.
+    // ----------------------------------------------------------------
+
+    /// N threads race on `register_with_capability(same_id)` after a
+    /// prior `unregister`. With the held orphan Arc kept alive for the
+    /// duration of the race, every attempt must observe a consistent
+    /// `OrphanStillAlive`; no thread may sneak in a successful insert
+    /// that would clobber the orphan's accounting.
+    #[test]
+    fn race_register_after_unregister_with_orphan_alive_all_see_orphan() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const THREADS: usize = 16;
+        const ATTEMPTS_PER_THREAD: usize = 8;
+        const RACE_ID: u64 = 9001;
+
+        let (reg, cap) = TenantRegistry::new();
+        let (orphan_arc, _orphan_cap) =
+            reg.register_with_capability(ctx(RACE_ID)).unwrap();
+        // Unregister. Because we still hold `orphan_arc`, the tombstone
+        // points to a Weak whose `strong_count() > 0` for as long as
+        // `orphan_arc` is alive.
+        let returned = reg.unregister(TenantId(RACE_ID), &cap).unwrap();
+        assert!(Arc::ptr_eq(&returned, &orphan_arc));
+        drop(returned); // keep orphan_arc as the only strong ref
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let reg = reg.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                let mut local_ok = 0usize;
+                let mut local_orphan = 0usize;
+                let mut local_already = 0usize;
+                for _ in 0..ATTEMPTS_PER_THREAD {
+                    match reg.register_with_capability(ctx(RACE_ID)) {
+                        Ok(_) => local_ok += 1,
+                        Err(RegistryError::OrphanStillAlive(_)) => local_orphan += 1,
+                        Err(RegistryError::AlreadyRegistered(_)) => local_already += 1,
+                        #[cfg(feature = "strict-cap-binding")]
+                        Err(RegistryError::CapabilityFromForeignRegistry) => {
+                            panic!("unexpected CapabilityFromForeignRegistry from register")
+                        }
+                    }
+                }
+                (local_ok, local_orphan, local_already)
+            }));
+        }
+        let mut total_ok = 0usize;
+        let mut total_orphan = 0usize;
+        let mut total_already = 0usize;
+        for h in handles {
+            let (ok, orphan, already) = h.join().unwrap();
+            total_ok += ok;
+            total_orphan += orphan;
+            total_already += already;
+        }
+        // While the orphan is alive, NO register call may succeed. Any
+        // success would mean the orphan's quota counter is still live
+        // and reachable through the held `orphan_arc` while a fresh
+        // registration uses a separate counter — the per-tenant quota
+        // reset this fix exists to prevent.
+        assert_eq!(
+            total_ok, 0,
+            "no register may succeed while orphan is alive (ok={total_ok}, orphan={total_orphan}, already={total_already})"
+        );
+        // And there must never be a stray AlreadyRegistered while we
+        // hold the orphan: nothing was ever in the slot, so the only
+        // legitimate error is OrphanStillAlive.
+        assert_eq!(
+            total_already, 0,
+            "AlreadyRegistered cannot occur while orphan is alive and slot is empty"
+        );
+        assert_eq!(total_orphan, THREADS * ATTEMPTS_PER_THREAD);
+
+        // The orphan Arc is still the only strong ref.
+        assert_eq!(Arc::strong_count(&orphan_arc), 1);
+        // The tombstone is still present (we never removed it on the
+        // refusal path).
+        assert!(reg.tombstones.contains_key(&TenantId(RACE_ID)));
+        drop(orphan_arc);
+        // After dropping the orphan, a fresh register must succeed
+        // exactly once and clear the tombstone.
+        let _ = reg.register_with_capability(ctx(RACE_ID)).unwrap();
+        assert!(!reg.tombstones.contains_key(&TenantId(RACE_ID)));
+    }
+
+    /// N threads race on `register_with_capability(same_id)` for an id
+    /// that has never been registered. At most one may succeed; the
+    /// rest must see `AlreadyRegistered`. No race condition should let
+    /// two of them both observe `Vacant` and both insert.
+    #[test]
+    fn race_register_fresh_id_at_most_one_succeeds() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const THREADS: usize = 32;
+        const RACE_ID: u64 = 9100;
+
+        let (reg, cap) = TenantRegistry::new();
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let reg = reg.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                reg.register_with_capability(ctx(RACE_ID))
+                    .map(|_| ())
+                    .map_err(|e| e)
+            }));
+        }
+        let mut ok_count = 0usize;
+        let mut already = 0usize;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(()) => ok_count += 1,
+                Err(RegistryError::AlreadyRegistered(_)) => already += 1,
+                Err(RegistryError::OrphanStillAlive(_)) => {
+                    panic!("no prior registration in this test — OrphanStillAlive impossible")
+                }
+                #[cfg(feature = "strict-cap-binding")]
+                Err(RegistryError::CapabilityFromForeignRegistry) => {
+                    panic!("register cannot return CapabilityFromForeignRegistry")
+                }
+            }
+        }
+        assert_eq!(ok_count, 1, "exactly one register must win the race");
+        assert_eq!(already, THREADS - 1);
+        assert_eq!(reg.len(&cap), 1);
+    }
+
+    /// Hold an `Arc<TenantContext>` from an unregistered tenant, then
+    /// attempt register from another thread; the other thread must see
+    /// `OrphanStillAlive`. This is the canonical orphan-protection
+    /// scenario the fix preserves under concurrency.
+    #[test]
+    fn held_orphan_blocks_concurrent_register() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const ORPHAN_ID: u64 = 9200;
+
+        let (reg, cap) = TenantRegistry::new();
+        let (orphan_arc, _orphan_cap) =
+            reg.register_with_capability(ctx(ORPHAN_ID)).unwrap();
+        let _ = reg.unregister(TenantId(ORPHAN_ID), &cap).unwrap();
+        // orphan_arc is still alive on this thread.
+
+        let barrier = Arc::new(Barrier::new(2));
+        let reg_for_thread = reg.clone();
+        let barrier_for_thread = Arc::clone(&barrier);
+        let join = thread::spawn(move || {
+            barrier_for_thread.wait();
+            reg_for_thread.register_with_capability(ctx(ORPHAN_ID))
+        });
+        barrier.wait();
+        let res = join.join().unwrap();
+        match res {
+            Err(RegistryError::OrphanStillAlive(id)) => {
+                assert_eq!(id, TenantId(ORPHAN_ID));
+            }
+            other => panic!("expected OrphanStillAlive, got {other:?}"),
+        }
+        // Orphan is still ours, and only ours.
+        assert_eq!(Arc::strong_count(&orphan_arc), 1);
+    }
+
+    /// Race `unregister(id)` on one thread against `register(id)` on
+    /// another. Either:
+    ///   - register wins, then unregister returns Some and a tombstone
+    ///     is recorded; OR
+    ///   - unregister wins (slot was empty so it returns None), then
+    ///     register succeeds.
+    /// The invariant we test: no observable state ever has the slot
+    /// vacant AND a stale tombstone Weak whose target is the newly
+    /// inserted Arc (i.e. a register that "succeeded" only to be
+    /// shadowed by a subsequent tombstone insert from a racing
+    /// unregister).
+    #[test]
+    fn race_register_vs_unregister_preserves_ordering() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const ID: u64 = 9300;
+        const ROUNDS: usize = 64;
+
+        for _ in 0..ROUNDS {
+            let (reg, cap) = TenantRegistry::new();
+            let barrier = Arc::new(Barrier::new(2));
+
+            let reg_r = reg.clone();
+            let barrier_r = Arc::clone(&barrier);
+            let t_register = thread::spawn(move || {
+                barrier_r.wait();
+                reg_r.register_with_capability(ctx(ID))
+            });
+
+            let reg_u = reg.clone();
+            let barrier_u = Arc::clone(&barrier);
+            let t_unregister = thread::spawn(move || {
+                barrier_u.wait();
+                reg_u.unregister(TenantId(ID), &cap)
+            });
+
+            let r_res = t_register.join().unwrap();
+            let u_res = t_unregister.join().unwrap();
+
+            // From a fresh registry with id ID never inserted: register
+            // cannot fail (no occupant, no tombstone). The branch on
+            // `u_res` distinguishes the two reachable serialisations.
+            let (r_arc, _r_cap) = r_res.expect(
+                "register against fresh id with only unregister racing must succeed",
+            );
+            assert_eq!(r_arc.id(), TenantId(ID));
+            match u_res {
+                Some(removed) => {
+                    // Order was: register THEN unregister. The removed
+                    // Arc must be the one register returned, and the
+                    // tombstone must be present (recorded by the
+                    // racing unregister).
+                    assert!(Arc::ptr_eq(&removed, &r_arc));
+                    assert!(
+                        reg.tombstones.contains_key(&TenantId(ID)),
+                        "unregister-after-register must record tombstone"
+                    );
+                    // Drop both Arcs so the Weak in the tombstone goes
+                    // dead; otherwise it would leak between rounds.
+                    drop(removed);
+                    drop(r_arc);
+                }
+                None => {
+                    // Order was: unregister THEN register. The slot
+                    // is occupied by `r_arc` and the tombstone is
+                    // absent (no prior occupant existed for unregister
+                    // to record, and register's own success path
+                    // never sets a tombstone).
+                    assert!(
+                        !reg.tombstones.contains_key(&TenantId(ID)),
+                        "register-after-empty-unregister must leave no tombstone"
+                    );
+                    drop(r_arc);
+                }
+            }
+        }
     }
 }
