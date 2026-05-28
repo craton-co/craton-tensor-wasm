@@ -15,21 +15,39 @@
 //! Actual on-disk store, signing CLI, and wire-format integration are
 //! v0.4 deliverables — see `docs/KERNEL-REGISTRY.md`.
 //!
-//! ## Signing envelope
+//! ## Signing envelope (v2)
 //!
 //! The HMAC-SHA256 input is the byte concatenation
 //!
 //! ```text
-//! name || 0x00 || version || 0x00 || sm_version_le_u32 || digest
+//! "twasm-kmf-v2"                                 (12 bytes, magic + version tag)
+//! u64_le(name.len())      || name.as_bytes()
+//! u64_le(version.len())   || version.as_bytes()
+//! u64_le(publisher.len()) || publisher.as_bytes()
+//! u64_le(8)               || published_unix_ms as u64_le
+//! u64_le(4)               || sm_version as u32_le
+//! u64_le(digest.len())    || digest_bytes
 //! ```
 //!
-//! where `digest` is the BLAKE3 hash of the UTF-8 PTX text. The
-//! `0x00` separators prevent length-extension confusion between, e.g.,
-//! `("matmul", "f32-1.0")` and `("matmul.f32", "-1.0")`. The
-//! `published_unix_ms` and `publisher` fields are NOT covered by the
-//! signature in v0.3.7 — they are advisory metadata only. The v0.4
-//! wire format will extend the envelope to cover them once a stable
-//! canonical encoding is settled.
+//! where `digest` is the BLAKE3 hash of the UTF-8 PTX text. Every
+//! field is preceded by a `u64`-little-endian length prefix. Fixed-
+//! width integer fields (`published_unix_ms`, `sm_version`) carry a
+//! length prefix too, so the canonical encoding is trivially
+//! parseable end-to-end and uniform across all fields.
+//!
+//! Length-prefixing replaces the prior NUL-separator scheme — under
+//! NUL separators the two manifests `("a\0b", "c", ...)` and
+//! `("a", "b\0c", ...)` produced identical signed-byte streams, a
+//! cross-field collision that an attacker with publish access could
+//! exploit. Length prefixes make field boundaries unambiguous and
+//! also bind the `publisher` and `published_unix_ms` fields into the
+//! MAC so they can no longer be rewritten post-sign without
+//! invalidating the signature.
+//!
+//! The leading `b"twasm-kmf-v2"` magic gates this envelope to v2.
+//! Manifests signed with the v0.3.7 (v1) NUL-separator scheme will
+//! NOT verify under the v2 MAC and must be re-signed — see the
+//! `[Unreleased]` CHANGELOG entry.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -53,13 +71,18 @@ pub struct KernelManifest {
     pub sm_version: u32,
     /// BLAKE3 hash of the PTX text. Content-addresses the artifact.
     pub digest: [u8; 32],
-    /// HMAC-SHA256 over (name || 0 || version || 0 || sm_version_le || digest).
+    /// HMAC-SHA256 over the v2 canonical signed-bytes envelope — see
+    /// the module-level docstring for the exact layout. Covers
+    /// `name`, `version`, `publisher`, `published_unix_ms`,
+    /// `sm_version`, and `digest`.
     pub signature: [u8; 32],
-    /// Wall-clock publish timestamp (Unix millis). Advisory metadata —
-    /// NOT covered by the signature in v0.3.7.
+    /// Wall-clock publish timestamp (Unix millis). Covered by the v2
+    /// signature envelope — tampering with this field invalidates the
+    /// signature.
     pub published_unix_ms: u64,
     /// Publisher identifier (typically a tenant id or signing-key id).
-    /// Advisory metadata — NOT covered by the signature in v0.3.7.
+    /// Covered by the v2 signature envelope — tampering with this
+    /// field invalidates the signature.
     pub publisher: String,
 }
 
@@ -100,6 +123,52 @@ impl KernelManifest {
         buf.copy_from_slice(&self.digest[..8]);
         u64::from_le_bytes(buf)
     }
+
+    /// Build the canonical v2 signed-bytes blob for this manifest.
+    ///
+    /// Both [`sign_manifest`] and [`InMemoryRegistry::verify_signature`]
+    /// route through this single helper, so the sign and verify
+    /// paths cannot drift. See the module-level docstring for the
+    /// exact wire layout. The output never contains the
+    /// `signature` field itself — the MAC is computed over this
+    /// blob and stored in `signature`.
+    pub(crate) fn canonical_signed_bytes(&self) -> Vec<u8> {
+        // Pre-size: 12 (magic) + 6*8 (length prefixes) + name + version
+        // + publisher + 8 (ts) + 4 (sm) + 32 (digest). The exact size
+        // doesn't matter for correctness, only for one fewer realloc.
+        let cap = 12
+            + 6 * 8
+            + self.name.len()
+            + self.version.len()
+            + self.publisher.len()
+            + 8
+            + 4
+            + self.digest.len();
+        let mut buf = Vec::with_capacity(cap);
+        buf.extend_from_slice(SIGNED_BYTES_MAGIC_V2);
+        push_len_prefixed(&mut buf, self.name.as_bytes());
+        push_len_prefixed(&mut buf, self.version.as_bytes());
+        push_len_prefixed(&mut buf, self.publisher.as_bytes());
+        push_len_prefixed(&mut buf, &self.published_unix_ms.to_le_bytes());
+        push_len_prefixed(&mut buf, &self.sm_version.to_le_bytes());
+        push_len_prefixed(&mut buf, &self.digest);
+        buf
+    }
+}
+
+/// Magic + version tag prefixed to every v2 canonical signed-bytes
+/// blob. Exactly 12 bytes — keeping it a fixed width means a future
+/// v3 envelope can prepend its own tag without ambiguity. Changing
+/// this constant is a breaking change to every previously-signed
+/// manifest in existence.
+pub(crate) const SIGNED_BYTES_MAGIC_V2: &[u8; 12] = b"twasm-kmf-v2";
+
+/// Append `bytes` to `buf` preceded by a `u64` little-endian length
+/// prefix. Used by [`KernelManifest::canonical_signed_bytes`] to
+/// emit each field in the canonical layout.
+fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
 }
 
 /// Resolves a JIT cache key to a (name, version) tuple that the
@@ -258,12 +327,7 @@ impl InMemoryRegistry {
         // compile-time 32-byte array so the unwrap is sound.
         let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&self.hmac_key[..])
             .expect("32-byte key is always valid HMAC-SHA256 input");
-        mac.update(manifest.name.as_bytes());
-        mac.update(b"\0");
-        mac.update(manifest.version.as_bytes());
-        mac.update(b"\0");
-        mac.update(&manifest.sm_version.to_le_bytes());
-        mac.update(&manifest.digest);
+        mac.update(&manifest.canonical_signed_bytes());
         let expected = mac.finalize().into_bytes();
         let ok = subtle::ConstantTimeEq::ct_eq(&expected[..], &manifest.signature[..]);
         if bool::from(ok) {
@@ -308,12 +372,7 @@ pub fn sign_manifest(unsigned: &KernelManifest, hmac_key: &[u8; 32]) -> [u8; 32]
     use hmac::{Hmac, Mac};
     let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(hmac_key)
         .expect("32-byte key is always valid HMAC-SHA256 input");
-    mac.update(unsigned.name.as_bytes());
-    mac.update(b"\0");
-    mac.update(unsigned.version.as_bytes());
-    mac.update(b"\0");
-    mac.update(&unsigned.sm_version.to_le_bytes());
-    mac.update(&unsigned.digest);
+    mac.update(&unsigned.canonical_signed_bytes());
     mac.finalize().into_bytes().into()
 }
 
@@ -405,6 +464,144 @@ mod tests {
         match reg.get("nope", "0.0.0") {
             Err(RegistryError::NotFound(k)) => assert_eq!(k, "nope@0.0.0"),
             other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    // --- v2 envelope: publisher + timestamp coverage --------------------
+
+    /// Round-trip: a manifest signed under the v2 envelope verifies
+    /// successfully. Complementary to `publish_and_get_roundtrip`
+    /// above but uses `verify_signature` directly so the test is
+    /// independent of the digest + uniqueness checks the registry
+    /// also runs.
+    #[test]
+    fn v2_envelope_roundtrip_verifies() {
+        let key = [0x42u8; 32];
+        let reg = InMemoryRegistry::new(key);
+        let ptx = "// fake ptx\n".to_string();
+        let m = signed_manifest("matmul.f32", "1.0.0", &ptx, &key);
+        reg.verify_signature(&m).expect("freshly signed manifest must verify");
+    }
+
+    /// Tamper-publisher: rewriting `publisher` after signing MUST
+    /// invalidate the signature. In the v0.3.7 envelope this field
+    /// was not covered and the signature still verified — the v2
+    /// envelope closes that hole.
+    #[test]
+    fn v2_envelope_rejects_publisher_tamper() {
+        let key = [0x42u8; 32];
+        let reg = InMemoryRegistry::new(key);
+        let ptx = "// fake ptx\n".to_string();
+        let mut m = signed_manifest("matmul.f32", "1.0.0", &ptx, &key);
+        // Sanity: the freshly-signed manifest verifies under the
+        // original publisher, so any failure below is attributable
+        // to the post-sign tamper rather than a sign-side bug.
+        reg.verify_signature(&m).expect("baseline must verify");
+        m.publisher = "attacker".to_string();
+        match reg.verify_signature(&m) {
+            Err(RegistryError::BadSignature(name)) => assert_eq!(name, "matmul.f32"),
+            other => panic!("expected BadSignature after publisher tamper, got {other:?}"),
+        }
+    }
+
+    /// Tamper-timestamp: rewriting `published_unix_ms` after signing
+    /// MUST invalidate the signature. Same v0.3.7 → v2 motivation as
+    /// `v2_envelope_rejects_publisher_tamper`.
+    #[test]
+    fn v2_envelope_rejects_timestamp_tamper() {
+        let key = [0x42u8; 32];
+        let reg = InMemoryRegistry::new(key);
+        let ptx = "// fake ptx\n".to_string();
+        let mut m = signed_manifest("matmul.f32", "1.0.0", &ptx, &key);
+        reg.verify_signature(&m).expect("baseline must verify");
+        // Shift the timestamp by one millisecond — any bit change
+        // is sufficient to break the MAC.
+        m.published_unix_ms = m.published_unix_ms.wrapping_add(1);
+        match reg.verify_signature(&m) {
+            Err(RegistryError::BadSignature(name)) => assert_eq!(name, "matmul.f32"),
+            other => panic!("expected BadSignature after timestamp tamper, got {other:?}"),
+        }
+    }
+
+    /// Canonicalisation collision: the v0.3.7 NUL-separator scheme
+    /// produced identical signed bytes for `("a\0b", "c", ...)` and
+    /// `("a", "b\0c", ...)`. Under the v2 length-prefixed envelope
+    /// these MUST differ, because the `u64`-LE length prefix on each
+    /// field disambiguates the boundary.
+    #[test]
+    fn v2_envelope_avoids_nul_collision() {
+        let digest = [0u8; 32];
+        let a = KernelManifest::new(
+            "a\0b".to_string(),
+            "c".to_string(),
+            80,
+            digest,
+            [0u8; 32],
+            0,
+            "p".to_string(),
+        );
+        let b = KernelManifest::new(
+            "a".to_string(),
+            "b\0c".to_string(),
+            80,
+            digest,
+            [0u8; 32],
+            0,
+            "p".to_string(),
+        );
+        let ca = a.canonical_signed_bytes();
+        let cb = b.canonical_signed_bytes();
+        assert_ne!(
+            ca, cb,
+            "v2 canonical envelope MUST disambiguate name/version field boundaries"
+        );
+        // Cross-check via the actual MAC, not just the canonical
+        // bytes — a future regression that strips the length prefix
+        // from one field but not the other could pass the byte
+        // compare but still collide once the MAC is computed.
+        let key = [0u8; 32];
+        let sig_a = sign_manifest(&a, &key);
+        let sig_b = sign_manifest(&b, &key);
+        assert_ne!(sig_a, sig_b, "v2 signatures MUST differ across NUL-collision pair");
+    }
+
+    /// Cross-version: a manifest "signed" by the legacy v0.3.7
+    /// canonical form (NUL separators, no publisher / timestamp
+    /// coverage, no magic prefix) MUST NOT verify under the v2 MAC.
+    /// We hand-roll the legacy envelope here so the test does not
+    /// depend on any deprecated helper sticking around.
+    #[test]
+    fn v2_envelope_rejects_legacy_v1_signature() {
+        use hmac::{Hmac, Mac};
+        let key = [0x42u8; 32];
+        let reg = InMemoryRegistry::new(key);
+        let ptx = "// fake ptx\n";
+        let digest = *blake3::hash(ptx.as_bytes()).as_bytes();
+        let mut m = KernelManifest::new(
+            "matmul.f32".to_string(),
+            "1.0.0".to_string(),
+            80,
+            digest,
+            [0u8; 32],
+            12345,
+            "legacy-publisher".to_string(),
+        );
+        // Compute the *legacy* (v0.3.7) MAC: name || 0 || version
+        // || 0 || sm_le || digest. No publisher, no timestamp, no
+        // magic, no length prefixes. This is what an old client or
+        // a tampered re-publish would produce.
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&key)
+            .expect("32-byte key is always valid HMAC-SHA256 input");
+        mac.update(m.name.as_bytes());
+        mac.update(b"\0");
+        mac.update(m.version.as_bytes());
+        mac.update(b"\0");
+        mac.update(&m.sm_version.to_le_bytes());
+        mac.update(&m.digest);
+        m.signature = mac.finalize().into_bytes().into();
+        match reg.verify_signature(&m) {
+            Err(RegistryError::BadSignature(name)) => assert_eq!(name, "matmul.f32"),
+            other => panic!("v1-shaped signature MUST NOT verify under v2 MAC: {other:?}"),
         }
     }
 }

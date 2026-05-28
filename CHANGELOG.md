@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (BREAKING)
+- `tensor-wasm-jit`: kernel registry signing envelope bumped to v2.
+  The v0.3.7 (v1) envelope concatenated `name || 0x00 || version
+  || 0x00 || sm_le || digest`, which (a) left `publisher` and
+  `published_unix_ms` outside the HMAC — anyone with publish
+  access could rewrite them and the signature still verified — and
+  (b) used NUL separators that collided across field boundaries
+  (e.g. `("a\0b","c")` MAC-identical to `("a","b\0c")`). The v2
+  envelope prepends a 12-byte `b"twasm-kmf-v2"` magic, length-
+  prefixes every field with a `u64` little-endian count, and now
+  covers `publisher` + `published_unix_ms`. **All manifests signed
+  under the v1 envelope must be re-signed — they will fail
+  verification under v2.** See
+  [`crates/tensor-wasm-jit/src/registry.rs`](crates/tensor-wasm-jit/src/registry.rs).
+
 ### Roadmap
 - 13 new strategic feature directions added under docs/PATH-TO-V1.md#post-v036-strategic-features; tracked in ACTIONABLE-ITEMS-PENDING.md.
 
