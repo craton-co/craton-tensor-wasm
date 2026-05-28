@@ -48,7 +48,6 @@ async-trait = "0.1"
 
 # Wasmtime (pinned to 25.x — minor version locked per risk register)
 wasmtime = { version = "25", default-features = false, features = ["async", "cranelift", "component-model", "runtime"] }
-wasmtime-wasi = "25"
 wat = "1"
 wasmparser = "0.218"
 cranelift-codegen = "0.111"

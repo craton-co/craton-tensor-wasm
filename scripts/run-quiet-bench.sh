@@ -32,10 +32,23 @@
 
 set -euo pipefail
 
+# Run from repo root so relative paths (bench-results/, target/) resolve
+# the same regardless of where the operator invoked the script from.
+cd "$(git rev-parse --show-toplevel)"
+
 OUT_DIR="bench-results/quiet"
 mkdir -p "$OUT_DIR"
 
 BENCH_FILTER="${1:-}"
+
+# Compute the baseline stamp *once* per session, not per-bench. With the
+# stamp inside the per-bench loop each Criterion bench in one run lands
+# in a different baseline dir (target/criterion/<bench>/quiet-<ts>/),
+# which defeats `--save-baseline` for cross-bench comparison: you cannot
+# `cargo bench -- --baseline quiet-<ts>` against a single name. Hoisting
+# the stamp here gives every bench in this invocation the same baseline
+# tag so they form a coherent set.
+STAMP="$(date +%Y%m%d-%H%M%S)"
 
 # -- step 1: CPU governor (Linux only, best-effort) -------------------
 if command -v cpupower >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
@@ -70,7 +83,7 @@ run_one() {
     drop_cache
     cargo bench -p tensor-wasm-bench --bench "$name" -- \
         --sample-size "$ELEVATED_SAMPLES" \
-        --save-baseline "quiet-$(date +%Y%m%d-%H%M%S)" \
+        --save-baseline "quiet-$STAMP" \
         2>&1 | tee "$OUT_DIR/${name}.log"
 }
 

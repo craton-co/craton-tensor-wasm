@@ -28,7 +28,6 @@ tokio.workspace = true
 tracing.workspace = true
 wasmparser.workspace = true
 wasmtime = { workspace = true, features = ["pooling-allocator", "memory-protection-keys"] }
-wasmtime-wasi.workspace = true
 
 [dev-dependencies]
 tokio-test.workspace = true
@@ -36,8 +35,6 @@ tracing-subscriber.workspace = true
 wat.workspace = true
 
 [features]
-default = ["async-execution"]
-async-execution = []
 
 [package.metadata.docs.rs]
 all-features = true

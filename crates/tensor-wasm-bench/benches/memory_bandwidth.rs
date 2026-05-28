@@ -32,7 +32,10 @@ fn bench_sequential_copy(c: &mut Criterion) {
             }
             b.iter(|| {
                 dst.as_mut_slice().copy_from_slice(src.as_slice());
-                criterion::black_box(&dst);
+                // Blackbox the *contents* pointer (post-write) rather than
+                // `&dst`, otherwise the compiler may treat `dst` as dead
+                // after the closure and elide the copy entirely.
+                criterion::black_box(dst.as_slice().as_ptr());
             });
         });
     }
@@ -43,8 +46,18 @@ fn bench_strided_copy(c: &mut Criterion) {
     let mut group = c.benchmark_group("memory_bandwidth/strided");
     group.measurement_time(Duration::from_secs(3));
     const STRIDE: usize = 4096;
+    const CHUNK: usize = 64;
     for &size in &[64 * 1024usize, 1024 * 1024, 16 * 1024 * 1024] {
-        group.throughput(Throughput::Bytes(size as u64));
+        // Bytes actually moved per iteration: we visit ~ size / STRIDE
+        // offsets and copy CHUNK bytes at each, so the touched byte count
+        // is (size / STRIDE) * CHUNK -- roughly size / 64 with STRIDE=4096
+        // and CHUNK=64. Reporting Throughput::Bytes(size) here would
+        // overstate MB/s by ~STRIDE/CHUNK (= 64x) because Criterion divides
+        // the iteration wall-time by the *declared* byte count. Declare the
+        // real touched count so MB/s is honest. If STRIDE or CHUNK change,
+        // keep this expression in lock-step with the inner loop below.
+        let bytes_copied = ((size as u64) / STRIDE as u64) * CHUNK as u64;
+        group.throughput(Throughput::Bytes(bytes_copied));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             let mut src = GuardedHostBuffer::new(size).unwrap();
             let mut dst = GuardedHostBuffer::new(size).unwrap();
@@ -61,12 +74,15 @@ fn bench_strided_copy(c: &mut Criterion) {
                 let src_len = src_slice.len();
                 let mut off = 0usize;
                 while off < src_len {
-                    let chunk_end = (off + 64).min(src_len);
+                    let chunk_end = (off + CHUNK).min(src_len);
                     dst_slice[off..chunk_end].copy_from_slice(&src_slice[off..chunk_end]);
                     let step = STRIDE.min(src_len - off).max(1);
                     off += step;
                 }
-                criterion::black_box(&dst_slice);
+                // Blackbox the *contents* pointer (post-write) rather than
+                // `&dst_slice`, which only hides the reference and lets LLVM
+                // prove the writes are dead after the closure returns.
+                criterion::black_box(dst_slice.as_ptr());
             });
         });
     }

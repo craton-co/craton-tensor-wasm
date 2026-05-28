@@ -71,6 +71,12 @@ jobs:
           failures = []
           missing = []
           for name, spec in metrics.items():
+              # Entries with explicit regression_check=false are listed for
+              # visibility / TODO tracking but skipped by the gate -- they
+              # carry median_ns=null until a real reading is captured.
+              if spec.get("regression_check", True) is False or spec.get("median_ns") is None:
+                  print(f"  [SKIP] {name}: regression_check disabled or baseline unset")
+                  continue
               if name not in measured:
                   missing.append(name)
                   continue

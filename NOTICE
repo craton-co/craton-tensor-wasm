@@ -8,7 +8,7 @@ This product includes software developed by:
   The OpenTelemetry Authors                 — Apache-2.0
   The Cranelift Authors                     — Apache-2.0 WITH LLVM-exception
   The CUDA Rust Working Group (cust)        — MIT OR Apache-2.0
-  Coreyt Joseph (cudarc)                    — MIT OR Apache-2.0
+  Corey Lammie (coreylowman, cudarc)        — MIT OR Apache-2.0
   NVIDIA Labs (cuda-oxide: cuda-host,       — Apache-2.0
     cuda-core, cuda-async)
   Arvind Sankaranarayanan (Pliron,          — Apache-2.0 WITH LLVM-exception
