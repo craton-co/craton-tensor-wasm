@@ -155,11 +155,19 @@ pub enum LoweredArg {
         /// move on a `memory.grow`). The CUDA launch site captures the
         /// pointer into a parameter slot and immediately hands it to
         /// `cuLaunchKernel`, before any guest code can run.
-        host_ptr: *const u8,
+        ///
+        /// Crate-private: the raw pointer is intentionally not part of
+        /// this crate's public API. A guest-driven `memory.grow` between
+        /// launch and any embedder readback can dangle this pointer, so
+        /// the only safe consumer is the launch path itself. Embedders
+        /// that need to observe the parsed argv take a pointer-free
+        /// [`LoweredArgSnapshot`] via
+        /// [`crate::host::WasiCudaContext::last_lowered_args`].
+        pub(crate) host_ptr: *const u8,
         /// Byte length the kernel will access.
-        len: u32,
+        pub len: u32,
         /// Original guest-memory offset (for logging / tests).
-        guest_offset: u32,
+        pub guest_offset: u32,
     },
 }
 
@@ -169,8 +177,94 @@ pub enum LoweredArg {
 // `spawn_blocking(synchronize)`, then drops the `Vec<LoweredArg>` before
 // returning to the wasmtime fiber. Recording it under `Send` is
 // nevertheless safe because no concurrent reader exists by construction.
+//
+// `Sync` is deliberately NOT implemented: no current call site shares a
+// `&LoweredArg` across threads, and leaving `Sync` off prevents an
+// embedder from accidentally moving a `&LoweredArg` (and therefore the
+// raw `host_ptr` it carries) to another thread where a `memory.grow` on
+// the originating instance could dangle it under their feet.
 unsafe impl Send for LoweredArg {}
-unsafe impl Sync for LoweredArg {}
+
+/// Pointer-free, freely-`Send`/`Sync` snapshot of a [`LoweredArg`].
+///
+/// `LoweredArgSnapshot` is the shape the public observability surface
+/// ([`crate::host::WasiCudaContext::last_lowered_args`]) hands out. It
+/// mirrors every variant of [`LoweredArg`] except that the `Ptr` variant
+/// drops the raw `host_ptr` field — only the `guest_offset` and `len`
+/// the guest declared survive.
+///
+/// The redaction is deliberate, not cosmetic. The host-side raw pointer
+/// inside a `LoweredArg::Ptr` is only valid while the guest's linear
+/// memory has not been reallocated; a `memory.grow` between launch and
+/// readback would dangle it. Stripping the field at the public boundary
+/// makes that use-after-grow unrepresentable for embedders, and also
+/// removes the only reason `LoweredArg` itself cannot implement `Sync`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoweredArgSnapshot {
+    /// 32-bit signed scalar.
+    I32(i32),
+    /// 64-bit signed scalar.
+    I64(i64),
+    /// 32-bit float scalar.
+    F32(f32),
+    /// 64-bit float scalar.
+    F64(f64),
+    /// 32-bit unsigned scalar.
+    U32(u32),
+    /// 64-bit unsigned scalar.
+    U64(u64),
+    /// Pointer argument with the host pointer redacted; only the
+    /// guest-declared `(guest_offset, len)` pair survives.
+    Ptr {
+        /// Byte length the kernel will access.
+        len: u32,
+        /// Original guest-memory offset (for logging / tests).
+        guest_offset: u32,
+    },
+}
+
+impl From<&LoweredArg> for LoweredArgSnapshot {
+    fn from(arg: &LoweredArg) -> Self {
+        match arg {
+            LoweredArg::I32(v) => LoweredArgSnapshot::I32(*v),
+            LoweredArg::I64(v) => LoweredArgSnapshot::I64(*v),
+            LoweredArg::F32(v) => LoweredArgSnapshot::F32(*v),
+            LoweredArg::F64(v) => LoweredArgSnapshot::F64(*v),
+            LoweredArg::U32(v) => LoweredArgSnapshot::U32(*v),
+            LoweredArg::U64(v) => LoweredArgSnapshot::U64(*v),
+            // `host_ptr` is intentionally dropped — see the type-level
+            // doc comment for the use-after-grow rationale.
+            LoweredArg::Ptr {
+                host_ptr: _,
+                len,
+                guest_offset,
+            } => LoweredArgSnapshot::Ptr {
+                len: *len,
+                guest_offset: *guest_offset,
+            },
+        }
+    }
+}
+
+impl LoweredArg {
+    /// Test/encoding helper: build a `LoweredArg::Ptr` carrying a null
+    /// host pointer.
+    ///
+    /// Out-of-crate callers (integration tests and embedders that want
+    /// to round-trip argv through [`encode_argv`]) cannot construct
+    /// `LoweredArg::Ptr` directly because `host_ptr` is crate-private.
+    /// `encode_argv` reads only `guest_offset` and `len`, so a null
+    /// placeholder is sufficient for the wire-format encoding path.
+    /// This constructor exists solely for that use case; the launch
+    /// path itself populates `host_ptr` via [`parse_argv`].
+    pub fn ptr_for_encoding(guest_offset: u32, len: u32) -> Self {
+        LoweredArg::Ptr {
+            host_ptr: std::ptr::null(),
+            len,
+            guest_offset,
+        }
+    }
+}
 
 /// Parse a tagged-argv byte buffer into a host-side `Vec<LoweredArg>`.
 ///

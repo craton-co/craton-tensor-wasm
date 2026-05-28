@@ -51,7 +51,7 @@
 use tensor_wasm_core::types::InstanceId;
 use tensor_wasm_wasi_gpu::abi::{AbiError, FN_LAUNCH, MODULE};
 use tensor_wasm_wasi_gpu::host::{add_to_linker, HasWasiCuda, WasiCudaContext};
-use tensor_wasm_wasi_gpu::kernel_args::{encode_argv, LoweredArg};
+use tensor_wasm_wasi_gpu::kernel_args::{encode_argv, LoweredArg, LoweredArgSnapshot};
 use tensor_wasm_wasi_gpu::registry::KernelEntry;
 
 struct TestStore {
@@ -329,9 +329,13 @@ async fn scalar_argv_round_trips_through_launch_path() {
     );
 
     // The parsed args must be visible regardless of CUDA-vs-stub.
+    // `last_lowered_args` returns a pointer-free snapshot, so compare
+    // against the snapshot projection of the expected `LoweredArg`s.
     let recorded = store.data().wasi_cuda().last_lowered_args();
+    let expected_snapshots: Vec<LoweredArgSnapshot> =
+        expected.iter().map(LoweredArgSnapshot::from).collect();
     assert_eq!(
-        recorded, expected,
+        recorded, expected_snapshots,
         "parsed argv must round-trip the original LoweredArg sequence"
     );
 }
@@ -352,18 +356,14 @@ async fn pointer_argv_round_trips_through_launch_path() {
     // 4096 (length 128); both live inside the 4-page (256 KiB) memory
     // the WAT exports. A scalar i32 separates them to confirm mixed
     // argv works.
+    //
+    // `LoweredArg::Ptr` carries a crate-private `host_ptr` so out-of-
+    // crate callers go through `LoweredArg::ptr_for_encoding`, which
+    // produces the null-pointer placeholder `encode_argv` ignores.
     let expected = vec![
-        LoweredArg::Ptr {
-            host_ptr: std::ptr::null(),
-            len: 64,
-            guest_offset: 256,
-        },
+        LoweredArg::ptr_for_encoding(256, 64),
         LoweredArg::I32(7),
-        LoweredArg::Ptr {
-            host_ptr: std::ptr::null(),
-            len: 128,
-            guest_offset: 4096,
-        },
+        LoweredArg::ptr_for_encoding(4096, 128),
     ];
     let argv = encode_argv(&expected);
     // Place the argv buffer high enough that it doesn't overlap the
@@ -391,28 +391,24 @@ async fn pointer_argv_round_trips_through_launch_path() {
     #[cfg(feature = "cuda")]
     assert_eq!(rc, AbiError::InvalidKernel.code());
 
+    // `last_lowered_args` returns pointer-free snapshots — the resolved
+    // `host_ptr` lives only on the crate-internal launch path and is
+    // intentionally redacted at the public boundary (see the
+    // `LoweredArgSnapshot` rationale).
     let recorded = store.data().wasi_cuda().last_lowered_args();
     assert_eq!(recorded.len(), 3, "expected three lowered args");
     // Spot-check fields. Pointers compare by `guest_offset` / `len`
-    // because the resolved `host_ptr` depends on where wasmtime
-    // allocated the linear-memory backing.
+    // only — the pointer itself is no longer part of the snapshot.
     match &recorded[0] {
-        LoweredArg::Ptr {
-            guest_offset,
-            len,
-            host_ptr,
-        } => {
+        LoweredArgSnapshot::Ptr { guest_offset, len } => {
             assert_eq!(*guest_offset, 256);
             assert_eq!(*len, 64);
-            assert!(!host_ptr.is_null(), "host_ptr must be resolved");
         }
         other => panic!("idx 0 expected Ptr, got {other:?}"),
     }
-    assert!(matches!(recorded[1], LoweredArg::I32(7)));
+    assert!(matches!(recorded[1], LoweredArgSnapshot::I32(7)));
     match &recorded[2] {
-        LoweredArg::Ptr {
-            guest_offset, len, ..
-        } => {
+        LoweredArgSnapshot::Ptr { guest_offset, len } => {
             assert_eq!(*guest_offset, 4096);
             assert_eq!(*len, 128);
         }

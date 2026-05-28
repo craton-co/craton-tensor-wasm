@@ -76,7 +76,7 @@ use crate::abi::{
     MAX_BLOCK_DIM, MAX_GRID_DIM, MAX_PTX_BYTES, MAX_THREADS_PER_BLOCK, MODULE,
 };
 use crate::async_dispatch::BackPressure;
-use crate::kernel_args::{parse_argv, LoweredArg};
+use crate::kernel_args::{parse_argv, LoweredArg, LoweredArgSnapshot};
 use crate::registry::{KernelEntry, KernelRegistry};
 
 /// Maximum byte length of a single recorded `last_error` message.
@@ -256,10 +256,42 @@ impl WasiCudaContext {
             .clone()
     }
 
-    /// Snapshot of the args parsed by the most recent successful `launch`
-    /// call. Intended for tests; production code should not depend on
-    /// this value remaining stable across launches on the same context.
-    pub fn last_lowered_args(&self) -> Vec<LoweredArg> {
+    /// Pointer-free snapshot suitable for observability and tests; the
+    /// host pointer is intentionally redacted to defend against
+    /// use-after-grow.
+    ///
+    /// The internal [`LoweredArg::Ptr`] variant carries a raw host
+    /// pointer into the guest's linear memory that the launch path
+    /// consumes synchronously. Any subsequent `memory.grow` by the same
+    /// guest can dangle that pointer; surfacing it to an embedder would
+    /// hand them a use-after-grow primitive whose lifetime no Rust
+    /// borrow check can express. Returning [`LoweredArgSnapshot`]
+    /// strips the raw pointer at the public boundary so embedders and
+    /// tests can still inspect the parsed-arg shape (variant,
+    /// guest-declared length, guest offset) without that hazard.
+    ///
+    /// Intended for tests and diagnostics; production code should not
+    /// depend on this value remaining stable across launches on the
+    /// same context.
+    pub fn last_lowered_args(&self) -> Vec<LoweredArgSnapshot> {
+        self.last_lowered_args
+            .lock()
+            .expect("last_lowered_args poisoned")
+            .iter()
+            .map(LoweredArgSnapshot::from)
+            .collect()
+    }
+
+    /// Crate-internal variant of [`Self::last_lowered_args`] that keeps
+    /// the raw [`LoweredArg`] payload (including the host pointer
+    /// inside `Ptr` variants).
+    ///
+    /// This is the shape the launch path itself needs — the host
+    /// pointer is what eventually feeds `cuLaunchKernel`. It is
+    /// deliberately not part of the public API: see
+    /// [`Self::last_lowered_args`] for the use-after-grow rationale
+    /// behind the public redaction.
+    pub(crate) fn last_lowered_args_internal(&self) -> Vec<LoweredArg> {
         self.last_lowered_args
             .lock()
             .unwrap_or_else(|e| e.into_inner())
