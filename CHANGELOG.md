@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `tensor-wasm-snapshot` (T9): tighten `limits::MAX_INPUT_BYTES` from
+  4 GiB to 1 GiB. The pre-T9 expression
+  (`64 * 1024 * 1024 * 64`) evaluated to 4 GiB — effectively no cap on
+  the attacker's pre-decompression memory footprint on a multi-tenant
+  API. Operators whose legitimate workload produces snapshots larger
+  than 1 GiB compressed must adjust the constant upward (it is `pub`
+  for exactly that reason). v2/v3 snapshots that fit under the new cap
+  are unaffected.
+- `tensor-wasm-snapshot` (T9): opt-in timestamp-based freshness check.
+  `SnapshotReader::with_max_age(Duration)` rejects any restored
+  snapshot whose `metadata.created_unix_ms` is older than the
+  configured budget, returning the new
+  `TensorWasmError::SnapshotTooOld { created_unix_ms, now_unix_ms,
+  max_age_ms }` variant. The default reader (`SnapshotReader::new()`)
+  has `max_age = None` and accepts arbitrarily old snapshots,
+  preserving v0.3.x backward compatibility. For v3 (HMAC-signed)
+  snapshots the trailer transitively authenticates `created_unix_ms`
+  (the timestamp sits inside the bincode-encoded payload that the
+  HMAC covers), so an attacker who replays a stale v3 blob cannot
+  lie about its age. **Backward-compat note:** snapshots written by
+  any pre-T9 writer that fell back to `created_unix_ms = 0` on a
+  `SystemTime` failure will fail every non-`None` `max_age` check;
+  operators opting into the freshness check must re-emit those
+  captures.
+- `tensor-wasm-snapshot` (T9): propagate `SystemTime::now()` failure
+  during capture as `TensorWasmError::Serialization` instead of
+  silently defaulting `created_unix_ms` to `0`. A `0` timestamp
+  silently defeats any future `max_age` check; surfacing the failure
+  forces the operator to fix the host clock before captures can
+  proceed. Affects [`SnapshotWriter::capture`] and
+  [`SnapshotWriter::capture_to_artifact_store`].
+
 ### Security (BREAKING)
 - `tensor-wasm-jit` (T12): kernel registry signing envelope bumped to v2.
   The v0.3.7 (v1) envelope concatenated `name || 0x00 || version

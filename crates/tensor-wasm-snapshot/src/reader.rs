@@ -16,6 +16,7 @@
 //! exercised. The cuda branches use the `cust` 0.3.x unified-memory APIs.
 
 use std::io::Read;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tensor_wasm_core::error::{TensorWasmError, Result};
 use tracing::{debug, instrument};
@@ -84,6 +85,14 @@ pub struct SnapshotReader {
     /// well-formed. Allows operators to enforce signature-only restores
     /// without compiling a separate binary.
     require_signature: bool,
+    /// T9 freshness check: when `Some(d)`, a restored snapshot whose
+    /// `metadata.created_unix_ms` is older than `now - d` is rejected
+    /// with [`TensorWasmError::SnapshotTooOld`]. `None` (the default)
+    /// disables the check and preserves the v0.3.x behaviour of
+    /// accepting arbitrarily old captures.
+    ///
+    /// See [`SnapshotReader::with_max_age`] for the public surface.
+    max_age: Option<Duration>,
 }
 
 impl Default for SnapshotReader {
@@ -102,6 +111,7 @@ impl std::fmt::Debug for SnapshotReader {
             &self.hmac_key.as_ref().map(|_| "<REDACTED 32-byte HMAC key>"),
         );
         d.field("require_signature", &self.require_signature);
+        d.field("max_age", &self.max_age);
         d.finish()
     }
 }
@@ -110,12 +120,16 @@ impl SnapshotReader {
     /// Construct a fresh reader with the default decompressed-size cap
     /// ([`limits::MAX_DECOMPRESSED_BYTES`]). Equivalent to
     /// [`SnapshotReader::default`] but `const`.
+    ///
+    /// The freshness check is **disabled** by default (`max_age = None`);
+    /// see [`SnapshotReader::with_max_age`] to opt in.
     pub const fn new() -> Self {
         Self {
             max_decompressed: limits::MAX_DECOMPRESSED_BYTES,
             #[cfg(feature = "signed-snapshots")]
             hmac_key: None,
             require_signature: false,
+            max_age: None,
         }
     }
 
@@ -184,6 +198,54 @@ impl SnapshotReader {
     #[must_use]
     pub const fn max_decompressed(&self) -> usize {
         self.max_decompressed
+    }
+
+    /// Enable the T9 freshness check with `max_age` as the maximum
+    /// accepted age of a captured snapshot.
+    ///
+    /// When enabled, the reader compares the snapshot's
+    /// `metadata.created_unix_ms` against the host's wall clock at the
+    /// moment of `restore` and rejects the blob with
+    /// [`TensorWasmError::SnapshotTooOld`] if `now - created > max_age`.
+    /// The check is **opt-in**: a reader constructed via
+    /// [`SnapshotReader::new`] (or [`SnapshotReader::default`]) has
+    /// `max_age = None` and accepts arbitrarily old snapshots, preserving
+    /// backward compatibility with v0.3.x callers and with the v0.3.x
+    /// wire format (snapshots written by pre-T9 writers that emitted
+    /// `created_unix_ms = 0` on `SystemTime` failure will fail every
+    /// `max_age` check — operators opting into the check must re-emit).
+    ///
+    /// The HMAC trailer on v3 snapshots transitively authenticates
+    /// `created_unix_ms` (the timestamp sits inside the bincode payload
+    /// that the HMAC covers), so an attacker who replays a stale v3
+    /// blob must keep its original timestamp; the reader's `max_age`
+    /// check then rejects it. Combined with
+    /// [`SnapshotReader::with_hmac_sha256_key`] and
+    /// [`SnapshotReader::require_signature`], this closes the
+    /// indefinite-replay window without needing the still-reserved
+    /// `sequence_no` / `nonce` fields (those are v0.4 work).
+    ///
+    /// Clock-skew note: the check uses `SystemTime::now()` on the
+    /// reader host. A reader whose clock is *behind* the writer's
+    /// clock at capture time would see `now < created` and treat the
+    /// resulting underflow as "fresh" (the check ignores future-dated
+    /// snapshots rather than rejecting them, since clock skew is
+    /// typically a transient condition and operators prefer accepting
+    /// a slightly-future-dated snapshot over a hard rejection). A
+    /// reader whose `SystemTime::now()` fails (clock before
+    /// `UNIX_EPOCH`) also accepts the snapshot — the failure does not
+    /// promote a clock-broken host to a brick.
+    #[must_use]
+    pub const fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = Some(max_age);
+        self
+    }
+
+    /// Current freshness-check budget, if any. `None` means the check is
+    /// disabled (the default).
+    #[must_use]
+    pub const fn max_age(&self) -> Option<Duration> {
+        self.max_age
     }
 
     /// Decode `bytes` previously produced by
@@ -528,6 +590,17 @@ impl SnapshotReader {
             ));
         }
 
+        // T9 freshness check. Runs *after* HMAC, CRC, and the structural
+        // checks so a malformed blob is not silently re-categorised as
+        // "stale". The check is opt-in via `with_max_age`; the default
+        // `max_age = None` preserves the v0.3.x behaviour of accepting
+        // arbitrarily old snapshots. For v3 blobs the HMAC has already
+        // certified `created_unix_ms` (the timestamp is inside the
+        // bincode-encoded payload that the HMAC covers), so an attacker
+        // who replays a stale v3 blob cannot lie about its age — the
+        // reader's clock is authoritative.
+        self.check_freshness(snapshot.metadata.created_unix_ms)?;
+
         debug!(
             decompressed = decompressed.len(),
             wasm = snapshot.wasm_memory.len(),
@@ -537,6 +610,47 @@ impl SnapshotReader {
             "snapshot restored",
         );
         Ok(snapshot)
+    }
+
+    /// Compare `created_unix_ms` against the host's wall clock and the
+    /// configured `max_age`. Returns
+    /// [`TensorWasmError::SnapshotTooOld`] if the snapshot is older than
+    /// `max_age`; returns `Ok(())` when the check is disabled
+    /// (`max_age == None`), when the host clock cannot be read, or when
+    /// the snapshot is future-dated (clock skew between writer and
+    /// reader hosts is typically transient and operators prefer accept
+    /// over reject in that direction — see [`SnapshotReader::with_max_age`]
+    /// docs).
+    fn check_freshness(&self, created_unix_ms: u64) -> Result<()> {
+        let max_age = match self.max_age {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        // Host clock unreadable -> accept rather than brick the reader.
+        // This is the symmetric counterpart to the writer's
+        // `SystemTime::now()` propagation: if the reader's clock is
+        // broken the operator wants a single clear "fix the clock"
+        // signal at capture time, not a cascade of failed restores.
+        let now_unix_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => match u64::try_from(d.as_millis()) {
+                Ok(ms) => ms,
+                Err(_) => return Ok(()),
+            },
+            Err(_) => return Ok(()),
+        };
+        // Future-dated snapshot (writer clock ahead of reader clock):
+        // accept. Saturating subtraction below means `age_ms == 0` in
+        // that case, which always satisfies any non-zero `max_age`.
+        let age_ms = now_unix_ms.saturating_sub(created_unix_ms);
+        let max_age_ms = u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX);
+        if age_ms > max_age_ms {
+            return Err(TensorWasmError::SnapshotTooOld {
+                created_unix_ms,
+                now_unix_ms,
+                max_age_ms,
+            });
+        }
+        Ok(())
     }
 
     /// Validate the trailing `[magic][signature_kind][signature]` bytes of
@@ -800,6 +914,13 @@ impl SnapshotReader {
                 .into(),
             ));
         }
+
+        // T9 freshness check (same opt-in semantics as the legacy
+        // restore path — see `check_freshness`). The artifact store's
+        // outer HMAC has already certified the bincode payload, so
+        // `created_unix_ms` cannot have been tampered with after the
+        // snapshot was sealed.
+        self.check_freshness(snapshot.metadata.created_unix_ms)?;
 
         debug!(
             wasm = snapshot.wasm_memory.len(),

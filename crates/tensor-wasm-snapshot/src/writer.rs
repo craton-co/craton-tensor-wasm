@@ -95,15 +95,19 @@ pub mod limits {
     pub const MAX_TOTAL_PAYLOAD_BYTES: usize =
         MAX_WASM_MEMORY_BYTES + MAX_GPU_MEMORY_BYTES + MAX_REGISTERS_BYTES + 65536;
 
-    /// Hard ceiling on the compressed byte slice accepted by the reader (~4 GiB).
+    /// Hard ceiling on the compressed byte slice accepted by the reader (1 GiB).
     ///
     /// Snapshots arriving over the network may have been crafted to look small
     /// but decompress into terabytes. The reader rejects any input larger than
     /// this before calling zstd to bound the attacker's memory budget.
     ///
+    /// Tightened to 1 GiB in T9 to reduce attacker pre-decompression memory
+    /// footprint. Was 4 GiB. Adjust upward if a legitimate workload's
+    /// snapshot exceeds this.
+    ///
     /// On a 32-bit target this expression would overflow `usize`; the static
     /// assertion at the crate root ensures we only ever compile on 64-bit.
-    pub const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024 * 64;
+    pub const MAX_INPUT_BYTES: usize = 1024 * 1024 * 1024;
 
     /// Default ceiling on bytes produced by zstd decompression before bincode
     /// runs (256 MiB). Bounds memory pressure from a zip-bomb that streams
@@ -154,6 +158,12 @@ pub struct SnapshotMetadata {
     /// Defaults to `0` for snapshots produced by writers that have not
     /// opted in. Today every writer in this crate emits `0`; the v0.4
     /// release will switch to a writer-supplied monotonic counter.
+    ///
+    /// **v0.4 follow-up: enforced replay protection via this field.**
+    /// Today: timestamp-based freshness (via
+    /// [`crate::reader::SnapshotReader::with_max_age`]) is the only
+    /// guard. The field is reserved on the wire so the v0.4 cutover can
+    /// land without another format bump.
     #[cfg_attr(feature = "signed-snapshots", serde(default))]
     pub sequence_no: u64,
     /// Optional caller-supplied nonce. When set, the reader requires the
@@ -161,6 +171,12 @@ pub struct SnapshotMetadata {
     /// `SnapshotReader::with_expected_nonce`. Defaults to None — backward
     /// compatible with operators that have not opted into the v0.4
     /// freshness check.
+    ///
+    /// **v0.4 follow-up: enforced replay protection via this field.**
+    /// Today: timestamp-based freshness (via
+    /// [`crate::reader::SnapshotReader::with_max_age`]) is the only
+    /// guard. The field is reserved on the wire so the v0.4 cutover can
+    /// land without another format bump.
     #[cfg_attr(feature = "signed-snapshots", serde(default))]
     pub nonce: Option<[u8; 16]>,
 }
@@ -423,10 +439,30 @@ impl SnapshotWriter {
 
         let total_uncompressed_bytes =
             (state.wasm_memory.len() + state.gpu_memory.len() + state.registers.len()) as u64;
+        // T9: propagate a `SystemTime` failure as a Serialization error rather
+        // than silently defaulting `created_unix_ms` to `0`. The reader's
+        // freshness check (`SnapshotReader::with_max_age`) treats `0` as
+        // "epoch", so a silent default would let a clock-broken host emit
+        // snapshots that the reader would either always reject (any opted-in
+        // `max_age`) or — worse, if the operator concludes the timestamps are
+        // unreliable and disables the check — accept forever. Surfacing the
+        // failure here forces the operator to fix the clock before captures
+        // can proceed.
         let created_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
+            .map_err(|e| {
+                TensorWasmError::Serialization(
+                    format!("snapshot created_unix_ms: SystemTime::now() before UNIX_EPOCH: {e}")
+                        .into(),
+                )
+            })
+            .and_then(|d| {
+                u64::try_from(d.as_millis()).map_err(|_| {
+                    TensorWasmError::Serialization(
+                        "snapshot created_unix_ms: milliseconds since epoch overflows u64".into(),
+                    )
+                })
+            })?;
 
         let crc32 = payload_crc32(state.wasm_memory, state.gpu_memory, state.registers);
         let metadata = SnapshotMetadata {
