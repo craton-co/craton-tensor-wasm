@@ -405,6 +405,40 @@ mod backing {
     }
 
     impl Backing {
+        /// Allocate `size` bytes of CUDA Unified Memory via cudarc.
+        ///
+        /// Zeroes only the visible window (`init_zero_bytes`, clamped to
+        /// `size`). Bytes outside `[0, init_zero_bytes)` are NOT zeroed and
+        /// contain undefined data until the caller writes them. This matches
+        /// the cust path's behaviour and restores the `visible_bytes`
+        /// optimisation that motivates
+        /// [`super::UnifiedBuffer::new_with_visible_window_on`]: a 256 MiB
+        /// Wasm linear-memory spawn pays only a `minimum_bytes` memset
+        /// (typically one 64 KiB Wasm page) instead of a full `cap`-sized
+        /// fill.
+        ///
+        /// # Audit H2 invariant (no cross-tenant data leak)
+        ///
+        /// Cross-tenant safety is upheld at the layer above this one:
+        ///
+        /// - The pool path
+        ///   ([`crate::pool::UnifiedMemoryPool::allocate`]) zeroes every
+        ///   carved `[offset, offset + size)` region via `ptr::write_bytes`
+        ///   before returning the [`crate::pool::PoolAllocation`] to the
+        ///   tenant. That defends slabs that are recycled across tenants
+        ///   (audit H1, regression-pinned by
+        ///   `pool::tests::recycled_allocation_reads_as_zero`).
+        /// - The direct linear-memory path
+        ///   ([`crate::wasm_memory::TensorWasmLinearMemory`]) zeroes the
+        ///   visible window at construction time (via this function's
+        ///   `init_zero_bytes` fill) and zeroes bytes freshly exposed by
+        ///   `memory.grow` in
+        ///   [`crate::wasm_memory::TensorWasmLinearMemory::grow_to`]
+        ///   (regression-pinned by the H2 comment block at that call site).
+        ///
+        /// Removing the redundant full-allocation memset that previously
+        /// ran here restores the visible-window optimisation; the H2
+        /// invariant is preserved by the layer-above defences listed above.
         pub(super) fn allocate(
             size: usize,
             init_zero_bytes: usize,
@@ -418,7 +452,10 @@ mod backing {
             // so we zero the Wasm visible window ourselves to match the
             // initial-zero contract of `memory 1` instantiation. Bytes beyond
             // `init_zero_bytes` stay uninitialised; Wasmtime separately zeros
-            // any bytes exposed by `memory.grow`.
+            // any bytes exposed by `memory.grow`. The audit-T14 perf fix
+            // dropped a redundant full-allocation memset that previously
+            // followed this fill — see the doc comment above for the H2
+            // safety rationale.
             let init = init_zero_bytes.min(size);
             if init > 0 {
                 buf.as_mut_slice()[..init].fill(0);
@@ -428,21 +465,6 @@ mod backing {
             // returned `UnifiedError::Allocation` otherwise.
             let ptr = NonNull::new(buf.as_ptr() as *mut u8)
                 .ok_or_else(|| UnifiedError::Allocation("cudarc returned null".into()))?;
-            // Cross-tenant data-leak mitigation (audit H2): the CUDA driver's
-            // `cuMemAllocManaged` does not zero-initialise the returned region,
-            // unlike `cust::memory::UnifiedBuffer::new(&0u8, size)` on the cust
-            // path or `vec![0u8; size]` on the heap path. Zero the entire
-            // allocation here so every backing presents the same "fresh memory
-            // is zero" contract to upstream callers (notably
-            // `TensorWasmLinearMemory` and `UnifiedMemoryPool`).
-            //
-            // SAFETY: `ptr` is non-null and points to exactly `size` valid
-            // bytes of managed memory we just allocated; no other thread can
-            // hold an alias because we have not yet returned the buffer to the
-            // caller.
-            unsafe {
-                std::ptr::write_bytes(ptr.as_ptr(), 0u8, size);
-            }
             Ok((ptr, Backing::Cudarc(buf)))
         }
     }
