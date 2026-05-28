@@ -200,7 +200,7 @@ mockall = "0.13"
 # instead of raw `std::env::set_var` / `remove_var`, both because the latter
 # became `unsafe` in Rust 2024 and because parallel mutation of process env
 # from tests is undefined behaviour. Pinned at 0.3 (latest 0.3.x).
-temp-env = "0.3"
+temp-env = { version = "0.3", features = ["async_closure"] }
 
 # Logging / time
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

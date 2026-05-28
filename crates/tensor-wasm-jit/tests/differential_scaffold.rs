@@ -41,7 +41,8 @@ fn oracle_new_default_skips_with_no_cuda() {
 
 #[test]
 fn oracle_disabled_returns_skipped_disabled() {
-    let cfg = OracleConfig { disabled: true, ..Default::default() };
+    let mut cfg = OracleConfig::default();
+    cfg.disabled = true;
     let oracle = DifferentialOracle::with_config(cfg);
     let bp = fixture_blueprint();
     assert_eq!(

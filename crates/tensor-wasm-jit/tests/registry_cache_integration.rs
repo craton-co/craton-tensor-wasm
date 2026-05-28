@@ -87,6 +87,10 @@ impl KernelRegistry for PanicOnSecondGetRegistry {
         self.inner.get(name, version)
     }
 
+    fn publish(&self, manifest: KernelManifest, ptx_text: String) -> Result<(), RegistryError> {
+        self.inner.publish(manifest, ptx_text)
+    }
+
     fn list(&self) -> Vec<KernelManifest> {
         self.inner.list()
     }

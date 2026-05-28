@@ -415,6 +415,14 @@ pub struct DispatchPermit {
     counter: Arc<BackPressureInner>,
 }
 
+impl std::fmt::Debug for DispatchPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatchPermit")
+            .field("permit_held", &self.permit.is_some())
+            .finish()
+    }
+}
+
 impl Drop for DispatchPermit {
     fn drop(&mut self) {
         // SAFETY: the permit's own Drop releases the slot.

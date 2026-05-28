@@ -84,6 +84,7 @@ use crate::middleware::KernelPublishTokens;
 use crate::rate_limit::{AuthContext, TokenId};
 use crate::routes::{ApiError, AppState};
 use tensor_wasm_core::types::TenantId;
+use tensor_wasm_jit::registry::KernelRegistry;
 
 /// Request body for `POST /kernels`.
 ///

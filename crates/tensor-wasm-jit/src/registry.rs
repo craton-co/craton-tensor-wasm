@@ -306,6 +306,12 @@ pub trait KernelRegistry: Send + Sync {
         name: &str,
         version: &str,
     ) -> Result<Arc<(KernelManifest, String)>, RegistryError>;
+    /// Verify and persist a signed manifest + PTX text.
+    fn publish(
+        &self,
+        manifest: KernelManifest,
+        ptx_text: String,
+    ) -> Result<(), RegistryError>;
     /// Enumerate all registered manifests (PTX text omitted).
     fn list(&self) -> Vec<KernelManifest>;
     /// Page-aware listing. Default implementation slices the result of
@@ -426,6 +432,14 @@ impl KernelRegistry for InMemoryRegistry {
             .get(&key)
             .cloned()
             .ok_or(RegistryError::NotFound(key))
+    }
+
+    fn publish(
+        &self,
+        manifest: KernelManifest,
+        ptx_text: String,
+    ) -> Result<(), RegistryError> {
+        InMemoryRegistry::publish(self, manifest, ptx_text)
     }
 
     fn list(&self) -> Vec<KernelManifest> {
@@ -854,6 +868,14 @@ impl KernelRegistry for DiskRegistry {
         // the right outcome.
         self.verify_signature(&manifest)?;
         Ok(Arc::new((manifest, ptx_text)))
+    }
+
+    fn publish(
+        &self,
+        manifest: KernelManifest,
+        ptx_text: String,
+    ) -> Result<(), RegistryError> {
+        DiskRegistry::publish(self, manifest, ptx_text)
     }
 
     fn list(&self) -> Vec<KernelManifest> {

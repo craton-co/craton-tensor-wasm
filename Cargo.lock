@@ -3288,6 +3288,7 @@ version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
 dependencies = [
+ "futures",
  "parking_lot",
 ]
 
@@ -3326,6 +3327,7 @@ dependencies = [
  "tensor-wasm-core",
  "tensor-wasm-exec",
  "tensor-wasm-jit",
+ "tensor-wasm-wasi-gpu",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",
@@ -3459,20 +3461,24 @@ dependencies = [
 name = "tensor-wasm-jit"
 version = "0.3.6"
 dependencies = [
+ "bincode",
  "blake3",
  "cranelift-codegen 0.111.9",
  "dashmap",
+ "hex",
  "hmac",
  "lru",
  "parking_lot",
  "pliron",
  "pliron-llvm",
+ "proptest",
  "rayon",
  "serde",
  "serde_json",
  "sha2",
  "subtle",
  "tempfile",
+ "tensor-wasm-artifacts",
  "tensor-wasm-core",
  "thiserror 1.0.69",
  "tokio",

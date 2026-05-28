@@ -21,6 +21,8 @@ use tracing::{debug, instrument};
 use crate::format::{SIGNATURE_KIND_HMAC_SHA256, SNAPSHOT_VERSION_V3, V3_TRAILER_MAGIC};
 #[cfg(feature = "artifact-backing")]
 use crate::format::SNAPSHOT_VERSION_V2;
+#[cfg(feature = "artifact-backing")]
+use tensor_wasm_artifacts::ArtifactStore;
 #[cfg(feature = "signed-snapshots")]
 use zeroize::Zeroizing;
 

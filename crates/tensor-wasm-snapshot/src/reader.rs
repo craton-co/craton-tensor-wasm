@@ -31,6 +31,8 @@ use crate::format::{
     SignatureKind, HMAC_SHA256_SIG_LEN, SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN,
     V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN,
 };
+#[cfg(feature = "artifact-backing")]
+use tensor_wasm_artifacts::ArtifactStore;
 #[cfg(feature = "signed-snapshots")]
 use zeroize::Zeroizing;
 

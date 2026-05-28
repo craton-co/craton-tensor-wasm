@@ -24,7 +24,7 @@
 use std::collections::HashSet;
 
 use tensor_wasm_jit::registry::{
-    sign_manifest, DiskRegistry, KernelManifest, RegistryError,
+    sign_manifest, DiskRegistry, KernelManifest, KernelRegistry, RegistryError,
 };
 
 /// Helper: build a v2-signed manifest matching `ptx_text` under `key`
