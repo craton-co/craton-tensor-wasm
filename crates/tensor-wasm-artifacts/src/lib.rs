@@ -261,7 +261,10 @@ impl ArtifactStore for DiskArtifactStore {
             ArtifactError::Io
         })?;
         tmp.persist(&final_path).map_err(|e| {
-            warn!(target: "tensor_wasm_artifacts", error = %e.error, "tempfile persist failed");
+            // `tempfile::PersistError` wraps the underlying `io::Error`
+            // plus the temp handle; the `Display` impl forwards to the
+            // io error so we don't need to reach for the field.
+            warn!(target: "tensor_wasm_artifacts", error = %e, "tempfile persist failed");
             ArtifactError::Io
         })?;
         Ok(hash)

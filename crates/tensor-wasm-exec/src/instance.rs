@@ -285,4 +285,34 @@ mod tests {
         let s = InstanceState::new(TenantId(0), InstanceId(0));
         assert!(!s.is_past_deadline());
     }
+
+    #[test]
+    fn scheduler_unbounded_by_default() {
+        // A freshly-constructed InstanceState carries an unbounded
+        // SchedulerContext so guests that import `wasi:scheduler/host`
+        // see a working surface even without a configured deadline.
+        let s = InstanceState::new(TenantId(0), InstanceId(0));
+        assert_eq!(s.scheduler().deadline_ms(), None);
+    }
+
+    #[test]
+    fn with_deadline_duration_seeds_scheduler() {
+        // The scheduler context's budget mirrors the configured
+        // wall-clock deadline so cooperative yields and the epoch
+        // interrupt agree on when the deadline trips.
+        let s = InstanceState::new(TenantId(0), InstanceId(0))
+            .with_deadline_duration(Duration::from_millis(750));
+        assert_eq!(s.scheduler().deadline_ms(), Some(750));
+    }
+
+    #[test]
+    fn with_deadline_duration_saturates_at_u32_max() {
+        // A pathologically long deadline (decades) saturates the u32
+        // ms field rather than wrapping. The epoch interrupt would
+        // never fire within u32::MAX ms either, so reporting u32::MAX
+        // is honest.
+        let s = InstanceState::new(TenantId(0), InstanceId(0))
+            .with_deadline_duration(Duration::from_secs(60 * 60 * 24 * 365 * 100));
+        assert_eq!(s.scheduler().deadline_ms(), Some(u32::MAX));
+    }
 }
