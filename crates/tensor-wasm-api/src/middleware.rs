@@ -32,9 +32,27 @@ use crate::token_scope::{parse_tokens_env, TokenScope};
 /// Default per-request timeout used by [`crate::server::build_router`].
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default process-wide cap on in-flight requests. Replaced by per-tenant
-/// buckets in a follow-up release.
+/// Default process-wide cap on in-flight requests. Retained for callers that
+/// want a single number; production deployments should prefer the per-route
+/// caps below.
 pub const DEFAULT_CONCURRENCY_LIMIT: usize = 64;
+
+/// Per-route concurrency caps (api S-26). A single global semaphore lets a
+/// probe storm starve `/invoke`; per-route caps isolate the budgets.
+///
+/// Probe routes (`/healthz`, `/metrics`) get a generous budget because they
+/// are cheap and a k8s deployment may have many replicas all scraping at
+/// once. Invoke is the heaviest path — keep it tight. Reads and writes get
+/// asymmetric caps because writes tend to compile Wasm and allocate engine
+/// resources.
+pub const PROBE_CONCURRENCY_LIMIT: usize = 256;
+/// Concurrent `/invoke` ceiling. Tighter than the default because invokes
+/// hold a Wasmtime instance lock across `call_async`.
+pub const INVOKE_CONCURRENCY_LIMIT: usize = 32;
+/// Concurrent read-route ceiling (GETs that are not probes).
+pub const READ_CONCURRENCY_LIMIT: usize = 64;
+/// Concurrent write-route ceiling (POST/PUT/DELETE excluding invoke).
+pub const WRITE_CONCURRENCY_LIMIT: usize = 16;
 
 /// Maximum allowed inbound request body size, in bytes. 64 MiB.
 ///

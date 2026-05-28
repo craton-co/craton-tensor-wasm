@@ -15,6 +15,8 @@ use crate::audit::{audit_log_middleware, AuditConfig};
 use crate::http_metrics::{http_metrics_middleware, HttpMetricsLayerConfig, RouteAllowList};
 use crate::middleware::{
     bearer_auth, body_limit_layer, concurrency_limit_layer, cors_layer, tenant_scope,
+    INVOKE_CONCURRENCY_LIMIT, PROBE_CONCURRENCY_LIMIT, READ_CONCURRENCY_LIMIT,
+    WRITE_CONCURRENCY_LIMIT,
     timeout_layer, trace_layer_with_propagation, AuthConfig, CorsConfig, TenantConfig,
     MAX_REQUEST_BODY_BYTES,
 };
@@ -164,7 +166,9 @@ pub fn build_router_with_audit(
         .layer(cors_layer(&cors))
         .layer(body_limit_layer(MAX_REQUEST_BODY_BYTES))
         .layer(timeout_layer(Duration::from_secs(30)))
-        .layer(concurrency_limit_layer(64))
+        // NOTE (api S-26): the global ConcurrencyLimit(64) is removed.
+        // Per-route caps below isolate budgets so a probe storm cannot
+        // starve /invoke, and a noisy /invoke cannot starve probes.
         // Pass the auth + tenant + limiter + audit config into the request
         // extensions so the protected stack's `from_fn` middleware can pick
         // them up without capturing through a type-erased closure. The
@@ -191,19 +195,36 @@ pub fn build_router_with_audit(
     // upstream health checks.
     let probe_router = Router::new()
         .route("/healthz", get(healthz))
-        .route("/metrics", get(metrics));
+        .route("/metrics", get(metrics))
+        // api S-26: probes get their own generous budget. A k8s deployment
+        // can have many replicas all scraping at once without affecting
+        // invoke capacity.
+        .layer(concurrency_limit_layer(PROBE_CONCURRENCY_LIMIT));
 
     // Protected stack: everything that operates on tenant data. Auth /
     // tenant resolution / rate limit / audit all run on top of
     // `common_layers`, in the same order as before so the audit record
     // still observes the final status and any handler-stamped outcome
     // extension.
-    let protected_router = Router::new()
-        .route("/functions", post(create_function))
-        .route("/functions/:id", delete(delete_function))
+    // api S-26: split protected routes into three sub-routers by class so
+    // each gets an isolated concurrency budget. Invoke is tightest because
+    // calls hold a Wasmtime instance lock; writes are middle; reads are
+    // loosest.
+    let invoke_router = Router::new()
         .route("/functions/:id/invoke", post(invoke_function))
         .route("/functions/:id/invoke-async", post(invoke_function_async))
+        .layer(concurrency_limit_layer(INVOKE_CONCURRENCY_LIMIT));
+    let write_router = Router::new()
+        .route("/functions", post(create_function))
+        .route("/functions/:id", delete(delete_function))
+        .layer(concurrency_limit_layer(WRITE_CONCURRENCY_LIMIT));
+    let read_router = Router::new()
         .route("/jobs/:id", get(get_job))
+        .layer(concurrency_limit_layer(READ_CONCURRENCY_LIMIT));
+
+    let protected_router = invoke_router
+        .merge(write_router)
+        .merge(read_router)
         .layer(axum::middleware::from_fn(bearer_auth))
         .layer(axum::middleware::from_fn(tenant_scope))
         .layer(axum::middleware::from_fn(rate_limit))

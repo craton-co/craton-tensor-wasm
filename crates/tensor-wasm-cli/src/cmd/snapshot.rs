@@ -290,26 +290,57 @@ async fn save(
         return Err(super::render_error_response(status, &text));
     }
 
-    let bytes = resp
-        .bytes()
-        .await
-        .with_context(|| format!("streaming snapshot body from {url}"))?;
-    if bytes.len() as u64 > cap {
-        return Err(anyhow::anyhow!(
-            "server returned {} bytes; refusing to write more than {} bytes to disk \
-             (lower with --max-restore-bytes; the hard ceiling is {} bytes)",
-            bytes.len(),
-            cap,
-            MAX_RESTORE_BYTES_CEILING
-        ));
+    // cli 1.2: stream the body instead of buffering into a single Bytes.
+    // Three benefits over the previous resp.bytes() approach:
+    //   1. A malicious / buggy server cannot OOM the CLI by streaming
+    //      arbitrarily many gigabytes — we abort as soon as `cap` bytes
+    //      have been accumulated.
+    //   2. An early Content-Length check rejects oversized payloads before
+    //      a single chunk is read.
+    //   3. The write goes to a temp file in the same directory as `output`
+    //      and is atomically renamed on success, so a failed download
+    //      never leaves a half-written snapshot at the target path.
+    if let Some(declared) = resp.content_length() {
+        if declared > cap {
+            return Err(anyhow::anyhow!(
+                "server declared {} bytes; refusing to write more than {} bytes to disk \
+                 (lower with --max-restore-bytes; the hard ceiling is {} bytes)",
+                declared,
+                cap,
+                MAX_RESTORE_BYTES_CEILING
+            ));
+        }
     }
-
-    std::fs::write(output, &bytes)
-        .with_context(|| format!("writing snapshot to {}", output.display()))?;
+    let parent = output.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating tempfile in {}", parent.display()))?;
+    let mut received: u64 = 0;
+    use futures::StreamExt;
+    use std::io::Write;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res
+            .with_context(|| format!("streaming snapshot body from {url}"))?;
+        received = received.saturating_add(chunk.len() as u64);
+        if received > cap {
+            drop(tmp); // discard the temp file
+            return Err(anyhow::anyhow!(
+                "server streamed > {} bytes; refusing to write more than {} bytes to disk \
+                 (lower with --max-restore-bytes; the hard ceiling is {} bytes)",
+                cap,
+                cap,
+                MAX_RESTORE_BYTES_CEILING
+            ));
+        }
+        tmp.write_all(&chunk)
+            .with_context(|| format!("writing snapshot chunk to tempfile"))?;
+    }
+    tmp.persist(output)
+        .map_err(|e| anyhow::anyhow!("renaming tempfile to {}: {}", output.display(), e))?;
 
     println!(
         "snapshot save: wrote {} bytes to {}",
-        bytes.len(),
+        received,
         output.display()
     );
     Ok(())

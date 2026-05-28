@@ -23,7 +23,7 @@
 //! knows a tenant's id and supplies a fresh [`TenantContext`] is not granted
 //! any additional authority over tenants it did not create.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tensor_wasm_core::types::TenantId;
 use dashmap::DashMap;
@@ -37,6 +37,16 @@ pub enum RegistryError {
     /// `register` was called with a tenant id already present in the registry.
     #[error("tenant {0} already registered")]
     AlreadyRegistered(TenantId),
+    /// `register` was called with an id that was previously unregistered,
+    /// but at least one `Arc<TenantContext>` from the prior registration is
+    /// still alive (an "orphan"). Re-registering with the same id while the
+    /// orphan exists would let in-flight `consume_bytes_with_capability`
+    /// calls commit to the orphan's counter while the new registration's
+    /// counter remained zero — effectively a per-tenant quota reset
+    /// (tenant 1.6 #9). Wait for the orphan to drop and call
+    /// [`TenantRegistry::collect_tombstones`] before retrying.
+    #[error("tenant {0} cannot be re-registered while an orphan Arc<TenantContext> is still alive")]
+    OrphanStillAlive(TenantId),
 }
 
 /// Decision returned by [`TenantRegistry::mps_or_fallback`].
@@ -117,6 +127,13 @@ impl RegistryAdminCapability {
 #[derive(Debug, Clone, Default)]
 pub struct TenantRegistry {
     inner: Arc<DashMap<TenantId, Arc<TenantContext>>>,
+    /// Weak refs to previously-unregistered contexts. On re-`register` of
+    /// an id, the tombstone (if any) is consulted: if its strong count is
+    /// still nonzero, an orphan is alive and re-registration is refused
+    /// (tenant 1.6 #9). Dead tombstones are pruned by
+    /// [`Self::collect_tombstones`] or implicitly on a successful
+    /// re-register.
+    tombstones: Arc<DashMap<TenantId, Weak<TenantContext>>>,
 }
 
 impl TenantRegistry {
@@ -166,6 +183,18 @@ impl TenantRegistry {
         ctx: TenantContext,
     ) -> Result<(Arc<TenantContext>, TenantCapability), RegistryError> {
         let id = ctx.id();
+        // tenant 1.6 #9: refuse re-registration while an orphan Arc from a
+        // prior registration is still alive. Without this, an in-flight
+        // `consume_bytes_with_capability` on the orphan could commit to a
+        // dead counter while the new registration's counter stays at 0 —
+        // a per-tenant quota reset.
+        if let Some(tomb) = self.tombstones.get(&id) {
+            if tomb.value().strong_count() > 0 {
+                return Err(RegistryError::OrphanStillAlive(id));
+            }
+        }
+        // Orphan (if any) is gone; clear the tombstone so the slot is free.
+        self.tombstones.remove(&id);
         let entry = self.inner.entry(id);
         match entry {
             dashmap::mapref::entry::Entry::Occupied(_) => Err(RegistryError::AlreadyRegistered(id)),
@@ -201,7 +230,36 @@ impl TenantRegistry {
         tenant_id: TenantId,
         _cap: &RegistryAdminCapability,
     ) -> Option<Arc<TenantContext>> {
-        self.inner.remove(&tenant_id).map(|(_, v)| v)
+        let removed = self.inner.remove(&tenant_id).map(|(_, v)| v);
+        if let Some(ref arc) = removed {
+            // tenant 1.6 #9: track the orphan so a future re-register can
+            // refuse until the last strong ref is dropped.
+            self.tombstones.insert(tenant_id, Arc::downgrade(arc));
+        }
+        removed
+    }
+
+    /// Prune dead orphan tombstones. Returns the number pruned.
+    ///
+    /// Gated behind [`RegistryAdminCapability`] — same threat model as
+    /// [`Self::tenants`]: orphan presence is a global property of the
+    /// registry that should not leak across tenant boundaries.
+    ///
+    /// Operators can call this periodically (e.g. from a background task)
+    /// to keep the tombstone map from growing with every churned tenant.
+    /// Callers do not normally need to invoke it manually — a successful
+    /// re-`register` of a now-clean id implicitly clears its tombstone.
+    pub fn collect_tombstones(&self, _cap: &RegistryAdminCapability) -> usize {
+        let mut pruned = 0;
+        self.tombstones.retain(|_id, weak| {
+            if weak.strong_count() == 0 {
+                pruned += 1;
+                false
+            } else {
+                true
+            }
+        });
+        pruned
     }
 
     /// Number of tenants currently registered.
