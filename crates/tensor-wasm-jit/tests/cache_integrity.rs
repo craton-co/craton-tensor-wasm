@@ -146,8 +146,16 @@ fn disk_cache_rejects_tampered_payload() {
         ),
     );
 
-    // Find the one `.ptxbin` file and flip a byte in the middle of the
-    // PTX payload (past the header, before the HMAC trailer).
+    // Find the one `.ptxbin` file and flip a byte inside the PTX payload
+    // (past the V2 header, before the 32-byte HMAC trailer). The V2 layout
+    // is: magic(16) + fingerprint(8) + sm_version(4) + grid_x(4) +
+    // block_x(4) + ptx_len(8) = 44-byte header. We compute the flip offset
+    // from the layout directly rather than `len/2` so that any future
+    // layout growth (e.g. another field added to V2 or a V3 bump) makes
+    // the failure mode explicit instead of silently flipping into a
+    // different region.
+    const V2_HEADER_LEN: usize = 16 + 8 + 4 + 4 + 4 + 8;
+    const HMAC_LEN: usize = 32;
     let entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -156,8 +164,12 @@ fn disk_cache_rejects_tampered_payload() {
     assert_eq!(entries.len(), 1, "disk cache must have written exactly one file");
     let path = entries[0].path();
     let mut bytes = std::fs::read(&path).expect("read entry");
-    let mid = bytes.len() / 2;
-    bytes[mid] ^= 0xFF;
+    assert!(
+        bytes.len() > V2_HEADER_LEN + HMAC_LEN,
+        "file should have non-empty ptx payload between header and trailer"
+    );
+    let flip_at = V2_HEADER_LEN + (bytes.len() - V2_HEADER_LEN - HMAC_LEN) / 2;
+    bytes[flip_at] ^= 0xFF;
     std::fs::write(&path, &bytes).expect("rewrite tampered entry");
 
     let cache2 = KernelCache::new().with_disk_persistence(DiskCacheConfig {

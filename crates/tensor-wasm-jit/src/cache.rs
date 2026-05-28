@@ -474,15 +474,25 @@ pub struct DiskCacheConfig {
 /// which holds a fixed-format header, the PTX bytes, and an HMAC-keyed
 /// BLAKE3 trailer that covers everything before it.
 ///
-/// File format (little-endian):
+/// ## V2 file format (little-endian, current writer)
 /// ```text
-/// [0..16)   magic = "TWJIT-KRNL-v1\0\0"
+/// [0..16)   magic = "TWJIT-KRNL-v2\0\0"
 /// [16..24)  blueprint fingerprint (u64)
 /// [24..28)  sm_version (u32)
-/// [28..36)  ptx length (u64)
-/// [36..36+ptx_len)  PTX text (UTF-8, NOT null-terminated)
-/// [36+ptx_len..36+ptx_len+32)  BLAKE3-keyed hash over bytes [0..36+ptx_len)
+/// [28..32)  launch_geometry.grid_x (u32)
+/// [32..36)  launch_geometry.block_x (u32)
+/// [36..44)  ptx length (u64)
+/// [44..44+ptx_len)  PTX text (UTF-8, NOT null-terminated)
+/// [44+ptx_len..44+ptx_len+32)  BLAKE3-keyed hash over bytes [0..44+ptx_len)
 /// ```
+///
+/// ## V1 file format (read-only legacy compatibility)
+/// V1 files (magic `"TWJIT-KRNL-v1\0\0\0"`) are still readable but treated
+/// as a miss with a `cache.l2.miss.legacy_magic` info log so the L1 path
+/// will re-emit, re-HMAC, and rewrite as V2 on the next put. V1 lacked the
+/// `launch_geometry` field; the original reconstructor defaulted it to
+/// `(0, 0)` which silently lost the `ptx_emit`-populated hint on every L2
+/// hit. Bumping the magic forces fresh emission of all stale entries.
 ///
 /// The fingerprint and sm_version are repeated in the header (also
 /// present in the filename's hash-derived stem) so a load can detect a
@@ -491,8 +501,16 @@ struct DiskCache {
     cfg: DiskCacheConfig,
 }
 
-const DISK_CACHE_MAGIC: &[u8; 16] = b"TWJIT-KRNL-v1\0\0\0";
-const DISK_CACHE_HEADER_LEN: usize = 16 + 8 + 4 + 8; // magic + fingerprint + sm_version + ptx_len
+/// V1 magic (legacy on-disk records). Read-only: treated as a miss so the
+/// next put rewrites the entry under [`DISK_CACHE_MAGIC_V2`]. See
+/// `cache.l2.miss.legacy_magic` info log.
+const DISK_CACHE_MAGIC_V1: &[u8; 16] = b"TWJIT-KRNL-v1\0\0\0";
+/// V2 magic (current writer). Adds 8 bytes of `launch_geometry` (grid_x,
+/// block_x) immediately after `sm_version` so L2 hits no longer drop the
+/// emit-time hint that the dispatch path consumes.
+const DISK_CACHE_MAGIC_V2: &[u8; 16] = b"TWJIT-KRNL-v2\0\0\0";
+/// V2 header: magic + fingerprint + sm_version + grid_x + block_x + ptx_len.
+const DISK_CACHE_HEADER_LEN_V2: usize = 16 + 8 + 4 + 4 + 4 + 8;
 const DISK_CACHE_HMAC_LEN: usize = 32;
 
 impl DiskCache {
@@ -528,11 +546,18 @@ impl DiskCache {
         use std::io::Write;
         std::fs::create_dir_all(&self.cfg.dir)?;
         let ptx_bytes = kernel.ptx.text.as_bytes();
-        let mut buf =
-            Vec::with_capacity(DISK_CACHE_HEADER_LEN + ptx_bytes.len() + DISK_CACHE_HMAC_LEN);
-        buf.extend_from_slice(DISK_CACHE_MAGIC);
+        let (grid_x, block_x) = kernel.ptx.launch_geometry;
+        let mut buf = Vec::with_capacity(
+            DISK_CACHE_HEADER_LEN_V2 + ptx_bytes.len() + DISK_CACHE_HMAC_LEN,
+        );
+        buf.extend_from_slice(DISK_CACHE_MAGIC_V2);
         buf.extend_from_slice(&key.blueprint.to_le_bytes());
         buf.extend_from_slice(&key.sm_version.to_le_bytes());
+        // jit S-3 follow-up: persist `launch_geometry` so L2 hits round-trip
+        // the (grid_x, block_x) hint that `ptx_emit` populates. Prior to V2
+        // the reconstructor defaulted this to (0, 0) on every disk hit.
+        buf.extend_from_slice(&grid_x.to_le_bytes());
+        buf.extend_from_slice(&block_x.to_le_bytes());
         buf.extend_from_slice(&(ptx_bytes.len() as u64).to_le_bytes());
         buf.extend_from_slice(ptx_bytes);
         // HMAC-keyed BLAKE3 over everything written so far. Uses blake3's
@@ -565,20 +590,46 @@ impl DiskCache {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        if bytes.len() < DISK_CACHE_HEADER_LEN + DISK_CACHE_HMAC_LEN {
+        // Magic-dispatch on the first 16 bytes. V2 is the current writer
+        // format; V1 is read-only legacy that we treat as a miss so the
+        // L1-driven re-emission rewrites the file under V2 (and finally
+        // persists `launch_geometry`).
+        if bytes.len() < 16 {
             tracing::warn!(
                 target: "tensor_wasm_jit::cache",
                 file = %path.display(),
                 len = bytes.len(),
-                "disk-cache entry too short; treating as miss"
+                "disk-cache entry too short for magic; treating as miss"
             );
             return Ok(None);
         }
-        if &bytes[..16] != DISK_CACHE_MAGIC {
+        let magic = &bytes[..16];
+        if magic == DISK_CACHE_MAGIC_V1 {
+            // Legacy format: pre-`launch_geometry` persistence. Don't try
+            // to read the old layout — bumping the magic means every
+            // process restart starts re-emitting fresh V2 entries so we
+            // also stop returning the buggy (0, 0) default.
+            tracing::info!(
+                target: "tensor_wasm_jit::cache",
+                file = %path.display(),
+                "cache.l2.miss.legacy_magic: V1 record, will be rewritten as V2 on next put"
+            );
+            return Ok(None);
+        }
+        if magic != DISK_CACHE_MAGIC_V2 {
             tracing::warn!(
                 target: "tensor_wasm_jit::cache",
                 file = %path.display(),
                 "disk-cache magic mismatch; treating as miss"
+            );
+            return Ok(None);
+        }
+        if bytes.len() < DISK_CACHE_HEADER_LEN_V2 + DISK_CACHE_HMAC_LEN {
+            tracing::warn!(
+                target: "tensor_wasm_jit::cache",
+                file = %path.display(),
+                len = bytes.len(),
+                "disk-cache V2 entry too short; treating as miss"
             );
             return Ok(None);
         }
@@ -623,10 +674,16 @@ impl DiskCache {
         bp_bytes.copy_from_slice(&prefix[16..24]);
         let mut sm_bytes = [0u8; 4];
         sm_bytes.copy_from_slice(&prefix[24..28]);
+        let mut grid_x_bytes = [0u8; 4];
+        grid_x_bytes.copy_from_slice(&prefix[28..32]);
+        let mut block_x_bytes = [0u8; 4];
+        block_x_bytes.copy_from_slice(&prefix[32..36]);
         let mut len_bytes = [0u8; 8];
-        len_bytes.copy_from_slice(&prefix[28..36]);
+        len_bytes.copy_from_slice(&prefix[36..44]);
         let fingerprint_on_disk = u64::from_le_bytes(bp_bytes);
         let sm_version_on_disk = u32::from_le_bytes(sm_bytes);
+        let grid_x_on_disk = u32::from_le_bytes(grid_x_bytes);
+        let block_x_on_disk = u32::from_le_bytes(block_x_bytes);
         let ptx_len_on_disk = u64::from_le_bytes(len_bytes) as usize;
         if fingerprint_on_disk != key.blueprint || sm_version_on_disk != key.sm_version {
             tracing::warn!(
@@ -636,7 +693,7 @@ impl DiskCache {
             );
             return Ok(None);
         }
-        let ptx_start = DISK_CACHE_HEADER_LEN;
+        let ptx_start = DISK_CACHE_HEADER_LEN_V2;
         let ptx_end = ptx_start.saturating_add(ptx_len_on_disk);
         if ptx_end > prefix.len() {
             tracing::warn!(
@@ -659,12 +716,13 @@ impl DiskCache {
         };
         // Reconstruct the kernel via the integrity-aware constructor so
         // the L1 cache accepts it without further verification work.
+        // V2 persists the emit-time `launch_geometry` hint; reading it
+        // back here closes the lost-geometry bug (previously this defaulted
+        // to (0, 0) and the dispatch path silently fell back to guest-
+        // declared launch params for every L2 hit).
         let ptx = Arc::new(EmittedPtx {
             text: ptx_text,
-            // Geometry is not persisted; default to the no-launch tuple.
-            // The dispatch path either re-fetches it from the blueprint
-            // or treats it as "use guest-declared launch params".
-            launch_geometry: (0, 0),
+            launch_geometry: (grid_x_on_disk, block_x_on_disk),
         });
         Ok(Some(CachedKernel::new(
             fingerprint_on_disk,
