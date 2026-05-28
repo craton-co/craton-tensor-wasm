@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- tensor-wasm-jit (T38): proptest harness driving `DifferentialOracle` against matmul/vector_add/conv2d blueprints + per-kernel tolerance table. Host-only verdicts run end-to-end today; CUDA GPU verdicts marked `#[ignore]` pending S22 runner.
+
 ### Roadmap
 - 13 new strategic feature directions added under docs/PATH-TO-V1.md#post-v036-strategic-features; tracked in ACTIONABLE-ITEMS-PENDING.md.
 

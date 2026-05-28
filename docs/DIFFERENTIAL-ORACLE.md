@@ -100,6 +100,32 @@ The oracle compares three dimensions; any inequality is a divergence:
    bounds, integer overflow, unreachable) per the table in
    [`crates/tensor-wasm-jit/src/deopt.rs`](../crates/tensor-wasm-jit/src/deopt.rs).
 
+## Tolerance table (v0.3.7)
+
+Per-blueprint floating-point tolerance the oracle accepts between the
+CPU reference and the JIT-emitted GPU path. Values mirror
+[`ToleranceTable::default_table`](../crates/tensor-wasm-jit/src/differential.rs)
+and are the contract the proptest harness in
+[`crates/tensor-wasm-jit/tests/differential_proptest.rs`](../crates/tensor-wasm-jit/tests/differential_proptest.rs)
+asserts.
+
+| Blueprint    | dtype | ULPs | abs    | rel    | Rationale                                            |
+| ------------ | ----- | ---- | ------ | ------ | ---------------------------------------------------- |
+| vector_add   | f32   | 1    | 0      | 0      | Element-wise; round-to-nearest-even on both paths    |
+| vector_mul   | f32   | 1    | 0      | 0      | Element-wise; same rounding contract                 |
+| vector_fma   | f32   | 1    | 0      | 0      | `f32::mul_add` ↔ `fma.rn.f32`, single rounding       |
+| matmul       | f32   | 2    | 1e-6   | 1e-6   | Reduction order is implementation-defined            |
+| conv2d       | f32   | 2    | 1e-6   | 1e-6   | Sliding-window MAC; same shape as matmul             |
+| (any)        | f16   | x4   | x4     | x4     | 10-bit mantissa; ULP budget scales by the multiplier |
+| (any)        | int   | 0    | 0      | 0      | Bit-identical required                               |
+
+The `ToleranceTable::strict()` constructor zeroes every entry — used
+by the CI gate that asserts bit-identity for ops the oracle pins as
+exact (today: integer kernels only). [`Tolerance::approx_eq_f32`](../crates/tensor-wasm-jit/src/differential.rs)
+implements the standard `|g - c| <= max(abs, rel * |c|) OR ulp_dist
+<= ulps` check; NaN ↔ NaN is treated as equal (mirrors `==` with the
+`total_cmp` semantics PTX uses on reductions).
+
 ## Related docs
 
 - [SECURITY-AUDIT.md](SECURITY-AUDIT.md) — internal pre-audit posture

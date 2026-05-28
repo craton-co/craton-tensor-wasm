@@ -101,6 +101,11 @@ serde_json = { workspace = true, optional = true }
 [dev-dependencies]
 tokio.workspace = true
 wat.workspace = true
+# Property-based tests driving the differential JIT correctness oracle
+# (T38). The `differential_proptest` integration test under `tests/` is
+# gated on the `differential-oracle` feature flag, so this dev-dep only
+# pulls into the build when the oracle harness is exercised.
+proptest = { workspace = true }
 
 [features]
 default = []
@@ -174,6 +179,16 @@ kernel-registry = [
 name = "lowering_e2e"
 path = "tests/lowering_e2e.rs"
 required-features = ["cuda-oxide-backend", "test-utils"]
+
+# T38 proptest harness for `DifferentialOracle`. Gated behind the
+# `differential-oracle` feature so the proptest dep is only pulled in
+# when the harness is exercised. Local invocation:
+#   cargo test -p tensor-wasm-jit \
+#     --features differential-oracle --test differential_proptest
+[[test]]
+name = "differential_proptest"
+path = "tests/differential_proptest.rs"
+required-features = ["differential-oracle"]
 
 [package.metadata.docs.rs]
 all-features = true
