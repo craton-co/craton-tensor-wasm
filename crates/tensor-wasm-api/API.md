@@ -124,15 +124,9 @@ as an unsigned 64-bit integer and forwarded to the executor as the owning
 
 * Absent header: defaults to tenant `0`.
 * Header present but not a valid `u64`: `400 Bad Request` with
-  `kind: "invalid_tenant"`.
-* More than one `X-TensorWasm-Tenant` header on the same request:
-  `400 Bad Request` with `kind: "duplicate_tenant_header"`. This
-  closes a header-smuggling channel where a permissive upstream proxy
-  could forward both copies and downstream observers see a different
-  tenant than the gateway accepted.
-* If `TENSOR_WASM_API_REQUIRE_TENANT=1` was set at startup, the header
-  is mandatory — absent requests are rejected with `kind:
-  "missing_tenant"`.
+  `kind: "missing_tenant"`.
+* If `TENSOR_WASM_API_REQUIRE_TENANT=1` was set at startup, the header is mandatory
+  — absent requests are rejected with the same `kind`.
 
 ### Request limits
 
@@ -266,11 +260,9 @@ may change between patch releases. Known `kind` values:
 | `invalid_name`     | 400  | `name` field empty or whitespace-only.                                   |
 | `invalid_base64`   | 400  | `wasm_b64` field is not valid standard base64.                           |
 | `invalid_wasm`     | 400  | Decoded Wasm bytes fail `wasmparser::validate` (short, bad magic, etc.). |
-| `missing_export`   | 400  | Module is missing both `_start` and `main`.                              |
-| `missing_tenant`   | 400  | `X-TensorWasm-Tenant` header absent when required.                       |
-| `invalid_tenant`   | 400  | `X-TensorWasm-Tenant` header present but not a `u64`.                    |
-| `duplicate_tenant_header` | 400 | More than one `X-TensorWasm-Tenant` header on the same request.      |
-| `invalid_auth`     | 401  | `Authorization` header exceeds the maximum permitted length (1 KiB).     |
+| `missing_export`   | 400  | Module is missing the requested export (or both `_start` and `main`, when defaulting). |
+| `invalid_args`     | 400  | `args[i]` is not a JSON number (only numeric literals are lowered to `WasmArg`). |
+| `missing_tenant`   | 400  | `X-TensorWasm-Tenant` header missing/garbled when required.                    |
 | `unauthorized`     | 401  | Missing or unrecognised bearer token.                                    |
 | `tenant_scope_denied` | 403 | Bearer token is not scoped to the `X-TensorWasm-Tenant` named in the request. |
 | `not_found`        | 404  | Requested function or job id does not exist.                             |
@@ -338,32 +330,78 @@ curl -X DELETE http://localhost:8080/functions/f47ac10b-58cc-4372-a567-0e02b2c3d
 ## `POST /functions/{id}/invoke`
 
 Invoke a deployed function synchronously. Spawns a fresh executor instance
-with a 30-second deadline, calls `_start` (falling back to `main`), and
-terminates the instance before returning. The owning tenant is taken from
-the `X-TensorWasm-Tenant` header (defaulting to `0`).
+with a 30-second deadline, calls the requested `export` (defaulting to
+`_start` → `main` discovery) with the supplied `args`, and terminates the
+instance before returning. The owning tenant is taken from the
+`X-TensorWasm-Tenant` header (defaulting to `0`).
 
-**Request body** — any JSON value, threaded through as the invocation
-argument payload. An empty object `{}` is the conventional choice.
+**Request body** — [`InvokeRequest`], both fields optional:
+
+```json
+{ "export": "add", "args": [1, 2] }
+```
+
+| Field    | Type           | Default                         | Description |
+|----------|----------------|---------------------------------|-------------|
+| `export` | string \| null | `_start` → `main` discovery     | Override the export name. When omitted (or `null`), the server tries `_start` first and falls back to `main`. |
+| `args`   | array          | `[]`                            | Argument list forwarded to the executor's `call_export_with_args` path. See "Argument types" below for the JSON → Wasm value mapping. |
+
+Unknown top-level fields are tolerated for forward compatibility. An empty
+body or `{}` is the canonical no-args case. Malformed JSON surfaces as
+`400 invalid_json` (the usual wire envelope).
+
+### Argument types
+
+| JSON literal                          | Wasm value type |
+|---------------------------------------|-----------------|
+| integer in `[-2³¹, 2³¹)`              | `i32`           |
+| integer outside the `i32` range       | `i64`           |
+| non-integer numeric (`1.5`, `1e10`)   | `f64`           |
+| anything else (string, array, null)   | rejected as `400 invalid_args` |
+
+`f32` cannot be selected unambiguously from JSON. If your export takes
+`f32` parameters, write a thin guest wrapper that demotes from `f64` on
+entry.
 
 **Success — `200 OK`**
+
+For `() -> ()` exports (the legacy WASI-command shape), the result list
+collapses to the literal string `"ok"` for back-compatibility:
 
 ```json
 { "result": "ok", "function_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479" }
 ```
 
-**Errors** — `404 Not Found` if the function id is unknown;
-`400 Bad Request` (`missing_export`) if neither `_start` nor `main` is
-exported; `504 Gateway Timeout` (`invoke_timeout`) if the call exceeds the
-30-second deadline; `500 Internal Server Error` (`wasmtime`) for other
-runtime failures.
+For exports with a non-empty result list, `result` is a JSON array of the
+returned values (one entry per wasm result slot):
 
-**Example**
+```json
+{ "result": [3], "function_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479" }
+```
+
+**Errors** — `404 Not Found` if the function id is unknown;
+`400 Bad Request` (`missing_export`) if the requested export is absent
+(or, in the default-fallback case, if neither `_start` nor `main` is
+exported); `400 Bad Request` (`invalid_args`) if any element of `args`
+cannot be converted to a `WasmArg`; `400 Bad Request` (`invalid_json`)
+on malformed bodies; `504 Gateway Timeout` (`invoke_timeout`) if the call
+exceeds the 30-second deadline; `500 Internal Server Error` (`wasmtime`)
+for other runtime failures.
+
+**Examples**
 
 ```bash
+# Legacy WASI command — empty body uses _start → main discovery.
 curl -X POST http://localhost:8080/functions/$ID/invoke \
   -H 'authorization: Bearer $TOKEN' \
   -H 'content-type: application/json' \
   -d '{}'
+
+# Typed adder export with explicit args.
+curl -X POST http://localhost:8080/functions/$ID/invoke \
+  -H 'authorization: Bearer $TOKEN' \
+  -H 'content-type: application/json' \
+  -d '{"export":"add","args":[1,2]}'
 ```
 
 ---
@@ -374,7 +412,10 @@ Fire-and-forget invocation. Records a `Pending` job, spawns the
 spawn/call/terminate flow onto a Tokio task, and returns immediately. The
 caller polls `GET /jobs/{id}` to learn when the invocation finishes.
 
-**Request body** — any JSON value (see `/invoke` above).
+**Request body** — same [`InvokeRequest`] schema as `/invoke` (`export?`,
+`args?`). The body is parsed and `args` are validated synchronously before
+the Tokio task spawn so `400 invalid_args` / `400 invalid_json` surface on
+the inbound request rather than as a `JobStatus::Failed` poll result.
 
 **Success — `202 Accepted`**
 

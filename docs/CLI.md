@@ -24,15 +24,31 @@ Run a Wasm module locally against an in-process `TensorWasmEngine`.
 
 - `<file.wasm>`: path to the module to execute. Must exist and be readable.
 - `--export <name>`: function to invoke. Defaults to `main`.
-- `--args <json>`: arguments to forward to the guest, encoded as a JSON array. Validated for shape only — the current executor invokes `() -> ()` exports, so values are ignored until S20 widens the call signature.
+- `--args <json>`: arguments to forward to the guest, encoded as a JSON array. Each element is converted to the closest-fitting wasm value type before being passed to `call_export_with_args`:
 
-Example:
+  | JSON literal | Wasm value type |
+  |---|---|
+  | integer in `i32` range (e.g. `1`, `-2147483648`) | `i32` |
+  | integer outside `i32` range (e.g. `2147483648`) | `i64` |
+  | non-integer numeric (e.g. `2.5`) | `f64` |
+  | anything else (string, array, null) | rejected with a parse error |
+
+  The export's declared signature must accept the resulting parameter types or wasmtime returns an error. `f32` cannot be selected from a JSON literal unambiguously; build a Wasm wrapper that demotes from `f64` if you need 32-bit floats from the CLI.
+
+Examples:
 
 ```bash
-tensor-wasm run tests/wasm-fixtures/vector_add.wasm --export add --args '[1.0, 2.0]'
+# Legacy () -> () export — prints `ok`.
+tensor-wasm run tests/wasm-fixtures/noop.wasm --export noop
+
+# (i32, i32) -> i32 adder — prints `3`.
+tensor-wasm run tests/wasm-fixtures/adder.wasm --export add --args '[1, 2]'
+
+# (f64) -> f64 doubler — prints `3.0`.
+tensor-wasm run tests/wasm-fixtures/doubler.wasm --export double --args '[1.5]'
 ```
 
-On success the command prints `ok`. On failure the chained-cause stack is written to stderr and the process exits non-zero. This subcommand exercises the same compile-and-spawn path that `tensor-wasm-api`'s `POST /functions/{id}/invoke` handler uses, so local runs are a faithful reproduction of server behaviour for the supported signatures.
+On success the command prints the export's result list. An empty result list (the `() -> ()` case) collapses to the literal `ok` for stable scripting; a single-element result unwraps to the scalar (so a `-> i32` adder prints `3`, not `[3]`); multi-element results print as a JSON array. On failure the chained-cause stack is written to stderr and the process exits non-zero. This subcommand exercises the same compile-and-spawn path that `tensor-wasm-api`'s `POST /functions/{id}/invoke` handler uses, so local runs are a faithful reproduction of server behaviour.
 
 ### `tensor-wasm deploy <file.wasm> --server <url>`
 
@@ -43,16 +59,15 @@ Upload a Wasm module to a TensorWasm server.
 
 `tensor-wasm deploy` reads the Wasm bytes, base64-encodes them, and `POST`s them to `/functions` on the target server. On success the response includes the assigned function id, which is printed to stdout for piping into subsequent `tensor-wasm invoke` calls.
 
-### `tensor-wasm invoke <id> --server <url> [--export <name>] [--args <json>]`
+### `tensor-wasm invoke <id> --server <url> [--args <json>]`
 
 Call a deployed function by id.
 
 - `<id>`: the function identifier returned by an earlier `tensor-wasm deploy`.
 - `--server <url>`: base URL of the target TensorWasm server.
-- `--export <name>`: name of the exported function to invoke. Defaults to `_start` (the WASI command convention); the server-side executor falls back to `main` when `_start` is absent.
-- `--args <json>`: arguments forwarded to the function as a JSON array. Defaults to an empty array when omitted.
+- `--args <json>`: arguments forwarded to the function as a JSON array. Element-to-`WasmArg` conversion follows the same rules as `tensor-wasm run --args` above — integers fitting `i32` become `i32`, larger integers become `i64`, fractional numerics become `f64`.
 
-The subcommand issues a `POST /functions/{id}/invoke` against the server with the JSON envelope `{"export": "<name>", "args": [...]}` and prints the decoded response to stdout. The envelope shape is the wire contract; clients written today keep working when the executor learns to thread `args` through (api S-31 follow-up). Non-2xx responses surface as non-zero exits with the error body forwarded to stderr.
+The subcommand issues a `POST /functions/{id}/invoke` against the server with the JSON body `{"export": "...", "args": [...]}` and prints the decoded response to stdout. The server now actually threads `args` into the executor's `call_export_with_args` path; the result list comes back as the response `result` field (or the literal string `"ok"` for empty-result `() -> ()` exports). Non-2xx responses surface as non-zero exits with the error body forwarded to stderr.
 
 ### `tensor-wasm bench <file.wasm> --export <name> [--n <iters>]`
 
@@ -84,43 +99,13 @@ bench: export=`add` iterations=1000
 
 Percentiles use the nearest-rank method on the sorted sample buffer. For a steady-state micro-benchmark (single instance, repeated calls), use the Criterion suite in `tensor-wasm-bench` — see [BUILD.md](./BUILD.md).
 
-### `tensor-wasm snapshot save --instance <id> --output <out.tensor-wasm> --server <url>`<br />`tensor-wasm snapshot restore --input <in.tensor-wasm> --as-instance <id> --server <url>`
+### `tensor-wasm snapshot save <instance-id> <out.tensor-wasm>`<br />`tensor-wasm snapshot restore <in.tensor-wasm>`
 
-Capture or restore an instance's state from a `.tensor-wasm` archive **via the remote TensorWasm HTTP API**. `tensor-wasm snapshot save` issues `POST /instances/{id}/snapshot` against the configured server, streams the archive body to disk at `--output`, and exits non-zero if the server returns a non-2xx response. `tensor-wasm snapshot restore` reads the local archive at `--input`, uploads it via `POST /instances/restore`, and reports the rehydrated instance id assigned by the server.
-
-> **Note.** These subcommands are HTTP clients — they do not invoke `tensor-wasm-snapshot::Writer` / `Reader` in-process. All snapshot validation (magic bytes, version, CRC32 integrity, optional HMAC signature) runs server-side; the CLI only enforces a local size cap (`--max-archive-bytes` for restore, `--max-restore-bytes` for save, default 256 MiB) to bound the on-disk footprint before any network call. Operators who want purely local snapshot tooling should depend on the `tensor-wasm-snapshot` crate directly.
-
-> **API not yet shipped.** As of this release the `/instances/...` endpoints are planned but not merged in `tensor-wasm-api`. Until they ship, every snapshot invocation against a real server returns `404 Not Found`, which the CLI surfaces with the dedicated `FEATURE_NOT_EXPOSED` exit code (3) and a link to the tracking issue. Validation errors on local input (bad path, file too large, malformed `--hmac-key-file`) surface as `LOCAL_VALIDATION_FAILED` (exit code 2) before any network call is attempted.
+Capture or restore an instance's state from a `.tensor-wasm` archive. `tensor-wasm snapshot save` writes the running instance's snapshot to the named output path via `tensor-wasm-snapshot::Writer`; `tensor-wasm snapshot restore` reads the archive, verifies the CRC32 integrity check, and rehydrates the instance through `tensor-wasm-snapshot::Reader`. Both commands surface validation errors (bad magic, version mismatch, CRC failure) as non-zero exits with a chained-cause message.
 
 #### Signed snapshots: `--hmac-key-file` and `--require-signature`
 
 Both `snapshot save` and `snapshot restore` accept `--hmac-key-file <PATH>` pointing at a 32-byte HMAC-SHA256 key. The file is interpreted as 64 hex characters when its trimmed length matches, otherwise as 32 raw bytes; any other length is rejected locally with exit code `2` (`LOCAL_VALIDATION_FAILED`) before the CLI dials the server. The hex-encoded key is forwarded as the `X-TensorWasm-Snapshot-HMAC-Key` request header — the actual `SnapshotWriter::with_hmac_sha256_key` / `SnapshotReader::with_hmac_sha256_key` plumbing lives server-side. `snapshot restore` additionally accepts `--require-signature`, which sends `X-TensorWasm-Snapshot-Require-Signature: true` so the server refuses to rehydrate any archive that does not carry an HMAC trailer (equivalent to calling `SnapshotReader::require_signature` on the server). See the `tensor-wasm-snapshot` crate's `FORMAT.md` for the on-disk layout of the signed v3 frame.
-
-### `tensor-wasm serve [--addr <host:port>] [--token <TOKEN>]... [--tenant-header-policy <policy>] [--allow-plaintext-public]`
-
-Run the TensorWasm HTTP API gateway in-process. This is the entrypoint the
-README quickstart and `docs/GETTING-STARTED.md` point at; it stands up an axum
-router built from `tensor_wasm_api::build_router_with_full_config`, binds it
-to `--addr`, and serves until Ctrl-C.
-
-- `--addr <host:port>`: address to bind to. Defaults to `127.0.0.1:8080`. Pass a routable address (e.g. `0.0.0.0:8080`) to expose the gateway outside the loopback interface — see the bind-safety gate below.
-- `--token <TOKEN>`: bearer token to allowlist. Repeat the flag to accept multiple tokens; each value is treated as a wildcard-scope token (equivalent to `token:tenant=*` in the env-driven `TENSOR_WASM_API_TOKENS` allowlist). When omitted entirely, the gateway falls back to reading `TENSOR_WASM_API_TOKENS` from the environment; if that is also empty, the gateway starts in **dev mode** (auth disabled, with a startup warning).
-- `--tenant-header-policy <optional|required>`: policy for the `X-TensorWasm-Tenant` request header. `optional` (default) mirrors `TENSOR_WASM_API_REQUIRE_TENANT` unset; `required` mirrors `TENSOR_WASM_API_REQUIRE_TENANT=1`.
-- `--cors-origin <ORIGIN>` *(informational only; `// TODO: wire through`)*: origin to allow via CORS, repeatable. The api crate does not yet expose a programmatic `CorsConfig` knob, so this flag is currently parsed and logged but not threaded into the router. The flag is preserved so the README quickstart command parses cleanly; the H18-H20 follow-up will wire it through.
-- `--max-body-bytes <BYTES>` *(informational only; `// TODO: wire through`)*: inbound request body cap. Defaults to 64 MiB (matching the api crate's compiled-in `MAX_REQUEST_BODY_BYTES`). Passing a non-default value emits a warning at startup; the router still enforces the compiled-in 64 MiB limit until the api crate grows a `BodyLimitConfig`.
-- `--allow-plaintext-public`: acknowledge that you are knowingly exposing a dev-mode (no auth) deployment to a non-loopback address. Required when `--addr` resolves to a non-loopback IP AND no bearer-token allowlist is configured. Without this opt-in the CLI refuses to bind — a no-auth gateway on a routable address has historically leaked internal endpoints to the public internet. Setting this flag silences the bind-safety gate; it does NOT enable auth, and the 60-second recurring "no auth + public bind" warning continues to fire in logs. Can also be supplied via the `TENSOR_WASM_ALLOW_PLAINTEXT_PUBLIC=1` environment variable.
-
-Example:
-
-```bash
-# Local dev — auth disabled, loopback only.
-tensor-wasm serve
-
-# Production — bearer auth on a routable address.
-tensor-wasm serve --addr 0.0.0.0:8080 --token "$TENSOR_WASM_PROD_TOKEN"
-```
-
-Logs are configured via `TENSOR_WASM_LOG` (see [Global behaviour](#global-behaviour)). The serve loop shuts down cleanly on Ctrl-C; SIGTERM handling for systemd / kubernetes drains is a follow-up.
 
 ### `tensor-wasm metrics --server <url>`
 
@@ -236,8 +221,7 @@ Pre-generated `.1` man pages live under
 - `tensor-wasm.1` — root command + global flags
 - `tensor-wasm-run.1`, `tensor-wasm-deploy.1`, `tensor-wasm-invoke.1`,
   `tensor-wasm-bench.1`, `tensor-wasm-snapshot.1`, `tensor-wasm-metrics.1`,
-  `tensor-wasm-serve.1`, `tensor-wasm-observe.1`,
-  `tensor-wasm-completions.1`, `tensor-wasm-man.1` —
+  `tensor-wasm-observe.1`, `tensor-wasm-completions.1`, `tensor-wasm-man.1` —
   one per top-level subcommand
 
 That directory's [`README.md`](../crates/tensor-wasm-cli/man/README.md) covers

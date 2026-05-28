@@ -27,21 +27,16 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    body::Body,
     extract::{rejection::JsonRejection, Extension, Path, State},
-    http::{header, HeaderMap, StatusCode},
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
-    },
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
-use futures::stream;
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::metrics::TensorWasmMetrics;
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::TensorWasmEngine;
-use tensor_wasm_exec::executor::{TensorWasmExecutor, ExecError, SpawnConfig};
+use tensor_wasm_exec::executor::{ExecError, SpawnConfig, TensorWasmExecutor, WasmArg};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use dashmap::DashMap;
@@ -77,22 +72,10 @@ pub const MAX_FUNCTION_NAME_BYTES: usize = 256;
 /// API never echoes raw module bytes back to callers. The storage type is
 /// `Arc<[u8]>` so concurrent invocations share a single allocation rather
 /// than cloning the bytes on every spawn.
-///
-/// `tenant_id` records the owning tenant of the record as resolved at deploy
-/// time from the `X-TensorWasm-Tenant` extension. The invoke / delete handlers
-/// gate every operation on it: a caller addressing tenant *B* (via either the
-/// bearer-token scope or the request header) may not touch a record whose
-/// `tenant_id` is *A*, even if both checks would otherwise pass against the
-/// caller's scope. See B1.9 follow-up: this closes the cross-tenant
-/// authz hole where wildcard-scoped tokens from a different tenant could
-/// invoke or delete another tenant's function.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionRecord {
     /// Server-assigned identifier.
     pub id: Uuid,
-    /// Owning tenant, set at deploy time. Used by invoke / delete to gate
-    /// cross-tenant access — see struct-level doc.
-    pub tenant_id: TenantId,
     /// Tenant-supplied display name.
     pub name: String,
     /// Decoded Wasm bytes, refcounted. Not serialised — see struct-level doc.
@@ -125,13 +108,6 @@ pub struct JobRecord {
     pub id: Uuid,
     /// Function this invocation was dispatched against.
     pub function_id: Uuid,
-    /// Tenant that originated this job. Used by `GET /jobs/{id}` to gate
-    /// cross-tenant reads — a token scoped to tenant `A` must not be able
-    /// to poll a job created under tenant `B` (api S-32 / cross-tenant
-    /// info leak). Populated by [`invoke_function_async`] from the request
-    /// tenant resolved by the [`crate::middleware::tenant_scope`]
-    /// middleware.
-    pub tenant_id: TenantId,
     /// Current status.
     pub status: JobStatus,
     /// Result payload (set when `status` transitions to `completed` or `failed`).
@@ -321,22 +297,6 @@ impl ApiError {
         }
     }
 
-    /// Construct a `501 Not Implemented` with the given `kind` and `message`.
-    ///
-    /// Used by feature scaffolds (notably the OpenAI-compatible gateway in
-    /// [`crate::openai`]) that need to expose a route surface today while the
-    /// underlying translation glue lands in a follow-up release. Clients can
-    /// rely on the `(status, kind)` pair to detect scaffold-mode responses
-    /// and degrade gracefully (e.g. by retrying against a Modal/Replicate
-    /// endpoint) without inspecting the human-readable `message`.
-    pub fn not_implemented(kind: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_IMPLEMENTED,
-            kind: kind.into(),
-            message: message.into(),
-        }
-    }
-
     /// Construct a `413 Payload Too Large` with `kind = "body_too_large"`.
     ///
     /// Returned when an inbound request body exceeds the global
@@ -469,31 +429,6 @@ impl From<ExecError> for ApiError {
                 kind: "capacity_exhausted".to_string(),
                 message: err.to_string(),
             },
-            // Pre-compile size cap tripped. 413 mirrors
-            // `ModuleMemoryTooLarge` — the client submitted a wasm
-            // blob bigger than the executor will compile, and the
-            // remedy is the same (ship a smaller module).
-            ExecError::ModuleTooLarge { .. } => ApiError {
-                status: StatusCode::PAYLOAD_TOO_LARGE,
-                kind: "module_too_large".to_string(),
-                message: err.to_string(),
-            },
-            // The engine's epoch ticker is not running, so the deadline
-            // contract cannot be honoured. This is an operational
-            // failure (the ticker is supposed to be spawned at startup),
-            // not a client error — surface as 500 and log loudly so
-            // operators see it.
-            ExecError::EpochTickerNotRunning => {
-                tracing::error!(
-                    target: "tensor_wasm_api::routes",
-                    "spawn refused: epoch ticker is not running; deadlines cannot fire",
-                );
-                ApiError {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    kind: "epoch_ticker_not_running".to_string(),
-                    message: "internal execution error".to_string(),
-                }
-            }
         }
     }
 }
@@ -519,6 +454,32 @@ pub struct CreateFunctionRequest {
 pub struct CreateFunctionResponse {
     /// Server-assigned identifier of the newly deployed function.
     pub id: Uuid,
+}
+
+/// Body of `POST /functions/{id}/invoke` and `POST /functions/{id}/invoke-async`.
+///
+/// Both fields are optional so callers that just want the default `_start`
+/// → `main` fallback can omit them entirely (an empty `{}` body remains
+/// valid). When `args` is supplied each element is converted into a
+/// [`WasmArg`] via [`WasmArg::from_json`] before being threaded into
+/// [`TensorWasmExecutor::call_export_with_args`].
+///
+/// `#[serde(default)]` plus `deny_unknown_fields = false` (the default)
+/// keeps the schema forward-compatible: adding new optional fields later
+/// will not break clients that send the legacy `{}` body, and clients
+/// sending arbitrary extra fields are tolerated rather than rejected with
+/// 400.
+#[derive(Debug, Default, Deserialize)]
+pub struct InvokeRequest {
+    /// Optional export name override. When `None`, the handler tries
+    /// `_start` first and falls back to `main`, matching the historical
+    /// behaviour for WASI command modules.
+    #[serde(default)]
+    pub export: Option<String>,
+    /// Optional JSON-array argument list. Each element is parsed into a
+    /// [`WasmArg`]; non-numeric elements surface as `400 invalid_args`.
+    #[serde(default)]
+    pub args: Vec<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -601,40 +562,15 @@ async fn decode_wasm_b64(wasm_b64: String) -> Result<Vec<u8>, ApiError> {
 /// Decodes the supplied base64, runs full `wasmparser` validation, and stores
 /// the bytes refcounted via `Arc<[u8]>` so concurrent invocations do not
 /// reallocate. Returns `400 invalid_wasm` if validation fails.
-///
-/// The bound tenant is sourced from the `X-TensorWasm-Tenant` middleware
-/// extension (defaulting to `TenantId(0)` if absent) and authorised against
-/// the caller's bearer scope via [`AuthContext::authorize_tenant`] BEFORE the
-/// record is inserted. Returns `403 tenant_scope_denied` when the caller's
-/// scope does not cover the bound tenant — closes B1.9 hole where a
-/// tenant-scoped token could deploy under a different tenant via the header.
-/// The resolved [`TenantId`] is also written to the new record so subsequent
-/// invoke / delete operations can gate on the resource owner.
 #[tracing::instrument(
     name = "http.create_function",
-    skip(state, payload, auth),
-    fields(
-        function_id = tracing::field::Empty,
-        tenant = tracing::field::Empty,
-    ),
+    skip(state, payload),
+    fields(function_id = tracing::field::Empty),
 )]
 pub async fn create_function(
     State(state): State<Arc<AppState>>,
-    tenant: Option<Extension<TenantId>>,
-    auth: Option<Extension<crate::rate_limit::AuthContext>>,
     payload: Result<Json<CreateFunctionRequest>, JsonRejection>,
 ) -> ApiResult<Json<CreateFunctionResponse>> {
-    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
-    tracing::Span::current().record("tenant", tracing::field::display(tenant));
-    // Tenant-scope check: reject before doing any per-tenant work (base64
-    // decode, wasm validation, in-memory insertion). Absent AuthContext only
-    // happens in configurations that bypass `bearer_auth` entirely (e.g.
-    // ad-hoc test routers); we degrade to dev-mode wildcard there. Same
-    // pattern as `invoke_function` below.
-    if let Some(Extension(ctx)) = auth.as_ref() {
-        ctx.authorize_tenant(tenant)?;
-    }
-
     let Json(req) = payload?;
     validate_function_name(&req.name)?;
     let bytes = decode_wasm_b64(req.wasm_b64).await?;
@@ -675,7 +611,6 @@ pub async fn create_function(
         id,
         FunctionRecord {
             id,
-            tenant_id: tenant,
             name: req.name,
             wasm_bytes: Arc::from(bytes),
             created_unix_ms: now_unix_ms(),
@@ -687,59 +622,12 @@ pub async fn create_function(
 /// `DELETE /functions/{id}` — remove a deployed function.
 ///
 /// Returns `204 No Content` on success and `404 Not Found` if the id is
-/// unknown. Performs a two-layer authorization check (B1.9 follow-up:
-/// closes the cross-tenant delete hole):
-///
-/// 1. **Token-scope layer.** The caller's bearer-token scope must cover the
-///    tenant supplied in `X-TensorWasm-Tenant`, enforced by
-///    [`AuthContext::authorize_tenant`] before the registry is consulted.
-///    Returns `403 tenant_scope_denied`.
-/// 2. **Resource layer.** Even if the caller has a wildcard scope, the
-///    function's stored `tenant_id` must equal the request's bound tenant.
-///    Otherwise tenant *B* with a wildcard token could delete tenant *A*'s
-///    record by passing `X-TensorWasm-Tenant: B`. Mismatch yields
-///    `403 tenant_scope_denied` with a distinct message; same envelope
-///    shape as `get_job`'s analogue from the B1.9 fix.
-#[tracing::instrument(
-    name = "http.delete_function",
-    skip(state, auth),
-    fields(
-        function_id = %id,
-        tenant = tracing::field::Empty,
-    ),
-)]
+/// unknown.
+#[tracing::instrument(name = "http.delete_function", skip(state), fields(function_id = %id))]
 pub async fn delete_function(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-    tenant: Option<Extension<TenantId>>,
-    auth: Option<Extension<crate::rate_limit::AuthContext>>,
 ) -> ApiResult<StatusCode> {
-    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
-    tracing::Span::current().record("tenant", tracing::field::display(tenant));
-    // Token-scope layer: rejected before any registry lookup so a caller
-    // outside scope cannot probe id existence via the `404 vs 403` split.
-    if let Some(Extension(ctx)) = auth.as_ref() {
-        ctx.authorize_tenant(tenant)?;
-    }
-
-    // Resource layer: look up under the shard lock, verify the record's
-    // tenant matches, then `remove`. We do the lookup first (rather than
-    // `remove` + reinsert on mismatch) so a 403 never has a side effect on
-    // the registry.
-    let owner = match state.functions.get(&id) {
-        Some(entry) => entry.value().tenant_id,
-        None => return Err(ApiError::not_found(format!("function {id} not found"))),
-    };
-    if owner != tenant {
-        return Err(ApiError::forbidden(
-            "tenant_scope_denied",
-            format!("function {id} is not owned by tenant {}", tenant.0),
-        ));
-    }
-
-    // `remove` re-acquires the shard lock; an interleaving delete from
-    // another request could race us. Either we win and return 204, or the
-    // other request won and we surface a 404 — both are correct outcomes.
     if state.functions.remove(&id).is_some() {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -747,16 +635,43 @@ pub async fn delete_function(
     }
 }
 
-/// Drive the spawn → call(`_start`|`main`) → terminate flow against the
-/// supplied bytes/tenant. Shared by the synchronous and async invoke paths
-/// so any future fix (telemetry, retries, etc.) lands in one place.
+/// Parse a JSON-array argument list into the executor's [`WasmArg`] form.
+///
+/// Surfaces a `400 invalid_args` envelope on the first element that fails
+/// conversion. The envelope's `message` includes the array index and the
+/// offending value so a caller debugging a malformed payload can pinpoint
+/// the problem without trial-and-error.
+fn parse_invoke_args(raw: &[serde_json::Value]) -> Result<Vec<WasmArg>, ApiError> {
+    raw.iter()
+        .enumerate()
+        .map(|(i, v)| {
+            WasmArg::from_json(v).map_err(|msg| {
+                ApiError::bad_request(
+                    "invalid_args",
+                    format!("args[{i}]: {msg} (value: {v})"),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Drive the spawn → call(`_start`|`main`|custom) → terminate flow against
+/// the supplied bytes/tenant. Shared by the synchronous and async invoke
+/// paths so any future fix (telemetry, retries, etc.) lands in one place.
+///
+/// When `export_override` is `Some`, that export is invoked directly with
+/// no fallback — the caller asked for a specific function, so a missing
+/// export surfaces as the usual `400 missing_export`. When `None`, the
+/// legacy WASI-command discovery applies: try `_start`, then `main`.
 #[tracing::instrument(
     name = "invoke.run",
-    skip(executor, wasm_bytes),
+    skip(executor, wasm_bytes, args),
     fields(
         tenant = %tenant,
         function_id = %function_id,
         wasm_bytes_len = wasm_bytes.len(),
+        export = tracing::field::Empty,
+        args_len = args.len(),
     ),
 )]
 async fn run_invoke(
@@ -764,96 +679,127 @@ async fn run_invoke(
     wasm_bytes: &[u8],
     tenant: TenantId,
     function_id: Uuid,
+    export_override: Option<&str>,
+    args: &[WasmArg],
 ) -> ApiResult<serde_json::Value> {
     let cfg = SpawnConfig::for_tenant(tenant).with_deadline(INVOKE_DEFAULT_DEADLINE);
     let instance_id = executor.spawn_instance(cfg, wasm_bytes).await?;
 
-    // Try `_start` (WASI command convention) first, then `main`. Anything
-    // other than `MissingExport` from the first attempt bubbles up directly;
-    // a missing `_start` falls through to `main`. If neither exists the
-    // `MissingExport` from the second attempt is returned (mapped to 400).
-    //
-    // api S-20 / exec orphan-instance: use `call_export_then_terminate` so
-    // the instance is cleaned up even if our future is dropped mid-await
+    // api S-20 / exec orphan-instance: use `call_export_with_args_then_terminate`
+    // so the instance is cleaned up even if our future is dropped mid-await
     // (e.g. by tower's `TimeoutLayer`). The previous `call_export` +
     // explicit `terminate` flow leaked the registry entry into
     // `instances` on outer cancellation, holding the wasmtime `Store`
     // and counting against `max_instances` until process restart.
-    let call_result = match executor.call_export_then_terminate(instance_id, "_start").await {
-        Ok(()) => Ok(()),
-        Err(ExecError::MissingExport(_)) => {
-            // `_start` was missing AND the instance was already terminated
-            // by the first guard. Re-spawn to try `main` — slightly more
-            // expensive than the old "reuse the instance" flow but only
-            // when `_start` is genuinely absent, and keeps the auto-
-            // terminate invariant intact.
-            let cfg = SpawnConfig::for_tenant(tenant).with_deadline(INVOKE_DEFAULT_DEADLINE);
-            let retry_id = executor.spawn_instance(cfg, wasm_bytes).await?;
-            executor.call_export_then_terminate(retry_id, "main").await
+    let result_value: serde_json::Value = if let Some(name) = export_override {
+        tracing::Span::current().record("export", tracing::field::display(name));
+        executor
+            .call_export_with_args_then_terminate(instance_id, name, args)
+            .await?
+    } else {
+        // Try `_start` (WASI command convention) first, then `main`. Anything
+        // other than `MissingExport` from the first attempt bubbles up directly;
+        // a missing `_start` falls through to `main`. If neither exists the
+        // `MissingExport` from the second attempt is returned (mapped to 400).
+        tracing::Span::current().record("export", tracing::field::display("_start|main"));
+        match executor
+            .call_export_with_args_then_terminate(instance_id, "_start", args)
+            .await
+        {
+            Ok(v) => v,
+            Err(ExecError::MissingExport(_)) => {
+                // `_start` was missing AND the instance was already terminated
+                // by the first guard. Re-spawn to try `main` — slightly more
+                // expensive than the old "reuse the instance" flow but only
+                // when `_start` is genuinely absent, and keeps the auto-
+                // terminate invariant intact.
+                let cfg =
+                    SpawnConfig::for_tenant(tenant).with_deadline(INVOKE_DEFAULT_DEADLINE);
+                let retry_id = executor.spawn_instance(cfg, wasm_bytes).await?;
+                executor
+                    .call_export_with_args_then_terminate(retry_id, "main", args)
+                    .await?
+            }
+            Err(other) => return Err(other.into()),
         }
-        Err(other) => Err(other),
     };
 
-    call_result?;
+    // For back-compat with the historical `{ "result": "ok" }` envelope,
+    // collapse an empty result array to the string `"ok"`. Non-empty
+    // result lists pass through verbatim so callers consuming an `(i32,
+    // i32) -> i32` adder see the JSON array shape.
+    let payload_result = match &result_value {
+        serde_json::Value::Array(items) if items.is_empty() => {
+            serde_json::Value::String("ok".to_string())
+        }
+        _ => result_value,
+    };
 
     Ok(serde_json::json!({
         "function_id": function_id.to_string(),
-        "result": "ok",
+        "result": payload_result,
     }))
 }
 
-/// JSON envelope accepted by `POST /functions/{id}/invoke` (and its async
-/// sibling).
+/// Extract an [`InvokeRequest`] from the inbound HTTP body, treating an
+/// absent / empty body as the default (no export override, no args).
 ///
-/// Both fields are optional with `#[serde(default)]` so an empty body (or
-/// a body that omits one of them) still deserialises — the wire contract
-/// pinned in `docs/CLI.md` is `{"export": "main", "args": [...]}`, but
-/// existing CLI clients that post `{}` (or no body) must keep working.
-///
-/// **Current behaviour:** the handler does not yet thread these fields
-/// through to the executor — the invoke path still calls `_start`
-/// (falling back to `main`) with the `() -> ()` signature. The struct
-/// exists so the wire shape is fixed today; once api S-31's argument
-/// pass-through lands, the executor will consume `export` and `args`
-/// without a wire-protocol break for clients written against this
-/// release.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct InvokeRequest {
-    /// Name of the export to invoke. When absent or `None`, the handler
-    /// falls back to its built-in `_start` → `main` resolution.
-    pub export: Option<String>,
-    /// Arguments forwarded to the export. Currently ignored — the
-    /// executor only supports `() -> ()` signatures.
-    pub args: Option<Vec<serde_json::Value>>,
+/// `/invoke` historically accepted no body (api S-31); now that argument
+/// passing is wired through we accept a body but keep the empty-body path
+/// cheap — an empty payload short-circuits before the JSON allocator is
+/// touched, mirroring the previous behaviour.
+async fn read_invoke_request(
+    payload: Result<Json<InvokeRequest>, JsonRejection>,
+) -> ApiResult<InvokeRequest> {
+    match payload {
+        Ok(Json(req)) => Ok(req),
+        Err(rej) => {
+            // Two soft-failure cases get rewritten as the all-defaults
+            // request so the legacy "fire-and-forget with no body" wire
+            // contract still works:
+            //
+            //  * `415 Unsupported Media Type` — body present but
+            //    `content-type` missing or wrong. The pre-args /invoke
+            //    accepted any body shape (it never parsed it); we keep
+            //    that surface working by treating it as defaults.
+            //  * empty inbound bytes (any rejection whose
+            //    `body_text()` is empty) — `curl -X POST /invoke`
+            //    with no `-d` body falls in here. Matches the
+            //    pre-args silent-no-op behaviour.
+            //
+            // Every other rejection — `400` (parse error, type error,
+            // missing required field) and `413` (body too large) — is
+            // forwarded through the existing `From<JsonRejection>`
+            // mapping so the canonical envelope kicks in.
+            if rej.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE
+                || rej.body_text().trim().is_empty()
+            {
+                Ok(InvokeRequest::default())
+            } else {
+                Err(rej.into())
+            }
+        }
+    }
 }
 
 /// `POST /functions/{id}/invoke` — synchronous invocation.
 ///
 /// Looks up the function's stored Wasm bytes, spawns a fresh instance via
-/// the shared [`TensorWasmExecutor`] with a 30-second deadline, calls `_start`
-/// (falling back to `main`), then terminates the instance. Returns the
-/// `function_id` and a string `result` on success; structured `ApiError`
+/// the shared [`TensorWasmExecutor`] with a 30-second deadline, calls the
+/// requested `export` (defaulting to `_start` → `main` discovery) with the
+/// supplied `args`, then terminates the instance. Returns the
+/// `function_id` and a JSON `result` on success; structured `ApiError`
 /// otherwise.
 ///
 /// The tenant id is sourced from the `X-TensorWasm-Tenant` middleware
 /// extension; absent it defaults to `TenantId(0)`.
 ///
-/// **Body parsing (api S-31 follow-up):** the handler accepts the
-/// documented `{"export": "...", "args": [...]}` envelope via the
-/// [`InvokeRequest`] extractor. Both fields are `#[serde(default)]` so
-/// empty bodies (and `{}`) still parse. The fields are NOT yet threaded
-/// into the executor — the call path remains the `_start` → `main`
-/// fallback — but the wire shape is fixed today so clients written
-/// against the CLI keep working when argument pass-through lands. A
-/// malformed body (invalid JSON, wrong-shape values) is intentionally
-/// ignored rather than rejected: pre-S-31 callers that posted opaque
-/// filler must not start seeing 400s after this change. The strict
-/// `InvokeRequest` schema (no recovery into a `serde_json::Value` tree)
-/// keeps the DoS surface bounded.
+/// Body schema is [`InvokeRequest`] (both fields optional). An empty body
+/// is treated as the all-defaults case for client compatibility with the
+/// pre-args wire contract.
 #[tracing::instrument(
     name = "http.invoke_function",
-    skip(state, auth, body),
+    skip(state, auth, payload),
     fields(
         function_id = %id,
         tenant = tracing::field::Empty,
@@ -864,7 +810,7 @@ pub async fn invoke_function(
     Path(id): Path<Uuid>,
     tenant: Option<Extension<TenantId>>,
     auth: Option<Extension<crate::rate_limit::AuthContext>>,
-    body: Result<Json<InvokeRequest>, JsonRejection>,
+    payload: Result<Json<InvokeRequest>, JsonRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
     tracing::Span::current().record("tenant", tracing::field::display(tenant));
@@ -876,46 +822,26 @@ pub async fn invoke_function(
         ctx.authorize_tenant(tenant)?;
     }
 
-    // Wire envelope: parsed when present and well-formed, treated as
-    // default otherwise. Empty/malformed bodies must NOT 400 — see the
-    // doc comment above for the api S-31 compatibility rationale. The
-    // one rejection we *do* still surface is `413 PAYLOAD_TOO_LARGE`:
-    // the `DefaultBodyLimit::max` cap is a security boundary and must
-    // not be silently swallowed by the envelope-tolerance shim.
-    // The parsed `export` and `args` are unused below today; once the
-    // executor learns to consume them this is the single place to
-    // thread them through.
-    let _envelope = match body {
-        Ok(Json(req)) => req,
-        Err(rej) if rej.status() == StatusCode::PAYLOAD_TOO_LARGE => {
-            return Err(ApiError::body_too_large(rej.body_text()));
-        }
-        Err(_) => InvokeRequest::default(),
-    };
+    let req = read_invoke_request(payload).await?;
+    let args = parse_invoke_args(&req.args)?;
 
-    // Snapshot the Wasm bytes AND the owning tenant under the DashMap shard
-    // lock, then drop the guard before we hit any `.await`. `Arc::clone` is
-    // a single refcount bump regardless of payload size.
-    let (wasm_bytes, owner) = match state.functions.get(&id) {
-        Some(entry) => {
-            let rec = entry.value();
-            (Arc::clone(&rec.wasm_bytes), rec.tenant_id)
-        }
+    // Snapshot the Wasm bytes under the DashMap shard lock, then drop the
+    // guard before we hit any `.await`. `Arc::clone` is a single refcount
+    // bump regardless of payload size.
+    let wasm_bytes = match state.functions.get(&id) {
+        Some(entry) => Arc::clone(&entry.value().wasm_bytes),
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
-    // Resource-layer authz: even if the caller's bearer scope admits the
-    // bound tenant (token-scope check above), the *function* must actually
-    // belong to that tenant. Without this guard, a wildcard-scoped caller
-    // from tenant B could invoke tenant A's function by passing
-    // `X-TensorWasm-Tenant: B`. B1.9 follow-up.
-    if owner != tenant {
-        return Err(ApiError::forbidden(
-            "tenant_scope_denied",
-            format!("function {id} is not owned by tenant {}", tenant.0),
-        ));
-    }
 
-    let value = run_invoke(&state.executor, &wasm_bytes, tenant, id).await?;
+    let value = run_invoke(
+        &state.executor,
+        &wasm_bytes,
+        tenant,
+        id,
+        req.export.as_deref(),
+        &args,
+    )
+    .await?;
     Ok(Json(value))
 }
 
@@ -983,14 +909,13 @@ impl Drop for JobsActiveGuard {
 /// `Failed` (with `{kind, message}`) on conclusion. Callers poll via
 /// `GET /jobs/{id}`.
 ///
-/// **Body parsing (api S-31 follow-up):** mirrors the synchronous
-/// handler — the [`InvokeRequest`] envelope is parsed when present but
-/// not yet threaded into the executor. Empty / malformed bodies fall
-/// back to default and the call proceeds, preserving wire-shape
-/// compatibility for pre-S-31 callers.
+/// Body schema mirrors [`invoke_function`]: optional `export` /
+/// `args` ([`InvokeRequest`]). The body is parsed synchronously before
+/// the Tokio task spawn so `400 invalid_args` surfaces synchronously
+/// (rather than as a `JobStatus::Failed` poll result).
 #[tracing::instrument(
     name = "http.invoke_function_async",
-    skip(state, auth, body),
+    skip(state, auth, payload),
     fields(
         function_id = %id,
         tenant = tracing::field::Empty,
@@ -1002,36 +927,20 @@ pub async fn invoke_function_async(
     Path(id): Path<Uuid>,
     tenant: Option<Extension<TenantId>>,
     auth: Option<Extension<crate::rate_limit::AuthContext>>,
-    body: Result<Json<InvokeRequest>, JsonRejection>,
+    payload: Result<Json<InvokeRequest>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
     tracing::Span::current().record("tenant", tracing::field::display(tenant));
     if let Some(Extension(ctx)) = auth.as_ref() {
         ctx.authorize_tenant(tenant)?;
     }
-    let _envelope = match body {
-        Ok(Json(req)) => req,
-        Err(rej) if rej.status() == StatusCode::PAYLOAD_TOO_LARGE => {
-            return Err(ApiError::body_too_large(rej.body_text()));
-        }
-        Err(_) => InvokeRequest::default(),
-    };
-    let (wasm_bytes, owner) = match state.functions.get(&id) {
-        Some(entry) => {
-            let rec = entry.value();
-            (Arc::clone(&rec.wasm_bytes), rec.tenant_id)
-        }
+    let req = read_invoke_request(payload).await?;
+    let args = parse_invoke_args(&req.args)?;
+    let export_override = req.export;
+    let wasm_bytes = match state.functions.get(&id) {
+        Some(entry) => Arc::clone(&entry.value().wasm_bytes),
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
-    // Resource-layer authz: see `invoke_function` for the rationale. B1.9
-    // follow-up — wildcard-scoped callers from a different tenant must not
-    // be able to spawn async invocations on someone else's function.
-    if owner != tenant {
-        return Err(ApiError::forbidden(
-            "tenant_scope_denied",
-            format!("function {id} is not owned by tenant {}", tenant.0),
-        ));
-    }
 
     let job_id = Uuid::new_v4();
     tracing::Span::current().record("job_id", tracing::field::display(job_id));
@@ -1040,7 +949,6 @@ pub async fn invoke_function_async(
         JobRecord {
             id: job_id,
             function_id: id,
-            tenant_id: tenant,
             status: JobStatus::Pending,
             result: None,
             created_unix_ms: now_unix_ms(),
@@ -1087,7 +995,15 @@ pub async fn invoke_function_async(
                 // [`test_hooks`] for the rationale.
                 test_hooks::maybe_panic_for_test();
 
-                let outcome = run_invoke(&executor, &wasm_bytes, tenant, id).await;
+                let outcome = run_invoke(
+                    &executor,
+                    &wasm_bytes,
+                    tenant,
+                    id,
+                    export_override.as_deref(),
+                    &args,
+                )
+                .await;
                 if let Some(mut entry) = jobs.get_mut(&job_id) {
                     match outcome {
                         Ok(value) => {
@@ -1126,208 +1042,16 @@ pub async fn invoke_function_async(
     ))
 }
 
-/// `Accept` header value that selects the Server-Sent Events response
-/// shape on [`invoke_function_stream`]. Anything else (or absence) falls
-/// through to the raw chunked-transfer (`application/octet-stream`)
-/// branch.
-pub const SSE_MIME: &str = "text/event-stream";
-
-/// Content-Type emitted by the chunked-transfer branch of
-/// [`invoke_function_stream`] when the request did not negotiate SSE.
-pub const CHUNKED_MIME: &str = "application/octet-stream";
-
-/// Returns `true` when the supplied `Accept` header value asks for
-/// `text/event-stream`. Tolerates the standard `accept: a, b; q=…`
-/// shape: any comma-separated token that starts (after trim) with
-/// `text/event-stream` is taken as a match. Quality-value scoring is
-/// out of scope for the scaffold; if a client lists multiple types
-/// including SSE we serve SSE.
-fn accept_wants_sse(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            s.split(',')
-                .any(|part| part.trim().to_ascii_lowercase().starts_with(SSE_MIME))
-        })
-        .unwrap_or(false)
-}
-
-/// `POST /functions/{id}/invoke-stream` — streaming invocation.
-///
-/// Mirrors the body / auth surface of [`invoke_function`]. The response
-/// shape is chosen from the request's `Accept` header:
-///
-/// * `Accept: text/event-stream` — Server-Sent Events. Each chunk the
-///   guest emits via `wasi:tensor/host.emit-chunk` becomes one `data:`
-///   line. A `keep-alive` comment is injected on idle so intermediate
-///   proxies don't reap the connection. Stream terminates with an
-///   `event: end` frame when the guest returns.
-/// * Anything else — `Content-Type: application/octet-stream`,
-///   chunked-transfer encoding. Each guest chunk is forwarded verbatim
-///   as one HTTP chunk frame.
-///
-/// ## v0.3.7 scaffold behaviour
-///
-/// The handler does NOT yet drive the executor through a streaming
-/// invocation path — that wiring lands in v0.4 alongside the
-/// `tensor_wasm_wasi_gpu::StreamingContext` hookup on `InstanceState`.
-/// For now the handler:
-///
-/// 1. Authorizes the caller (bearer + tenant scope) exactly like
-///    `/invoke`, so the route shares the existing security envelope.
-/// 2. Confirms the requested function exists.
-/// 3. Emits a single `scaffold` SSE event (or chunked frame) carrying
-///    `{"status":"not_yet_wired"}` and closes the stream.
-///
-/// Clients that hit this route today learn the wire shape (status
-/// code, content-type, event framing) without committing to a
-/// behaviour the executor cannot yet honour. Once v0.4 lands the
-/// scaffold body is replaced with a real `mpsc::Receiver` drain
-/// without any URL / method / body-shape change.
-///
-/// ## Security
-///
-/// Bytes the guest emits will eventually pass through a `sanitize_path`-
-/// style filter before they hit the wire — log-injection and ANSI-
-/// escape stripping is documented in `docs/STREAMING.md` and lives in
-/// the v0.4 follow-up. The scaffold returns only host-controlled
-/// bytes, so the filter is intentionally not in this code path yet.
-#[tracing::instrument(
-    name = "http.invoke_function_stream",
-    skip(state, auth, headers),
-    fields(
-        function_id = %id,
-        tenant = tracing::field::Empty,
-        sse = tracing::field::Empty,
-    ),
-)]
-pub async fn invoke_function_stream(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-    tenant: Option<Extension<TenantId>>,
-    auth: Option<Extension<crate::rate_limit::AuthContext>>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
-    tracing::Span::current().record("tenant", tracing::field::display(tenant));
-    if let Some(Extension(ctx)) = auth.as_ref() {
-        ctx.authorize_tenant(tenant)?;
-    }
-
-    // 404 before any negotiation work, mirroring `/invoke`.
-    if !state.functions.contains_key(&id) {
-        return Err(ApiError::not_found(format!("function {id} not found")));
-    }
-
-    let wants_sse = accept_wants_sse(&headers);
-    tracing::Span::current().record("sse", tracing::field::display(wants_sse));
-
-    // The scaffold payload — host-controlled, no guest bytes — that the
-    // v0.4 follow-up will replace with a drain of the
-    // `mpsc::Receiver<Vec<u8>>` produced by `StreamingContext`.
-    let scaffold_payload =
-        serde_json::json!({ "status": "not_yet_wired", "function_id": id.to_string() })
-            .to_string();
-
-    if wants_sse {
-        // One `event: scaffold` frame, then end-of-stream. The
-        // `KeepAlive` layer is wired even though the stream closes
-        // immediately so the v0.4 swap (long-lived streams) inherits
-        // the correct keep-alive cadence without a separate edit.
-        let scaffold_event = Event::default()
-            .event("scaffold")
-            .data(scaffold_payload);
-        let end_event = Event::default().event("end").data("");
-        let s = stream::iter(vec![
-            Ok::<Event, std::convert::Infallible>(scaffold_event),
-            Ok(end_event),
-        ]);
-        Ok(Sse::new(s)
-            .keep_alive(KeepAlive::default())
-            .into_response())
-    } else {
-        // Chunked-transfer branch. axum infers `Transfer-Encoding:
-        // chunked` from the lack of `Content-Length` on a
-        // `Body::from_stream` response.
-        let chunk = format!("event: scaffold\ndata: {scaffold_payload}\n\n");
-        let s = stream::iter(vec![Ok::<axum::body::Bytes, std::io::Error>(
-            axum::body::Bytes::from(chunk),
-        )]);
-        let mut resp = Response::new(Body::from_stream(s));
-        resp.headers_mut().insert(
-            header::CONTENT_TYPE,
-            CHUNKED_MIME.parse().expect("static mime parses"),
-        );
-        Ok(resp)
-    }
-}
-
 /// `GET /jobs/{id}` — poll an async invocation.
-///
-/// Tenant scoping (api S-32): a caller may only poll jobs that were
-/// dispatched under a tenant their bearer token addresses AND whose
-/// `tenant_id` matches the caller's `X-TensorWasm-Tenant` header. Both
-/// checks return `403 tenant_scope_denied` on failure — mirroring the
-/// shape `invoke` / `invoke-async` already use, so a cross-tenant probe
-/// cannot distinguish "wrong scope" from "wrong tenant" from the wire
-/// envelope alone. Previously this handler returned the full `JobRecord`
-/// (including the `result` payload) for any job id any authenticated
-/// caller knew, leaking other tenants' job results.
-#[tracing::instrument(
-    name = "http.get_job",
-    skip(state, auth),
-    fields(
-        job_id = %id,
-        tenant = tracing::field::Empty,
-    ),
-)]
+#[tracing::instrument(name = "http.get_job", skip(state), fields(job_id = %id))]
 pub async fn get_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-    tenant: Option<Extension<TenantId>>,
-    auth: Option<Extension<crate::rate_limit::AuthContext>>,
 ) -> ApiResult<Json<JobRecord>> {
-    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
-    tracing::Span::current().record("tenant", tracing::field::display(tenant));
-    // Layer 1: token-scope check, same as invoke / invoke-async — the
-    // caller's bearer token must be authorised to address the tenant the
-    // request claims (via X-TensorWasm-Tenant). Absent AuthContext only
-    // happens in configurations that bypass `bearer_auth` entirely (ad-hoc
-    // test routers); fall through to dev-mode wildcard there.
-    if let Some(Extension(ctx)) = auth.as_ref() {
-        ctx.authorize_tenant(tenant)?;
+    match state.jobs.get(&id) {
+        Some(rec) => Ok(Json(rec.clone())),
+        None => Err(ApiError::not_found(format!("job {id} not found"))),
     }
-
-    // Snapshot the record under the DashMap shard lock; comparing the
-    // tenant_id afterwards lets us drop the guard quickly. Clone happens
-    // only on the success path — the cross-tenant path returns before
-    // copying the (possibly large) `result` payload.
-    let rec = match state.jobs.get(&id) {
-        Some(entry) => entry.value().clone(),
-        None => return Err(ApiError::not_found(format!("job {id} not found"))),
-    };
-
-    // Layer 2: per-resource tenant check. Even when the caller's token is
-    // scoped to multiple tenants (or wildcard), the request must address
-    // the SAME tenant the job was dispatched under. Without this check, a
-    // wildcard-scoped token issued for tenant A could read jobs from
-    // tenant B simply by knowing (or brute-forcing) the job UUID. We
-    // surface `tenant_scope_denied` (403) rather than `not_found` (404)
-    // for consistency with the synchronous invoke path's denial shape —
-    // both lock-outs share the same kind so clients can handle them
-    // uniformly.
-    if rec.tenant_id != tenant {
-        return Err(ApiError::forbidden(
-            "tenant_scope_denied",
-            format!(
-                "job {id} belongs to a different tenant than X-TensorWasm-Tenant; \
-                 callers must poll jobs under the same tenant they were dispatched under",
-            ),
-        ));
-    }
-
-    Ok(Json(rec))
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,10 +1132,6 @@ mod tests {
         let oops = ApiError::internal("boom");
         assert_eq!(oops.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(oops.kind, "internal");
-
-        let ni = ApiError::not_implemented("openai_not_yet_wired", "scaffold");
-        assert_eq!(ni.status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(ni.kind, "openai_not_yet_wired");
     }
 
     #[test]
@@ -1449,17 +1169,12 @@ mod tests {
     fn function_record_skips_wasm_bytes_on_wire() {
         let rec = FunctionRecord {
             id: Uuid::nil(),
-            tenant_id: TenantId(0),
             name: "n".to_string(),
             wasm_bytes: Arc::from(vec![1u8, 2, 3]),
             created_unix_ms: 0,
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert!(v.get("wasm_bytes").is_none(), "wasm_bytes leaked: {v}");
-        // tenant_id is part of the wire form (mirrors JobRecord.tenant_id
-        // from B1.9). Pin its presence so any future struct-refactor that
-        // strips it from the serialised shape trips this test.
-        assert!(v.get("tenant_id").is_some(), "tenant_id missing: {v}");
     }
 
     #[tokio::test]

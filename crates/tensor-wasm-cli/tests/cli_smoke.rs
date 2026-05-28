@@ -151,19 +151,45 @@ fn bench_rejects_zero_iterations() {
 
 #[test]
 fn run_executes_inline_wat_fixture() {
-    // Build a trivial Wasm fixture with an `add` export the CLI can call.
-    // Note: TensorWasmExecutor::call_export currently runs `() -> ()` signatures —
-    // so the `add` function in this fixture must take no params and return
-    // nothing. We still pass --args to exercise JSON validation; the
-    // executor ignores the values.
+    // Build a no-arg fixture and confirm the legacy `() -> ()` path still
+    // prints the literal `ok`. The richer `(i32, i32) -> i32` path is
+    // covered by `run_passes_args_to_adder` below.
     let wat = r#"
         (module
-            (func (export "add"))
+            (func (export "noop"))
         )
     "#;
     let wasm = wat::parse_str(wat).expect("compile WAT fixture");
     let tmp = tempfile::tempdir().expect("create tempdir");
     let wasm_path = tmp.path().join("fixture.wasm");
+    std::fs::write(&wasm_path, &wasm).expect("write wasm fixture");
+
+    tensor_wasm()
+        .args(["run", wasm_path.to_str().unwrap(), "--export", "noop"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
+}
+
+/// Verify `--args` is actually threaded into the call. An `(i32, i32) ->
+/// i32` adder built inline as WAT receives `[1, 2]` and the CLI prints
+/// `3` (the scalar-collapse rule in `run.rs` unwraps the single-element
+/// result list). Pre-feature this test would have hung the runtime: the
+/// executor only knew the `() -> ()` signature, so the dynamic call
+/// arity-mismatched and trapped.
+#[test]
+fn run_passes_args_to_adder() {
+    let wat = r#"
+        (module
+            (func (export "add") (param i32 i32) (result i32)
+                local.get 0
+                local.get 1
+                i32.add)
+        )
+    "#;
+    let wasm = wat::parse_str(wat).expect("compile adder WAT");
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let wasm_path = tmp.path().join("adder.wasm");
     std::fs::write(&wasm_path, &wasm).expect("write wasm fixture");
 
     tensor_wasm()
@@ -173,11 +199,11 @@ fn run_executes_inline_wat_fixture() {
             "--export",
             "add",
             "--args",
-            "[1.0, 2.0]",
+            "[1, 2]",
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("ok"));
+        .stdout(predicate::str::contains("3"));
 }
 
 /// `--args` is parsed and validated but the values are not forwarded to

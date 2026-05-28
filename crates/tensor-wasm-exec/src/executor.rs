@@ -21,7 +21,7 @@ use lru::LruCache;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
-use wasmtime::{ExternType, Module, ResourceLimiter, Store};
+use wasmtime::{ExternType, Module, ResourceLimiter, Store, Val};
 
 use crate::engine::TensorWasmEngine;
 use crate::instance::{TensorWasmInstance, InstanceState};
@@ -258,6 +258,15 @@ pub struct SpawnConfig {
     pub tenant_id: TenantId,
     /// Optional per-call deadline.
     pub deadline: Option<Duration>,
+    /// Arguments forwarded to the first [`TensorWasmExecutor::call_export_with_args`]
+    /// invocation against this instance.
+    ///
+    /// Callers that drive a single spawn-then-call flow (CLI `run`, API
+    /// `/invoke`) populate this field so the caller's argument list survives
+    /// the trip across crate boundaries without a parallel `CallConfig`.
+    /// Multi-call flows should ignore this field and pass arguments directly
+    /// to each `call_export_with_args` invocation.
+    pub args: Vec<WasmArg>,
 }
 
 impl SpawnConfig {
@@ -266,6 +275,7 @@ impl SpawnConfig {
         Self {
             tenant_id,
             deadline: None,
+            args: Vec::new(),
         }
     }
 
@@ -273,6 +283,94 @@ impl SpawnConfig {
     pub fn with_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// Attach an argument list for the upcoming call. See [`SpawnConfig::args`].
+    pub fn with_args(mut self, args: Vec<WasmArg>) -> Self {
+        self.args = args;
+        self
+    }
+}
+
+/// A typed Wasm value supplied to [`TensorWasmExecutor::call_export_with_args`].
+///
+/// Mirrors the four core wasm value types (`i32`, `i64`, `f32`, `f64`). Held
+/// `Copy` so callers can clone an argument list cheaply when retrying. Marked
+/// `#[non_exhaustive]` so additional value types (e.g. `v128`, reference
+/// types) can be added in a future minor release without breaking the
+/// match-arm count on downstream code.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum WasmArg {
+    /// A 32-bit signed integer argument.
+    I32(i32),
+    /// A 64-bit signed integer argument.
+    I64(i64),
+    /// A 32-bit IEEE-754 float argument.
+    F32(f32),
+    /// A 64-bit IEEE-754 float argument.
+    F64(f64),
+}
+
+impl WasmArg {
+    /// Convert a [`serde_json::Value`] into the closest-fitting [`WasmArg`]
+    /// variant.
+    ///
+    /// Integer literals that fit in `i32` become [`WasmArg::I32`]; larger
+    /// integers become [`WasmArg::I64`]; non-integer numerics become
+    /// [`WasmArg::F64`]. Any non-numeric value is rejected with an error
+    /// string suitable for forwarding into a user-facing CLI / HTTP error.
+    /// `f32` cannot be selected from JSON unambiguously — callers needing a
+    /// 32-bit float should construct [`WasmArg::F32`] directly.
+    pub fn from_json(v: &serde_json::Value) -> Result<Self, &'static str> {
+        match v {
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    if let Ok(i32v) = i32::try_from(i) {
+                        Ok(WasmArg::I32(i32v))
+                    } else {
+                        Ok(WasmArg::I64(i))
+                    }
+                } else if let Some(f) = n.as_f64() {
+                    Ok(WasmArg::F64(f))
+                } else {
+                    Err("unsupported number")
+                }
+            }
+            _ => Err("unsupported arg type — only numbers"),
+        }
+    }
+
+    /// Convert a [`WasmArg`] into the wasmtime [`Val`] expected by
+    /// `Func::call_async`. `f32`/`f64` are stored as bit patterns per the
+    /// wasmtime ABI.
+    pub fn into_val(self) -> wasmtime::Val {
+        match self {
+            WasmArg::I32(v) => wasmtime::Val::I32(v),
+            WasmArg::I64(v) => wasmtime::Val::I64(v),
+            WasmArg::F32(v) => wasmtime::Val::F32(v.to_bits()),
+            WasmArg::F64(v) => wasmtime::Val::F64(v.to_bits()),
+        }
+    }
+}
+
+/// Render a wasmtime [`Val`] as the closest-fitting [`serde_json::Value`].
+///
+/// `i32`/`i64` become JSON numbers (integer); `f32`/`f64` become JSON
+/// numbers (floating-point); other value types — `v128`, references —
+/// degrade to a JSON `null` so callers see a stable shape rather than a
+/// runtime error. Used by [`TensorWasmExecutor::call_export_with_args`]
+/// to project the wasmtime result slice into a JSON array.
+fn val_to_json(v: &Val) -> serde_json::Value {
+    match v {
+        Val::I32(n) => serde_json::json!(*n),
+        Val::I64(n) => serde_json::json!(*n),
+        Val::F32(bits) => serde_json::json!(f32::from_bits(*bits)),
+        Val::F64(bits) => serde_json::json!(f64::from_bits(*bits)),
+        // Unsupported value types fall through as JSON null rather than
+        // erroring — keeps the response shape predictable for callers that
+        // only ever return numeric scalars (the common case for B5.6).
+        _ => serde_json::Value::Null,
     }
 }
 
@@ -895,6 +993,42 @@ impl TensorWasmExecutor {
     /// observed per call.
     #[instrument(skip(self), fields(instance = %id, export = %export))]
     pub async fn call_export(&self, id: InstanceId, export: &str) -> Result<(), ExecError> {
+        // Back-compat wrapper: most callers (the bench loop, the executor's
+        // own tests, the orphan-cleanup integration test) only need the
+        // `() -> ()` signature and explicitly assert success via `.unwrap()`
+        // or `?`. Threading the new `Result<serde_json::Value, _>` shape
+        // through every call site would be churn for no behavioural gain;
+        // instead we keep the unit-typed surface here and delegate to the
+        // shared implementation. The result value is discarded — callers
+        // wanting it should use [`Self::call_export_with_args`] directly.
+        self.call_export_with_args(id, export, &[]).await.map(|_| ())
+    }
+
+    /// Invoke `export` with the supplied `args` (which may be empty) and
+    /// return the export's result list, serialised as a JSON array.
+    ///
+    /// This is the general entry point for guest-export invocation; the
+    /// `()`-shaped [`Self::call_export`] is a thin wrapper that discards
+    /// the result. The choice of `serde_json::Value` for the return type
+    /// keeps the executor's public API free of any tensor-wasm-api types
+    /// while still giving the HTTP transport a structured payload to
+    /// forward verbatim.
+    ///
+    /// When `args` is empty the implementation uses the typed
+    /// `func.typed::<(), ()>()` fast path, matching the historical
+    /// behaviour and keeping every existing `() -> ()` export call
+    /// branch-for-branch identical. With a non-empty `args` slice the
+    /// dynamic `func.call_async(&[Val], &mut [Val])` path runs instead;
+    /// the result slice is sized from the export's declared result arity
+    /// at runtime, so an export returning `(i32, i32)` produces a JSON
+    /// array with two numbers.
+    #[instrument(skip(self, args), fields(instance = %id, export = %export, args_len = args.len()))]
+    pub async fn call_export_with_args(
+        &self,
+        id: InstanceId,
+        export: &str,
+        args: &[WasmArg],
+    ) -> Result<serde_json::Value, ExecError> {
         let handle = self
             .instances
             .get(&id)
@@ -943,11 +1077,41 @@ impl TensorWasmExecutor {
         let func = wasmtime_instance
             .get_func(&mut guard.store, export)
             .ok_or_else(|| ExecError::MissingExport(export.to_string()))?;
-        let typed = func
-            .typed::<(), ()>(&guard.store)
-            .map_err(ExecError::Wasmtime)?;
-        match typed.call_async(&mut guard.store, ()).await {
-            Ok(()) => Ok(()),
+
+        // Branch on argument arity: the empty-args case uses the typed
+        // fast path so we don't disturb the behaviour every existing
+        // `() -> ()` test relies on (and so the dynamic-call overhead
+        // stays off the bench path). The non-empty case takes the
+        // dynamic `Func::call_async` path with `&[Val]` IO buffers; the
+        // result vec is pre-sized to the export's declared result arity
+        // so wasmtime can write straight into it.
+        let call_outcome = if args.is_empty() {
+            match func.typed::<(), ()>(&guard.store) {
+                Ok(typed) => typed
+                    .call_async(&mut guard.store, ())
+                    .await
+                    .map(|()| serde_json::Value::Array(Vec::new())),
+                Err(e) => Err(e),
+            }
+        } else {
+            let params: Vec<Val> = args.iter().copied().map(WasmArg::into_val).collect();
+            let func_ty = func.ty(&guard.store);
+            // `Val::I32(0)` is just a placeholder — wasmtime overwrites
+            // every slot before returning. The element count must match
+            // the export's declared result arity exactly or wasmtime
+            // returns an error.
+            let mut results: Vec<Val> = vec![Val::I32(0); func_ty.results().len()];
+            match func.call_async(&mut guard.store, &params, &mut results).await {
+                Ok(()) => {
+                    let json: Vec<serde_json::Value> = results.iter().map(val_to_json).collect();
+                    Ok(serde_json::Value::Array(json))
+                }
+                Err(e) => Err(e),
+            }
+        };
+
+        match call_outcome {
+            Ok(value) => Ok(value),
             Err(err) => {
                 // If we had a deadline AND the wall clock has tripped past
                 // it, classify the failure as Timeout with real numbers.
@@ -1021,6 +1185,24 @@ impl TensorWasmExecutor {
         id: InstanceId,
         export: &str,
     ) -> Result<(), ExecError> {
+        // Unit-typed back-compat surface, mirrors [`Self::call_export`].
+        self.call_export_with_args_then_terminate(id, export, &[])
+            .await
+            .map(|_| ())
+    }
+
+    /// Argument-aware sibling of [`Self::call_export_then_terminate`].
+    ///
+    /// Identical lifecycle / drop-guard semantics — auto-terminates on
+    /// success, failure, and Future-drop — but routes through
+    /// [`Self::call_export_with_args`] so callers receive the export's
+    /// result list as a JSON array.
+    pub async fn call_export_with_args_then_terminate(
+        &self,
+        id: InstanceId,
+        export: &str,
+        args: &[WasmArg],
+    ) -> Result<serde_json::Value, ExecError> {
         let guard = AutoTerminateGuard {
             instances: Arc::clone(&self.instances),
             instance_count: Arc::clone(&self.instance_count),
@@ -1030,7 +1212,7 @@ impl TensorWasmExecutor {
             // is allowed to disarm.
             armed: true,
         };
-        let result = self.call_export(id, export).await;
+        let result = self.call_export_with_args(id, export, args).await;
         // Disarm BEFORE the async terminate so a panic in `terminate`
         // does not double-fire. Both paths still remove the instance
         // exactly once: the guard via the sync DashMap::remove if it

@@ -3,7 +3,7 @@
   "info": {
     "title": "TensorWasm HTTP API",
     "description": "REST surface of a Craton TensorWasm serverless Wasm node. Prose documentation, error semantics, and the full middleware stack live in crates/tensor-wasm-api/API.md. NOTE: This file is a hand-ported 3.0 mirror of the canonical 3.1 spec at openapi/tensor-wasm-api.yaml and is kept for tooling that does not yet parse 3.1.",
-    "version": "0.3.6",
+    "version": "0.3.5",
     "license": {
       "name": "Apache-2.0",
       "url": "https://www.apache.org/licenses/LICENSE-2.0"
@@ -420,16 +420,23 @@
       },
       "InvokeRequest": {
         "type": "object",
-        "description": "Wire envelope for synchronous and asynchronous invocation. Both fields are optional and the server tolerates empty / missing bodies; clients written today must use this shape so they keep working when api S-31 wires `args` through to the executor.",
+        "description": "Body of POST /functions/{id}/invoke (and the async sibling). Both fields are optional — an empty body or `{}` is the canonical no-args case, matching the pre-args wire contract. Unknown top-level fields are ignored for forward compatibility; malformed JSON surfaces as 400 invalid_json.",
         "properties": {
           "export": {
             "type": "string",
-            "description": "Name of the exported function to call. When omitted, the server falls back to its built-in `_start` → `main` resolution."
+            "nullable": true,
+            "description": "Optional export-name override. When omitted (or null), the server tries `_start` first and falls back to `main`, matching the WASI command convention."
           },
           "args": {
             "type": "array",
-            "items": {},
-            "description": "Arguments forwarded to the export. Currently ignored — the executor only supports `() -> ()` signatures."
+            "description": "Argument list forwarded to the executor's `call_export_with_args` path. Each element is converted to the closest-fitting wasm value type: integers in [-2^31, 2^31) become i32, larger integers become i64, non-integer numerics become f64. Strings / arrays / null / booleans are rejected as 400 invalid_args. f32 cannot be selected from JSON unambiguously — write a guest wrapper that demotes from f64 if you need it.",
+            "items": {
+              "oneOf": [
+                { "type": "integer", "format": "int64" },
+                { "type": "number", "format": "double" }
+              ]
+            },
+            "default": []
           }
         },
         "additionalProperties": false
@@ -439,8 +446,7 @@
         "properties": {
           "function_id": { "$ref": "#/components/schemas/FunctionId" },
           "result": {
-            "type": "string",
-            "description": "Stable string-shaped invocation result. Will widen to the executor's JSON return value once that surface lands."
+            "description": "Invocation result. For exports returning `()` this collapses to the literal string `\"ok\"` (legacy back-compat envelope). For exports with a non-empty result list this is a JSON array of return values — one element per wasm result slot, with i32/i64 rendered as JSON integers and f32/f64 as JSON numbers."
           }
         },
         "required": ["function_id", "result"],
@@ -484,11 +490,9 @@
               "invalid_name",
               "invalid_base64",
               "invalid_wasm",
+              "invalid_args",
               "missing_export",
               "missing_tenant",
-              "invalid_tenant",
-              "duplicate_tenant_header",
-              "invalid_auth",
               "unauthorized",
               "tenant_scope_denied",
               "not_found",

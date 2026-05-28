@@ -63,15 +63,16 @@ You run `wasmtime run foo.wasm` (or `wasmer run foo.wasm`) from a
 shell, a Makefile, or CI. You may also use AOT compile.
 
 **Likely outcome.** `tensor-wasm run` is feature-parity for the
-*launch-a-`.wasm`-and-watch-it-finish* case **with one caveat**:
-the v0.1.0 CLI only invokes `() -> ()` exports. If your guest
-takes arguments, TensorWasm accepts and validates `--args` JSON
-but does *not* pass values through — `call_export` only supports
-the no-arg signature (verified in
-[`crates/tensor-wasm-cli/src/cmd/run.rs`](../crates/tensor-wasm-cli/src/cmd/run.rs)).
-Argument lowering is a v0.2 follow-up; do not migrate arg-taking
-CLI workloads yet. See
-[§7](#7-cli-user-migration-wasmtime-run--wasmer-run).
+*launch-a-`.wasm`-and-watch-it-finish* case. `--args` accepts a
+JSON array; each element is lowered into the matching wasm value
+type (`i32` / `i64` / `f64` — `f32` is not selectable from JSON
+unambiguously) and threaded into the executor's
+`call_export_with_args` path, so an `(i32, i32) -> i32` adder
+genuinely receives `[1, 2]` and returns `3`. See
+[`crates/tensor-wasm-cli/src/cmd/run.rs`](../crates/tensor-wasm-cli/src/cmd/run.rs)
+for the wiring and
+[§7](#7-cli-user-migration-wasmtime-run--wasmer-run) for the
+side-by-side migration table.
 
 ### 1.3 The server user
 
