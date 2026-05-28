@@ -321,25 +321,73 @@ unsafe impl LinearMemory for TensorWasmLinearMemory {
 /// Wasm linear memory carved out of an [`UnifiedMemoryPool`] slab.
 ///
 /// Holds an `Arc<UnifiedMemoryPool>` keepalive so the slab outlives the Wasm
-/// instance, plus a raw pointer + length into the slab's bytes. The
-/// [`crate::pool::PoolAllocation`] drop guard is intentionally leaked at
-/// construction time (see `TensorWasmMemoryCreator::new_memory`); the live-allocation
-/// counter therefore stays elevated for the lifetime of this memory and serves
-/// as a misuse signal if the caller tries to [`UnifiedMemoryPool::reset`] while
-/// any pool-backed memory still exists.
+/// instance, plus a raw pointer + length into the slab's bytes, plus the
+/// `(offset, size)` of the carved region (kept so `Drop` can call
+/// [`UnifiedMemoryPool::release`] with the same figures the original
+/// [`crate::pool::PoolAllocation`] would have used).
+///
+/// # Invariants
+///
+/// The [`crate::pool::PoolAllocation`] drop guard returned by
+/// [`crate::pool::UnifiedMemoryPool::allocate`] is intentionally leaked at
+/// construction time (see `TensorWasmMemoryCreator::new_memory`); the bump
+/// pointer therefore never rewinds while this memory is alive, preserving
+/// monotonic-bump semantics across the pool's lifetime.
+///
+/// On Drop:
+///
+/// * the pool's `live` counter IS decremented via
+///   [`UnifiedMemoryPool::release`] — this closes the audit T6 finding
+///   that `live` was leaked permanently elevated, which permanently blocked
+///   [`UnifiedMemoryPool::reset`];
+/// * the bump pointer is NOT rewound — monotonic-bump semantics are
+///   preserved, so any `base_ptr` carved out later (and into a different
+///   `PooledLinearMemory`) keeps pointing at distinct bytes;
+/// * the reserved `[offset, offset+size)` region is logically freed and
+///   will be zero-filled on next reuse by the per-allocation zero-fill in
+///   [`UnifiedMemoryPool::allocate`] (so cross-tenant data leaks via
+///   recycled-byte reads stay closed, audit H1).
 struct PooledLinearMemory {
-    /// Keeps the slab alive while this memory is in use. Never read
-    /// directly — its Drop is the whole point.
-    #[allow(dead_code)]
+    /// Keeps the slab alive while this memory is in use AND provides the
+    /// `release` callback the `Drop` impl invokes. Read by `Drop`.
     pool_keepalive: Arc<UnifiedMemoryPool>,
-    /// Pointer to the first byte of the carved region.
+    /// Bump offset returned by `pool.allocate(...)` at construction time.
+    /// Passed back to [`UnifiedMemoryPool::release`] in `Drop` so future
+    /// debug-assertions can match it against a shadow free-list; today
+    /// `release` only uses it for symmetry with `PoolAllocation::Drop`.
+    pool_offset: usize,
+    /// Pointer to the first byte of the carved region (== slab base
+    /// + `pool_offset`).
     base_ptr: *mut u8,
-    /// Bytes carved (the hard cap).
+    /// Bytes carved (the hard cap). This is the total reserved size,
+    /// distinct from any currently-grown visible window (`current_size`).
+    /// Passed to [`UnifiedMemoryPool::release`] alongside `pool_offset`.
     size: usize,
     /// Currently-visible (logical) size. `<= size`.
     current_size: usize,
     /// Hard cap exposed to Wasm. Equals `size`.
     max_size: usize,
+}
+
+impl Drop for PooledLinearMemory {
+    fn drop(&mut self) {
+        // Audit T6: mirror the `std::mem::forget(alloc)` side-effect onto our
+        // own teardown so the pool's `live` counter returns to zero once
+        // every pool-backed Wasm memory has been dropped. This is what makes
+        // `UnifiedMemoryPool::reset` runnable after the all-released-at-end
+        // teardown the pool documents — without this `Drop`, the leaked
+        // `PoolAllocation` kept `live` elevated forever, permanently blocking
+        // reset.
+        //
+        // Crucially, the bump pointer is NOT rewound here — only the live
+        // counter is decremented. Monotonic-bump semantics are preserved
+        // (any other `PooledLinearMemory` still alive keeps a valid
+        // `base_ptr`); the bump pointer only rewinds when the operator
+        // explicitly calls `reset()`, which is gated by `&mut self` and
+        // therefore impossible while any `Arc<UnifiedMemoryPool>` keepalive
+        // is held.
+        self.pool_keepalive.release(self.pool_offset, self.size);
+    }
 }
 
 impl std::fmt::Debug for PooledLinearMemory {
@@ -681,6 +729,13 @@ unsafe impl MemoryCreator for TensorWasmMemoryCreator {
             let carve_size = max.max(1);
             match pool.allocate(carve_size, WASM_PAGE) {
                 Ok(mut alloc) => {
+                    // Capture `(offset, size)` BEFORE we `mem::forget` the
+                    // PoolAllocation drop guard — these figures get handed to
+                    // `pool.release(...)` from `PooledLinearMemory::Drop` so
+                    // the pool's `live` counter walks back down on teardown
+                    // (audit T6). The bump pointer is not rewound by release;
+                    // monotonic-bump semantics are preserved.
+                    let pool_offset = alloc.offset();
                     let slice = alloc.as_mut_slice();
                     let base_ptr = slice.as_mut_ptr();
                     let size = slice.len();
@@ -688,38 +743,51 @@ unsafe impl MemoryCreator for TensorWasmMemoryCreator {
                     // The pool uses "batch reclaim" semantics (reset() succeeds
                     // only when live count is zero) and pool-backed linear
                     // memories are torn down together when the parent
-                    // TensorWasmMemoryCreator's Arc<UnifiedMemoryPool> drops. The
-                    // PoolAllocation's Drop would decrement the live counter;
-                    // we keep that counter as a leak-detection signal for misuse.
+                    // TensorWasmMemoryCreator's Arc<UnifiedMemoryPool> drops.
                     //
-                    // Trade-off: this prevents the pool from being reset while
-                    // ANY pooled memory exists. Caller's responsibility to drop
-                    // the creator (and thus the pool Arc) before reset.
+                    // Before audit T6, the leak was used to keep the live
+                    // counter permanently elevated as a misuse signal —
+                    // dropping the pool-backed memory had no effect on the
+                    // counter and `reset()` was therefore permanently blocked
+                    // once any pool-backed memory had been issued. That
+                    // blocked the legitimate "drop every issued memory then
+                    // reset" workflow operators expect for per-tenant slab
+                    // reuse.
+                    //
+                    // T6 fix: `PooledLinearMemory::Drop` now calls
+                    // `pool.release(pool_offset, size)` to mirror the
+                    // forgotten `PoolAllocation::Drop` — same effect on the
+                    // `live` counter (decrement), no effect on the bump
+                    // pointer (no rewind). The `mem::forget(alloc)` still
+                    // matters because the borrow-checker view of
+                    // `PoolAllocation` would otherwise tie us to a lifetime
+                    // `'p` over `&'p UnifiedMemoryPool`, which we cannot give
+                    // an owned `Arc`-keyed `LinearMemory`.
                     //
                     // The raw `base_ptr` remains valid because `pool_keepalive`
                     // holds the slab alive for the lifetime of the returned
                     // `PooledLinearMemory`, and the bump allocator never hands
-                    // the same byte range to another allocation.
+                    // the same byte range to another allocation until an
+                    // explicit `reset()` rewinds the bump pointer — which
+                    // requires `&mut UnifiedMemoryPool`, impossible while any
+                    // `Arc<UnifiedMemoryPool>` clone (including this one)
+                    // exists.
                     //
-                    // # One-shot teardown contract
+                    // # Teardown contract (audit T6)
                     //
-                    // Pool slabs that ever served a [`PooledLinearMemory`] are
-                    // single-shot for the lifetime of the pool, because
-                    // `PoolAllocation` drop guards are intentionally leaked
-                    // here to keep the bump pointer monotonic. The
-                    // `live_allocations()` counter therefore stays elevated
-                    // for the remaining lifetime of the pool — dropping the
-                    // `PooledLinearMemory` does NOT decrement it, and
-                    // [`UnifiedMemoryPool::reset`] will permanently refuse to
-                    // run on that pool. Operators wanting per-tenant resets
-                    // should use a per-tenant `UnifiedMemoryPool` instance
-                    // (one pool per tenant, drop the pool when the tenant
-                    // departs) rather than expecting reuse-with-reset on a
-                    // shared pool. See `tests/pool_teardown_contract.rs` for
-                    // the pinned behaviour.
+                    // Pool slabs that served a [`PooledLinearMemory`] become
+                    // reset-eligible once every issued memory has been
+                    // dropped: dropping a `PooledLinearMemory` decrements the
+                    // pool's `live` counter (without rewinding the bump
+                    // pointer), and once `live` reaches zero AND every
+                    // `Arc<UnifiedMemoryPool>` clone except the operator's
+                    // has been dropped, `Arc::get_mut(&mut pool).reset()`
+                    // succeeds. See `tests/pool_teardown_contract.rs` for the
+                    // pinned behaviour.
                     std::mem::forget(alloc);
                     return Ok(Box::new(PooledLinearMemory {
                         pool_keepalive: Arc::clone(pool),
+                        pool_offset,
                         base_ptr,
                         size,
                         current_size: minimum,
@@ -1142,7 +1210,12 @@ mod tests {
         assert!(mem.maximum_byte_size() == Some(128 * 1024));
         // Verify the pool's live count incremented (proving the carving path ran)
         assert_eq!(pool.live_allocations(), 1);
-        // Note: pool.reset() will fail until the leaked PoolAllocation count is
-        // cleared — by design (see SAFETY comment in new_memory).
+        // After audit T6: dropping `mem` decrements `live` back to 0 (the
+        // `PooledLinearMemory::Drop` impl calls `pool.release`). The bump
+        // pointer stays put — only `reset()` rewinds. See
+        // `tests/pool_teardown_contract.rs` for the end-to-end pinned
+        // behaviour.
+        drop(mem);
+        assert_eq!(pool.live_allocations(), 0);
     }
 }
