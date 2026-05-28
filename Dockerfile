@@ -4,10 +4,10 @@
 # Multi-stage Dockerfile producing tensor-wasm-api images for each
 # cust-successor backend:
 #
-#   docker build --build-arg BACKEND=cust       -t tensor-wasm:0.3.5-cust       .
-#   docker build --build-arg BACKEND=cudarc     -t tensor-wasm:0.3.5-cudarc     .
-#   docker build --build-arg BACKEND=cuda-oxide -t tensor-wasm:0.3.5-cuda-oxide .
-#   docker build                                -t tensor-wasm:0.3.5            .  # host-only (no CUDA)
+#   docker build --build-arg BACKEND=cust       -t tensor-wasm:0.3.6-cust       .
+#   docker build --build-arg BACKEND=cudarc     -t tensor-wasm:0.3.6-cudarc     .
+#   docker build --build-arg BACKEND=cuda-oxide -t tensor-wasm:0.3.6-cuda-oxide .
+#   docker build                                -t tensor-wasm:0.3.6            .  # host-only (no CUDA)
 #
 # The matching Helm chart `image.backend` value selects the right tag
 # at deploy time -- see deploy/helm/tensor-wasm/values.yaml and the
@@ -18,7 +18,7 @@
 # the v0.4 release-engineering workflow will invoke once the
 # ghcr.io/craton-co/tensor-wasm registry path is provisioned.
 #
-# Registry status as of v0.3.5: the ghcr.io path is NOT yet
+# Registry status as of v0.3.6: the ghcr.io path is NOT yet
 # provisioned -- operators consuming these images today must run
 # `docker build` locally + push to their own registry, or wait for
 # the v0.4 release pipeline. See deploy/helm/tensor-wasm/README.md
@@ -33,7 +33,7 @@ FROM rust:1.84-slim-bookworm AS builder
 
 ARG BACKEND
 # Re-declare inside the stage so it's available in RUN.
-ARG WORKSPACE_VERSION=0.3.5
+ARG WORKSPACE_VERSION=0.3.6
 
 # nightly-2026-04-03 matches rust-toolchain.toml + cuda-oxide's pin.
 # We install via rustup rather than relying on rust:nightly image so

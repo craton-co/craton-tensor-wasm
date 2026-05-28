@@ -8,7 +8,7 @@
 
 > A GPU-accelerated serverless WebAssembly runtime.
 
-**Status: v0.3.5 — released 2026-05-25.** Consolidates the implementable
+**Status: v0.3.6 — released 2026-05-27.** Consolidates the implementable
 items from the v0.2 / v0.3 / v0.4 PATH-TO-V1 milestones into a single
 shipped version.
 
@@ -20,18 +20,18 @@ cold-starts, and OpenTelemetry tracing wired end-to-end.
 
 ## Status
 
-**v0.3.5** — auth, observability, ops, and supply-chain hardening shipped.
+**v0.3.6** — auth, observability, ops, and supply-chain hardening shipped.
 The host-only execution path is solid (≈ 150 tests across 10 crates, all
 green on a CUDA-free developer laptop). CUDA-bound paths (real
 `cudaMallocManaged`, real PTX `ptxas` validation, real kernel launches)
 are gated behind `--features unified-memory` and exercised by the CUDA
 self-hosted runner once it lands (see `docs/CUDARC-SPIKE.md` for the
-concrete compile-friction status as of the 0.3.5 cut). See
+concrete compile-friction status as of the 0.3.6 cut). See
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) and
 [`bench-results/tail-latency.json`](bench-results/tail-latency.json) for
 the honest measured numbers.
 
-What 0.3.5 ships on top of 0.1.0:
+What 0.3.6 ships on top of 0.1.0:
 
 - **Auth & multi-tenancy.** Per-tenant scoped bearer tokens (W2.1) with
   `tenant_scope_denied` 403s; structured audit log opt-in via

@@ -43,7 +43,7 @@ publishes the images automatically on every `release: published` event.
   access on the repository cannot complete Steps 1 or 2.
 - **The Dockerfile at repo root builds clean** on a dev box. The C8
   Dockerfile (see [`../../Dockerfile`](../../Dockerfile)) was last
-  validated on the workspace at `0.3.5`; if more than one minor version
+  validated on the workspace at `0.3.6`; if more than one minor version
   has elapsed since this runbook was last executed, re-run
   `docker build -t tensor-wasm:smoke .` once before Step 3.
 - **A decision** on registry visibility: public (recommended for OSS
@@ -128,19 +128,19 @@ root, with the PAT from Step 2 already in `$GH_PAT`:
 
 ```sh
 # Build the host-only image at the current workspace version.
-docker build -t ghcr.io/craton-co/tensor-wasm:0.3.5-local .
+docker build -t ghcr.io/craton-co/tensor-wasm:0.3.6-local .
 
 # Log in to ghcr.io using the PAT, not your account password.
 echo "$GH_PAT" | docker login ghcr.io -u <sponsor-username> --password-stdin
 
 # Push. First push to a not-yet-existing repository creates the
 # package; the org-level permissions from Step 1 apply.
-docker push ghcr.io/craton-co/tensor-wasm:0.3.5-local
+docker push ghcr.io/craton-co/tensor-wasm:0.3.6-local
 ```
 
 After the push completes, open
 `https://github.com/orgs/craton-co/packages` — the
-`tensor-wasm` package should appear with the `0.3.5-local` tag. If it
+`tensor-wasm` package should appear with the `0.3.6-local` tag. If it
 does not, the most common cause is Step 1's "Inherit access from
 source repository" toggle never being saved (the UI does not always
 confirm); re-check and re-push.
@@ -149,7 +149,7 @@ Clean up the smoke image so it does not appear as a published version
 in the package's release history:
 
 ```sh
-# List versions to find the version ID for the 0.3.5-local tag.
+# List versions to find the version ID for the 0.3.6-local tag.
 gh api /orgs/craton-co/packages/container/tensor-wasm/versions
 
 # Delete by version ID (NOT by tag name; the API only accepts IDs).
@@ -158,7 +158,7 @@ gh api -X DELETE /orgs/craton-co/packages/container/tensor-wasm/versions/<ID>
 
 The smoke image deliberately uses the `-local` tag suffix so that even
 if the cleanup is forgotten, a downstream operator running
-`docker pull ghcr.io/craton-co/tensor-wasm:0.3.5` will not
+`docker pull ghcr.io/craton-co/tensor-wasm:0.3.6` will not
 accidentally land on the smoke build.
 
 ### Step 4 — wire the release workflow
@@ -257,11 +257,11 @@ TensorWasm build cache** and is not a member of the sponsor org. Any
 laptop, cloud VM, or CI runner outside `craton-co` works.
 
 ```sh
-docker pull ghcr.io/craton-co/tensor-wasm:0.3.5
-docker run --rm ghcr.io/craton-co/tensor-wasm:0.3.5 --version
+docker pull ghcr.io/craton-co/tensor-wasm:0.3.6
+docker run --rm ghcr.io/craton-co/tensor-wasm:0.3.6 --version
 ```
 
-Expected output: `tensor-wasm 0.3.5` (or whatever version was just
+Expected output: `tensor-wasm 0.3.6` (or whatever version was just
 released). If the pull returns `manifest unknown`, the publish-step
 matrix leg failed — check the workflow run; the most likely cause is
 the `packages: write` permission not being granted at the repo level
@@ -274,7 +274,7 @@ mode (the Dockerfile's default `CMD`):
 ```sh
 docker run -d --name twasm-smoke -p 8080:8080 \
     -e TENSOR_WASM_API_TOKENS='smoke:tenant=*' \
-    ghcr.io/craton-co/tensor-wasm:0.3.5
+    ghcr.io/craton-co/tensor-wasm:0.3.6
 # Wait the start-period (5s) plus one interval (10s).
 sleep 20
 docker inspect --format='{{.State.Health.Status}}' twasm-smoke
@@ -286,7 +286,7 @@ If the status reports `unhealthy`, the HEALTHCHECK is failing — most
 commonly because `curl` is not present in the runtime layer (the
 Dockerfile installs it implicitly via the `ca-certificates` package
 chain on Debian bookworm-slim; verify with
-`docker run --rm --entrypoint sh ghcr.io/craton-co/tensor-wasm:0.3.5 -c 'which curl'`).
+`docker run --rm --entrypoint sh ghcr.io/craton-co/tensor-wasm:0.3.6 -c 'which curl'`).
 
 ### Step 6 — update deploy docs
 
@@ -319,11 +319,11 @@ must track the workspace version, because the chart's default
 `image.tag` resolves through `appVersion` — a lag means `helm install`
 pulls the wrong image once the registry is provisioned. The current
 release-engineering convention is to bump them together (the chart's
-`appVersion` is at `0.3.5` matching the workspace as of 2026-05-25).
+`appVersion` is at `0.3.6` matching the workspace as of 2026-05-27).
 If a future workspace bump lands without the matching chart bump,
 recover with:
 
-1. Edit `Chart.yaml`: `appVersion: "0.3.5"` (or whatever the latest
+1. Edit `Chart.yaml`: `appVersion: "0.3.6"` (or whatever the latest
    released tag is).
 2. Bump the chart `version:` field by a patch step (chart-only change,
    no breaking value-key changes).
@@ -376,17 +376,17 @@ flag exists; the project convention is a label override):
 
 ```sh
 # Pull the EOL image.
-docker pull ghcr.io/craton-co/tensor-wasm:0.3.5
+docker pull ghcr.io/craton-co/tensor-wasm:0.3.6
 
 # Re-tag with a deprecation label and re-push.
-docker tag ghcr.io/craton-co/tensor-wasm:0.3.5 ghcr.io/craton-co/tensor-wasm:0.3.5-deprecated
+docker tag ghcr.io/craton-co/tensor-wasm:0.3.6 ghcr.io/craton-co/tensor-wasm:0.3.6-deprecated
 
 # Or use buildx imagetools to set OCI annotations without re-pushing the layers.
 docker buildx imagetools create \
     --annotation "io.craton.tensor-wasm.eol=2027-01-01" \
     --annotation "io.craton.tensor-wasm.successor=0.5.0" \
-    ghcr.io/craton-co/tensor-wasm:0.3.5 \
-    --tag ghcr.io/craton-co/tensor-wasm:0.3.5
+    ghcr.io/craton-co/tensor-wasm:0.3.6 \
+    --tag ghcr.io/craton-co/tensor-wasm:0.3.6
 ```
 
 The annotation surfaces in `docker manifest inspect` output and in
