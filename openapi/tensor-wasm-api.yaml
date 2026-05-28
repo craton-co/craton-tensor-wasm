@@ -96,6 +96,11 @@ paths:
       tags: [lifecycle]
       summary: Deploy a new Wasm module
       operationId: createFunction
+      description: |
+        The bearer token's `:tenant=` scope must cover the tenant supplied
+        via `X-TensorWasm-Tenant` (default 0). The resolved tenant is
+        recorded on the new record as its owner and gates every subsequent
+        invoke / delete; see the `FunctionRecord` schema.
       parameters:
         - $ref: "#/components/parameters/TenantHeader"
       requestBody:
@@ -121,7 +126,7 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
-          $ref: "#/components/responses/Forbidden"
+          $ref: "#/components/responses/TenantScopeDenied"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "429":
@@ -132,6 +137,11 @@ paths:
       tags: [lifecycle]
       summary: Delete a deployed function
       operationId: deleteFunction
+      description: |
+        Two-layer authorization: (1) the bearer token's `:tenant=` scope
+        must cover the tenant supplied via `X-TensorWasm-Tenant`, and
+        (2) the function's owning tenant (set at deploy time) must equal
+        that same tenant. Either mismatch returns `403 tenant_scope_denied`.
       parameters:
         - $ref: "#/components/parameters/FunctionId"
         - $ref: "#/components/parameters/TenantHeader"
@@ -145,6 +155,8 @@ paths:
               $ref: "#/components/headers/XTraceId"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/TenantScopeDenied"
         "404":
           $ref: "#/components/responses/NotFound"
         "429":
@@ -155,6 +167,11 @@ paths:
       tags: [invoke]
       summary: Invoke a function synchronously
       operationId: invokeFunction
+      description: |
+        Two-layer authorization: (1) the bearer token's `:tenant=` scope
+        must cover the tenant supplied via `X-TensorWasm-Tenant`, and
+        (2) the function's owning tenant (set at deploy time) must equal
+        that same tenant. Either mismatch returns `403 tenant_scope_denied`.
       parameters:
         - $ref: "#/components/parameters/FunctionId"
         - $ref: "#/components/parameters/TenantHeader"
@@ -185,7 +202,7 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
-          $ref: "#/components/responses/Forbidden"
+          $ref: "#/components/responses/TenantScopeDenied"
         "404":
           $ref: "#/components/responses/NotFound"
         "413":
@@ -202,6 +219,11 @@ paths:
       tags: [invoke]
       summary: Invoke a function asynchronously
       operationId: invokeFunctionAsync
+      description: |
+        Two-layer authorization: (1) the bearer token's `:tenant=` scope
+        must cover the tenant supplied via `X-TensorWasm-Tenant`, and
+        (2) the function's owning tenant (set at deploy time) must equal
+        that same tenant. Either mismatch returns `403 tenant_scope_denied`.
       parameters:
         - $ref: "#/components/parameters/FunctionId"
         - $ref: "#/components/parameters/TenantHeader"
@@ -231,7 +253,7 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
-          $ref: "#/components/responses/Forbidden"
+          $ref: "#/components/responses/TenantScopeDenied"
         "404":
           $ref: "#/components/responses/NotFound"
         "413":
@@ -359,6 +381,31 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ApiErrorEnvelope"
+    TenantScopeDenied:
+      description: |
+        The caller is not authorised to operate on the bound tenant. The
+        response body always uses `kind: "tenant_scope_denied"` and the
+        standard `ApiErrorEnvelope` shape. Two failure modes fold into
+        this status:
+
+        * **Token-scope mismatch.** The bearer token's `:tenant=` scope
+          does not cover `X-TensorWasm-Tenant`. Checked first so an
+          out-of-scope caller cannot probe id existence via a `404 vs 403`
+          split.
+        * **Resource-owner mismatch.** The token scope admits the bound
+          tenant, but the addressed `FunctionRecord` (or `JobRecord`) is
+          owned by a different tenant. This is the resource-layer check
+          added by the B1.9 follow-up: without it, a wildcard-scoped
+          caller from tenant B could touch tenant A's records.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        X-Trace-Id:
+          $ref: "#/components/headers/XTraceId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorEnvelope"
     NotFound:
       description: Function or job id is unknown
       headers:
@@ -460,6 +507,39 @@ components:
         id:
           $ref: "#/components/schemas/FunctionId"
       required: [id]
+      additionalProperties: false
+    FunctionRecord:
+      type: object
+      description: |
+        Server-side record of a deployed Wasm module. Mirrors the
+        `tensor_wasm_api::routes::FunctionRecord` Rust struct. The `wasm_bytes`
+        field is intentionally excluded from the wire form — the gateway
+        never echoes raw module bytes back. `tenant_id` records the
+        owning tenant resolved from `X-TensorWasm-Tenant` at deploy time;
+        invoke / delete handlers gate cross-tenant access on it (returning
+        `403 tenant_scope_denied` on a mismatch).
+      properties:
+        id:
+          $ref: "#/components/schemas/FunctionId"
+        tenant_id:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Owning tenant (u64), set at deploy time from the
+            `X-TensorWasm-Tenant` header. Defaults to 0 when the header is
+            absent. Compared against the bound tenant on every invoke /
+            delete; mismatch yields `403 tenant_scope_denied`.
+        name:
+          type: string
+          minLength: 1
+          description: Tenant-supplied display name, echoed back verbatim.
+        created_unix_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Millisecond-precision Unix timestamp of deploy.
+      required: [id, tenant_id, name, created_unix_ms]
       additionalProperties: false
     InvokeResult:
       type: object
