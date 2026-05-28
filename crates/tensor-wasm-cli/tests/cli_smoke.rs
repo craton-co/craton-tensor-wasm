@@ -180,6 +180,83 @@ fn run_executes_inline_wat_fixture() {
         .stdout(predicate::str::contains("ok"));
 }
 
+/// `--args` is parsed and validated but the values are not forwarded to
+/// `call_export` today (executor only supports `() -> ()`). When the
+/// caller passes a non-empty array we must emit a loud stderr warning so
+/// the user knows their arguments were silently dropped. Regression
+/// coverage for cli "Bug 1 — `run --args` silently dropped".
+#[test]
+fn run_warns_when_args_silently_dropped() {
+    let wat = r#"
+        (module
+            (func (export "add"))
+        )
+    "#;
+    let wasm = wat::parse_str(wat).expect("compile WAT fixture");
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let wasm_path = tmp.path().join("fixture.wasm");
+    std::fs::write(&wasm_path, &wasm).expect("write wasm fixture");
+
+    let assertion = tensor_wasm()
+        .args([
+            "run",
+            wasm_path.to_str().unwrap(),
+            "--export",
+            "add",
+            "--args",
+            "[1,2]",
+        ])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    // Use insta to pin the user-visible warning copy. The line is
+    // wrapped/joined into a single rendered string in the binary; the
+    // snapshot makes any future drift visible in code review.
+    let warning_line = stderr
+        .lines()
+        .find(|l| l.starts_with("warning: --args"))
+        .unwrap_or("");
+    insta::assert_snapshot!("run_args_dropped_warning", warning_line);
+    assert!(
+        stderr.contains("ignoring 2 argument(s)"),
+        "warning must name the dropped count, got: {stderr}"
+    );
+}
+
+/// Empty `--args '[]'` is a no-op: we still validate the JSON shape but
+/// must NOT emit the "silently dropped" warning, since the user is not
+/// actually passing arguments. The warning is reserved for the case where
+/// the user has a real expectation that the values will reach the guest.
+#[test]
+fn run_does_not_warn_for_empty_args_array() {
+    let wat = r#"
+        (module
+            (func (export "noop"))
+        )
+    "#;
+    let wasm = wat::parse_str(wat).expect("compile WAT fixture");
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let wasm_path = tmp.path().join("fixture.wasm");
+    std::fs::write(&wasm_path, &wasm).expect("write wasm fixture");
+
+    let assertion = tensor_wasm()
+        .args([
+            "run",
+            wasm_path.to_str().unwrap(),
+            "--export",
+            "noop",
+            "--args",
+            "[]",
+        ])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr);
+    assert!(
+        !stderr.contains("not forwarded to the guest"),
+        "empty array must not trigger the dropped-args warning, got: {stderr}"
+    );
+}
+
 /// `127.0.0.1:1` is reserved (TCPMUX) and never bound in our CI sandboxes,
 /// so every connect attempt fails fast. Used by the three HTTP-shaped
 /// subcommand tests below to prove the real `reqwest` code path runs without

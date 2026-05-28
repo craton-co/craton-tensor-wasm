@@ -664,6 +664,32 @@ async fn run_invoke(
     }))
 }
 
+/// JSON envelope accepted by `POST /functions/{id}/invoke` (and its async
+/// sibling).
+///
+/// Both fields are optional with `#[serde(default)]` so an empty body (or
+/// a body that omits one of them) still deserialises — the wire contract
+/// pinned in `docs/CLI.md` is `{"export": "main", "args": [...]}`, but
+/// existing CLI clients that post `{}` (or no body) must keep working.
+///
+/// **Current behaviour:** the handler does not yet thread these fields
+/// through to the executor — the invoke path still calls `_start`
+/// (falling back to `main`) with the `() -> ()` signature. The struct
+/// exists so the wire shape is fixed today; once api S-31's argument
+/// pass-through lands, the executor will consume `export` and `args`
+/// without a wire-protocol break for clients written against this
+/// release.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct InvokeRequest {
+    /// Name of the export to invoke. When absent or `None`, the handler
+    /// falls back to its built-in `_start` → `main` resolution.
+    pub export: Option<String>,
+    /// Arguments forwarded to the export. Currently ignored — the
+    /// executor only supports `() -> ()` signatures.
+    pub args: Option<Vec<serde_json::Value>>,
+}
+
 /// `POST /functions/{id}/invoke` — synchronous invocation.
 ///
 /// Looks up the function's stored Wasm bytes, spawns a fresh instance via
@@ -675,13 +701,21 @@ async fn run_invoke(
 /// The tenant id is sourced from the `X-TensorWasm-Tenant` middleware
 /// extension; absent it defaults to `TenantId(0)`.
 ///
-/// Body parsing intentionally omitted (api S-31): /invoke currently
-/// accepts no per-call arguments; the body will be re-added with a strict
-/// schema when argument passing lands. Until then, accepting any body
-/// would be a wasted-CPU DoS surface.
+/// **Body parsing (api S-31 follow-up):** the handler accepts the
+/// documented `{"export": "...", "args": [...]}` envelope via the
+/// [`InvokeRequest`] extractor. Both fields are `#[serde(default)]` so
+/// empty bodies (and `{}`) still parse. The fields are NOT yet threaded
+/// into the executor — the call path remains the `_start` → `main`
+/// fallback — but the wire shape is fixed today so clients written
+/// against the CLI keep working when argument pass-through lands. A
+/// malformed body (invalid JSON, wrong-shape values) is intentionally
+/// ignored rather than rejected: pre-S-31 callers that posted opaque
+/// filler must not start seeing 400s after this change. The strict
+/// `InvokeRequest` schema (no recovery into a `serde_json::Value` tree)
+/// keeps the DoS surface bounded.
 #[tracing::instrument(
     name = "http.invoke_function",
-    skip(state, auth),
+    skip(state, auth, body),
     fields(
         function_id = %id,
         tenant = tracing::field::Empty,
@@ -692,6 +726,7 @@ pub async fn invoke_function(
     Path(id): Path<Uuid>,
     tenant: Option<Extension<TenantId>>,
     auth: Option<Extension<crate::rate_limit::AuthContext>>,
+    body: Result<Json<InvokeRequest>, JsonRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
     tracing::Span::current().record("tenant", tracing::field::display(tenant));
@@ -702,6 +737,23 @@ pub async fn invoke_function(
     if let Some(Extension(ctx)) = auth.as_ref() {
         ctx.authorize_tenant(tenant)?;
     }
+
+    // Wire envelope: parsed when present and well-formed, treated as
+    // default otherwise. Empty/malformed bodies must NOT 400 — see the
+    // doc comment above for the api S-31 compatibility rationale. The
+    // one rejection we *do* still surface is `413 PAYLOAD_TOO_LARGE`:
+    // the `DefaultBodyLimit::max` cap is a security boundary and must
+    // not be silently swallowed by the envelope-tolerance shim.
+    // The parsed `export` and `args` are unused below today; once the
+    // executor learns to consume them this is the single place to
+    // thread them through.
+    let _envelope = match body {
+        Ok(Json(req)) => req,
+        Err(rej) if rej.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return Err(ApiError::body_too_large(rej.body_text()));
+        }
+        Err(_) => InvokeRequest::default(),
+    };
 
     // Snapshot the Wasm bytes under the DashMap shard lock, then drop the
     // guard before we hit any `.await`. `Arc::clone` is a single refcount
@@ -779,13 +831,14 @@ impl Drop for JobsActiveGuard {
 /// `Failed` (with `{kind, message}`) on conclusion. Callers poll via
 /// `GET /jobs/{id}`.
 ///
-/// Body parsing intentionally omitted (api S-31): /invoke currently
-/// accepts no per-call arguments; the body will be re-added with a strict
-/// schema when argument passing lands. Until then, accepting any body
-/// would be a wasted-CPU DoS surface.
+/// **Body parsing (api S-31 follow-up):** mirrors the synchronous
+/// handler — the [`InvokeRequest`] envelope is parsed when present but
+/// not yet threaded into the executor. Empty / malformed bodies fall
+/// back to default and the call proceeds, preserving wire-shape
+/// compatibility for pre-S-31 callers.
 #[tracing::instrument(
     name = "http.invoke_function_async",
-    skip(state, auth),
+    skip(state, auth, body),
     fields(
         function_id = %id,
         tenant = tracing::field::Empty,
@@ -797,12 +850,20 @@ pub async fn invoke_function_async(
     Path(id): Path<Uuid>,
     tenant: Option<Extension<TenantId>>,
     auth: Option<Extension<crate::rate_limit::AuthContext>>,
+    body: Result<Json<InvokeRequest>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
     tracing::Span::current().record("tenant", tracing::field::display(tenant));
     if let Some(Extension(ctx)) = auth.as_ref() {
         ctx.authorize_tenant(tenant)?;
     }
+    let _envelope = match body {
+        Ok(Json(req)) => req,
+        Err(rej) if rej.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return Err(ApiError::body_too_large(rej.body_text()));
+        }
+        Err(_) => InvokeRequest::default(),
+    };
     let wasm_bytes = match state.functions.get(&id) {
         Some(entry) => Arc::clone(&entry.value().wasm_bytes),
         None => return Err(ApiError::not_found(format!("function {id} not found"))),

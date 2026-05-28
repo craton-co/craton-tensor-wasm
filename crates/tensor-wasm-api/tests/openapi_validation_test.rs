@@ -510,6 +510,7 @@ fn spec_declares_required_component_schemas() {
         "Health",
         "CreateFunctionRequest",
         "CreateFunctionResponse",
+        "InvokeRequest",
         "InvokeResult",
         "InvokeAsyncResponse",
         "JobStatus",

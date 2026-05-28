@@ -1,16 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
 
-//! Regression coverage for api S-31: the `/invoke` and `/invoke-async`
-//! handlers must not parse the request body. Historically both handlers
-//! accepted `_args: Result<Json<serde_json::Value>, JsonRejection>`, which
-//! still allocated a full `serde_json::Value` tree (up to the 64 MiB
-//! tower-http cap) on every request and immediately discarded it — a
-//! wasted-CPU DoS surface.
+//! Regression coverage for api S-31 and the CLI Bug 2 follow-up:
+//! `/invoke` and `/invoke-async` accept the documented
+//! `{"export": "...", "args": [...]}` envelope but must remain tolerant
+//! of bodies that predate the envelope's introduction. Specifically:
 //!
-//! These tests post real bodies (well-formed and deliberately malformed)
-//! and assert the response is not a JSON-parse error, proving the body
-//! never reaches a `Json<_>` extractor.
+//! 1. Well-formed JSON bodies that omit (or carry extras alongside) the
+//!    envelope fields must still produce a 200 / 202 success — pre-fix
+//!    callers that posted `{"filler": "..."}` or `{}` keep working.
+//! 2. Malformed JSON bodies must NOT surface as `invalid_json` 400.
+//!    The handler uses `Result<Json<InvokeRequest>, JsonRejection>` and
+//!    silently falls back to `InvokeRequest::default()` on any parse
+//!    failure (with the sole exception of `413 PAYLOAD_TOO_LARGE`, which
+//!    remains a security boundary and must surface).
+//!
+//! These properties combined keep the per-request CPU cost bounded
+//! (`InvokeRequest` is a strict, two-field struct — no recovery into a
+//! `serde_json::Value` tree of arbitrary depth) while pinning the wire
+//! shape so clients written today keep working when api S-31's argument
+//! pass-through lands.
 
 use std::sync::Arc;
 
