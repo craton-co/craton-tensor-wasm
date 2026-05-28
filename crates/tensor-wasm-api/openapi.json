@@ -141,10 +141,7 @@
           "required": false,
           "content": {
             "application/json": {
-              "schema": {
-                "type": "object",
-                "description": "Arbitrary JSON payload threaded through as the invocation argument. The v0.x executor ignores the value; the field is reserved for future use."
-              }
+              "schema": { "$ref": "#/components/schemas/InvokeRequest" }
             }
           }
         },
@@ -185,10 +182,7 @@
           "required": false,
           "content": {
             "application/json": {
-              "schema": {
-                "type": "object",
-                "description": "Arbitrary JSON payload, same shape as the synchronous invoke endpoint."
-              }
+              "schema": { "$ref": "#/components/schemas/InvokeRequest" }
             }
           }
         },
@@ -422,6 +416,22 @@
           "id": { "$ref": "#/components/schemas/FunctionId" }
         },
         "required": ["id"],
+        "additionalProperties": false
+      },
+      "InvokeRequest": {
+        "type": "object",
+        "description": "Wire envelope for synchronous and asynchronous invocation. Both fields are optional and the server tolerates empty / missing bodies; clients written today must use this shape so they keep working when api S-31 wires `args` through to the executor.",
+        "properties": {
+          "export": {
+            "type": "string",
+            "description": "Name of the exported function to call. When omitted, the server falls back to its built-in `_start` → `main` resolution."
+          },
+          "args": {
+            "type": "array",
+            "items": {},
+            "description": "Arguments forwarded to the export. Currently ignored — the executor only supports `() -> ()` signatures."
+          }
+        },
         "additionalProperties": false
       },
       "InvokeResult": {

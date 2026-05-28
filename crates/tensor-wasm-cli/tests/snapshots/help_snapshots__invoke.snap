@@ -12,6 +12,7 @@ Arguments:
 
 Options:
       --server <SERVER>  Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
+      --export <EXPORT>  Name of the exported function to call on the deployed module. Defaults to `_start` (WASI command convention); the server falls back to `main` when `_start` is absent [default: _start]
       --tenant <TENANT>  Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
       --args <ARGS>      Arguments forwarded to the function, encoded as a JSON array
   -h, --help             Print help

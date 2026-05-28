@@ -44,8 +44,33 @@ pub async fn run(args: RunArgs) -> Result<()> {
         // Validate that --args is well-formed JSON; surface parse errors early.
         let parsed: serde_json::Value = serde_json::from_str(json)
             .with_context(|| format!("--args value is not valid JSON: {json}"))?;
-        if !parsed.is_array() {
-            anyhow::bail!("--args must be a JSON array, got {}", parsed);
+        let arr = match parsed.as_array() {
+            Some(a) => a,
+            None => anyhow::bail!("--args must be a JSON array, got {}", parsed),
+        };
+        // Loud warning when the user passes arguments that the executor will
+        // silently drop. `call_export` currently only invokes `() -> ()`
+        // signatures, so any non-empty `--args` payload is parsed, validated,
+        // then discarded — historically this manifested as "I passed args
+        // and got `ok`, where did they go?". Emit on both stderr (for users
+        // running the binary directly) and `tracing::warn!` (for users with
+        // a subscriber wired up); the duplication is intentional so the
+        // warning is impossible to miss in either context.
+        let n = arr.len();
+        if n > 0 {
+            eprintln!(
+                "warning: --args is parsed but not forwarded to the guest \
+                 export (signature () -> () currently); ignoring {n} \
+                 argument(s). See \
+                 https://github.com/craton-co/craton-tensor-wasm/issues/XXX \
+                 for status."
+            );
+            tracing::warn!(
+                target: "tensor_wasm_cli::run",
+                ignored = n,
+                "--args parsed but not forwarded to guest export \
+                 (signature () -> () currently)",
+            );
         }
     }
 
