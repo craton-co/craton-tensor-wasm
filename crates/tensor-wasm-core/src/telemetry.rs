@@ -27,7 +27,13 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// `Auto` reads the `TENSOR_WASM_LOG` environment variable (or `RUST_LOG` if `TENSOR_WASM_LOG`
 /// is unset), falling back to `info` if neither is set. The other variants pin
 /// the level explicitly, primarily for tests.
+///
+/// **Non-exhaustive**: callers MUST use `..` in `match` arms so a future
+/// minor release that adds a level (e.g. a hypothetical `Off` variant)
+/// does not break downstream code. The enum has no `Default` impl —
+/// construct variants explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LogLevel {
     /// Read from environment (`TENSOR_WASM_LOG` first, then `RUST_LOG`).
     Auto,
@@ -353,8 +359,14 @@ fn run_otlp_init(level: LogLevel, json: bool, otlp_env_var: &str) -> Result<(), 
 /// [`INIT_OTLP_RESULT`] and replayed verbatim to every subsequent caller.
 /// Without that, repeat callers would silently see `Ok(false)` even when
 /// the original initialisation had failed.
+///
+/// **Non-exhaustive**: callers MUST use `..` in `match` arms so a future
+/// minor release that adds a failure mode (e.g. a separate
+/// `PropagatorRejected` variant) does not break downstream code. The
+/// enum has no `Default` impl — construct variants explicitly.
 #[cfg(feature = "otlp")]
 #[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
 pub enum OtlpInitError {
     /// The OTLP exporter could not be built.
     #[error("OTLP exporter build failed: {0}")]

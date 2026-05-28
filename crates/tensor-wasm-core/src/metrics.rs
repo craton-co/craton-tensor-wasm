@@ -60,7 +60,14 @@ pub const DEFAULT_HTTP_DURATION_BUCKETS_SECONDS: [f64; 12] = [
 /// 3-digit status codes) without per-request `String` allocations.
 /// Construction via the public fields is still permitted as an escape
 /// hatch — the validated path is preferred.
+///
+/// **Non-exhaustive**: callers MUST use `..` in `match` patterns and
+/// cannot construct via a struct literal that exhaustively names every
+/// field. Use [`HttpRequestLabels::new`] (or the validated
+/// [`HttpRequestLabels::try_new`]) so adding a new label field in a
+/// future minor release is non-breaking.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+#[non_exhaustive]
 pub struct HttpRequestLabels {
     /// Axum route template that matched the request (e.g. `/functions/:id/invoke`).
     /// Never the substituted value — see crate-level docs on cardinality.
@@ -154,7 +161,13 @@ pub fn registered_route_allowlist() -> Option<Arc<RouteAllowlist>> {
 
 /// Errors returned by [`HttpRequestLabels::try_new`] when a candidate
 /// label tuple would inflate metric cardinality past the bounded set.
+///
+/// **Non-exhaustive**: callers MUST use `..` in `match` arms so new
+/// validation error variants added in a future minor release do not break
+/// downstream code. The enum has no `Default` impl — construct variants
+/// explicitly.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LabelError {
     /// The supplied `route` value is not present in the registered
     /// [`RouteAllowlist`]. Carries the offending string for diagnostic
@@ -249,6 +262,27 @@ mod once_cell_table {
 }
 
 impl HttpRequestLabels {
+    /// Construct a [`HttpRequestLabels`] from already-validated label
+    /// components.
+    ///
+    /// This is the non-validating constructor — useful when the caller
+    /// has already proven the values are bounded (e.g. tests, or code
+    /// that constructed them by some path other than user input). For
+    /// the validated/allocation-free path use [`Self::try_new`] instead.
+    /// Exists primarily so callers do not have to name every field of a
+    /// `#[non_exhaustive]` struct directly.
+    pub fn new(
+        route: impl Into<Cow<'static, str>>,
+        method: impl Into<Cow<'static, str>>,
+        status: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            route: route.into(),
+            method: method.into(),
+            status: status.into(),
+        }
+    }
+
     /// Build a validated [`HttpRequestLabels`] from caller-supplied
     /// route / method / status values.
     ///
@@ -330,12 +364,40 @@ impl HttpRequestLabels {
 /// Drops `status` (in-flight requests have not produced a status yet) and
 /// keeps `route` + `method` for the same cardinality bound as
 /// [`HttpRequestLabels`].
+///
+/// Fields are `Cow<'static, str>` so callers that already hold a
+/// `&'static str` (the common case — axum route templates and HTTP verbs
+/// are compile-time constants) can hand it in as a zero-copy
+/// `Cow::Borrowed` instead of paying a `String` allocation on every
+/// request. The sibling [`HttpRequestLabels`] uses the same pattern.
+///
+/// **Non-exhaustive**: callers MUST use `..` in `match` patterns and
+/// construct via [`HttpInFlightLabels::new`] (or `..Default::default()`
+/// — not available, this struct has no `Default` impl) so adding a new
+/// label field in a future minor release is non-breaking.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+#[non_exhaustive]
 pub struct HttpInFlightLabels {
     /// Axum route template that matched the request.
-    pub route: String,
+    pub route: Cow<'static, str>,
     /// HTTP method (`GET`, `POST`, `DELETE`).
-    pub method: String,
+    pub method: Cow<'static, str>,
+}
+
+impl HttpInFlightLabels {
+    /// Construct a [`HttpInFlightLabels`] from already-validated label
+    /// components. Exists so callers do not have to name every field of
+    /// a `#[non_exhaustive]` struct and can pass `&'static str` literals
+    /// without writing `Cow::Borrowed(...)` themselves.
+    pub fn new(
+        route: impl Into<Cow<'static, str>>,
+        method: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            route: route.into(),
+            method: method.into(),
+        }
+    }
 }
 
 /// Label set for `tensor_wasm_gpu_memory_bytes_per_tenant`.
@@ -357,12 +419,36 @@ pub struct HttpInFlightLabels {
 /// per-tenant breakdown of `tensor_wasm_jobs_active` planned for v0.4
 /// is expected to reuse this exact label shape so a single relabel rule
 /// covers both series.
+///
+/// Fields are `Cow<'static, str>` so callers that hold the tenant
+/// rendering as an owned `String` (the common case — `TenantId::Display`
+/// allocates) can hand it in as `Cow::Owned`, while tests and codepaths
+/// that already hold a `&'static str` ID can avoid the allocation
+/// entirely. The sibling [`HttpRequestLabels`] uses the same pattern.
+///
+/// **Non-exhaustive**: callers MUST use `..` in `match` patterns and
+/// construct via [`TenantLabels::new`] so adding a new dimension to the
+/// tenant breakdown in a future minor release is non-breaking.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+#[non_exhaustive]
 pub struct TenantLabels {
     /// Server-allocated tenant id rendered via [`crate::types::TenantId`]'s
     /// `Display` impl (e.g. `"T#42"`). Never user-supplied — the API
     /// layer assigns these monotonically when a tenant first appears.
-    pub tenant_id: String,
+    pub tenant_id: Cow<'static, str>,
+}
+
+impl TenantLabels {
+    /// Construct a [`TenantLabels`] from a tenant-id rendering. Accepts
+    /// any value convertible into `Cow<'static, str>` so callers can
+    /// pass a `String` (owned) or a `&'static str` (borrowed) without
+    /// re-wrapping. Exists so callers do not have to name every field
+    /// of a `#[non_exhaustive]` struct directly.
+    pub fn new(tenant_id: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+        }
+    }
 }
 
 /// Label set for `tensor_wasm_build_info`.
@@ -374,7 +460,14 @@ pub struct TenantLabels {
 /// trivially bounded. The values come from compile-time `env!()` lookups
 /// driven by `tensor-wasm-core/build.rs`; see that script for the
 /// source-of-truth contract per field.
+///
+/// **Non-exhaustive**: callers MUST use `..` in `match` patterns and
+/// construct via [`BuildInfoLabels::new`] so adding a new build-info
+/// dimension (e.g. a `host_arch` label) in a future minor release is
+/// non-breaking. The crate-provided helper
+/// [`current_build_info_labels`] is the production source of values.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+#[non_exhaustive]
 pub struct BuildInfoLabels {
     /// Crate / binary semver, taken from `CARGO_PKG_VERSION` at compile
     /// time (the workspace-wide `[workspace.package] version` pin).
@@ -393,6 +486,28 @@ pub struct BuildInfoLabels {
     /// `x86_64-unknown-linux-gnu`), or `"unknown"` if the build script
     /// could not read `TARGET` from its environment.
     pub target: String,
+}
+
+impl BuildInfoLabels {
+    /// Construct a [`BuildInfoLabels`] from the five build-identity
+    /// components. Exists so callers do not have to name every field of
+    /// a `#[non_exhaustive]` struct directly; the typical production
+    /// path is the crate-provided [`current_build_info_labels`] helper.
+    pub fn new(
+        version: impl Into<String>,
+        git_sha: impl Into<String>,
+        rustc_version: impl Into<String>,
+        profile: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
+        Self {
+            version: version.into(),
+            git_sha: git_sha.into(),
+            rustc_version: rustc_version.into(),
+            profile: profile.into(),
+            target: target.into(),
+        }
+    }
 }
 
 /// All TensorWasm metrics collected behind a single [`Registry`].
@@ -498,7 +613,14 @@ impl prometheus_client::metrics::family::MetricConstructor<Histogram> for HttpDu
 /// The histogram is intentionally omitted because `prometheus-client` does
 /// not expose a public accessor for the internal bucket state — to inspect
 /// kernel latency, use [`TensorWasmMetrics::encode_text`] and parse the output.
+///
+/// **Non-exhaustive**: callers MUST use `..` in struct-pattern matches and
+/// construct via `Self { ..Default::default() }` once a `Default` impl is
+/// added, or by snapshotting an existing [`TensorWasmMetrics`] via
+/// [`TensorWasmMetrics::stats`]. Adding a new counter field in a future
+/// minor release is non-breaking under this attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TensorWasmMetricsStats {
     /// Current value of `tensor_wasm_active_instances`.
     pub active_instances: i64,
@@ -888,8 +1010,8 @@ mod tests {
             .get_or_create(&labels)
             .observe(0.002);
         let in_flight_labels = HttpInFlightLabels {
-            route: "/healthz".to_string(),
-            method: "GET".to_string(),
+            route: Cow::Borrowed("/healthz"),
+            method: Cow::Borrowed("GET"),
         };
         m.http_requests_in_flight()
             .get_or_create(&in_flight_labels)
@@ -922,9 +1044,9 @@ mod tests {
     fn http_request_buckets_overridable() {
         let m = TensorWasmMetrics::with_http_buckets([0.5f64, 1.0, 2.0]);
         let labels = HttpRequestLabels {
-            route: "/x".to_string(),
-            method: "GET".to_string(),
-            status: "200".to_string(),
+            route: Cow::Borrowed("/x"),
+            method: Cow::Borrowed("GET"),
+            status: Cow::Borrowed("200"),
         };
         m.http_request_duration_seconds()
             .get_or_create(&labels)
@@ -1203,8 +1325,8 @@ mod tests {
         // (same contract as the W2.3 HTTP families). Prime two distinct
         // tenants and assert both series appear with the expected values.
         let m = TensorWasmMetrics::new();
-        let t1 = TenantLabels { tenant_id: "T#1".to_string() };
-        let t2 = TenantLabels { tenant_id: "T#2".to_string() };
+        let t1 = TenantLabels { tenant_id: Cow::Borrowed("T#1") };
+        let t2 = TenantLabels { tenant_id: Cow::Borrowed("T#2") };
         m.gpu_memory_bytes_per_tenant().get_or_create(&t1).set(4096);
         m.gpu_memory_bytes_per_tenant().get_or_create(&t2).set(8192);
         let s = m.encode_text();

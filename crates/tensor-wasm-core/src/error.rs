@@ -39,12 +39,30 @@ use thiserror::Error;
 
 use crate::types::TenantId;
 
+/// Returns a short, stable name for an [`std::io::ErrorKind`] suitable for
+/// the sanitised `Display` of [`TensorWasmError::Io`].
+///
+/// Uses `Debug` formatting to surface the variant identifier
+/// (`"NotFound"`, `"PermissionDenied"`, ...) rather than the prose
+/// `Display` form (`"entity not found"`, ...) — the variant name is what
+/// dashboards, alert rules, and operators grep for. The set of returned
+/// strings is closed and tracks the upstream `std::io::ErrorKind` enum.
+fn io_kind_name(err: &io::Error) -> String {
+    format!("{:?}", err.kind())
+}
+
 /// The unified error type for every TensorWasm crate.
 ///
 /// Variants are deliberately broad — host-level code matches on the variant to
 /// classify failures into tenant-facing vs operator-facing responses. Inner
 /// error sources are preserved via `#[source]` chains.
+///
+/// **Non-exhaustive**: callers MUST use `..` in `match` arms so new variants
+/// added in a future minor release do not break downstream code. The enum has
+/// no `Default` impl, so the `Self { .., ..Default::default() }` pattern does
+/// not apply here — construct variants explicitly.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TensorWasmError {
     /// A call into the CUDA driver or runtime failed.
     ///
@@ -107,7 +125,17 @@ pub enum TensorWasmError {
     },
 
     /// An I/O error from the host OS.
-    #[error("I/O error: {0}")]
+    ///
+    /// **`Display` is intentionally sanitised.** `std::io::Error::Display`
+    /// echoes the underlying OS error string and — when the error was built
+    /// from a filesystem operation — frequently includes the offending path.
+    /// Both are unsafe to render into a tenant-facing 4xx body. The
+    /// sanitised `Display` here surfaces only the `ErrorKind` discriminant
+    /// (e.g. `"NotFound"`, `"PermissionDenied"`) which is a closed,
+    /// non-sensitive enum. The inner `io::Error` remains reachable through
+    /// `Debug` and via [`std::error::Error::source`] for server-side
+    /// operator logs.
+    #[error("I/O error (kind: {})", io_kind_name(.0))]
     Io(#[from] io::Error),
 
     /// A (de)serialisation error.
@@ -255,10 +283,20 @@ mod tests {
 
     #[test]
     fn display_io() {
+        // The sanitised `Display` surfaces the `ErrorKind` variant name but
+        // MUST NOT echo the inner OS string (which routinely carries
+        // filesystem paths and host-specific diagnostic text). See the
+        // regression test in `tests/error_display_does_not_leak.rs` for
+        // the leak-shaped assertions; this inline test pins the exact
+        // shape of the sanitised render.
         let e = TensorWasmError::Io(io::Error::new(io::ErrorKind::NotFound, "missing"));
         let s = format!("{e}");
         assert!(s.contains("I/O error"));
-        assert!(s.contains("missing"));
+        assert!(s.contains("NotFound"));
+        assert!(
+            !s.contains("missing"),
+            "Display must not leak the inner OS string, got: {s}",
+        );
     }
 
     #[test]

@@ -690,9 +690,7 @@ impl TenantContextBuilder {
         #[cfg(not(feature = "cuda"))]
         let cu_context = ();
 
-        let metrics_labels = TenantLabels {
-            tenant_id: self.tenant_id.to_string(),
-        };
+        let metrics_labels = TenantLabels::new(self.tenant_id.to_string());
         TenantContext {
             tenant_id: self.tenant_id,
             isolation: self.isolation,
@@ -884,9 +882,7 @@ mod tests {
             .with_memory_quota_bytes(1 << 20)
             .with_metrics(metrics.clone())
             .build();
-        let labels = TenantLabels {
-            tenant_id: TenantId(12).to_string(),
-        };
+        let labels = TenantLabels::new(TenantId(12).to_string());
 
         // Consume → gauge reads the post-add total.
         ctx.consume_bytes(4096).unwrap();
@@ -957,9 +953,7 @@ mod tests {
         // Underflow path: release without prior consume. The counter
         // clamps to zero and the gauge should reflect zero, not wrap.
         ctx.release_bytes(123);
-        let labels = TenantLabels {
-            tenant_id: TenantId(13).to_string(),
-        };
+        let labels = TenantLabels::new(TenantId(13).to_string());
         assert_eq!(
             metrics
                 .gpu_memory_bytes_per_tenant()

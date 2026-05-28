@@ -60,6 +60,11 @@ fn classify(r: &Result<bool, OtlpInitError>) -> Kind {
         Ok(false) => Kind::OkFalse,
         Err(OtlpInitError::Exporter(_)) => Kind::ErrExporter,
         Err(OtlpInitError::AlreadyInitialized) => Kind::ErrAlreadyInitialized,
+        // `OtlpInitError` is `#[non_exhaustive]`; if a new variant is added
+        // upstream this branch keeps the test compiling — the new variant
+        // is grouped under whichever existing `Kind` is closest in
+        // operator-visible behaviour, and the test author can revisit.
+        Err(_) => Kind::ErrExporter,
     }
 }
 
