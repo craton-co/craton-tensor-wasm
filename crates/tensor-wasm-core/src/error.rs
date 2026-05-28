@@ -233,21 +233,13 @@ impl TensorWasmError {
     /// because the API layer otherwise returns `503` for hard 404-class
     /// failures and the CLI's retry loop spins on doomed requests.
     pub fn is_retryable(&self) -> bool {
-<<<<<<< HEAD
         match self {
-            TensorWasmError::KernelTimeout { .. } | TensorWasmError::MemoryExhausted { .. } => true,
+            TensorWasmError::KernelTimeout { .. }
+            | TensorWasmError::MemoryExhausted { .. }
+            | TensorWasmError::GpuMemoryExhausted { .. } => true,
             TensorWasmError::Io(err) => is_retryable_io_kind(err.kind()),
             _ => false,
         }
-=======
-        matches!(
-            self,
-            TensorWasmError::KernelTimeout { .. }
-                | TensorWasmError::Io(_)
-                | TensorWasmError::MemoryExhausted { .. }
-                | TensorWasmError::GpuMemoryExhausted { .. }
-        )
->>>>>>> worktree-agent-ab4d4301706272b03
     }
 
     /// Returns the inner diagnostic string for the four variants that wrap a
