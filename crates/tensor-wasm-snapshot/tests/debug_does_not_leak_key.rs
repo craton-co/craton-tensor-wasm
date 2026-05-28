@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
+
 //! Regression test for the HMAC-key Debug-leak finding (snapshot 3.3).
 //!
 //! `SnapshotWriter` and `SnapshotReader` derived `Debug` over their

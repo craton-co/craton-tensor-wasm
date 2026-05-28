@@ -34,6 +34,10 @@ subtle = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Property-based roundtrip coverage — see `tests/roundtrip_proptest.rs`.
+# Pulled in only at test time so the published crate retains its current
+# dep surface.
+proptest = { workspace = true }
 
 [features]
 default = ["signed-snapshots"]

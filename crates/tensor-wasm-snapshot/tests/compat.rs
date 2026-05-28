@@ -85,7 +85,7 @@ fn load_fixture(name: &str) -> Vec<u8> {
 }
 
 #[test]
-
+#[ignore = "requires committed golden fixtures; see crates/tensor-wasm-snapshot/tests/fixtures/README.md"]
 fn minimal_golden_restores_under_current_reader() {
     let bytes = load_fixture(MINIMAL_FIXTURE);
     let restored = SnapshotReader::new()
@@ -106,7 +106,7 @@ fn minimal_golden_restores_under_current_reader() {
 }
 
 #[test]
-
+#[ignore = "requires committed golden fixtures; see crates/tensor-wasm-snapshot/tests/fixtures/README.md"]
 fn rich_golden_restores_under_current_reader() {
     let bytes = load_fixture(RICH_FIXTURE);
     let restored = SnapshotReader::new()
@@ -133,7 +133,7 @@ fn rich_golden_restores_under_current_reader() {
 /// changes [`SNAPSHOT_MAGIC`] or [`SNAPSHOT_VERSION`] without bumping the
 /// fixture, this assertion fails before the round-trip test even runs.
 #[test]
-
+#[ignore = "requires committed golden fixtures; see crates/tensor-wasm-snapshot/tests/fixtures/README.md"]
 fn raw_magic_and_version_match_source_constants() {
     let bytes = load_fixture(MINIMAL_FIXTURE);
     let decompressed = zstd::decode_all(bytes.as_slice()).expect("zstd decode golden");
@@ -191,7 +191,7 @@ fn raw_magic_and_version_match_source_constants() {
 /// the "unknown version" branch regardless of which supported version the
 /// fixture was minted against.
 #[test]
-
+#[ignore = "requires committed golden fixtures; see crates/tensor-wasm-snapshot/tests/fixtures/README.md"]
 fn bumped_version_byte_is_rejected() {
     use tensor_wasm_snapshot::format::SNAPSHOT_VERSION_V3;
 
