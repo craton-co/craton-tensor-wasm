@@ -502,6 +502,12 @@ impl TenantLabels {
     /// different prefix and silently splitting a tenant's series into
     /// two label values on the dashboard.
     pub fn from_tenant_id(id: crate::types::TenantId) -> Self {
+        // PERF: hot-path allocation. Audit flagged this as re-formatting
+        // `T#{id}` on every call; a `DashMap<TenantId, &'static str>` cache
+        // (cf. `StatusTable` at line ~292 for the `Box::leak` pattern) would
+        // amortise the format + heap allocation to once per distinct tenant.
+        // Deferred: `dashmap` is not a dep of `tensor-wasm-core` and adding it
+        // exceeds the scope of a self-contained perf change.
         Self::new(format!("T#{}", id.get()))
     }
 }
@@ -1016,7 +1022,10 @@ impl TensorWasmMetrics {
 
     /// Render the registry as a Prometheus text-format exposition document.
     pub fn encode_text(&self) -> String {
-        let mut out = String::new();
+        // PERF: scrape payloads are in the tens of KB; pre-sizing to 8 KiB
+        // avoids 2-3 reallocations per scrape on the typical hot path while
+        // costing only a single page of slack for the smallest registries.
+        let mut out = String::with_capacity(8 * 1024);
         let registry = self.inner.registry.lock();
         encode(&mut out, &registry).expect("text encoding into a String cannot fail");
         out
