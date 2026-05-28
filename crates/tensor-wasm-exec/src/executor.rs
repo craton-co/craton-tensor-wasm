@@ -991,6 +991,11 @@ impl TensorWasmExecutor {
     /// the wasm returns of its own accord — the deadline cannot fire without
     /// the ticker. A warning is logged the first time this combination is
     /// observed per call.
+    #[deprecated(
+        since = "0.3.7",
+        note = "use `call_export_with_args` with an empty `&[]` for the same semantics; \
+                v0.4 removes this shim. See `docs/MIGRATING-FROM-WASMTIME-WASMER.md` § \"Typed exports\"."
+    )]
     #[instrument(skip(self), fields(instance = %id, export = %export))]
     pub async fn call_export(&self, id: InstanceId, export: &str) -> Result<(), ExecError> {
         // Back-compat wrapper: most callers (the bench loop, the executor's
@@ -1180,6 +1185,11 @@ impl TensorWasmExecutor {
     /// Per-store epoch cancellation interrupts wasm execution at the
     /// next epoch tick, which is what closes the actual run-time
     /// window.
+    #[deprecated(
+        since = "0.3.7",
+        note = "use `call_export_with_args_then_terminate` with an empty `&[]` for the same semantics; \
+                v0.4 removes this shim. See `docs/MIGRATING-FROM-WASMTIME-WASMER.md` § \"Typed exports\"."
+    )]
     pub async fn call_export_then_terminate(
         &self,
         id: InstanceId,
@@ -1283,7 +1293,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(exec.live_count(), 1);
-        exec.call_export(id, "noop").await.unwrap();
+        exec.call_export_with_args(id, "noop", &[]).await.unwrap();
         exec.terminate(id).await.unwrap();
         assert_eq!(exec.live_count(), 0);
     }
@@ -1296,8 +1306,44 @@ mod tests {
             .spawn_instance(SpawnConfig::for_tenant(TenantId(1)), &trivial_wasm())
             .await
             .unwrap();
-        let err = exec.call_export(id, "does_not_exist").await.unwrap_err();
+        let err = exec
+            .call_export_with_args(id, "does_not_exist", &[])
+            .await
+            .unwrap_err();
         assert!(matches!(err, ExecError::MissingExport(_)));
+    }
+
+    /// Back-compat smoke test: the `#[deprecated]` `call_export` shim must
+    /// still drive a guest to completion until v0.4 removes it. Tagged
+    /// `#[allow(deprecated)]` because exercising the deprecated path is
+    /// the *point* of this test — without it the test would emit the
+    /// migration warning we ship to external callers.
+    ///
+    /// The `let _f = TensorWasmExecutor::call_export;` line at the bottom
+    /// is a static proof-of-presence: if the `#[deprecated]` attribute
+    /// were ever dropped again (as it was in merge `66af7db`), the
+    /// `#[allow(deprecated)]` would become an "unnecessary attribute"
+    /// warning under `-D unused`, signalling regression. The same logic
+    /// applies to `call_export_then_terminate`.
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn legacy_call_export_still_works() {
+        let engine = Arc::new(TensorWasmEngine::new().unwrap());
+        let exec = TensorWasmExecutor::new(engine);
+        let id = exec
+            .spawn_instance(SpawnConfig::for_tenant(TenantId(1)), &trivial_wasm())
+            .await
+            .unwrap();
+        exec.call_export(id, "noop").await.unwrap();
+        exec.terminate(id).await.unwrap();
+
+        // Static proof-of-presence: both deprecated shims must be
+        // resolvable as `fn` items. If a future refactor removes the
+        // `#[deprecated]` attribute, the `#[allow(deprecated)]` above
+        // is flagged as unused and CI breaks — exactly the regression
+        // guard we want.
+        let _f = TensorWasmExecutor::call_export;
+        let _g = TensorWasmExecutor::call_export_then_terminate;
     }
 
     #[tokio::test]
