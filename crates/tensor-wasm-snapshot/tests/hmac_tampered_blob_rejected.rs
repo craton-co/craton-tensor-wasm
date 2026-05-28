@@ -41,9 +41,12 @@ fn tampered_wasm_memory_with_refixed_crc_is_rejected() {
     let gpu = vec![0xAAu8, 0xBB, 0xCC];
     let regs = vec![0x77u8; 8];
 
-    // 1. Capture a real signed v3 archive.
+    // 1. Capture a real signed v3 archive. T40: this test splices the v3
+    //    trailer, so pin the writer to the legacy envelope — the v0.4
+    //    artifact-envelope default produces no v3 trailer.
     let archive = SnapshotWriter::new()
         .with_hmac_sha256_key(KEY)
+        .with_legacy_envelope()
         .capture(InstanceState {
             tenant_id: TenantId(0xC0FFEE),
             instance_id: InstanceId(0xDEAD_BEEF),

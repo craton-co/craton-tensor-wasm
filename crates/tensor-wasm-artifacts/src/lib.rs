@@ -771,6 +771,225 @@ fn hex_of(bytes: &[u8; 32]) -> String {
 }
 
 // =====================================================================
+// In-memory envelope encode/decode (T40 — snapshot v0.4 default flip)
+// =====================================================================
+//
+// The streaming disk-store paths above own the canonical encode/decode
+// loop, but the snapshot crate's default `SnapshotWriter::capture` /
+// `SnapshotReader::restore` deal in `Vec<u8>` (not a `&DiskArtifactStore`),
+// so they need a pure-bytes door into the same envelope. These two
+// helpers expose exactly that: a `Vec<u8>`-in / `Vec<u8>`-out pair that
+// produces and consumes bytes byte-identical to what `DiskArtifactStore`
+// would write to disk.
+//
+// They are intentionally NOT `pub` on the `ArtifactStore` trait — the
+// trait abstracts over storage *backends*; these helpers are a framing
+// utility. Callers who want a persistent store should still go through
+// `DiskArtifactStore::put` / `get`; callers who need the framed bytes
+// in memory (e.g. to bundle inside another envelope, or to attach to
+// an HTTP body) use these.
+
+/// Encode `payload` into the unified artifact-store envelope (v0.4
+/// snapshot default).
+///
+/// Returns `Vec<u8>` containing the byte sequence
+/// `ARTIFACT_MAGIC || ARTIFACT_VERSION || blake3(payload) || zstd(payload) || hmac_sha256(prefix)` —
+/// the same bytes [`DiskArtifactStore::put`] would write to its tempfile
+/// before atomic-rename. Useful for callers that need the framed envelope
+/// in memory (the snapshot crate's default `capture` path is the
+/// motivating consumer).
+///
+/// The HMAC covers `magic || version || content_hash || zstd(payload)`;
+/// the trailing 32-byte tag is appended after. Verification is the
+/// counterpart [`decode_envelope_from_bytes`], which recomputes the MAC
+/// in constant time and rejects on mismatch before any decoded bytes
+/// are exposed to the caller.
+///
+/// Errors are reported via [`ArtifactError`] to keep the error surface
+/// homogeneous with the disk store; the only failure modes are
+/// `TooLarge` (when `payload.len() > MAX_PAYLOAD_LEN`) and `Io` (when
+/// the in-memory zstd encoder reports an internal error).
+pub fn encode_envelope_to_vec(
+    payload: &[u8],
+    hmac_key: &[u8; 32],
+) -> Result<Vec<u8>, ArtifactError> {
+    if payload.len() > MAX_PAYLOAD_LEN {
+        warn!(
+            target: "tensor_wasm_artifacts",
+            actual = payload.len(),
+            limit = MAX_PAYLOAD_LEN,
+            "rejecting oversized payload (encode_envelope_to_vec)"
+        );
+        return Err(ArtifactError::TooLarge {
+            actual: payload.len(),
+            limit: MAX_PAYLOAD_LEN,
+        });
+    }
+
+    let hash = ContentHash::of(payload);
+    let mut mac = new_mac(hmac_key);
+
+    // Pre-size the framing buffer conservatively: header + a quarter of
+    // the payload (zstd typically compresses better than 4:1 on tensor
+    // memory, so this overshoots harmlessly for small inputs and
+    // undershoots only marginally on incompressible blobs) + the HMAC
+    // trailer. The Vec grows on demand if the estimate is too small.
+    let mut buf: Vec<u8> = Vec::with_capacity(
+        ARTIFACT_HEADER_LEN + payload.len() / 4 + ARTIFACT_HMAC_LEN,
+    );
+
+    // Header: 16-byte magic + 4-byte version + 32-byte content hash.
+    buf.extend_from_slice(&ARTIFACT_MAGIC);
+    buf.extend_from_slice(&ARTIFACT_VERSION.to_le_bytes());
+    buf.extend_from_slice(&hash.0);
+
+    // Stream zstd into the buffer through a MacWriter so the HMAC sees
+    // exactly the bytes we write. The MAC has already consumed the
+    // header by way of the explicit `mac.update`s above? No — the
+    // header was extended into `buf` directly (no tee). Feed it to
+    // the MAC explicitly here so the prefix the MAC covers matches the
+    // disk-store layout byte-for-byte (`header || zstd_body`).
+    {
+        use hmac::Mac;
+        mac.update(&buf[..ARTIFACT_HEADER_LEN]);
+    }
+
+    // Compress the payload into the buffer; tee through MacWriter so the
+    // MAC also consumes the compressed bytes. The MacWriter takes the
+    // buffer by mutable reference (Vec<u8> implements Write via
+    // `extend_from_slice`-flavoured semantics), so the resulting bytes
+    // continue to land in `buf` while the MAC observes the same
+    // sequence the disk-store writer would see.
+    {
+        let mut tee = MacWriter::new(&mut buf, &mut mac);
+        let mut encoder = zstd::stream::write::Encoder::new(&mut tee, DEFAULT_ZSTD_LEVEL)
+            .map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed (encode_envelope_to_vec)");
+                ArtifactError::Io
+            })?;
+        encoder.write_all(payload).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd write failed (encode_envelope_to_vec)");
+            ArtifactError::Io
+        })?;
+        encoder.finish().map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd finish failed (encode_envelope_to_vec)");
+            ArtifactError::Io
+        })?;
+    }
+
+    // Append the HMAC tag. The tag is NOT fed back into the MAC.
+    let tag = finalize_into_tag(mac);
+    buf.extend_from_slice(&tag);
+    Ok(buf)
+}
+
+/// Decode the unified artifact-store envelope from `bytes`, returning
+/// the inner payload after verifying the HMAC in constant time and the
+/// BLAKE3 content hash as defence-in-depth.
+///
+/// Counterpart to [`encode_envelope_to_vec`]. Used by the snapshot
+/// crate's default `SnapshotReader::restore` to detect and consume the
+/// v0.4 envelope before falling through to the legacy v3 / v2 readers.
+/// Returns [`ArtifactError::BadMagic`] if the leading 16 bytes do not
+/// match [`ARTIFACT_MAGIC`] — callers rely on that variant to know they
+/// should try a different envelope shape, so the magic check is the
+/// first thing this function does (cheap, allocation-free).
+///
+/// Validation order:
+/// 1. Minimum length, then magic and version (cheap, before any keyed
+///    work).
+/// 2. HMAC verification in constant time over `magic || version ||
+///    content_hash || zstd_body`. Failure returns [`ArtifactError::BadHmac`]
+///    without touching the decoded payload.
+/// 3. zstd decompression with a [`MAX_DECOMPRESSED_LEN`] cap, mirroring
+///    the disk store's zip-bomb defence.
+/// 4. Recompute the content hash and compare to the header value —
+///    catches a writer bug that hashed the wrong bytes even if the
+///    HMAC verified (impossible without key leak, but cheap to check).
+pub fn decode_envelope_from_bytes(
+    bytes: &[u8],
+    hmac_key: &[u8; 32],
+) -> Result<Vec<u8>, ArtifactError> {
+    // Minimum-length gate: header + at least one byte of zstd frame + HMAC tag.
+    if bytes.len() < ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN {
+        return Err(ArtifactError::BadMagic);
+    }
+    // Magic check first — cheap rejection for foreign envelopes (the
+    // snapshot reader uses this branch to fall through to v3 / v2).
+    if bytes[..16] != ARTIFACT_MAGIC {
+        return Err(ArtifactError::BadMagic);
+    }
+    let version = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    if version != ARTIFACT_VERSION {
+        return Err(ArtifactError::BadVersion(version));
+    }
+    let mut hash_on_disk = [0u8; 32];
+    hash_on_disk.copy_from_slice(&bytes[20..52]);
+
+    // HMAC verification: the tag is the trailing 32 bytes, the MAC
+    // covers everything before that (header + zstd body).
+    let hmac_start = bytes.len() - ARTIFACT_HMAC_LEN;
+    let (prefix, tag_bytes) = bytes.split_at(hmac_start);
+    let mut mac = new_mac(hmac_key);
+    {
+        use hmac::Mac;
+        mac.update(prefix);
+    }
+    let expected = finalize_into_tag(mac);
+    use subtle::ConstantTimeEq;
+    let mac_ok = bool::from(expected.as_slice().ct_eq(tag_bytes));
+    if !mac_ok {
+        warn!(
+            target: "tensor_wasm_artifacts",
+            "HMAC mismatch (decode_envelope_from_bytes; possible tampering or stale key)"
+        );
+        return Err(ArtifactError::BadHmac);
+    }
+
+    // Decompress the body that sits between the header and the HMAC tag.
+    // Use a `Read::take` probe one byte past the cap so a zstd-bomb is
+    // rejected before the buffer grows past `MAX_DECOMPRESSED_LEN`,
+    // matching the disk-store streaming reader.
+    let body = &prefix[ARTIFACT_HEADER_LEN..];
+    let cap = MAX_DECOMPRESSED_LEN;
+    let probe_limit = u64::try_from(cap)
+        .ok()
+        .and_then(|c| c.checked_add(1))
+        .unwrap_or(u64::MAX);
+    let mut payload: Vec<u8> = Vec::with_capacity(cap.min(1024 * 1024));
+    let decoder = zstd::stream::read::Decoder::new(body).map_err(|e| {
+        warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed (decode_envelope_from_bytes)");
+        ArtifactError::Decompression(e.to_string())
+    })?;
+    decoder
+        .take(probe_limit)
+        .read_to_end(&mut payload)
+        .map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd decode failed (decode_envelope_from_bytes)");
+            ArtifactError::Decompression(e.to_string())
+        })?;
+    if payload.len() > cap {
+        return Err(ArtifactError::TooLarge {
+            actual: payload.len(),
+            limit: cap,
+        });
+    }
+
+    // Defence-in-depth: recompute and compare. A header-vs-payload
+    // mismatch would mean a valid-HMAC blob was constructed under a
+    // wrong content hash (impossible without key leak, but cheap).
+    let recomputed = ContentHash::of(&payload);
+    if recomputed.0 != hash_on_disk {
+        return Err(ArtifactError::HashMismatch {
+            expected: hex_of(&hash_on_disk),
+            actual: recomputed.to_string(),
+        });
+    }
+
+    Ok(payload)
+}
+
+// =====================================================================
 // In-memory store
 // =====================================================================
 

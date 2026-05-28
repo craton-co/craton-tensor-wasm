@@ -44,8 +44,13 @@ fn forged_trailer_without_kind_byte_in_mac_input_is_rejected() {
     // genuine prefix means a regression in the verifier — accepting this
     // forgery — would let the test fall through to the post-HMAC pipeline
     // and observably produce an Ok(_), making the failure mode loud.
+    // T40: this test reads / forges the v3 trailer shape, so pin the
+    // writer to the legacy envelope. The artifact-envelope default has
+    // no v3 trailer at all and would not produce a blob the forgery
+    // logic below can splice.
     let real_blob = SnapshotWriter::new()
         .with_hmac_sha256_key(KEY)
+        .with_legacy_envelope()
         .capture(InstanceState {
             tenant_id: TenantId(0xCAFE),
             instance_id: InstanceId(0xBEEF),

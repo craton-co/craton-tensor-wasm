@@ -331,6 +331,21 @@ pub struct SnapshotWriter {
     /// allocator's freelist after the writer has gone out of scope.
     #[cfg(feature = "signed-snapshots")]
     pub(crate) hmac_key: Option<Zeroizing<[u8; 32]>>,
+    /// T40: when `true`, [`SnapshotWriter::capture`] emits the legacy
+    /// v2/v3 inline envelope even though the `artifact-backing` feature
+    /// is the v0.4 default. Set via
+    /// [`SnapshotWriter::with_legacy_envelope`]; the dedicated
+    /// [`SnapshotWriter::capture_legacy`] method is the explicit
+    /// equivalent for per-call opt-out.
+    ///
+    /// The field is present unconditionally (no `cfg`) so a downstream
+    /// consumer that builds with `--no-default-features` still sees the
+    /// builder method and writes its expected v2/v3 output without
+    /// having to thread a feature flag through their config plumbing.
+    /// When `artifact-backing` is disabled at compile time the field is
+    /// effectively always `true` (legacy is the only envelope shape
+    /// available), and the builder is a no-op idempotency hook.
+    pub(crate) use_legacy_envelope: bool,
 }
 
 impl std::fmt::Debug for SnapshotWriter {
@@ -342,6 +357,7 @@ impl std::fmt::Debug for SnapshotWriter {
             "hmac_key",
             &self.hmac_key.as_ref().map(|_| "<REDACTED 32-byte HMAC key>"),
         );
+        d.field("use_legacy_envelope", &self.use_legacy_envelope);
         d.finish()
     }
 }
@@ -368,6 +384,7 @@ impl SnapshotWriter {
             zstd_level: DEFAULT_ZSTD_LEVEL,
             #[cfg(feature = "signed-snapshots")]
             hmac_key: None,
+            use_legacy_envelope: false,
         }
     }
 
@@ -380,7 +397,28 @@ impl SnapshotWriter {
             zstd_level,
             #[cfg(feature = "signed-snapshots")]
             hmac_key: None,
+            use_legacy_envelope: false,
         }
+    }
+
+    /// T40: pin this writer's [`SnapshotWriter::capture`] output to the
+    /// legacy v2/v3 inline envelope even when the `artifact-backing`
+    /// feature is enabled (the v0.4 default).
+    ///
+    /// Use this for operators whose snapshot tooling pre-dates v0.4 and
+    /// still expects the magic-prefix v3 trailer shape on the wire. The
+    /// equivalent per-call opt-out is [`SnapshotWriter::capture_legacy`],
+    /// which ignores this flag and always emits v2/v3.
+    ///
+    /// Combine with [`SnapshotWriter::with_hmac_sha256_key`] to keep
+    /// emitting the signed v3 envelope; without an HMAC key the writer
+    /// continues to produce the unsigned v2 envelope. Calling this
+    /// method on a build that has `artifact-backing` disabled at compile
+    /// time is a no-op — the legacy envelope is already the only shape.
+    #[must_use]
+    pub const fn with_legacy_envelope(mut self) -> Self {
+        self.use_legacy_envelope = true;
+        self
     }
 
     /// Configure HMAC-SHA256 signing with a 32-byte key.
@@ -537,18 +575,89 @@ impl SnapshotWriter {
 
     /// Encode and compress `state` into a snapshot blob.
     ///
-    /// The returned bytes are self-describing: the magic and version are
-    /// embedded in the bincode payload, so a caller only needs to persist the
-    /// `Vec<u8>` as-is. Returns [`TensorWasmError::Serialization`] if bincode encoding
-    /// fails, the zstd encoder reports a system error, or any input blob exceeds
-    /// the caps in [`limits`]. Capture is the first line of defence — oversized
-    /// inputs are rejected here so the writer never produces bytes that the
-    /// reader would have to reject.
+    /// The returned bytes are self-describing — a caller only needs to
+    /// persist the `Vec<u8>` as-is and hand it back to
+    /// [`SnapshotReader::restore`](crate::reader::SnapshotReader::restore)
+    /// on the read side.
+    ///
+    /// **T40 default-cutover (v0.4).** When the `artifact-backing`
+    /// feature is enabled (which is the default in v0.4), the writer
+    /// has an HMAC key configured via
+    /// [`SnapshotWriter::with_hmac_sha256_key`], **and** the writer has
+    /// NOT had [`SnapshotWriter::with_legacy_envelope`] called on it,
+    /// the returned bytes are the unified artifact-store envelope:
+    ///
+    /// ```text
+    /// b"twasm-artifact01"(16) || version(4)=1 || blake3(payload)(32)
+    ///                         || zstd(bincode(Snapshot))
+    ///                         || hmac_sha256(prefix)(32)
+    /// ```
+    ///
+    /// In every other configuration — feature off, no HMAC key, or the
+    /// legacy-envelope opt-out set — the writer emits the legacy v2/v3
+    /// inline envelope (`zstd(bincode(Snapshot)) [|| v3 trailer]`).
+    /// Both shapes are accepted by
+    /// [`SnapshotReader::restore`](crate::reader::SnapshotReader::restore);
+    /// the reader auto-detects the envelope by its leading magic and
+    /// falls through to the legacy v3 (T8) and v2 decoders. The
+    /// no-HMAC-key fallback is what keeps the v0.3.x keyless callers
+    /// (most in-tree tests, benches, and the kernel-conformance suite)
+    /// working unchanged — they continue to emit v2 because the v0.4
+    /// envelope needs an HMAC key by construction.
+    ///
+    /// Returns [`TensorWasmError::Serialization`] if bincode encoding
+    /// fails, the zstd encoder reports a system error, or any input
+    /// blob exceeds the caps in [`limits`].
     #[instrument(skip(self, state), fields(
         tenant = %state.tenant_id,
         instance = %state.instance_id,
     ))]
     pub fn capture(&self, state: InstanceState<'_>) -> Result<Vec<u8>> {
+        // T40 default-cutover: route through the artifact-store envelope
+        // when (a) the feature is compiled in, (b) the caller has not
+        // opted into the legacy shape, and (c) we have an HMAC key the
+        // outer envelope can sign with. The HMAC-key gate is what keeps
+        // the keyless v0.3.x callers on the legacy v2 path — the v0.4
+        // envelope mandates HMAC by construction, so without a key the
+        // only honest answer is "stay on v2 until a key is supplied".
+        #[cfg(all(feature = "artifact-backing", feature = "signed-snapshots"))]
+        {
+            if !self.use_legacy_envelope {
+                if let Some(ref key) = self.hmac_key {
+                    // `key` is `&Zeroizing<[u8; 32]>`; `Zeroizing<T>`
+                    // implements `Deref<Target = T>`, so `&*key` (one
+                    // explicit deref through the wrapper, then auto-ref
+                    // back) borrows the underlying `[u8; 32]` array. The
+                    // artifact crate's envelope helper takes `&[u8; 32]`
+                    // by reference, so no copy is made.
+                    let key_ref: &[u8; 32] = key;
+                    return self.capture_via_artifact_envelope(state, key_ref);
+                }
+            }
+        }
+        self.capture_legacy(state)
+    }
+
+    /// T40: explicit opt-out of the v0.4 artifact-store envelope —
+    /// always emits the legacy v2/v3 inline shape regardless of the
+    /// `artifact-backing` feature flag or
+    /// [`SnapshotWriter::with_legacy_envelope`] state.
+    ///
+    /// Equivalent to calling `capture()` on a writer built with
+    /// `--no-default-features --features signed-snapshots`. Provided so
+    /// downstream callers can pin to the legacy wire format without
+    /// recompiling the snapshot crate (useful for tooling that has to
+    /// produce both shapes during the migration window).
+    ///
+    /// Behaviour with respect to the HMAC key is unchanged from the
+    /// v0.3.x `capture` contract:
+    ///   - no key set → unsigned v2 envelope.
+    ///   - key set → HMAC-signed v3 envelope (T8 magic-prefix trailer).
+    #[instrument(skip(self, state), fields(
+        tenant = %state.tenant_id,
+        instance = %state.instance_id,
+    ))]
+    pub fn capture_legacy(&self, state: InstanceState<'_>) -> Result<Vec<u8>> {
         let (metadata, crc32) = self.build_metadata(&state)?;
         let total_uncompressed_bytes = metadata.total_uncompressed_bytes;
 
@@ -756,6 +865,47 @@ impl SnapshotWriter {
         );
         Ok(hash)
     }
+
+    /// T40: in-memory equivalent of [`SnapshotWriter::capture_to_artifact_store`].
+    ///
+    /// Produces the unified artifact-store envelope as `Vec<u8>` rather
+    /// than handing it to a [`tensor_wasm_artifacts::DiskArtifactStore`]
+    /// — the wire bytes are byte-identical to what the disk store would
+    /// write to its tempfile, but the caller owns the buffer and decides
+    /// where it goes (HTTP body, `Bytes`, fanout to multiple sinks…).
+    ///
+    /// Used by [`SnapshotWriter::capture`] when the default v0.4 path is
+    /// active. The bincode-encoded [`SnapshotRef`] is the same shape as
+    /// `capture_to_artifact_store`'s payload, so a blob produced here
+    /// round-trips through
+    /// [`SnapshotReader::restore`](crate::reader::SnapshotReader::restore)
+    /// (which routes through `decode_envelope_from_bytes` when it sees
+    /// the artifact magic) — and, equivalently, through a
+    /// `DiskArtifactStore` that has been seeded with the same bytes.
+    #[cfg(all(feature = "artifact-backing", feature = "signed-snapshots"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "artifact-backing", feature = "signed-snapshots"))))]
+    fn capture_via_artifact_envelope(
+        &self,
+        state: InstanceState<'_>,
+        hmac_key: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        let (snapshot_ref, total_uncompressed_bytes) = self.build_snapshot_ref(state)?;
+        let payload = bincode::serde::encode_to_vec(&snapshot_ref, bincode::config::legacy())
+            .map_err(|e| TensorWasmError::Serialization(format!("bincode encode: {e}").into()))?;
+        let envelope = tensor_wasm_artifacts::encode_envelope_to_vec(&payload, hmac_key)
+            .map_err(|e| {
+                TensorWasmError::Serialization(
+                    format!("artifact envelope encode: {e}").into(),
+                )
+            })?;
+        debug!(
+            uncompressed = total_uncompressed_bytes,
+            encoded = payload.len(),
+            envelope = envelope.len(),
+            "snapshot captured via artifact envelope (T40 default)",
+        );
+        Ok(envelope)
+    }
 }
 
 #[cfg(test)]
@@ -904,9 +1054,17 @@ mod tests {
         assert_eq!(version, crate::format::SNAPSHOT_VERSION_V2);
     }
 
-    /// Configuring an HMAC key bumps the on-wire version to v3 and appends a
-    /// 33-byte trailer (`[kind=1][32-byte signature]`). A v3 blob round-trips
-    /// through a reader configured with the same key.
+    /// Configuring an HMAC key on a writer that explicitly opted into
+    /// the legacy envelope (post-T40) bumps the on-wire version to v3
+    /// and appends a 37-byte trailer (`[magic: 4][kind: 1][sig: 32]`).
+    /// A v3 blob round-trips through a reader configured with the same
+    /// key.
+    ///
+    /// **T40 note:** the legacy-envelope opt-out is required here
+    /// because the v0.4 default would otherwise route through the
+    /// artifact-store envelope (which does not produce a v3 trailer).
+    /// The legacy v3 wire format itself is unchanged from pre-T40
+    /// — this test pins that shape against future regressions.
     #[cfg(feature = "signed-snapshots")]
     #[test]
     fn signed_writer_emits_v3_and_round_trips() {
@@ -914,6 +1072,7 @@ mod tests {
         let (wasm, gpu, regs) = sample_state();
         let bytes = SnapshotWriter::new()
             .with_hmac_sha256_key(key)
+            .with_legacy_envelope()
             .capture(InstanceState {
                 tenant_id: TenantId(9),
                 instance_id: InstanceId(99),

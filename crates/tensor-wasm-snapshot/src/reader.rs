@@ -286,6 +286,28 @@ impl SnapshotReader {
             ));
         }
 
+        // T40 default-cutover: detect the v0.4 unified artifact-store
+        // envelope by its leading 16-byte magic. This is the cheapest
+        // possible discriminator — `bytes[..16] == ARTIFACT_MAGIC` is a
+        // single fixed-length comparison before any keyed work runs.
+        // Foreign blobs (legacy v3/v2) fall through to the existing
+        // trailer-magic detector below.
+        //
+        // The fall-through is deliberately driven by `ArtifactError::BadMagic`
+        // (and by the magic mismatch on the leading 16 bytes that
+        // produces it): a v3 blob carries `zstd` framing in its first
+        // bytes, which never equals `b"twasm-artifact01"`. Any other
+        // artifact-envelope failure (bad version, bad HMAC, hash
+        // mismatch) is reported as an error rather than silently
+        // re-classified — those signal a tampered or wrong-key v4
+        // blob and shouldn't be confused with a legacy-format input.
+        #[cfg(all(feature = "artifact-backing", feature = "signed-snapshots"))]
+        {
+            if let Some(snapshot) = self.try_restore_artifact_envelope(bytes)? {
+                return Ok(snapshot);
+            }
+        }
+
         // Detect a v3 (signed) blob by peeking at the trailer position.
         // A v3 envelope is
         // `[compressed prefix][V3_TRAILER_MAGIC: 4][signature_kind: 1][32-byte sig]`
@@ -930,6 +952,166 @@ impl SnapshotReader {
             "snapshot restored from artifact store",
         );
         Ok(snapshot)
+    }
+
+    /// T40: detect a v0.4 unified artifact-store envelope by its leading
+    /// magic, and if present, decode the inner bincode-encoded
+    /// [`Snapshot`] payload.
+    ///
+    /// Returns `Ok(None)` when the leading 16 bytes do not match
+    /// [`tensor_wasm_artifacts::ARTIFACT_MAGIC`] — the caller falls
+    /// through to the legacy v3/v2 path. Returns `Ok(Some(snapshot))`
+    /// when the envelope verifies (HMAC, content hash) and the inner
+    /// payload passes the same per-blob caps / CRC32 / total-bytes
+    /// cross-check as the legacy path. Returns `Err` for any
+    /// *artifact-envelope* failure other than `BadMagic` (HMAC
+    /// mismatch, hash mismatch, malformed inner payload, etc.) so a
+    /// tampered v4 blob is not silently mistaken for a malformed v3
+    /// blob.
+    ///
+    /// The HMAC key consulted is the one configured via
+    /// [`SnapshotReader::with_hmac_sha256_key`] — same key that
+    /// verifies the legacy v3 trailer. Without a key configured, a
+    /// v4 envelope is rejected the same way a v3 trailer is (the
+    /// outer envelope requires HMAC by construction).
+    #[cfg(all(feature = "artifact-backing", feature = "signed-snapshots"))]
+    fn try_restore_artifact_envelope(&self, bytes: &[u8]) -> Result<Option<Snapshot>> {
+        use tensor_wasm_artifacts::{ArtifactError, ARTIFACT_MAGIC};
+        // Cheap magic check — if the leading 16 bytes are not the
+        // artifact magic we let the caller fall through to v3/v2
+        // detection. This is the load-bearing classifier; everything
+        // below assumes the envelope is at least claiming to be v4.
+        if bytes.len() < ARTIFACT_MAGIC.len() || bytes[..ARTIFACT_MAGIC.len()] != ARTIFACT_MAGIC {
+            return Ok(None);
+        }
+        let key = self.hmac_key.as_ref().ok_or_else(|| {
+            TensorWasmError::Serialization(
+                "snapshot is artifact-envelope (v4) but reader has no HMAC key".into(),
+            )
+        })?;
+        // The artifact crate's pure decode helper does magic + version +
+        // HMAC + zstd + content-hash checks in one pass. We map its
+        // errors into `TensorWasmError::Serialization` for forward to
+        // the snapshot caller; the messages are already operator-facing
+        // (no key bytes leak).
+        // `key: &Zeroizing<[u8; 32]>` deref-coerces to `&[u8; 32]` at
+        // the call site below — no explicit `&**key` dance needed, and
+        // the underlying 32 bytes are never copied out of the
+        // zeroizing wrapper.
+        let payload = tensor_wasm_artifacts::decode_envelope_from_bytes(bytes, key)
+            .map_err(|e| match e {
+                // `BadMagic` should be impossible here — we already
+                // checked the leading 16 bytes — but treat it as a
+                // hard failure rather than a fall-through. Otherwise
+                // a writer that produced a malformed envelope (e.g.
+                // truncated below the minimum length) could escape
+                // through the legacy reader and surface a confusing
+                // "zstd init" error.
+                ArtifactError::BadMagic => TensorWasmError::Serialization(
+                    "snapshot artifact envelope: minimum-length / magic check failed".into(),
+                ),
+                other => TensorWasmError::Serialization(
+                    format!("snapshot artifact envelope: {other}").into(),
+                ),
+            })?;
+
+        // Decode the bincode payload using the same static allocator
+        // ceiling the legacy path uses. The envelope's HMAC has already
+        // certified these bytes, so length-prefix abuse cannot reach
+        // here without a key leak — the cap is defence-in-depth.
+        let cfg = bincode::config::legacy()
+            .with_limit::<{ crate::writer::limits::MAX_TOTAL_PAYLOAD_BYTES }>();
+        let (snapshot, _read): (Snapshot, usize) =
+            bincode::serde::decode_from_slice(payload.as_slice(), cfg).map_err(|e| {
+                TensorWasmError::Serialization(format!("bincode decode: {e}").into())
+            })?;
+
+        if snapshot.magic != SNAPSHOT_MAGIC {
+            return Err(TensorWasmError::Serialization(
+                format!(
+                    "snapshot magic mismatch: expected {:#X}, got {:#X}",
+                    SNAPSHOT_MAGIC, snapshot.magic,
+                )
+                .into(),
+            ));
+        }
+        // The artifact-backed write path emits the v2 inner discriminant
+        // (the outer envelope already supplies authentication). Accept
+        // v2 and v3 for forward compatibility — a future writer might
+        // route signed inner payloads through the same envelope without
+        // bumping the wire format.
+        if snapshot.version != SNAPSHOT_VERSION_V2 && snapshot.version != SNAPSHOT_VERSION_V3 {
+            return Err(TensorWasmError::Serialization(
+                format!(
+                    "snapshot version mismatch: expected {} or {}, got {}",
+                    SNAPSHOT_VERSION_V2, SNAPSHOT_VERSION_V3, snapshot.version,
+                )
+                .into(),
+            ));
+        }
+        check_blob_size(
+            "wasm_memory",
+            snapshot.wasm_memory.len(),
+            limits::MAX_WASM_MEMORY_BYTES,
+        )?;
+        check_blob_size(
+            "gpu_memory",
+            snapshot.gpu_memory.len(),
+            limits::MAX_GPU_MEMORY_BYTES,
+        )?;
+        check_blob_size(
+            "registers",
+            snapshot.registers.len(),
+            limits::MAX_REGISTERS_BYTES,
+        )?;
+        let expected_crc = payload_crc32(
+            &snapshot.wasm_memory,
+            &snapshot.gpu_memory,
+            &snapshot.registers,
+        );
+        if snapshot.crc32 != expected_crc {
+            return Err(TensorWasmError::Serialization(
+                format!(
+                    "snapshot crc32 mismatch: expected {:#010X}, got {:#010X}",
+                    expected_crc, snapshot.crc32,
+                )
+                .into(),
+            ));
+        }
+        let actual_total = snapshot
+            .wasm_memory
+            .len()
+            .checked_add(snapshot.gpu_memory.len())
+            .and_then(|s| s.checked_add(snapshot.registers.len()))
+            .ok_or_else(|| {
+                TensorWasmError::Serialization(
+                    "snapshot blob length sum overflowed usize".into(),
+                )
+            })?;
+        if (actual_total as u64) != snapshot.metadata.total_uncompressed_bytes {
+            return Err(TensorWasmError::Serialization(
+                format!(
+                    "snapshot metadata.total_uncompressed_bytes mismatch: \
+                     expected {} (wasm_memory={} + gpu_memory={} + registers={}), got {}",
+                    actual_total,
+                    snapshot.wasm_memory.len(),
+                    snapshot.gpu_memory.len(),
+                    snapshot.registers.len(),
+                    snapshot.metadata.total_uncompressed_bytes,
+                )
+                .into(),
+            ));
+        }
+        self.check_freshness(snapshot.metadata.created_unix_ms)?;
+
+        debug!(
+            wasm = snapshot.wasm_memory.len(),
+            gpu = snapshot.gpu_memory.len(),
+            regs = snapshot.registers.len(),
+            version = snapshot.version,
+            "snapshot restored via artifact envelope (T40 default)",
+        );
+        Ok(Some(snapshot))
     }
 }
 

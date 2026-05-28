@@ -239,17 +239,78 @@ A `version` mismatch (anything other than `2` or `3`) is a hard error;
 the reader does not attempt to migrate older snapshots in place. Re-
 capture from the live instance is the supported upgrade path.
 
-## Artifact-store backing (opt-in, v0.3.8+)
+## v4 (artifact-store-backed, default in v0.4 — T40)
 
-The legacy v2 and v3 envelopes described above are unchanged and remain
-the default for `SnapshotWriter::capture` / `SnapshotReader::restore` —
-every snapshot already on disk continues to read and write byte-for-byte
-identically.
+The `artifact-backing` cargo feature is **on by default** as of v0.4
+(T40). New writes from `SnapshotWriter::capture` route through the
+unified `tensor-wasm-artifacts` envelope when the writer has an HMAC
+key configured via `SnapshotWriter::with_hmac_sha256_key`; reads
+auto-detect the envelope by its leading 16-byte magic and decode it
+without ever entering the v3 / v2 paths. The legacy v2 and v3
+envelopes documented above remain accepted on the **read** side
+indefinitely — every snapshot already on disk continues to load
+byte-for-byte unchanged.
 
-Behind the `artifact-backing` cargo feature, the writer and reader gain
-two additional methods that route snapshots through the unified
-`tensor-wasm-artifacts::DiskArtifactStore` envelope instead of the
-inline zstd-and-trailer shape:
+### Detection ordering (reader)
+
+`SnapshotReader::restore` dispatches by the leading-magic test, in
+this order:
+
+1. **`bytes[..16] == b"twasm-artifact01"`** → decode via the artifact
+   envelope path (see "On-disk shape" below). Returns
+   `Serialization` for any artifact-envelope failure other than the
+   leading-magic mismatch; in particular, a tampered or wrong-key v4
+   blob is rejected here and is **not** retried as a legacy blob.
+2. **Trailer-magic prefix at `bytes[len - 37..len - 33] == b"S3T1"`**
+   → decode via the legacy v3 path (T8 magic-prefix trailer; see
+   "v3 wire format" above). Requires the `signed-snapshots` feature
+   and an HMAC key configured on the reader.
+3. **Otherwise** → decode via the legacy v2 path (the bare
+   zstd(bincode(Snapshot)) shape).
+
+Detection is purely magic-based; no version field is consulted until
+after the envelope decoder has authenticated the bytes. This is what
+keeps "authenticate then parse" honest on the v4 path (the artifact
+crate's `decode_envelope_from_bytes` verifies HMAC before any
+decompressed bytes reach the snapshot decoder) and what lets the
+legacy v3 path keep its T8 magic-prefix guarantee.
+
+### Opt-out (writer)
+
+Two equivalent ways to keep emitting the legacy v3 wire format:
+
+1. Per-call: `SnapshotWriter::capture_legacy(state)` — always emits
+   v2/v3, regardless of feature flag or builder state.
+2. Per-writer: `SnapshotWriter::with_legacy_envelope()` — flips this
+   writer into legacy-only mode; subsequent `capture(...)` calls
+   behave like `capture_legacy(...)`.
+
+Both keep compiling on a build that disabled `artifact-backing` (the
+`with_legacy_envelope` builder becomes an idempotency no-op).
+Downstream consumers can also build with
+`--no-default-features --features signed-snapshots` to disable v4
+emission at compile time; that's the path for tooling whose entire
+config surface predates v0.4.
+
+### Behaviour without an HMAC key (graceful fallback)
+
+If `SnapshotWriter::with_hmac_sha256_key` has not been called, the
+v0.4 default `capture` cannot emit the v4 envelope (the outer
+envelope mandates HMAC by construction). The writer falls back to
+the legacy unsigned v2 envelope — same wire bytes the v0.3.x keyless
+default produced. This is the load-bearing compatibility hook for
+every in-tree caller (proptest, mem-conformance, bench) that
+constructs `SnapshotWriter::new()` without further configuration:
+their captures continue to be v2 on the wire and the default reader
+parses them through the v2 fall-through above.
+
+## Artifact-store backing (managed disk store, also under `artifact-backing`)
+
+Behind the same `artifact-backing` cargo feature, the writer and
+reader also expose two methods that route snapshots through the
+persistent `tensor-wasm-artifacts::DiskArtifactStore` (atomic-rename
+writes, content-addressed filenames, key-fingerprinted partitions)
+instead of the in-memory envelope shape `capture` emits:
 
 ```rust
 // Writer side (gated on the `artifact-backing` feature):
@@ -318,12 +379,18 @@ those settings. Mirror the same on the reader: `max_decompressed`,
    `Snapshot` with a stale CRC32 should still be rejected even though
    the artifact store happily authenticated the payload.
 
-### v0.4 default-cutover plan
+### v0.4 default-cutover — LANDED in T40
 
-v0.3.8 ships this path as **opt-in only** — minimum blast radius for
-operators with snapshot tooling already pinned to the v2/v3 envelope.
-v0.4 will flip the default of `SnapshotWriter::capture` /
-`SnapshotReader::restore` to the artifact-store envelope, and keep the
-inline v2/v3 path available as a legacy decoder for in-place migration
-of existing on-disk snapshots. See `docs/ARTIFACT-STORE.md` § "Convergence
-plan — v0.4" for the full rollout sequence.
+The v0.4 cutover landed as T40. The `artifact-backing` feature is now
+a default cargo feature; `SnapshotWriter::capture` routes through the
+unified envelope when an HMAC key is configured, and
+`SnapshotReader::restore` auto-detects either shape via the leading
+magic. The inline v2/v3 path is preserved as a legacy decoder
+indefinitely — every existing on-disk snapshot continues to load — and
+two opt-out hooks (`SnapshotWriter::with_legacy_envelope` and
+`SnapshotWriter::capture_legacy`) let operators keep emitting the
+legacy wire format when they need to. See the "v4
+(artifact-store-backed, default in v0.4 — T40)" section above for
+the detection ordering and opt-out semantics, and
+`docs/ARTIFACT-STORE.md` § "Convergence plan — v0.4" for the full
+rollout sequence.
