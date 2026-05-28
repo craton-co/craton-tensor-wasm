@@ -354,6 +354,23 @@ impl ApiError {
         }
     }
 
+    /// Construct a `501 Not Implemented` with a caller-supplied `kind` and
+    /// `message`.
+    ///
+    /// Used by feature-shim handlers (the OpenAI-compatible inference
+    /// gateway in [`crate::openai`], for example) that need to advertise a
+    /// route on the wire surface but cannot yet execute it. The `kind`
+    /// argument lets each shim pick its own stable identifier (e.g.
+    /// `openai_not_yet_wired`) so clients can branch on the precise
+    /// reason rather than parsing the human-readable `message`.
+    pub fn not_implemented(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            kind: kind.into(),
+            message: message.into(),
+        }
+    }
+
     /// Render this error into the canonical `(kind, message)` pair so the
     /// async job recorder can persist the same shape callers see from the
     /// synchronous path.
@@ -1266,6 +1283,10 @@ mod tests {
         let oops = ApiError::internal("boom");
         assert_eq!(oops.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(oops.kind, "internal");
+
+        let ni = ApiError::not_implemented("openai_not_yet_wired", "scaffold");
+        assert_eq!(ni.status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(ni.kind, "openai_not_yet_wired");
     }
 
     #[test]

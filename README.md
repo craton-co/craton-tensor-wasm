@@ -120,6 +120,7 @@ Operational capabilities that ship on by default (no feature flag):
 | Per-token rate limit | `TENSOR_WASM_API_RATE_LIMIT_QPS`, `_BURST` | W1.4. Retires the global concurrency cap. |
 | HTTP request metrics | always on | W2.3. `tensor_wasm_http_requests_total`, duration histogram, in-flight gauge. |
 | `build_info` metric | always on | W4.9. Version, git commit, enabled features as labels. |
+| OpenAI-compatible inference gateway shim (`/v1/completions`, `/v1/chat/completions`) | always on | B4.9 scaffold returning 501; v0.4 wires translation. See [`docs/OPENAI-COMPAT.md`](docs/OPENAI-COMPAT.md). |
 
 Full taxonomy: [`docs/BUILD.md`](docs/BUILD.md).
 
