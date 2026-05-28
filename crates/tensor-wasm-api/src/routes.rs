@@ -108,6 +108,13 @@ pub struct JobRecord {
     pub id: Uuid,
     /// Function this invocation was dispatched against.
     pub function_id: Uuid,
+    /// Tenant that originated this job. Used by `GET /jobs/{id}` to gate
+    /// cross-tenant reads — a token scoped to tenant `A` must not be able
+    /// to poll a job created under tenant `B` (api S-32 / cross-tenant
+    /// info leak). Populated by [`invoke_function_async`] from the request
+    /// tenant resolved by the [`crate::middleware::tenant_scope`]
+    /// middleware.
+    pub tenant_id: TenantId,
     /// Current status.
     pub status: JobStatus,
     /// Result payload (set when `status` transitions to `completed` or `failed`).
@@ -815,6 +822,7 @@ pub async fn invoke_function_async(
         JobRecord {
             id: job_id,
             function_id: id,
+            tenant_id: tenant,
             status: JobStatus::Pending,
             result: None,
             created_unix_ms: now_unix_ms(),
@@ -901,15 +909,70 @@ pub async fn invoke_function_async(
 }
 
 /// `GET /jobs/{id}` — poll an async invocation.
-#[tracing::instrument(name = "http.get_job", skip(state), fields(job_id = %id))]
+///
+/// Tenant scoping (api S-32): a caller may only poll jobs that were
+/// dispatched under a tenant their bearer token addresses AND whose
+/// `tenant_id` matches the caller's `X-TensorWasm-Tenant` header. Both
+/// checks return `403 tenant_scope_denied` on failure — mirroring the
+/// shape `invoke` / `invoke-async` already use, so a cross-tenant probe
+/// cannot distinguish "wrong scope" from "wrong tenant" from the wire
+/// envelope alone. Previously this handler returned the full `JobRecord`
+/// (including the `result` payload) for any job id any authenticated
+/// caller knew, leaking other tenants' job results.
+#[tracing::instrument(
+    name = "http.get_job",
+    skip(state, auth),
+    fields(
+        job_id = %id,
+        tenant = tracing::field::Empty,
+    ),
+)]
 pub async fn get_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
+    tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<crate::rate_limit::AuthContext>>,
 ) -> ApiResult<Json<JobRecord>> {
-    match state.jobs.get(&id) {
-        Some(rec) => Ok(Json(rec.clone())),
-        None => Err(ApiError::not_found(format!("job {id} not found"))),
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    tracing::Span::current().record("tenant", tracing::field::display(tenant));
+    // Layer 1: token-scope check, same as invoke / invoke-async — the
+    // caller's bearer token must be authorised to address the tenant the
+    // request claims (via X-TensorWasm-Tenant). Absent AuthContext only
+    // happens in configurations that bypass `bearer_auth` entirely (ad-hoc
+    // test routers); fall through to dev-mode wildcard there.
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        ctx.authorize_tenant(tenant)?;
     }
+
+    // Snapshot the record under the DashMap shard lock; comparing the
+    // tenant_id afterwards lets us drop the guard quickly. Clone happens
+    // only on the success path — the cross-tenant path returns before
+    // copying the (possibly large) `result` payload.
+    let rec = match state.jobs.get(&id) {
+        Some(entry) => entry.value().clone(),
+        None => return Err(ApiError::not_found(format!("job {id} not found"))),
+    };
+
+    // Layer 2: per-resource tenant check. Even when the caller's token is
+    // scoped to multiple tenants (or wildcard), the request must address
+    // the SAME tenant the job was dispatched under. Without this check, a
+    // wildcard-scoped token issued for tenant A could read jobs from
+    // tenant B simply by knowing (or brute-forcing) the job UUID. We
+    // surface `tenant_scope_denied` (403) rather than `not_found` (404)
+    // for consistency with the synchronous invoke path's denial shape —
+    // both lock-outs share the same kind so clients can handle them
+    // uniformly.
+    if rec.tenant_id != tenant {
+        return Err(ApiError::forbidden(
+            "tenant_scope_denied",
+            format!(
+                "job {id} belongs to a different tenant than X-TensorWasm-Tenant; \
+                 callers must poll jobs under the same tenant they were dispatched under",
+            ),
+        ));
+    }
+
+    Ok(Json(rec))
 }
 
 // ---------------------------------------------------------------------------
