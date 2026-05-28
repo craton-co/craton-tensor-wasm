@@ -10,6 +10,7 @@
 //! shared.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::{Arc, OnceLock};
 
@@ -100,8 +101,33 @@ pub struct HttpRequestLabels {
 /// The stored strings are `&'static str` so the validator can hand them
 /// back to callers as zero-copy `Cow::Borrowed` and the `Family` map
 /// keys do not pay a per-request allocation for the closed route set.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteAllowlist(Vec<&'static str>);
+///
+/// Lookup is `O(1)` via an internal `HashSet<&'static str>` populated at
+/// construction. The declaration-order list is kept alongside for
+/// callers (e.g. tests, route-introspection dashboards) that need to
+/// iterate the registered set.
+#[derive(Clone, Debug)]
+pub struct RouteAllowlist {
+    /// Declaration-order view of the registered routes. Preserved for
+    /// callers that need to enumerate the allow-list deterministically.
+    ordered: Vec<&'static str>,
+    /// Hash-indexed view used by [`Self::lookup`] to keep the per-request
+    /// validator at `O(1)` regardless of allow-list size.
+    set: HashSet<&'static str>,
+}
+
+impl PartialEq for RouteAllowlist {
+    fn eq(&self, other: &Self) -> bool {
+        // `ordered` is the source of truth: two allow-lists are equal
+        // iff they list the same routes in the same order. The hash
+        // index is a derived field — comparing it would double-count
+        // and `HashSet`'s `PartialEq` is also order-insensitive, so
+        // including it adds no information.
+        self.ordered == other.ordered
+    }
+}
+
+impl Eq for RouteAllowlist {}
 
 impl RouteAllowlist {
     /// Construct a fresh allow-list from a slice of static route templates.
@@ -109,20 +135,35 @@ impl RouteAllowlist {
     /// Returned in an [`Arc`] so the caller can clone the handle cheaply
     /// into [`register_route_allowlist`] and into any test that wants to
     /// inspect the registered set.
+    ///
+    /// The internal `HashSet` index used by [`Self::lookup`] is built
+    /// once here, so a process startup that registers a 100+ route
+    /// allow-list pays the hashing cost exactly once instead of on
+    /// every request.
     pub fn new(routes: &[&'static str]) -> Arc<Self> {
-        Arc::new(Self(routes.to_vec()))
+        let ordered = routes.to_vec();
+        let set = ordered.iter().copied().collect();
+        Arc::new(Self { ordered, set })
     }
 
     /// Look up `route` in the allow-list. Returns the matching
     /// `&'static str` so the caller can attach it to a label without
     /// allocating, or `None` if the route is not registered.
+    ///
+    /// `O(1)` average via the internal `HashSet` — no linear scan of
+    /// the registered routes, so a 100+ route allow-list does not
+    /// inflate per-request latency.
     pub fn lookup(&self, route: &str) -> Option<&'static str> {
-        self.0.iter().copied().find(|&r| r == route)
+        // `HashSet::get` over `&'static str` keyed by `&str` returns
+        // a `Option<&&'static str>`; deref once to recover the
+        // `&'static str` pointer the caller can hand back as
+        // `Cow::Borrowed` without allocating.
+        self.set.get(route).copied()
     }
 
     /// Return the registered route templates in declaration order.
     pub fn routes(&self) -> &[&'static str] {
-        &self.0
+        &self.ordered
     }
 }
 
@@ -451,6 +492,33 @@ impl TenantLabels {
     }
 }
 
+impl TenantLabels {
+    /// Construct labels from any string-like tenant id rendering.
+    ///
+    /// Accepts `&'static str`, `String`, or `Cow<'static, str>` so
+    /// callers that already hold a static literal (test fixtures) and
+    /// callers that produce a fresh `String` via `TenantId::to_string`
+    /// share one entry point without an extra clone. Prefer
+    /// [`Self::from_tenant_id`] when the caller has a typed
+    /// [`crate::types::TenantId`] — that path is the canonical one and
+    /// guarantees the `T#<u64>` rendering dashboards depend on.
+    pub fn new(tenant_id: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            tenant_id: tenant_id.into().into_owned(),
+        }
+    }
+
+    /// Construct labels from a typed tenant id, enforcing the canonical
+    /// `T#<u64>` rendering. Prefer this over [`Self::new`] for any code
+    /// that has a [`crate::types::TenantId`] in hand — it removes the
+    /// possibility of a caller accidentally formatting the id with a
+    /// different prefix and silently splitting a tenant's series into
+    /// two label values on the dashboard.
+    pub fn from_tenant_id(id: crate::types::TenantId) -> Self {
+        Self::new(format!("T#{}", id.get()))
+    }
+}
+
 /// Label set for `tensor_wasm_build_info`.
 ///
 /// Standard Prometheus "info-style metric" labels: a gauge that is always
@@ -489,23 +557,29 @@ pub struct BuildInfoLabels {
 }
 
 impl BuildInfoLabels {
-    /// Construct a [`BuildInfoLabels`] from the five build-identity
-    /// components. Exists so callers do not have to name every field of
-    /// a `#[non_exhaustive]` struct directly; the typical production
-    /// path is the crate-provided [`current_build_info_labels`] helper.
+    /// Construct a [`BuildInfoLabels`] from any combination of
+    /// `&'static str`, `String`, or `Cow<'static, str>` per field.
+    ///
+    /// Each argument accepts `impl Into<Cow<'static, str>>` so the
+    /// CLI's `--version` plumbing (`&'static str` literals from
+    /// `env!()`) and the build-info helper (`String` produced by
+    /// `to_string()`) can share one entry point without an extra
+    /// `to_string()` round-trip. The internal storage stays `String`
+    /// to keep the struct trivially serializable and to match the
+    /// existing `current_build_info_labels()` constructor.
     pub fn new(
-        version: impl Into<String>,
-        git_sha: impl Into<String>,
-        rustc_version: impl Into<String>,
-        profile: impl Into<String>,
-        target: impl Into<String>,
+        version: impl Into<Cow<'static, str>>,
+        git_sha: impl Into<Cow<'static, str>>,
+        rustc_version: impl Into<Cow<'static, str>>,
+        profile: impl Into<Cow<'static, str>>,
+        target: impl Into<Cow<'static, str>>,
     ) -> Self {
         Self {
-            version: version.into(),
-            git_sha: git_sha.into(),
-            rustc_version: rustc_version.into(),
-            profile: profile.into(),
-            target: target.into(),
+            version: version.into().into_owned(),
+            git_sha: git_sha.into().into_owned(),
+            rustc_version: rustc_version.into().into_owned(),
+            profile: profile.into().into_owned(),
+            target: target.into().into_owned(),
         }
     }
 }
@@ -1366,6 +1440,162 @@ mod tests {
             s.contains("tensor_wasm_gpu_memory_used_bytes"),
             "single-series total must be preserved alongside the per-tenant family; got:\n{s}"
         );
+    }
+
+    // --- BuildInfoLabels::new --------------------------------------------
+    //
+    // The struct's fields are `pub`, so the literal-construction path is
+    // already exercised by `build_info_constants_match_labels`. The two
+    // tests below pin the ergonomic constructor: it must round-trip its
+    // arguments verbatim and accept any `impl Into<Cow<'static, str>>`
+    // payload (the `String` case is the load-bearing one — without that
+    // the `to_string()` from `current_build_info_labels` would not
+    // compile against `new()`).
+
+    #[test]
+    fn build_info_labels_new_round_trips() {
+        let labels = BuildInfoLabels::new(
+            "1.2.3",
+            "deadbeef",
+            "rustc 1.99.0",
+            "release",
+            "x86_64-unknown-linux-gnu",
+        );
+        assert_eq!(labels.version, "1.2.3");
+        assert_eq!(labels.git_sha, "deadbeef");
+        assert_eq!(labels.rustc_version, "rustc 1.99.0");
+        assert_eq!(labels.profile, "release");
+        assert_eq!(labels.target, "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn build_info_labels_string_field_accepts_owned() {
+        // The constructor accepts `impl Into<Cow<'static, str>>` so a
+        // freshly-allocated `String` (e.g. from `format!`) flows through
+        // without an extra `.as_str()` round-trip on the caller. This
+        // pin keeps a future tightening of the bound (say, to
+        // `&'static str`) from silently breaking the
+        // `current_build_info_labels()` plumbing that hands in
+        // `BUILD_VERSION.to_string()` and friends.
+        let owned = String::from("foo");
+        let labels = BuildInfoLabels::new(
+            owned,
+            String::from("bar"),
+            String::from("baz"),
+            String::from("qux"),
+            String::from("quux"),
+        );
+        assert_eq!(labels.version, "foo");
+        assert_eq!(labels.git_sha, "bar");
+        assert_eq!(labels.rustc_version, "baz");
+        assert_eq!(labels.profile, "qux");
+        assert_eq!(labels.target, "quux");
+    }
+
+    // --- TenantLabels::from_tenant_id ------------------------------------
+    //
+    // The struct's `tenant_id` field is a freely-mutable `String`, so the
+    // contract "the value is always the `T#<u64>` Display form of a
+    // `TenantId`" is enforced only by convention at call sites. The typed
+    // constructor below is the load-bearing one — it removes the
+    // possibility of a caller formatting the id with a different prefix
+    // and splitting a tenant's series into two label values.
+
+    #[test]
+    fn tenant_labels_from_tenant_id_renders_canonical_form() {
+        use crate::types::TenantId;
+        let labels = TenantLabels::from_tenant_id(TenantId(42));
+        assert_eq!(labels.tenant_id, "T#42");
+        // The Display form of the typed id agrees with the label string.
+        assert_eq!(labels.tenant_id, TenantId(42).to_string());
+    }
+
+    #[test]
+    fn tenant_labels_new_accepts_string_and_static_str() {
+        // Mirrors `BuildInfoLabels::new`: any `impl Into<Cow<'static, str>>`
+        // payload flows through. The `&'static str` path is exercised by
+        // the existing `gpu_memory_per_tenant_*` tests; here we cover the
+        // `String` case so a future `Cow<'static, str>` migration of the
+        // field can keep the same surface.
+        let from_static = TenantLabels::new("T#1");
+        let from_owned = TenantLabels::new(String::from("T#2"));
+        assert_eq!(from_static.tenant_id, "T#1");
+        assert_eq!(from_owned.tenant_id, "T#2");
+    }
+
+    // --- RouteAllowlist hash lookup --------------------------------------
+    //
+    // The internal storage migrated from a `Vec<&'static str>` linear
+    // scan to a `HashSet<&'static str>` to keep `lookup()` at `O(1)`
+    // even when the allow-list has hundreds of routes. The tests below
+    // pin the post-migration contract: lookups still return the
+    // `&'static str` pointer from the registered set (so callers can
+    // attach it as `Cow::Borrowed`), and the declaration-order accessor
+    // is preserved for callers that need to iterate.
+
+    #[test]
+    fn route_allowlist_lookup_finds_registered_route() {
+        let list = RouteAllowlist::new(&["/healthz", "/v1/chat/completions", "/metrics"]);
+        // Lookup returns Some for every registered route.
+        assert_eq!(list.lookup("/healthz"), Some("/healthz"));
+        assert_eq!(
+            list.lookup("/v1/chat/completions"),
+            Some("/v1/chat/completions"),
+        );
+        assert_eq!(list.lookup("/metrics"), Some("/metrics"));
+        // Unknown route is rejected.
+        assert_eq!(list.lookup("/not-a-route"), None);
+        // Case sensitivity is preserved (the registered routes are the
+        // exact axum templates, not a case-insensitive bag).
+        assert_eq!(list.lookup("/HEALTHZ"), None);
+    }
+
+    #[test]
+    fn route_allowlist_routes_preserves_declaration_order() {
+        // The hash index used by `lookup` is order-insensitive; the
+        // `routes()` accessor must still return the registered routes
+        // in the order the caller supplied them so any dashboard /
+        // diagnostic dump stays stable.
+        let registered: &[&'static str] = &["/c", "/a", "/b"];
+        let list = RouteAllowlist::new(registered);
+        assert_eq!(list.routes(), registered);
+    }
+
+    #[test]
+    fn route_allowlist_lookup_returns_static_pointer() {
+        // The whole reason for storing `&'static str` (instead of
+        // `String`) is so the validator can hand back a `Cow::Borrowed`
+        // without allocating. Pin that contract: the pointer returned by
+        // `lookup` is the *same* `&'static str` the caller registered,
+        // not a freshly-allocated copy.
+        const ROUTE: &str = "/healthz";
+        let list = RouteAllowlist::new(&[ROUTE]);
+        let matched = list.lookup("/healthz").expect("registered");
+        assert!(
+            std::ptr::eq(matched.as_ptr(), ROUTE.as_ptr()),
+            "lookup should return the registered `&'static str`, got a new pointer",
+        );
+    }
+
+    #[test]
+    fn route_allowlist_lookup_handles_large_allowlists() {
+        // The migration's motivation is a 100+ route allow-list. Build
+        // one and confirm both hit and miss paths still resolve
+        // correctly (the hash index is the only code path under test
+        // here — timing is exercised by
+        // `crates/tensor-wasm-bench/benches/metrics_label_validation.rs`).
+        let routes: Vec<&'static str> = (0..128)
+            .map(|i| -> &'static str {
+                Box::leak(format!("/route_{i}").into_boxed_str())
+            })
+            .collect();
+        let list = RouteAllowlist::new(&routes);
+        // Every registered route is found.
+        for r in &routes {
+            assert_eq!(list.lookup(r), Some(*r));
+        }
+        // A route not in the list is rejected even at large sizes.
+        assert_eq!(list.lookup("/route_999999"), None);
     }
 
     #[test]
