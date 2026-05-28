@@ -130,8 +130,10 @@ pub async fn run(args: DeployArgs, ctx: &HttpContext) -> Result<()> {
         .with_context(|| format!("POST {url}"))?;
 
     let status = resp.status();
-    let text = resp
-        .text()
+    // T17: bound the in-memory response body. The deploy endpoint emits a
+    // short `{"id": "<uuid>"}` ack or a structured error envelope on
+    // failure — both well under the 16 MiB cap.
+    let text = super::bounded_text(resp)
         .await
         .with_context(|| format!("reading response body from {url}"))?;
 

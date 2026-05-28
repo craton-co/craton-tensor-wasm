@@ -435,8 +435,13 @@ async fn restore(
         .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
 
     let status = resp.status();
-    let text = resp
-        .text()
+    // T17: the restore endpoint returns a short `{"id": "<uuid>"}` ack
+    // (or an error envelope on failure). Route through `bounded_text`
+    // so a malicious server cannot fill the CLI's RAM by sending a
+    // multi-gigabyte success body. The streamed save path elsewhere in
+    // this file is the legitimate large-body channel — it writes to
+    // disk under its own `--max-restore-bytes` cap.
+    let text = super::bounded_text(resp)
         .await
         .with_context(|| format!("reading response body from {url}"))?;
     if !status.is_success() {

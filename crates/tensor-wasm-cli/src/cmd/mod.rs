@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 
 pub mod bench;
 pub mod completions;
@@ -317,6 +318,160 @@ pub(crate) fn extract_scheme_host(url: &str) -> Option<(&str, &str)> {
         authority
     };
     Some((scheme, host))
+}
+
+// ---------------------------------------------------------------------------
+// Response-body size cap (T17, DoS hardening)
+// ---------------------------------------------------------------------------
+//
+// Multiple HTTP paths in the CLI used to call `reqwest::Response::text()` /
+// `bytes()` with no upper bound. A malicious or buggy server could stream
+// gigabytes into the CLI's RAM that way. The helpers below buffer a response
+// body into `Vec<u8>` while enforcing [`MAX_RESPONSE_BODY_BYTES`]; any client
+// path that legitimately needs more should stream to disk through
+// `reqwest::Response::bytes_stream()` instead (see `snapshot.rs` for an
+// example).
+
+/// Hard cap (in bytes) on the size of in-memory response bodies the CLI
+/// will buffer. Set defensively — any client path that legitimately needs
+/// more should stream to disk instead. 16 MiB is comfortably larger than
+/// any legitimate Prometheus exposition, kernel-manifest list, or JSON
+/// envelope the API server emits today, and small enough that 8x parallel
+/// requests cannot exhaust a CI runner with 256 MiB free.
+///
+/// `pub` (not `pub(crate)`) — and `#[doc(hidden)]` — purely so the
+/// integration test in `tests/bounded_response.rs` can reference the
+/// exact constant rather than hard-coding `16 << 20`. It is NOT
+/// considered stable API.
+#[doc(hidden)]
+pub const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Typed error returned by [`bounded_bytes`] / [`bounded_text`].
+///
+/// `anyhow::Error` auto-converts from any `std::error::Error + Send + Sync +
+/// 'static`, so callers can keep their existing `?` ergonomics — the typed
+/// shape is here so a test (or future structured-error work) can match
+/// `ResponseTooLarge` without scraping a message string.
+///
+/// `pub` + `#[doc(hidden)]` so the integration test in
+/// `tests/bounded_response.rs` can `match` on the variant. NOT stable
+/// API — external consumers should depend on the CLI binary.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum ApiClientError {
+    /// The server announced (via `Content-Length`) or streamed more bytes
+    /// than the CLI is willing to buffer in memory. `actual` is what we
+    /// observed — either the declared `Content-Length` (when we bailed
+    /// fast) or the running total accumulated when the cap tripped.
+    ResponseTooLarge {
+        /// Either the declared `Content-Length` or the running byte count
+        /// at the moment the cap tripped, whichever is the trigger.
+        actual: u64,
+        /// The cap that was violated. Always equals
+        /// [`MAX_RESPONSE_BODY_BYTES`] today, threaded through so the
+        /// error message stays accurate if the constant ever changes.
+        limit: usize,
+    },
+    /// `reqwest` failed mid-stream (connection reset, TLS error, etc.).
+    /// The underlying error is preserved so the original cause chains
+    /// through `anyhow`'s error reporter.
+    Stream(reqwest::Error),
+    /// The body decoded as bytes successfully but was not valid UTF-8
+    /// (only reachable through [`bounded_text`]).
+    Utf8(std::string::FromUtf8Error),
+}
+
+impl std::fmt::Display for ApiClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiClientError::ResponseTooLarge { actual, limit } => write!(
+                f,
+                "response body exceeds in-memory cap: server reported {actual} bytes, \
+                 client limit is {limit} bytes ({} MiB); refusing to buffer",
+                limit / (1024 * 1024)
+            ),
+            ApiClientError::Stream(e) => write!(f, "streaming response body: {e}"),
+            ApiClientError::Utf8(e) => write!(f, "response body is not valid UTF-8: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ApiClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ApiClientError::Stream(e) => Some(e),
+            ApiClientError::Utf8(e) => Some(e),
+            ApiClientError::ResponseTooLarge { .. } => None,
+        }
+    }
+}
+
+/// Read a [`reqwest::Response`] body to a `Vec<u8>`, rejecting bodies
+/// larger than [`MAX_RESPONSE_BODY_BYTES`].
+///
+/// Two layers of defence:
+///   1. If the server advertised a `Content-Length` larger than the cap,
+///      bail FAST without reading a single byte off the socket — this
+///      stops a malicious server from forcing the CLI to consume its
+///      cap's worth of bandwidth before erroring.
+///   2. Otherwise, accumulate `bytes_stream()` chunks into a `Vec<u8>`
+///      while tripwiring `total > MAX_RESPONSE_BODY_BYTES` after each
+///      chunk. Hitting the trip also emits a `tracing::warn!` so an
+///      operator running with `RUST_LOG=warn` sees the source URL.
+#[doc(hidden)]
+pub async fn bounded_bytes(
+    resp: reqwest::Response,
+) -> std::result::Result<Vec<u8>, ApiClientError> {
+    let limit = MAX_RESPONSE_BODY_BYTES;
+    // Fast-fail on declared Content-Length. A server that streams more than
+    // it declared will still trip the per-chunk check below.
+    if let Some(declared) = resp.content_length() {
+        if declared > limit as u64 {
+            tracing::warn!(
+                declared,
+                limit,
+                "refusing to buffer response: Content-Length exceeds CLI cap"
+            );
+            return Err(ApiClientError::ResponseTooLarge {
+                actual: declared,
+                limit,
+            });
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.map_err(ApiClientError::Stream)?;
+        // Use `checked_add` so a pathological server claiming a chunk of
+        // `usize::MAX` bytes can't overflow `buf.len() + chunk.len()` past
+        // the cap check.
+        let new_total = buf.len().checked_add(chunk.len()).unwrap_or(usize::MAX);
+        if new_total > limit {
+            tracing::warn!(
+                running_total = new_total as u64,
+                limit,
+                "response body cap tripped mid-stream"
+            );
+            return Err(ApiClientError::ResponseTooLarge {
+                actual: new_total as u64,
+                limit,
+            });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Same as [`bounded_bytes`] but decodes the buffered body as UTF-8.
+///
+/// Almost every CLI call site needs a `String` for `render_error_response`
+/// / `serde_json::from_str`, so this is the canonical helper to reach for.
+#[doc(hidden)]
+pub async fn bounded_text(
+    resp: reqwest::Response,
+) -> std::result::Result<String, ApiClientError> {
+    let bytes = bounded_bytes(resp).await?;
+    String::from_utf8(bytes).map_err(ApiClientError::Utf8)
 }
 
 #[cfg(test)]

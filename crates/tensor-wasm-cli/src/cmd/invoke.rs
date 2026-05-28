@@ -90,8 +90,9 @@ pub async fn run(args: InvokeArgs, ctx: &HttpContext) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
 
     let status = resp.status();
-    let text = resp
-        .text()
+    // T17: bound the in-memory response body. A 16 MiB cap is far above
+    // any legitimate invoke result envelope the API server emits.
+    let text = super::bounded_text(resp)
         .await
         .map_err(|e| anyhow::anyhow!("reading response body from {url}: {e}"))?;
 

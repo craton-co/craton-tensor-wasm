@@ -231,8 +231,9 @@ async fn publish(
         .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
 
     let status = resp.status();
-    let text = resp
-        .text()
+    // T17: bound the buffered response body — the publish endpoint should
+    // only ever respond with a short JSON ack, never a streamed blob.
+    let text = super::bounded_text(resp)
         .await
         .with_context(|| format!("reading response body from {url}"))?;
     if !status.is_success() {
@@ -254,8 +255,11 @@ async fn list(server: &str, ctx: &HttpContext) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("GET {url}: {e}"))?;
     let status = resp.status();
-    let text = resp
-        .text()
+    // T17: bound the buffered response body. A massively-populated kernel
+    // registry would still fit comfortably under 16 MiB of JSON; an
+    // operator who legitimately exceeds that should paginate, not bloat
+    // a single `list` call.
+    let text = super::bounded_text(resp)
         .await
         .with_context(|| format!("reading response body from {url}"))?;
     if !status.is_success() {
