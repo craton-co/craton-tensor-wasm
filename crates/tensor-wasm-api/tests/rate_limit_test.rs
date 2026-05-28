@@ -12,8 +12,8 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use tensor_wasm_api::{
-    build_router_with_full_config, AppState, AuthConfig, RateLimitConfig, RateLimiter,
-    TenantConfig,
+    build_router_with_full_config, AppState, AuthConfig, PerTenantRateLimitConfig,
+    RateLimitConfig, RateLimiter, TenantConfig,
 };
 use tower::ServiceExt;
 
@@ -35,7 +35,11 @@ const ALLOWED_STATUS: StatusCode = StatusCode::NOT_FOUND;
 
 fn router_with_limit(tokens: &[&str], qps: u32, burst: u32) -> axum::Router {
     let auth = AuthConfig::from_tokens(tokens.iter().copied());
-    let limiter = RateLimiter::new(RateLimitConfig { qps, burst });
+    let limiter = RateLimiter::new(RateLimitConfig {
+        qps,
+        burst,
+        per_tenant_default: PerTenantRateLimitConfig::disabled(),
+    });
     build_router_with_full_config(
         Arc::new(AppState::default()),
         auth,
@@ -169,7 +173,11 @@ async fn dev_mode_shares_a_single_bucket() {
     // With burst=2 / qps=1, the 3rd request 429s regardless of which
     // "client" sent it.
     let auth = AuthConfig::default(); // dev mode
-    let limiter = RateLimiter::new(RateLimitConfig { qps: 1, burst: 2 });
+    let limiter = RateLimiter::new(RateLimitConfig {
+        qps: 1,
+        burst: 2,
+        per_tenant_default: PerTenantRateLimitConfig::disabled(),
+    });
     let router = build_router_with_full_config(
         Arc::new(AppState::default()),
         auth,
