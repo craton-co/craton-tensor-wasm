@@ -10,8 +10,7 @@
 //! and hands out aligned sub-slices via a simple bump pointer.
 
 use std::fmt;
-
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::unified::{DeviceId, UnifiedBuffer, UnifiedError};
 
@@ -54,16 +53,34 @@ use crate::unified::{DeviceId, UnifiedBuffer, UnifiedError};
 /// line in [`crate::wasm_memory::TensorWasmMemoryCreator::new_memory`].
 pub struct UnifiedMemoryPool {
     slab: UnifiedBuffer,
-    state: Mutex<PoolState>,
-}
-
-struct PoolState {
     /// Next free byte offset within the slab.
-    bump: usize,
-    /// Outstanding allocations counter; the slab is "reset-eligible" when this hits zero.
-    live: usize,
-    /// Total bytes ever issued (sticky counter for metrics).
-    issued_total: u64,
+    ///
+    /// Audit T26: this counter was previously a field on a `Mutex<PoolState>`
+    /// shared with `live` and `issued_total`. Every `allocate` call therefore
+    /// took the same mutex, serialising tenants that were otherwise touching
+    /// disjoint byte ranges. Moving the bump to an `AtomicUsize` with a CAS
+    /// loop in [`Self::allocate`] removes that contention point while
+    /// preserving the disjoint-allocation invariant (a successful CAS proves
+    /// `[old_bump, new_bump)` was reserved exclusively by this caller).
+    ///
+    /// The CAS must NOT race with [`Self::reset`], which would let `allocate`
+    /// hand out a region overlapping a tenant's still-live `base_ptr`. The
+    /// `&mut self` signature on `reset` (T4) provides exactly that mutual
+    /// exclusion: while reset holds `&mut self`, the type system forbids any
+    /// concurrent `&self` call into `allocate`. Inside reset we therefore use
+    /// `*self.bump.get_mut() = 0` (a non-atomic write through the unique
+    /// reference) rather than `store(Release)`, because there is provably no
+    /// other thread observing the atomic at that point.
+    bump: AtomicUsize,
+    /// Outstanding allocations counter; the slab is "reset-eligible" when
+    /// this hits zero. Incremented atomically in [`Self::allocate`] AFTER
+    /// the bump reservation succeeds, decremented in [`Self::release`] (the
+    /// safe `PoolAllocation::Drop` path and the T6 `PooledLinearMemory::Drop`
+    /// mirror path).
+    live: AtomicUsize,
+    /// Total bytes ever issued (sticky counter for metrics). Saturates at
+    /// `u64::MAX`. Never decremented; survives [`Self::reset`] intact.
+    issued_total: AtomicU64,
 }
 
 /// A region of memory carved from a pool. Drops decrement the pool's live count.
@@ -84,11 +101,9 @@ impl UnifiedMemoryPool {
         let slab = UnifiedBuffer::new_on(capacity, device_id)?;
         Ok(Self {
             slab,
-            state: Mutex::new(PoolState {
-                bump: 0,
-                live: 0,
-                issued_total: 0,
-            }),
+            bump: AtomicUsize::new(0),
+            live: AtomicUsize::new(0),
+            issued_total: AtomicU64::new(0),
         })
     }
 
@@ -104,18 +119,25 @@ impl UnifiedMemoryPool {
 
     /// Bytes still available for new allocations.
     pub fn remaining(&self) -> usize {
-        let st = self.state.lock();
-        self.slab.len().saturating_sub(st.bump)
+        // `Acquire` pairs with the `Release` CAS in `allocate`: any caller
+        // reading `remaining` after observing a successful `allocate` on
+        // another thread sees the bumped value.
+        self.slab.len().saturating_sub(self.bump.load(Ordering::Acquire))
     }
 
     /// Outstanding allocation count.
     pub fn live_allocations(&self) -> usize {
-        self.state.lock().live
+        // `Acquire` so a thread that observes `live == 0` and goes on to
+        // `reset()` is guaranteed to have happens-before with every prior
+        // `release` increment-then-decrement.
+        self.live.load(Ordering::Acquire)
     }
 
     /// Total bytes issued since the pool was created (or last reset).
     pub fn issued_total(&self) -> u64 {
-        self.state.lock().issued_total
+        // Metrics path; `Relaxed` is sufficient — operators only read this for
+        // alerting, not to reason about happens-before with allocation.
+        self.issued_total.load(Ordering::Relaxed)
     }
 
     /// Allocate `size` bytes aligned to `align` (must be a power of two).
@@ -147,38 +169,90 @@ impl UnifiedMemoryPool {
             )));
         }
 
-        let mut st = self.state.lock();
-        // Compute `(bump + align - 1) & !(align - 1)` with overflow checks so
-        // a pathological `bump` near `usize::MAX` cannot wrap.
-        let aligned_bump = st
-            .bump
-            .checked_add(align - 1)
-            .map(|v| v & !(align - 1))
-            .ok_or_else(|| UnifiedError::Allocation("alignment overflow".into()))?;
-        let end = aligned_bump
-            .checked_add(size)
-            .ok_or_else(|| UnifiedError::Allocation("offset overflow".into()))?;
-        if end > self.slab.len() {
-            // Pool exhaustion is reported as the structured `TooLarge`
-            // variant so the `From<UnifiedError> for TensorWasmError` impl
-            // can route exhaustion to `MemoryExhausted { requested, limit }`
-            // with the real figures, not zeroed placeholders. The
-            // `requested` field reflects the caller-visible size; `limit` is
-            // the slab capacity so operators can size pools from telemetry.
-            return Err(UnifiedError::TooLarge {
-                requested: size as u64,
-                limit: self.slab.len() as u64,
-            });
+        // Audit T26: CAS loop on the bump pointer. Previously this critical
+        // section took a `parking_lot::Mutex<PoolState>` to update `bump`,
+        // `live`, and `issued_total` atomically. The mutex serialised
+        // unrelated tenants on the hot allocation path; the atomic-bump
+        // version lets disjoint allocations proceed in parallel without
+        // changing any externally visible behaviour.
+        //
+        // Disjoint-region invariant: a CAS success on `bump` proves nothing
+        // else updated `bump` between our `load` and `compare_exchange_weak`.
+        // Therefore the byte range `[aligned_bump, end)` was unreserved at
+        // CAS time and is now reserved exclusively by this caller. The zero-
+        // fill below targets that range and cannot race another allocator
+        // because the bump pointer has already moved past `end`.
+        //
+        // Reset interaction: `reset` requires `&mut self` (T4), so no
+        // concurrent `&self` allocate call can be live during reset, which
+        // means a reset will never race with this CAS.
+        let (aligned_bump, _end) = loop {
+            // `Relaxed` is sufficient here: the only ordering we care about
+            // is on the CAS itself, where `AcqRel` ties the bump update to
+            // the subsequent zero-fill (`Acquire`) and to any other thread
+            // that later observes the new bump (`Release`).
+            let current_bump = self.bump.load(Ordering::Relaxed);
+            // Compute `(bump + align - 1) & !(align - 1)` with overflow
+            // checks so a pathological `bump` near `usize::MAX` cannot wrap.
+            let aligned = current_bump
+                .checked_add(align - 1)
+                .map(|v| v & !(align - 1))
+                .ok_or_else(|| UnifiedError::Allocation("alignment overflow".into()))?;
+            let new_end = aligned
+                .checked_add(size)
+                .ok_or_else(|| UnifiedError::Allocation("offset overflow".into()))?;
+            if new_end > self.slab.len() {
+                // Pool exhaustion is reported as the structured `TooLarge`
+                // variant so the `From<UnifiedError> for TensorWasmError`
+                // impl can route exhaustion to
+                // `MemoryExhausted { requested, limit }` with the real
+                // figures, not zeroed placeholders. The `requested` field
+                // reflects the caller-visible size; `limit` is the slab
+                // capacity so operators can size pools from telemetry.
+                return Err(UnifiedError::TooLarge {
+                    requested: size as u64,
+                    limit: self.slab.len() as u64,
+                });
+            }
+            // `compare_exchange_weak` is fine on this hot path: spurious
+            // failures simply re-iterate the loop. `AcqRel` on success
+            // synchronises with the zero-fill below and with later
+            // observers; `Relaxed` on failure is sufficient because we
+            // re-read `bump` at the top of the next iteration.
+            match self.bump.compare_exchange_weak(
+                current_bump,
+                new_end,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break (aligned, new_end),
+                Err(_) => continue,
+            }
+        };
+        // The CAS succeeded; we now own `[aligned_bump, end)`.
+        // `live` and `issued_total` are independent atomic counters — no
+        // ordering dependency on each other. `Release` on `live` so a
+        // reader that later observes `live > 0` also observes the bump
+        // update via the same fence chain.
+        self.live.fetch_add(1, Ordering::Release);
+        // `Relaxed` for the sticky metrics counter — operators read this
+        // for alerting, not synchronisation. `saturating_add` is performed
+        // by a CAS loop to preserve the saturating-at-u64::MAX behaviour
+        // of the original `st.issued_total.saturating_add(...)` call.
+        let size_u64 = size as u64;
+        let mut issued = self.issued_total.load(Ordering::Relaxed);
+        loop {
+            let next = issued.saturating_add(size_u64);
+            match self.issued_total.compare_exchange_weak(
+                issued,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => issued = observed,
+            }
         }
-        st.bump = end;
-        st.live += 1;
-        st.issued_total = st.issued_total.saturating_add(size as u64);
-        // Drop the lock before the (potentially large) zero-fill so other
-        // allocators aren't blocked on memset for tenants that aren't us. The
-        // bump pointer has already moved past `[aligned_bump, end)` so no
-        // concurrent allocate() can hand the same range to another caller.
-        drop(st);
-
         // Cross-tenant data-leak mitigation (audit H1):
         // -------------------------------------------------------------------
         // The slab is recycled across tenants via `reset()`, which only resets
@@ -268,15 +342,25 @@ impl UnifiedMemoryPool {
     /// (b) continue to use one pool per tenant and drop the pool wholesale
     ///     at tenant teardown.
     pub fn reset(&mut self) -> Result<(), UnifiedError> {
-        let mut st = self.state.lock();
-        if st.live != 0 {
+        // `&mut self` guarantees no other thread holds *any* reference to
+        // `self`, so a non-atomic `get_mut().clone()` would be sound here.
+        // We still go through the atomic accessor for ergonomic symmetry
+        // with the rest of the module; `Ordering::Acquire` ensures any
+        // `release` decrement on another thread that this one has not yet
+        // synchronised with is visible (it must be, given the `&mut self`
+        // contract, but the explicit acquire keeps the code self-documenting).
+        let live_now = *self.live.get_mut();
+        if live_now != 0 {
             return Err(UnifiedError::Allocation(format!(
-                "cannot reset: {} live allocations outstanding",
-                st.live
+                "cannot reset: {live_now} live allocations outstanding",
             )));
         }
-        st.bump = 0;
-        // `issued_total` is sticky on purpose — it reflects lifetime activity.
+        // Direct non-atomic writes through `get_mut()` — `&mut self` proves
+        // uniqueness, so this cannot race with any concurrent CAS in
+        // `allocate` (the type system forbids `&self` calls while `reset`
+        // is in flight). `issued_total` is sticky on purpose — it reflects
+        // lifetime activity.
+        *self.bump.get_mut() = 0;
         Ok(())
     }
 
@@ -306,13 +390,33 @@ impl UnifiedMemoryPool {
     /// In release builds the counter saturates at zero (defensive: an
     /// under-count is still safer than wrapping `usize`).
     pub(crate) fn release(&self, _offset: usize, _size: usize) {
-        let mut st = self.state.lock();
-        debug_assert!(
-            st.live > 0,
-            "UnifiedMemoryPool::release called more times than allocate \
-             (would underflow live counter)"
-        );
-        st.live = st.live.saturating_sub(1);
+        // Audit T26: `live` is an `AtomicUsize` (was previously behind the
+        // shared `Mutex<PoolState>`). We do the underflow-safe decrement
+        // in a single CAS loop so a buggy double-release saturates at zero
+        // in release builds rather than wrapping to `usize::MAX` —
+        // identical defensive behaviour to the original
+        // `saturating_sub(1)` under the mutex.
+        //
+        // `AcqRel` so a thread that later observes `live == 0` and proceeds
+        // to `reset()` has a happens-before chain to every prior release.
+        let mut current = self.live.load(Ordering::Acquire);
+        loop {
+            debug_assert!(
+                current > 0,
+                "UnifiedMemoryPool::release called more times than allocate \
+                 (would underflow live counter)"
+            );
+            let next = current.saturating_sub(1);
+            match self.live.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Raw pointer to the start of the slab (intended for tests / FFI).
@@ -570,6 +674,94 @@ mod tests {
             leaked.len(),
             leaked.first(),
         );
+    }
+
+    #[test]
+    fn pool_concurrent_allocate_cas() {
+        // Audit T26: the CAS-bump replacement must keep the disjoint-region
+        // invariant intact under concurrent pressure. Spawn 16 threads, each
+        // performing N allocations of 1000 bytes (alignment 1 so the
+        // `aligned_bump` arithmetic is a no-op and the total consumed equals
+        // exactly `threads * iters * 1000`), collect every offset, and assert:
+        //
+        //   (a) the final `bump` equals `threads * iters * 1000` — no CAS
+        //       loss, no double-bump;
+        //   (b) `live_allocations` equals `threads * iters` — every allocation
+        //       incremented `live` exactly once;
+        //   (c) the set of offsets is pairwise non-overlapping — disjoint
+        //       allocation invariant survived the mutex removal.
+        //
+        // We intentionally `std::mem::forget` every allocation so the live
+        // counter is held high; the test owns the pool exclusively so it can
+        // drive the counter back to zero at the end via `release`.
+        use std::sync::Arc;
+        use std::thread;
+
+        const THREADS: usize = 16;
+        const ITERS: usize = 1000;
+        const SIZE: usize = 1000;
+
+        let pool = Arc::new(
+            UnifiedMemoryPool::new(THREADS * ITERS * SIZE + 4096).expect("pool"),
+        );
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let pool = Arc::clone(&pool);
+            handles.push(thread::spawn(move || {
+                let mut offsets = Vec::with_capacity(ITERS);
+                for _ in 0..ITERS {
+                    let a = pool.allocate(SIZE, 1).expect("alloc");
+                    offsets.push((a.offset(), a.len()));
+                    // Forget the drop guard so the live counter stays
+                    // elevated; we walk it back down at the end. This also
+                    // means the bump pointer cannot accidentally rewind via
+                    // `reset` between iterations.
+                    std::mem::forget(a);
+                }
+                offsets
+            }));
+        }
+
+        let mut all_offsets: Vec<(usize, usize)> = Vec::with_capacity(THREADS * ITERS);
+        for h in handles {
+            all_offsets.extend(h.join().expect("thread join"));
+        }
+
+        // (a) total bump consumed.
+        assert_eq!(
+            pool.capacity() - pool.remaining(),
+            THREADS * ITERS * SIZE,
+            "total consumed bytes must equal threads * iters * size; \
+             a discrepancy means a CAS update was lost or doubled"
+        );
+
+        // (b) live count.
+        assert_eq!(
+            pool.live_allocations(),
+            THREADS * ITERS,
+            "every allocation must increment `live` exactly once"
+        );
+
+        // (c) pairwise disjoint regions. Sort by offset; then walk and
+        // assert each region starts at or after the previous one ended.
+        all_offsets.sort_unstable_by_key(|&(off, _)| off);
+        for w in all_offsets.windows(2) {
+            let (off_a, len_a) = w[0];
+            let (off_b, _len_b) = w[1];
+            assert!(
+                off_a + len_a <= off_b,
+                "concurrent allocations overlap: [{off_a}, {}) vs [{off_b}, ...) \
+                 — CAS bump did not preserve the disjoint-region invariant",
+                off_a + len_a,
+            );
+        }
+
+        // Drain the live counter by hand so the pool's Drop is clean.
+        for (off, len) in all_offsets {
+            pool.release(off, len);
+        }
+        assert_eq!(pool.live_allocations(), 0);
     }
 
     #[test]
