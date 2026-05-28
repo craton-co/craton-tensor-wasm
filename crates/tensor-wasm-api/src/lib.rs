@@ -88,7 +88,9 @@ pub use middleware::{
     AuthConfig, CorsConfig, TenantConfig, ENV_API_TOKENS, ENV_CORS_ALLOWED_ORIGINS,
     ENV_REQUIRE_TENANT, HEADER_TENANT, MAX_REQUEST_BODY_BYTES,
 };
-pub use rate_limit::{AuthContext, RateLimitConfig, RateLimiter, TokenId};
+pub use rate_limit::{
+    AuthContext, PerTenantRateLimitConfig, RateLimitConfig, RateLimiter, TokenId,
+};
 pub use routes::{ApiError, AppState, FunctionRecord, JobRecord, JobStatus};
 pub use server::{
     build_router, build_router_with_audit, build_router_with_config,

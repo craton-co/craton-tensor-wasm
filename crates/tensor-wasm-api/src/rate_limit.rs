@@ -741,8 +741,19 @@ mod tests {
     use tower::ServiceExt;
 
     fn cfg(qps: u32, burst: u32) -> RateLimitConfig {
-        RateLimitConfig { qps, burst }
+        // Disable the per-tenant layer so these tests exercise the token
+        // (backstop) layer in isolation; the per-tenant primary layer has
+        // its own dedicated tests elsewhere.
+        RateLimitConfig {
+            qps,
+            burst,
+            per_tenant_default: PerTenantRateLimitConfig::disabled(),
+        }
     }
+
+    /// Convenience: the tenant every inline unit test in this module pins
+    /// to. Pre-multi-tenant tests only need a single stable value here.
+    const TENANT: TenantId = TenantId(1);
 
     #[test]
     fn config_disabled_when_either_zero() {
@@ -773,13 +784,13 @@ mod tests {
         let tok = TokenId::from_bearer("alpha");
         for i in 0..5 {
             assert!(
-                matches!(limiter.try_admit(tok), AdmitResult::Admit),
+                matches!(limiter.try_admit(tok, TENANT), AdmitResult::Admit),
                 "burst slot {i} should admit",
             );
         }
         // 6th request in the same instant: rejected.
         assert!(matches!(
-            limiter.try_admit(tok),
+            limiter.try_admit(tok, TENANT),
             AdmitResult::Reject { .. },
         ));
     }
@@ -791,27 +802,27 @@ mod tests {
         let tok = TokenId::from_bearer("alpha");
         // Drain the bucket.
         for _ in 0..5 {
-            assert!(matches!(limiter.try_admit(tok), AdmitResult::Admit));
+            assert!(matches!(limiter.try_admit(tok, TENANT), AdmitResult::Admit));
         }
         assert!(matches!(
-            limiter.try_admit(tok),
+            limiter.try_admit(tok, TENANT),
             AdmitResult::Reject { .. },
         ));
         // Advance enough wall-time to refill exactly one permit at 10 qps.
         clock.advance(Duration::from_millis(100));
-        assert!(matches!(limiter.try_admit(tok), AdmitResult::Admit));
+        assert!(matches!(limiter.try_admit(tok, TENANT), AdmitResult::Admit));
         // Immediately after: empty again.
         assert!(matches!(
-            limiter.try_admit(tok),
+            limiter.try_admit(tok, TENANT),
             AdmitResult::Reject { .. },
         ));
         // Advance enough to refill the entire burst.
         clock.advance(Duration::from_secs(1));
         for _ in 0..5 {
-            assert!(matches!(limiter.try_admit(tok), AdmitResult::Admit));
+            assert!(matches!(limiter.try_admit(tok, TENANT), AdmitResult::Admit));
         }
         assert!(matches!(
-            limiter.try_admit(tok),
+            limiter.try_admit(tok, TENANT),
             AdmitResult::Reject { .. },
         ));
     }
@@ -823,15 +834,15 @@ mod tests {
         let a = TokenId::from_bearer("alpha");
         let b = TokenId::from_bearer("beta");
         for _ in 0..2 {
-            assert!(matches!(limiter.try_admit(a), AdmitResult::Admit));
+            assert!(matches!(limiter.try_admit(a, TENANT), AdmitResult::Admit));
         }
         // A is drained.
-        assert!(matches!(limiter.try_admit(a), AdmitResult::Reject { .. }));
+        assert!(matches!(limiter.try_admit(a, TENANT), AdmitResult::Reject { .. }));
         // B is untouched.
         for _ in 0..2 {
-            assert!(matches!(limiter.try_admit(b), AdmitResult::Admit));
+            assert!(matches!(limiter.try_admit(b, TENANT), AdmitResult::Admit));
         }
-        assert!(matches!(limiter.try_admit(b), AdmitResult::Reject { .. }));
+        assert!(matches!(limiter.try_admit(b, TENANT), AdmitResult::Reject { .. }));
     }
 
     #[test]
@@ -840,7 +851,7 @@ mod tests {
         let limiter = RateLimiter::with_clock(RateLimitConfig::disabled(), clock);
         let tok = TokenId::from_bearer("alpha");
         for _ in 0..1000 {
-            assert!(matches!(limiter.try_admit(tok), AdmitResult::Admit));
+            assert!(matches!(limiter.try_admit(tok, TENANT), AdmitResult::Admit));
         }
     }
 
@@ -850,8 +861,8 @@ mod tests {
         // qps=1000, burst=1 → very fast refill, but we still want >=1s back-off.
         let limiter = RateLimiter::with_clock(cfg(1000, 1), clock.clone());
         let tok = TokenId::from_bearer("alpha");
-        assert!(matches!(limiter.try_admit(tok), AdmitResult::Admit));
-        match limiter.try_admit(tok) {
+        assert!(matches!(limiter.try_admit(tok, TENANT), AdmitResult::Admit));
+        match limiter.try_admit(tok, TENANT) {
             AdmitResult::Reject { retry_after_secs } => {
                 assert!(retry_after_secs >= 1, "got {retry_after_secs}");
             }
