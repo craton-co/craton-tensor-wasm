@@ -17,6 +17,7 @@ pub mod bench;
 pub mod completions;
 pub mod deploy;
 pub mod invoke;
+pub mod kernel;
 pub mod man;
 pub mod metrics;
 pub mod observe;

@@ -63,6 +63,24 @@ pliron = { version = "0.15", optional = true }
 # toolchain pre-installed.
 pliron-llvm = { version = "0.15", optional = true }
 
+# Signed kernel registry (roadmap feature #3 scaffold). All four crates
+# are off by default — they only get pulled in when the
+# `kernel-registry` feature is on. `hmac` + `sha2` are pinned to the same
+# versions the snapshot crate already uses for its HMAC-SHA256 signing
+# path (snapshots v3), so cargo can deduplicate. `subtle` matches the
+# 2.x line used by the api crate's constant-time token comparator.
+# `serde` / `serde_json` give us a manifest wire format the v0.4 server
+# endpoint can decode without an additional ser-de helper layer.
+# `zeroize` scrubs the in-memory copy of the HMAC signing key when the
+# registry is dropped — the same scrub-on-Drop guarantee the cli's
+# `load_hmac_key` provides for its on-disk key buffer.
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+subtle = { version = "2", optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+zeroize = { version = "1", optional = true }
+
 [dev-dependencies]
 tokio.workspace = true
 wat.workspace = true
@@ -98,6 +116,20 @@ cuda-oxide-backend = ["dep:pliron"]
 # (W4.x's CI image will satisfy this; the default workstation build will
 # not).
 pliron-llvm-backend = ["cuda-oxide-backend", "dep:pliron-llvm"]
+# Signed kernel registry (roadmap feature #3 scaffold). When enabled,
+# the `registry` module is compiled and the runtime can resolve PTX
+# kernels published as HMAC-SHA256-signed `KernelManifest` records. v0.3.7
+# only ships the in-memory backend + signing helpers; the on-disk store
+# and the server-side `/kernels` route land in v0.4. See
+# `docs/KERNEL-REGISTRY.md` for the rollout plan and security notes.
+kernel-registry = [
+    "dep:hmac",
+    "dep:sha2",
+    "dep:subtle",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:zeroize",
+]
 
 [package.metadata.docs.rs]
 all-features = true

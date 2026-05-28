@@ -16,11 +16,12 @@ together define the bar.
 2. [Where v0.1.0 stands today](#where-v010-stands-today)
 3. [Anti-goals — what v1.0 does NOT promise](#anti-goals-what-v10-does-not-promise)
 4. [The five-milestone path](#the-five-milestone-path)
-5. [Per-area workstreams](#per-area-workstreams)
-6. [Open decisions to resolve before v1.0](#open-decisions-to-resolve-before-v10)
-7. [Risk register](#risk-register)
-8. [Effort and timeline (caveated)](#effort-and-timeline-caveated)
-9. [Out of scope — deferred to v2.0](#out-of-scope--deferred-to-v20)
+5. [Post-v0.3.6 strategic features](#post-v036-strategic-features)
+6. [Per-area workstreams](#per-area-workstreams)
+7. [Open decisions to resolve before v1.0](#open-decisions-to-resolve-before-v10)
+8. [Risk register](#risk-register)
+9. [Effort and timeline (caveated)](#effort-and-timeline-caveated)
+10. [Out of scope — deferred to v2.0](#out-of-scope--deferred-to-v20)
 
 ---
 
@@ -264,6 +265,34 @@ unless a beta-cycle bug demands it.
 - [ ] **Backport policy.** v1.x will receive security patches and
       severity-1 fixes for at least 12 months. Documented in
       `SECURITY.md`.
+
+---
+
+## Post-v0.3.6 strategic features
+
+Features that landed as v0.3.x _scaffolds_ — surface-area-stable, but
+with the production wire (server endpoints, on-disk stores, control
+plane) deferred to v0.4 so a design partner can target them ahead of
+the parity port. Each item lives behind a feature flag in its owning
+crate so the default build doesn't pay the dep cost until the wire
+lands.
+
+1. **OpenAI gateway shim** (`tensor-wasm-api`, v0.3.6). Wired into the
+   router behind a route allowlist with an OpenAPI spec. See B5.6.
+2. **Unified backing for tensor buffers** (`tensor-wasm-mem`, v0.3.5).
+   `UnifiedBacking` trait + `UvmAdvice` impls for the three buffer
+   shapes. See B5.4 and `docs/CUDA-OXIDE-CUTOVER.md`.
+3. **Signed kernel registry** (`tensor-wasm-jit`, v0.3.7). HMAC-SHA256
+   `KernelManifest` records + in-memory `InMemoryRegistry`. CLI
+   surface (`tensor-wasm kernel publish|list|verify`) is staged but
+   exits with code 3 (`FEATURE_NOT_EXPOSED`) until v0.4 wires the
+   server-side `/kernels` route. See
+   [KERNEL-REGISTRY.md](KERNEL-REGISTRY.md).
+
+These items are deliberately NOT exit criteria for v0.4; they exist
+to let design partners build against a stable Rust + CLI surface
+ahead of the v0.4 wire. The "graduate from scaffold to wired" step
+moves to the relevant v0.4 milestone above.
 
 ---
 

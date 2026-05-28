@@ -57,6 +57,7 @@ async fn main() {
         Command::Invoke(args) => cmd::invoke::run(args, &ctx).await,
         Command::Bench(args) => cmd::bench::run(args).await,
         Command::Snapshot { action } => cmd::snapshot::run(action, &ctx).await,
+        Command::Kernel { action } => cmd::kernel::run(action, &ctx).await,
         Command::Metrics(args) => cmd::metrics::run(args, &ctx).await,
         Command::Observe(args) => cmd::observe::run(args, &ctx).await,
         Command::Serve(args) => cmd::serve::run(args).await,
