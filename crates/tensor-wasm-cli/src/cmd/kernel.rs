@@ -271,7 +271,18 @@ async fn list(server: &str, ctx: &HttpContext) -> Result<()> {
         println!("(no kernels registered)");
     } else {
         for m in &parsed.manifests {
-            println!("{}@{}  sm={}  publisher={}", m.name, m.version, m.sm_version, m.publisher);
+            // T18: `name`, `version`, and `publisher` are server-controlled
+            // strings deserialised from the `/kernels` response. Strip
+            // ASCII control bytes per field so a malicious manifest cannot
+            // smuggle ANSI escapes into the operator's terminal. The
+            // `sm_version` field is an integer and is safe as-is.
+            println!(
+                "{}@{}  sm={}  publisher={}",
+                super::sanitise_terminal_output(&m.name),
+                super::sanitise_terminal_output(&m.version),
+                m.sm_version,
+                super::sanitise_terminal_output(&m.publisher),
+            );
         }
     }
     Ok(())

@@ -152,7 +152,11 @@ pub async fn run(args: DeployArgs, ctx: &HttpContext) -> Result<()> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("response missing `id` field: {text}"))?;
 
-    println!("{id}");
+    // T18: `id` was extracted from a server-supplied JSON envelope, so a
+    // malicious server can stuff ANSI escapes (or a literal CR) into the
+    // string. Sanitise before displaying so the response cannot rewrite
+    // the operator's terminal title bar or smuggle in a control byte.
+    println!("{}", super::sanitise_terminal_output(id));
     Ok(())
 }
 

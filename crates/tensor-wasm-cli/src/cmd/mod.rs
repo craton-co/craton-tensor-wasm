@@ -474,6 +474,44 @@ pub async fn bounded_text(
     String::from_utf8(bytes).map_err(ApiClientError::Utf8)
 }
 
+// ---------------------------------------------------------------------------
+// Terminal-output sanitisation (T18, terminal-hijack hardening)
+// ---------------------------------------------------------------------------
+//
+// Several CLI paths take a server-returned `String` (snapshot restore id,
+// invoke fallback body, metrics text, kernel-list rows, observe-board cells)
+// and `println!` it verbatim. A malicious server can embed ANSI escape
+// sequences (`ESC [ …`) which rewrite the user's terminal title bar, hide
+// subsequent output, smuggle in a CR-overwritten "yes" answer to a later
+// prompt, or otherwise hijack the operator's terminal session. The helper
+// below scrubs server-controlled bytes before they reach the terminal.
+
+/// Strip ASCII control bytes (`< 0x20`, except `\n`, `\r`, `\t`) and the
+/// DEL byte (`0x7F`) from a server-returned string before printing it to
+/// the user's terminal. Prevents ANSI escape injection, title-bar
+/// rewriting, and "smuggle a CR" attacks via malicious responses.
+///
+/// Multi-byte UTF-8 sequences are preserved untouched — only US-ASCII
+/// control bytes are filtered. The replacement is `?` so the operator
+/// sees that something was stripped.
+///
+/// `pub` + `#[doc(hidden)]` so the integration test in
+/// `tests/sanitise_terminal_output.rs` can exercise the helper directly.
+/// NOT considered stable API — external consumers should depend on the
+/// CLI binary.
+#[doc(hidden)]
+pub fn sanitise_terminal_output(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,6 +695,35 @@ mod tests {
         assert!(!is_loopback_host("example.com"));
         assert!(!is_loopback_host("10.0.0.1"));
         assert!(!is_loopback_host(""));
+    }
+
+    #[test]
+    fn sanitise_terminal_output_strips_ansi_csi() {
+        // ESC `[` `3` `1` `m` is a common SGR colour escape. After
+        // sanitisation the ESC byte must be replaced with `?` so the
+        // sequence can no longer be recognised by the terminal emulator
+        // as a control directive.
+        let out = sanitise_terminal_output("hello\x1b[31mworld");
+        assert!(!out.contains('\x1b'), "ESC byte survived: {out:?}");
+        assert!(out.contains("hello"));
+        assert!(out.contains("world"));
+    }
+
+    #[test]
+    fn sanitise_terminal_output_preserves_unicode_and_whitespace() {
+        // Newline, carriage return, tab, and any multi-byte UTF-8
+        // sequence must pass through untouched — the helper must NOT
+        // mangle legitimate human-readable output.
+        let input = "héllo\n\tworld\r";
+        assert_eq!(sanitise_terminal_output(input), input);
+    }
+
+    #[test]
+    fn sanitise_terminal_output_replaces_del() {
+        // 0x7F (DEL) is technically `c.is_control()` per the Unicode
+        // tables and is not one of the three whitespace exceptions, so
+        // it must be replaced with `?`.
+        assert_eq!(sanitise_terminal_output("a\x7Fb"), "a?b");
     }
 
     #[test]

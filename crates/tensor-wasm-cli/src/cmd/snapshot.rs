@@ -457,7 +457,12 @@ async fn restore(
         .ok()
         .and_then(|v| v.get("id").and_then(|s| s.as_str()).map(str::to_owned))
         .unwrap_or_else(|| text.trim().to_owned());
-    println!("{id}");
+    // T18: the id came off the wire from the server (or, on the fallback
+    // path, is the raw response body). Strip ASCII control bytes before
+    // displaying so a malicious server cannot inject ANSI escapes that
+    // rewrite the operator's terminal title bar, smuggle in a CR, or
+    // hide subsequent output.
+    println!("{}", super::sanitise_terminal_output(&id));
     Ok(())
 }
 
