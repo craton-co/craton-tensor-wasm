@@ -66,21 +66,31 @@ fn l2_hit_preserves_launch_geometry() {
 
 #[test]
 fn l2_legacy_v1_file_is_treated_as_miss() {
-    // A pre-existing V1 file (magic "TWJIT-KRNL-v1\0\0\0") must be silently
-    // discarded as a miss so the next put rewrites it as V2 — preserving
-    // the launch_geometry from that point on. We synthesise a syntactically
-    // valid V1 record so the bytes are unambiguously V1, not garbage.
+    // A pre-existing pre-T30 raw record (V1 magic "TWJIT-KRNL-v1\0\0\0",
+    // or V2 magic "TWJIT-KRNL-v2\0\0\0" — both written by the
+    // pre-migration code that wrote the V2 envelope directly to the
+    // `.ptxbin` file) must be silently discarded as a miss so the next
+    // put rewrites it under the T30 layered `(sidecar -> artifact-store
+    // blob)` shape.
+    //
+    // T30 reads the sidecar magic [`SIDECAR_MAGIC_V1`] (= "TWJIT-IDX-v1")
+    // at the head of every `.ptxbin` file. A legacy file's first 16
+    // bytes are the kernel-envelope magic ("TWJIT-KRNL-v1" or
+    // "TWJIT-KRNL-v2"), so the sidecar-magic check rejects it as
+    // "legacy or unknown" and the loader returns a clean miss.
     use std::io::Write;
     let tmp = TempDir::new().expect("tempdir");
     let dir: PathBuf = tmp.path().to_path_buf();
     let hmac_key = [0x55; 32];
 
     let key = CacheKey::for_tenant(TenantId(1), 0xFEED_FACE, 89);
-    // Hash the key the same way DiskCache::path_for does so we land on the
-    // exact filename a real put would have produced. Hardcoding the
+    // Hash the key the same way DiskCache::path_for does so we land on
+    // the exact filename a real put would have produced. Hardcoding the
     // computation here (rather than exposing path_for) keeps the test
-    // sealed against cache internals — if path_for ever changes, both the
-    // writer and this test fail together.
+    // sealed against cache internals — if path_for ever changes, both
+    // the writer and this test fail together. Path shape since T20:
+    //   `{key_prefix_hex:16}-{cache_key_hex:32}.ptxbin`
+    // where `key_prefix_hex` is the first 8 bytes of blake3(hmac_key).
     let path = {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"tensor-wasm-jit::DiskCache::path::v1\0");
@@ -89,18 +99,29 @@ fn l2_legacy_v1_file_is_treated_as_miss() {
         hasher.update(&key.sm_version.to_le_bytes());
         hasher.update(&key.emit_config_hash.to_le_bytes());
         let h = hasher.finalize();
-        let hex_stem: String = h
+        let cache_key_hex: String = h
             .as_bytes()
             .iter()
             .take(16)
             .map(|b| format!("{b:02x}"))
             .collect();
-        dir.join(format!("{hex_stem}.ptxbin"))
+        let key_fp = blake3::hash(&hmac_key[..]);
+        let key_prefix_hex: String = key_fp
+            .as_bytes()
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        dir.join(format!("{key_prefix_hex}-{cache_key_hex}.ptxbin"))
     };
 
     // Build a V1 record by hand. V1 layout was:
     //   magic(16) || fingerprint(8) || sm_version(4) || ptx_len(8)
     //     || ptx_text(N) || hmac(32)
+    // This sits directly at the sidecar's path (the same path post-T30
+    // sidecars use), but its leading 16 bytes ("TWJIT-KRNL-v1\0\0\0")
+    // do NOT match SIDECAR_MAGIC_V1 ("TWJIT-IDX-v1\0\0\0\0"), so the
+    // T30 loader rejects it as legacy/unknown and returns a miss.
     std::fs::create_dir_all(&dir).unwrap();
     let ptx_text = b".visible .entry legacy_kernel(){}";
     let mut buf: Vec<u8> = Vec::new();
@@ -121,7 +142,8 @@ fn l2_legacy_v1_file_is_treated_as_miss() {
     });
     assert!(
         cache.get(&key).is_none(),
-        "V1 records must be treated as miss so the L1 path re-emits and \
-         rewrites as V2 (the only way to recover the lost launch_geometry)"
+        "legacy pre-T30 records must be treated as miss so the L1 path \
+         re-emits and rewrites under the T30 layered layout (the only way \
+         to recover the lost launch_geometry on the cold path)"
     );
 }

@@ -17,6 +17,11 @@ categories = ["wasm", "compilers", "concurrency"]
 
 [dependencies]
 tensor-wasm-core = { workspace = true }
+# T30: the on-disk L2 kernel cache (`cache::DiskCache`) now layers the v2
+# kernel envelope (TWJIT-KRNL-v2) over the streaming content-addressed
+# `DiskArtifactStore`. This is a hard dependency — the disk cache cannot
+# function without it.
+tensor-wasm-artifacts = { workspace = true }
 blake3.workspace = true
 cranelift-codegen.workspace = true
 dashmap.workspace = true
@@ -103,13 +108,11 @@ sha2 = { version = "0.10", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 # T35 (v0.4): `DiskRegistry` reuses the unified content-addressed signed
-# blob store from `tensor-wasm-artifacts` for persistence. The store
-# brings HMAC-SHA256 envelope, zstd compression, size caps, and atomic
-# rename-on-publish; the registry only contributes the
-# `(name, version, sm_version) -> ContentHash` keymap on top. Optional +
-# tied to the `kernel-registry` feature so the default jit build keeps
-# the lean dep graph the original B6.3 scaffold designed for.
-tensor-wasm-artifacts = { workspace = true, optional = true }
+# blob store from `tensor-wasm-artifacts` for persistence. T30 promoted
+# this to a hard dependency (the on-disk L2 kernel cache also layers on
+# it now); see the top-of-section [dependencies] entry. The
+# `kernel-registry` feature still gates the `DiskRegistry` *symbols* but
+# no longer depends on a dep:tensor-wasm-artifacts switch.
 # T35: bincode for `KernelManifest` ↔ on-disk blob serialization. v2 +
 # `serde` so we route through the existing `serde::{Serialize,
 # Deserialize}` derives on `KernelManifest` (same path the snapshot
@@ -184,7 +187,6 @@ kernel-registry = [
     "dep:sha2",
     "dep:serde",
     "dep:serde_json",
-    "dep:tensor-wasm-artifacts",
     "dep:bincode",
 ]
 

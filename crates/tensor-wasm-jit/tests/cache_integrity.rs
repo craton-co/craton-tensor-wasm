@@ -146,31 +146,43 @@ fn disk_cache_rejects_tampered_payload() {
         ),
     );
 
-    // Find the one `.ptxbin` file and flip a byte inside the PTX payload
-    // (past the V2 header, before the 32-byte HMAC trailer). The V2 layout
-    // is: magic(16) + fingerprint(8) + sm_version(4) + grid_x(4) +
-    // block_x(4) + ptx_len(8) = 44-byte header. We compute the flip offset
-    // from the layout directly rather than `len/2` so that any future
-    // layout growth (e.g. another field added to V2 or a V3 bump) makes
-    // the failure mode explicit instead of silently flipping into a
-    // different region.
-    const V2_HEADER_LEN: usize = 16 + 8 + 4 + 4 + 4 + 8;
-    const HMAC_LEN: usize = 32;
+    // T30 layout: `put` produces TWO files in `dir`:
+    //   * a tiny `.ptxbin` sidecar mapping CacheKey -> ContentHash, and
+    //   * a `.bin` artifact-store blob holding the streaming
+    //     HMAC-SHA256 + zstd envelope around the V2 kernel envelope.
+    //
+    // The PTX bytes live inside the compressed `.bin` body, so we
+    // tamper with the blob: flip a byte well past the artifact-store
+    // header (so we land inside the zstd frame, not the magic/version/
+    // content-hash prefix) and before the trailing 32-byte HMAC tag.
+    // The store's streaming HMAC over the prefix bytes must reject
+    // this on read, surfacing as a miss through the cache's `get`.
+    const ARTIFACT_HEADER_LEN: usize = 16 + 4 + 32; // magic + version + content_hash
+    const ARTIFACT_HMAC_LEN: usize = 32;
     let entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "ptxbin"))
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "bin"))
         .collect();
-    assert_eq!(entries.len(), 1, "disk cache must have written exactly one file");
-    let path = entries[0].path();
-    let mut bytes = std::fs::read(&path).expect("read entry");
-    assert!(
-        bytes.len() > V2_HEADER_LEN + HMAC_LEN,
-        "file should have non-empty ptx payload between header and trailer"
+    assert_eq!(
+        entries.len(),
+        1,
+        "T30 disk cache must have written exactly one artifact-store blob"
     );
-    let flip_at = V2_HEADER_LEN + (bytes.len() - V2_HEADER_LEN - HMAC_LEN) / 2;
+    let path = entries[0].path();
+    let mut bytes = std::fs::read(&path).expect("read blob");
+    assert!(
+        bytes.len() > ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN,
+        "blob should have a non-empty zstd body between header and tag"
+    );
+    // Flip a byte in the middle of the zstd body (between the
+    // 52-byte header prefix and the 32-byte HMAC tail). The body is
+    // HMAC-covered, so any bit-flip here invalidates the MAC and the
+    // store rejects on read.
+    let flip_at =
+        ARTIFACT_HEADER_LEN + (bytes.len() - ARTIFACT_HEADER_LEN - ARTIFACT_HMAC_LEN) / 2;
     bytes[flip_at] ^= 0xFF;
-    std::fs::write(&path, &bytes).expect("rewrite tampered entry");
+    std::fs::write(&path, &bytes).expect("rewrite tampered blob");
 
     let cache2 = KernelCache::new().with_disk_persistence(DiskCacheConfig {
         dir,
