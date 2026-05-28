@@ -21,6 +21,7 @@ together define the bar.
 7. [Risk register](#risk-register)
 8. [Effort and timeline (caveated)](#effort-and-timeline-caveated)
 9. [Out of scope — deferred to v2.0](#out-of-scope--deferred-to-v20)
+10. [Post-v0.3.6 strategic features](#post-v036-strategic-features)
 
 ---
 
@@ -468,6 +469,198 @@ For visibility, the v2.x line is likely to include:
 
 None of this blocks v1.0. Mentioning it here so it's clear we know it
 exists and have a place to put it.
+
+---
+
+## Post-v0.3.6 strategic features
+
+The items below come out of the comprehensive review conducted at the
+v0.3.6 mark. They are *additions* to the workstreams above, not
+replacements: the existing milestone exit criteria still gate v0.5 /
+v1.0. These are the strategic bets that turn TensorWasm from "Wasmtime
+plus a CUDA crate" into a credible GPU-Wasm platform.
+
+Items are grouped into three tiers by horizon and confidence: high-
+leverage near-term (v0.4), strategic medium-term (v0.5–v1.0), and
+speculative / R&D. Cost estimates are engineer-weeks of focused work
+by a single contributor familiar with the affected crates; they are
+not calendar time.
+
+### High-leverage near-term (v0.4)
+
+#### 1. Typed multi-value guest export ABI
+
+- **What:** Today the executor only invokes `() -> ()`. Wire `--args`
+  JSON through to the guest so typed multi-value exports work end to
+  end. Touches `tensor-wasm-exec`, the CLI, and the HTTP API.
+- **Why:** Unlocks every non-trivial guest. Without typed args, every
+  real workload has to smuggle inputs through preopens or env vars.
+- **Cost:** ~2 weeks.
+- **Risk:** Low. The Wasmtime side already supports it; the work is
+  plumbing and a JSON ↔ `Val` codec with clear failure modes.
+
+#### 2. Streaming HTTP `invoke` responses
+
+- **What:** SSE or chunked transfer encoding for `invoke`, so guests
+  can emit token-by-token output. Adds a new host function
+  `wasi:tensor/host.emit-chunk` that the guest can call repeatedly.
+- **Why:** Closes the LLM use case. Without streaming, every chat-
+  style workload has to buffer to completion before the client sees
+  anything, which is a non-starter against Modal / Beam / vLLM.
+- **Cost:** ~3 weeks.
+- **Risk:** Low–medium. Backpressure, cancellation, and per-tenant
+  fair scheduling on the streaming path each need design notes.
+
+#### 3. Signed kernel registry
+
+- **What:** `tensor-wasm kernel publish --sign` mirroring the existing
+  snapshot-signing pattern. Operators consume vetted kernels (matmul,
+  attention, conv2d) as first-class signed artifacts instead of
+  rebuilding from source.
+- **Why:** Lets the kernel library evolve independently of the
+  runtime, and gives operators a defensible supply-chain story for
+  the GPU code path.
+- **Cost:** ~3 weeks.
+- **Risk:** Low. The signing primitives, HMAC trailer format, and
+  on-disk layout already exist from the snapshot and JIT L2 work.
+
+#### 4. Cooperative deadlines via WASI yield
+
+- **What:** Well-behaved guests offer suspend points via a new WASI
+  yield host function; the scheduler uses these to keep tail latency
+  bounded under MPS contention.
+- **Why:** Today a long-running guest under MPS contention blocks
+  other tenants until preemption. Cooperative yields close the gap
+  without paying full preemption cost.
+- **Cost:** ~1 week.
+- **Risk:** Low. The fallback (uncooperative guests) is the status
+  quo, so this is a strict improvement when adopted.
+
+#### 5. Pre-instantiated instance pool
+
+- **What:** Pre-spawn N instances per (tenant, module) tuple and draw
+  from a channel on `invoke` instead of paying cold-start on every
+  call.
+- **Why:** Pushes P99 latency down materially. The current numbers
+  are where Modal and Beam currently win the head-to-head benchmarks
+  — this directly attacks that gap.
+- **Cost:** ~2 weeks.
+- **Risk:** Medium. Pool sizing, eviction, and pinned-resource
+  accounting interact with the GPU memory quota work (#8).
+
+### Strategic medium-term (v0.5–v1.0)
+
+#### 6. Differential JIT correctness oracle
+
+- **What:** Every `auto_offload` candidate runs on both the Wasmtime
+  CPU path and the JIT GPU path under proptest; bit-identity is
+  asserted across a generated input distribution.
+- **Why:** Highest-credibility security-pitch item before the v0.5
+  external audit. "Our JIT is bit-identical to the interpreter under
+  random inputs" is much stronger than any test-suite claim alone.
+- **Cost:** ~3 weeks.
+- **Risk:** Medium. Floating-point determinism across CPU and GPU
+  paths requires care; some kernels will need an explicit tolerance
+  policy with a documented rationale.
+
+#### 7. Pliron-based auto-offload pipeline
+
+- **What:** A real compiler pipeline — Wasm → CLIF → Pliron
+  `dialect-mir` → cuda-oxide → PTX — replacing the three hand-written
+  offload blueprints.
+- **Why:** **THE feature that distinguishes "Wasmtime + a CUDA crate"
+  from "the way you run GPU Wasm".** Expands offload coverage from
+  three named kernels to anything the pipeline can lower.
+- **Cost:** 2–3 months.
+- **Risk:** High. Pliron is still maturing; lowering quality on real
+  Wasm workloads is unproven. Worth the bet because the alternative
+  is shipping a permanent allow-list of kernels.
+
+#### 8. Per-tenant GPU memory quotas via `cuMemPool`
+
+- **What:** Hard per-tenant GPU memory caps enforced inside MPS using
+  `cuMemPool` (CUDA 11.2+). Replaces today's soft accounting.
+- **Why:** Makes the multi-tenant pitch defensible. Without hard
+  quotas, any tenant can OOM the whole device and the isolation
+  story falls apart on first contact.
+- **Cost:** ~4 weeks.
+- **Risk:** Medium. Older driver / minimum-CUDA requirements need to
+  be enforced and documented in the support matrix.
+
+#### 9. Unified content-addressed signed artifact store
+
+- **What:** Fold the JIT L2 cache and the snapshot store into a
+  single content-addressed, signed artifact primitive. Both already
+  share the HMAC trailer format and on-disk layout.
+- **Why:** One fewer concept in operator docs; one fewer code path
+  to audit; consistent garbage collection and quota story.
+- **Cost:** ~3 weeks.
+- **Risk:** Low. The two stores already converged in format; this is
+  collapsing the abstraction, not reinventing it.
+
+#### 10. OpenAI-compatible inference gateway shim
+
+- **What:** A thin gateway exposing `/v1/completions` and
+  `/v1/chat/completions` that translates to the internal `invoke`
+  protocol.
+- **Why:** **Highest-ROI item on this list.** The addressable market
+  of "things that speak the OpenAI API" is orders of magnitude
+  bigger than "Wasmtime / Wasmer migrators". Cheapest possible way
+  to put TensorWasm into a real LLM serving stack.
+- **Cost:** ~2 weeks.
+- **Risk:** Low. The spec is stable, the translation is mechanical,
+  and #2 (streaming responses) is the hard prerequisite — once that
+  ships, this is almost free.
+
+### Speculative / R&D
+
+#### 11. WASI-NN compatibility layer
+
+- **What:** A compatibility shim that lets existing WASI-NN guests
+  (compiled for ONNX, llama.cpp, OpenVINO) execute on TensorWasm
+  with a CUDA-accelerated backend.
+- **Why:** Inherits an existing guest ecosystem instead of asking
+  authors to port to a TensorWasm-specific WIT.
+- **Cost:** 6 weeks.
+- **Risk:** High. The WASI-NN spec is still moving; building against
+  a moving target risks landing a layer that ages out before the
+  audience materializes.
+
+#### 12. Direct guest-side GPU dispatch via SPIR-V
+
+- **What:** A SPIR-V → PTX path that lets guests dispatch GPU work
+  directly, rather than going through host kernels.
+- **Why:** Speculative. WebGPU-as-guest-interface is explicitly
+  anti-goal'd in this doc — but worth keeping a WIT door open for in
+  case the calculus shifts.
+- **Cost:** 6 months or more.
+- **Risk:** Very high. Conflicts with the current anti-goal; security
+  model for guest-issued PTX is open; SPIR-V → PTX lowering is its
+  own multi-engineer project.
+
+#### 13. Distributed dispatch sidecar over QUIC
+
+- **What:** A single-hop sidecar that fronts a TensorWasm host and
+  transparently bursts GPU work to peer hosts over QUIC when local
+  capacity is exhausted.
+- **Why:** Multi-host scheduling without committing to a full control
+  plane. v1.x territory, not v1.0.
+- **Cost:** 2–3 months.
+- **Risk:** Medium–high. Failure modes, tenancy boundaries across
+  hosts, and operator UX all need design work before any code.
+
+---
+
+**Top priority for the v0.5-beta external-deploy gate: #10
+(OpenAI-compatible inference gateway shim).** Of the items on this
+list, it has the highest ratio of addressable market to engineering
+cost, depends only on #2 (which is already on the v0.4 critical
+path), and converts the runtime's existing strengths — streaming,
+multi-tenancy, signed artifacts — into a deliverable that an LLM
+serving team can adopt without rewriting their client code. The
+medium-term strategic items (#6, #7, #8) are what make the platform
+*credible* once adopted; #10 is what gets it adopted in the first
+place.
 
 ---
 

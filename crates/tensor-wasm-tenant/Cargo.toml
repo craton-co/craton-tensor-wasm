@@ -27,6 +27,7 @@ thiserror.workspace = true
 tracing.workspace = true
 dashmap.workspace = true
 cust = { workspace = true, optional = true }
+loom = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tokio-test.workspace = true
@@ -38,7 +39,19 @@ tracing-subscriber.workspace = true
 name = "context_switch"
 harness = false
 
+[[test]]
+name = "loom_consume_release"
+path = "tests/loom_consume_release.rs"
+required-features = ["loom"]
+
 [features]
 default = []
 mps = []
 cuda = ["dep:cust"]
+loom = ["dep:loom"]
+# When enabled, `TenantCapability` is bound to the `TenantRegistry` that
+# minted it: a cap from registry A is rejected by registry B even if both
+# caps name the same `TenantId`. Gated behind a feature so the v0.3 line
+# remains source-compatible with call sites that mix caps across
+# registries (e.g. test harnesses); v0.4 will flip this on by default.
+strict-cap-binding = []

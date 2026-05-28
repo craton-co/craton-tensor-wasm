@@ -8,8 +8,9 @@
 //! - a creator whose `device_id` disagrees with its pool's logs a `WARN`
 //!   when the pool is exhausted and the fallback path runs on the
 //!   creator's (different) device;
-//! - the `From<UnifiedError> for TensorWasmError` conversion turns an
-//!   "exhausted" allocation message into `TensorWasmError::MemoryExhausted`.
+//! - the `From<UnifiedError> for TensorWasmError` conversion turns a
+//!   structured `UnifiedError::TooLarge` into `TensorWasmError::MemoryExhausted`
+//!   carrying the real `requested` / `limit` figures (no substring matching).
 
 use std::sync::{Arc, Mutex};
 
@@ -134,19 +135,29 @@ fn creator_with_pool_device_mismatch_warns_on_fallback() {
 }
 
 #[test]
-fn unified_error_exhausted_maps_to_memory_exhausted() {
-    let e = UnifiedError::Allocation("pool exhausted: need 4096 bytes, capacity 1024".into());
+fn unified_error_too_large_maps_to_memory_exhausted_with_figures() {
+    // Exhaustion is reported via the structured `TooLarge` variant; the
+    // `From` impl plumbs `requested` / `limit` straight through to
+    // `MemoryExhausted` (no string parsing, no zeroed placeholders).
+    let e = UnifiedError::TooLarge {
+        requested: 4096,
+        limit: 1024,
+    };
     let b: TensorWasmError = e.into();
-    assert!(
-        matches!(b, TensorWasmError::MemoryExhausted { .. }),
-        "exhaustion message must convert to TensorWasmError::MemoryExhausted, got {b:?}"
-    );
+    match b {
+        TensorWasmError::MemoryExhausted { requested, limit } => {
+            assert_eq!(requested, 4096);
+            assert_eq!(limit, 1024);
+        }
+        other => panic!("expected MemoryExhausted, got {other:?}"),
+    }
 }
 
 #[test]
-fn unified_error_non_exhausted_falls_through_to_serialization() {
-    // Sanity counterpart: an Allocation error that is NOT exhaustion must
-    // continue to produce TensorWasmError::Serialization (with the detail string).
+fn unified_error_allocation_falls_through_to_serialization() {
+    // Any `Allocation` payload reaching the conversion is a caller bug
+    // (bad alignment, `minimum > maximum`, etc.); exhaustion goes through
+    // `TooLarge`. The detail string is forwarded into `Serialization`.
     let e = UnifiedError::Allocation("minimum 8 > maximum 4".into());
     let b: TensorWasmError = e.into();
     assert!(matches!(b, TensorWasmError::Serialization(_)));

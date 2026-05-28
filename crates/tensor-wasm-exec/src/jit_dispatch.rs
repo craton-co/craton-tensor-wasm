@@ -436,6 +436,12 @@ mod tests {
         }
     }
 
+    impl TenantContext for TestState {
+        fn tenant_id(&self) -> TenantId {
+            TenantId(0)
+        }
+    }
+
     /// Build a Wasm module that imports `tensor-wasm:jit/host::dispatch` and
     /// re-exports it as `call_dispatch(fp_lo, fp_hi) -> i32`, hardcoding
     /// `scratch_ptr` / `args_len` / `results_len` to zero. The test then
@@ -786,7 +792,7 @@ mod tests {
     fn alloc_does_not_overwrite_guest_static_data() {
         let engine = make_engine();
         let cache = Arc::new(KernelCache::new());
-        let mut linker: Linker<()> = Linker::new(&engine);
+        let mut linker: Linker<TestState> = Linker::new(&engine);
         add_jit_dispatch_to_linker(&mut linker, cache).expect("register");
         // Memory: 2 pages (128 KiB) > SCRATCH_ARENA_BYTES (64 KiB), so the
         // arena_floor sits at 65536 and the lower 64 KiB is "guest data".
@@ -802,7 +808,7 @@ mod tests {
               (func (export "sentinel") (result i32)
                 (i32.load8_u (i32.const 1024))))
         "#;
-        let mut store = Store::new(&engine, ());
+        let mut store = Store::new(&engine, TestState::default());
         let wasm = wat::parse_str(wat).expect("wat");
         let module = Module::new(&engine, &wasm).expect("module");
         let instance = linker

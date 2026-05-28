@@ -5,6 +5,11 @@ All notable changes to Craton TensorWasm will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Roadmap
+- 13 new strategic feature directions added under docs/PATH-TO-V1.md#post-v036-strategic-features; tracked in ACTIONABLE-ITEMS-PENDING.md.
+
 ## [0.3.0] - 2026-05-25
 
 This release consolidates the v0.2, v0.3 and v0.4 PATH-TO-V1 milestones'

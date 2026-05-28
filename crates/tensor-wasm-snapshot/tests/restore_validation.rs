@@ -88,6 +88,8 @@ fn restore_rejects_oversized_registers_via_handcrafted_blob() {
             instance_id: InstanceId(1),
             created_unix_ms: 0,
             total_uncompressed_bytes: (limits::MAX_REGISTERS_BYTES + 1) as u64,
+            sequence_no: 0,
+            nonce: None,
         },
         crc32,
     };
@@ -171,6 +173,8 @@ fn restore_rejects_magic_mismatch() {
             instance_id: InstanceId(0),
             created_unix_ms: 0,
             total_uncompressed_bytes: 0,
+            sequence_no: 0,
+            nonce: None,
         },
         crc32: tensor_wasm_snapshot::payload_crc32(&[], &[], &[]),
     };
@@ -216,6 +220,8 @@ fn restore_rejects_tampered_total_uncompressed_bytes() {
             // Deliberately wrong: claim a much larger payload than the blobs
             // actually carry.
             total_uncompressed_bytes: actual_total + 1024,
+            sequence_no: 0,
+            nonce: None,
         },
         crc32,
     };

@@ -180,10 +180,11 @@ async fn kind_not_found() {
 
 #[tokio::test]
 async fn kind_tenant_header_invalid() {
-    // Bad tenant value (non-u64) surfaces as missing_tenant 400 — the
-    // other branch of the same envelope. Driven against a protected route
-    // because `/healthz` no longer flows through `tenant_scope` (see
-    // `openapi/tensor-wasm-api.yaml`, `security: []`).
+    // Bad tenant value (non-u64) surfaces as `invalid_tenant` 400 —
+    // distinct from the absent-and-required `missing_tenant` branch
+    // exercised by `kind_missing_tenant` above. Driven against a
+    // protected route because `/healthz` no longer flows through
+    // `tenant_scope` (see `openapi/tensor-wasm-api.yaml`, `security: []`).
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("/jobs/{}", Uuid::nil()))
@@ -192,7 +193,7 @@ async fn kind_tenant_header_invalid() {
         .unwrap();
     let resp = dev_router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert_envelope(body_json(resp.into_body()).await, "missing_tenant").await;
+    assert_envelope(body_json(resp.into_body()).await, "invalid_tenant").await;
 }
 
 #[tokio::test]

@@ -3,7 +3,7 @@
 
 # Actionable items pending — what an AI agent could not do
 
-Complete checklist as of `v0.3.6` (2026-05-27). Every item below requires a
+**As of v0.3.6 (2026-05-28)**. Every item below requires a
 human, an organization, hardware, or upstream activity that the AI agent
 sessions that built waves W1-W5 + O + F + B + C + D could not perform.
 
@@ -337,5 +337,34 @@ entry and (if applicable) close the audit problem in `CHANGELOG.md`.
 
 ---
 
-_Status: as of `v0.3.6` tag (2026-05-27). Update each time an item moves
+## v0.4+ feature roadmap (added 2026-05-28)
+
+Tracking table for the 13 strategic features identified during the
+comprehensive v0.3.6 review. Full rationale, cost, and risk notes for
+each item live in
+[`docs/PATH-TO-V1.md#post-v036-strategic-features`](docs/PATH-TO-V1.md#post-v036-strategic-features).
+
+| # | Title | Tier | ETA | Owner | Status |
+|---|---|---|---|---|---|
+| 1 | [Typed multi-value guest export ABI](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🔵 not started |
+| 2 | [Streaming HTTP `invoke` responses](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🔵 not started |
+| 3 | [Signed kernel registry](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🔵 not started |
+| 4 | [Cooperative deadlines via WASI yield](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🔵 not started |
+| 5 | [Pre-instantiated instance pool](docs/PATH-TO-V1.md#post-v036-strategic-features) | High-leverage near-term (v0.4) | TBD | TBD | 🔵 not started |
+| 6 | [Differential JIT correctness oracle](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🔵 not started |
+| 7 | [Pliron-based auto-offload pipeline](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🔵 not started |
+| 8 | [Per-tenant GPU memory quotas via `cuMemPool`](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🔵 not started |
+| 9 | [Unified content-addressed signed artifact store](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🔵 not started |
+| 10 | [OpenAI-compatible inference gateway shim](docs/PATH-TO-V1.md#post-v036-strategic-features) | Strategic medium-term (v0.5–v1.0) | TBD | TBD | 🔵 not started |
+| 11 | [WASI-NN compatibility layer](docs/PATH-TO-V1.md#post-v036-strategic-features) | Speculative / R&D | TBD | TBD | 🔵 not started |
+| 12 | [Direct guest-side GPU dispatch via SPIR-V](docs/PATH-TO-V1.md#post-v036-strategic-features) | Speculative / R&D | TBD | TBD | 🔵 not started |
+| 13 | [Distributed dispatch sidecar over QUIC](docs/PATH-TO-V1.md#post-v036-strategic-features) | Speculative / R&D | TBD | TBD | 🔵 not started |
+
+Top priority for the v0.5-beta external-deploy gate is **#10
+(OpenAI-compatible inference gateway shim)**; see PATH-TO-V1 for
+rationale.
+
+---
+
+_Status: as of `v0.3.6` tag (2026-05-28). Update each time an item moves
 state — this is a living checklist._

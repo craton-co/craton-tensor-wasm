@@ -71,6 +71,26 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// tokens accepted by [`bearer_auth`]. Empty / unset = dev mode pass-through.
 pub const ENV_API_TOKENS: &str = "TENSOR_WASM_API_TOKENS";
 
+/// Maximum byte length permitted for an inbound `Authorization` header
+/// value before [`bearer_auth`] will even attempt to parse it.
+///
+/// Hyper's default cap on the combined header block sits around 16 KiB,
+/// so an attacker can still send a single `Authorization: Bearer <huge>`
+/// value of several KiB. The downstream constant-time comparison in
+/// [`AuthConfig::scope_for`] is `O(token_len)` per allowlisted token,
+/// so unbounded oversized values let a hostile client burn CPU at
+/// roughly `O(num_tokens * token_len)` per request. Capping the value
+/// length here (1 KiB) keeps that cost flat — any legitimate bearer
+/// token in production is well under this limit (JWTs are typically
+/// 500–800 bytes, opaque tokens are far smaller).
+///
+/// A value longer than this returns `401 Unauthorized` with
+/// `kind: "invalid_auth"`. We deliberately reject as `401` rather than
+/// `400` so the response shape stays uniform with other auth failures
+/// (missing header, mismatched token) and an attacker cannot use the
+/// status code to probe the size cap.
+pub const MAX_AUTH_HEADER_BYTES: usize = 1024;
+
 /// Environment variable that, when set to `1`, makes the `X-TensorWasm-Tenant`
 /// header mandatory. Otherwise its absence defaults to tenant `0`.
 pub const ENV_REQUIRE_TENANT: &str = "TENSOR_WASM_API_REQUIRE_TENANT";
@@ -582,7 +602,24 @@ fn envelope(status: StatusCode, kind: &str, message: &str) -> Response {
 /// such as `Bearer`) or the scheme is not bearer. An empty-credential
 /// case (e.g. `"Bearer   "`) returns `Some("")` so the caller can still
 /// enforce its empty-token rejection rule.
+///
+/// **Control-byte defence.** RFC 7230 §3.2.6 bans control characters
+/// (other than horizontal tab) from header field values, and
+/// [`axum::http::HeaderValue`] already rejects NUL/CR/LF at construction.
+/// The `to_str()` conversion in [`bearer_auth`] further restricts the
+/// input to "visible ASCII" plus tab. We nonetheless apply an explicit
+/// belt-and-braces check here so any future refactor that fans this
+/// helper out behind a more permissive byte source cannot silently
+/// re-open a CRLF/NUL injection channel into downstream consumers of
+/// the returned token (audit log fields, span attributes, etc.).
 fn parse_bearer_credentials(value: &str) -> Option<&str> {
+    // Defence in depth: reject the entire value if any control byte
+    // (other than the horizontal tab we explicitly use as a separator)
+    // is present. Covers NUL (C-string truncation), CR/LF (log-line
+    // forgery), and the DEL byte (terminal-escape smuggling).
+    if value.bytes().any(|b| b != b'\t' && (b < 0x20 || b == 0x7F)) {
+        return None;
+    }
     // Find the first whitespace byte (space or tab) — anything else
     // separating scheme from credentials would itself be a protocol
     // violation, so we don't bother with general Unicode whitespace.
@@ -641,10 +678,25 @@ pub async fn bearer_auth(mut req: Request, next: Next) -> Response {
             "duplicate Authorization headers are not allowed",
         );
     }
-    let header = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
+    // api header-hardening: cap the inbound Authorization value length
+    // BEFORE the constant-time compare loop runs. Hyper's default cap on
+    // the header block (~16 KiB) is large enough that a single oversized
+    // `Authorization: Bearer <huge>` would still burn CPU through every
+    // `ct_eq` iteration. See [`MAX_AUTH_HEADER_BYTES`] for the rationale.
+    // We inspect the raw bytes so a non-UTF-8 value (rejected by
+    // `to_str()` below) is bounded too.
+    let raw_auth = req.headers().get(axum::http::header::AUTHORIZATION);
+    if let Some(value) = raw_auth {
+        if value.as_bytes().len() > MAX_AUTH_HEADER_BYTES {
+            return envelope(
+                StatusCode::UNAUTHORIZED,
+                "invalid_auth",
+                "Authorization header exceeds the maximum permitted length",
+            );
+        }
+    }
+
+    let header = raw_auth.and_then(|h| h.to_str().ok());
 
     let token = match header.and_then(parse_bearer_credentials) {
         Some(t) if !t.is_empty() => t.to_owned(),
@@ -676,10 +728,35 @@ pub async fn bearer_auth(mut req: Request, next: Next) -> Response {
 /// Parse the `X-TensorWasm-Tenant` header into a `TenantId`, applying the
 /// configured policy.
 ///
-/// * Header absent + `TENSOR_WASM_API_REQUIRE_TENANT=1` => `Err(<400 response>)`.
-/// * Header absent otherwise => `Ok(TenantId(0))`.
-/// * Header present but not a `u64` => `Err(<400 response>)`.
+/// Outcomes:
+///
+/// * **More than one `X-TensorWasm-Tenant` header present** => `Err(400
+///   duplicate_tenant_header)`. `HeaderMap::get` returns only the first
+///   match, so an attacker behind a permissive proxy could send
+///   `X-TensorWasm-Tenant: 1, X-TensorWasm-Tenant: 999` and confuse
+///   downstream observers about which tenant the request really
+///   belongs to. We reject outright before any single value is read.
+/// * **Header absent + `TENSOR_WASM_API_REQUIRE_TENANT=1`** => `Err(400
+///   missing_tenant)`.
+/// * **Header absent otherwise** => `Ok(TenantId(0))`.
+/// * **Header present but not a `u64`** => `Err(400 invalid_tenant)`.
+///   The distinct `invalid_tenant` kind separates a malformed value
+///   from the legitimately-absent case so dashboards can alert on each
+///   class independently — a spike in `invalid_tenant` typically
+///   indicates a client bug or a probing attacker, whereas a spike in
+///   `missing_tenant` indicates a misconfigured client.
 pub fn extract_tenant(headers: &HeaderMap, cfg: TenantConfig) -> Result<TenantId, Response> {
+    // Fix 1: refuse requests carrying more than one X-TensorWasm-Tenant
+    // header. The single-`get` path would otherwise pick the first
+    // occurrence silently while a downstream observer sees the second.
+    let header_count = headers.get_all(HEADER_TENANT).iter().count();
+    if header_count > 1 {
+        return Err(envelope(
+            StatusCode::BAD_REQUEST,
+            "duplicate_tenant_header",
+            "multiple X-TensorWasm-Tenant headers are not allowed",
+        ));
+    }
     let raw = headers.get(HEADER_TENANT).and_then(|h| h.to_str().ok());
     match raw {
         None => {
@@ -695,9 +772,12 @@ pub fn extract_tenant(headers: &HeaderMap, cfg: TenantConfig) -> Result<TenantId
         }
         Some(s) => match s.trim().parse::<u64>() {
             Ok(v) => Ok(TenantId(v)),
+            // Fix 2: the header is PRESENT but unparseable — emit
+            // `invalid_tenant`, distinct from the absent-and-required
+            // `missing_tenant` case above.
             Err(_) => Err(envelope(
                 StatusCode::BAD_REQUEST,
-                "missing_tenant",
+                "invalid_tenant",
                 "X-TensorWasm-Tenant must be a u64",
             )),
         },

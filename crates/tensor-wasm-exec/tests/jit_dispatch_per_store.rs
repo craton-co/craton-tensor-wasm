@@ -48,7 +48,7 @@ fn make_engine() -> Engine {
 }
 
 fn instance_state(tenant: u64, id: u64) -> InstanceState {
-    InstanceState::new(TenantId(tenant), InstanceId(id))
+    InstanceState::new(TenantId(tenant), InstanceId(id as u128))
 }
 
 /// Two stores from the SAME linker must not share an arena.

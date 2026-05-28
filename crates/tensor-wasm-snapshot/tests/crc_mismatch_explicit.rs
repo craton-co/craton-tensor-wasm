@@ -37,6 +37,8 @@ fn crc_mismatch_after_payload_mutation_is_rejected() {
             instance_id: InstanceId(0xDEADBEEF),
             created_unix_ms: 42,
             total_uncompressed_bytes: (wasm.len() + gpu.len() + regs.len()) as u64,
+            sequence_no: 0,
+            nonce: None,
         },
         crc32: good_crc,
     };

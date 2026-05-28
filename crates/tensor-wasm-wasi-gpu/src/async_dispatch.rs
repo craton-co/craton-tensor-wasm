@@ -183,6 +183,14 @@ pub struct BorrowedDispatchPermit<'a> {
     counter: &'a BackPressureInner,
 }
 
+impl std::fmt::Debug for BorrowedDispatchPermit<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BorrowedDispatchPermit")
+            .field("issued", &self.permit.is_some())
+            .finish()
+    }
+}
+
 impl Drop for BorrowedDispatchPermit<'_> {
     fn drop(&mut self) {
         // SAFETY: the permit's own Drop releases the slot.

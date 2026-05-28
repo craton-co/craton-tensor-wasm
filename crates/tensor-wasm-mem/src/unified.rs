@@ -518,14 +518,15 @@ impl fmt::Debug for UnifiedBuffer {
 ///
 /// - `ZeroSize` → `TensorWasmError::Serialization` with a descriptive message
 ///   (zero-byte allocations are caller bugs, not memory exhaustion).
-/// - `Allocation { .. }` → `TensorWasmError::MemoryExhausted { requested: 0, limit: 0 }`
-///   when the message contains "exhausted", surfacing exhaustion as a
-///   first-class error variant (placeholder numeric fields are used because
-///   `UnifiedError::Allocation` carries no structured size info — the original
-///   string is lost in this mapping; richer mapping is a TODO once
-///   `UnifiedError::Allocation` is split into structured variants). Otherwise
-///   the variant falls through to `TensorWasmError::Serialization` carrying the
-///   detail string.
+/// - `Allocation { .. }` → `TensorWasmError::Serialization` carrying the
+///   detail string. Exhaustion is NOT routed through this variant — pool /
+///   buffer exhaustion is reported as the structured
+///   `UnifiedError::TooLarge { requested, limit }` instead, which maps
+///   directly to `MemoryExhausted` below. Any remaining `Allocation` payload
+///   reaching this conversion is a caller bug (e.g. `minimum > maximum`,
+///   bad alignment) and is surfaced as `Serialization` accordingly.
+/// - `TooLarge { requested, limit }` → `TensorWasmError::MemoryExhausted {
+///   requested, limit }` (1:1, structured).
 /// - `Cuda { .. }` → `TensorWasmError::CudaError` (1:1 mapping).
 ///
 /// [`TensorWasmError`]: tensor_wasm_core::error::TensorWasmError
@@ -535,21 +536,9 @@ impl From<UnifiedError> for tensor_wasm_core::error::TensorWasmError {
             UnifiedError::ZeroSize => tensor_wasm_core::error::TensorWasmError::Serialization(
                 "unified buffer: zero-byte allocation rejected".into(),
             ),
-            UnifiedError::Allocation(msg) => {
-                if msg.contains("exhausted") {
-                    // TODO: when `UnifiedError::Allocation` grows structured
-                    // {requested, capacity} fields, plumb them through here
-                    // instead of losing the detail in placeholder zeros.
-                    tensor_wasm_core::error::TensorWasmError::MemoryExhausted {
-                        requested: 0,
-                        limit: 0,
-                    }
-                } else {
-                    tensor_wasm_core::error::TensorWasmError::Serialization(
-                        format!("unified buffer allocation failed: {msg}").into(),
-                    )
-                }
-            }
+            UnifiedError::Allocation(msg) => tensor_wasm_core::error::TensorWasmError::Serialization(
+                format!("unified buffer allocation failed: {msg}").into(),
+            ),
             UnifiedError::Cuda(msg) => tensor_wasm_core::error::TensorWasmError::CudaError(msg.into()),
             UnifiedError::TooLarge { requested, limit } => {
                 tensor_wasm_core::error::TensorWasmError::MemoryExhausted { requested, limit }
@@ -645,13 +634,22 @@ mod tests {
     }
 
     #[test]
-    fn from_unified_error_to_tensor_wasm_error_allocation_exhausted() {
-        let e = UnifiedError::Allocation("pool exhausted: need 1024 bytes".into());
+    fn from_unified_error_too_large_maps_to_memory_exhausted_with_figures() {
+        // Pool / buffer exhaustion is reported as the structured `TooLarge`
+        // variant; the `From` impl plumbs the `requested` / `limit` fields
+        // straight through to `MemoryExhausted` (no string parsing).
+        let e = UnifiedError::TooLarge {
+            requested: 4096,
+            limit: 1024,
+        };
         let b: tensor_wasm_core::error::TensorWasmError = e.into();
-        assert!(matches!(
-            b,
-            tensor_wasm_core::error::TensorWasmError::MemoryExhausted { .. }
-        ));
+        match b {
+            tensor_wasm_core::error::TensorWasmError::MemoryExhausted { requested, limit } => {
+                assert_eq!(requested, 4096);
+                assert_eq!(limit, 1024);
+            }
+            other => panic!("expected MemoryExhausted, got {other:?}"),
+        }
     }
 
     #[test]
@@ -695,7 +693,11 @@ mod tests {
     }
 
     #[test]
-    fn from_unified_error_to_tensor_wasm_error_allocation_non_exhausted() {
+    fn from_unified_error_allocation_maps_to_serialization() {
+        // Any `Allocation` payload reaching this conversion is a caller bug
+        // (bad alignment, `minimum > maximum`, etc.) — exhaustion is now
+        // routed through the structured `TooLarge` variant. The conversion
+        // simply forwards the detail string into `Serialization`.
         let e = UnifiedError::Allocation("minimum 1024 > maximum 512".into());
         let b: tensor_wasm_core::error::TensorWasmError = e.into();
         assert!(matches!(b, tensor_wasm_core::error::TensorWasmError::Serialization(_)));

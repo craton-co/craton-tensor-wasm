@@ -848,7 +848,7 @@ async fn dispatch_pipeline_compiles_against_real_module_bytes() {
         "expected four lowered args (3 pointers + 1 scalar); got {}",
         recorded.len()
     );
-    assert!(matches!(recorded[3], LoweredArg::U32(n) if n == N as u32));
+    assert!(matches!(recorded[3], LoweredArgSnapshot::U32(n) if n == N as u32));
 }
 
 /// Regression: `build_kernel_param_storage` must lay out every slot

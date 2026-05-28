@@ -245,6 +245,10 @@ Vulnerability reports and disclosures are covered in [SECURITY.md](SECURITY.md).
 Reach the maintainers at `security@craton.com.ar`. Coordinated disclosure is
 preferred; please do not file security issues on the public tracker.
 
+## Roadmap
+
+See [docs/PATH-TO-V1.md](docs/PATH-TO-V1.md#post-v036-strategic-features) for the post-v0.3.6 strategic feature backlog (13 items grouped by tier).
+
 ## License
 
 Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) (committed

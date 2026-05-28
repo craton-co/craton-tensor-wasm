@@ -110,6 +110,8 @@ fn bincode_legacy_encoding_is_deterministic_across_calls() {
             instance_id: InstanceId(0x1234_5678_9ABC_DEF0),
             created_unix_ms: 1_700_000_000_000,
             total_uncompressed_bytes: 1600,
+            sequence_no: 0,
+            nonce: None,
         },
         crc32: crc,
     };

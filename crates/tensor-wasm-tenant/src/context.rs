@@ -19,6 +19,27 @@
 //! exercised. The cuda branches use the `cust` 0.3.x context-stack and
 //! primary-context APIs.
 
+// The `loom` feature swaps `std::sync::atomic::AtomicU64` for
+// `loom::sync::atomic::AtomicU64` so `tests/loom_consume_release.rs` can
+// drive `consume_bytes_inner` / `release_bytes_inner` through loom's
+// exhaustive scheduler. The two types share the same surface API used
+// by the CAS loops below (`load`, `compare_exchange_weak`, `fetch_add`,
+// `new`), so the inner-loop bodies need no further cfg-gating.
+//
+// NOTE(loom): `loom::sync::atomic::AtomicU64::new` is NOT `const fn`
+// (loom's atomics carry per-execution tracking state), whereas
+// `std::sync::atomic::AtomicU64::new` is. The `static
+// ISOLATION_DOWNGRADE_COUNT` declaration below therefore needs the
+// std-flavoured type even under `--features loom`; the eventual
+// loom model body in `tests/loom_consume_release.rs` builds a
+// dedicated `loom::sync::atomic::AtomicU64` (or a minimal stand-in
+// struct that uses one) rather than reaching for this static. This
+// scaffold keeps the import swap localised to the CAS-loop hot path
+// while leaving the alert-counter on the std type for static-init
+// compatibility.
+#[cfg(feature = "loom")]
+use loom::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(feature = "loom"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tensor_wasm_core::error::TensorWasmError;
@@ -106,12 +127,32 @@ impl std::fmt::Display for IsolationKind {
 /// (the scheduler, the memory pool, etc.). What is NOT derived is any
 /// `From<TenantId>` or public constructor, so a workload running inside
 /// tenant A cannot fabricate one for tenant B.
+///
+/// # Registry binding (`strict-cap-binding` feature)
+///
+/// Under the `strict-cap-binding` feature, every capability also carries
+/// an `Arc<()>` token that points to its minting registry's allocation.
+/// Comparison is by `Arc::ptr_eq`, so a capability minted by registry A
+/// is rejected when presented against a context registered in registry
+/// B, even if both contexts happen to share the same numeric `TenantId`.
+/// Without this gate, capabilities from independent registries are
+/// interchangeable — see the audit note on `RegistryAdminCapability` for
+/// the threat model. The feature is off by default in the 0.3 line so
+/// existing call sites that mix caps across registries (notably test
+/// harnesses) continue to compile and behave identically; v0.4 will flip
+/// it on.
 #[derive(Debug, Clone)]
 pub struct TenantCapability {
     tenant_id: TenantId,
     /// Crate-private zero-sized seal: prevents `TenantCapability { .. }`
     /// struct-literal construction outside `tensor-wasm-tenant`.
     _seal: (),
+    /// Pointer-identity stamp of the registry that minted this capability.
+    /// Only present under the `strict-cap-binding` feature; the field
+    /// disappears entirely (no memory cost, no API surface) when the
+    /// feature is off.
+    #[cfg(feature = "strict-cap-binding")]
+    pub(crate) registry_token: std::sync::Arc<()>,
 }
 
 impl TenantCapability {
@@ -119,10 +160,28 @@ impl TenantCapability {
     ///
     /// `pub(crate)` so only the registry can call it; the
     /// `TenantCapability` cannot be created from outside this crate at all.
+    /// The non-strict-binding signature is unchanged.
+    #[cfg(not(feature = "strict-cap-binding"))]
     pub(crate) fn mint(tenant_id: TenantId) -> Self {
         Self {
             tenant_id,
             _seal: (),
+        }
+    }
+
+    /// Mint a capability bound to `tenant_id` AND to the minting registry,
+    /// identified by `registry_token` (an `Arc::clone` of the registry's
+    /// per-instance token allocation). Comparison at `check_capability`
+    /// time is by `Arc::ptr_eq`, so two registries that happen to allocate
+    /// `Arc::new(())` at the same address would still be distinct
+    /// allocations and `ptr_eq` would return `false` for caps from one
+    /// against contexts of the other.
+    #[cfg(feature = "strict-cap-binding")]
+    pub(crate) fn mint(tenant_id: TenantId, registry_token: std::sync::Arc<()>) -> Self {
+        Self {
+            tenant_id,
+            _seal: (),
+            registry_token,
         }
     }
 
@@ -180,6 +239,19 @@ pub struct TenantContext {
     /// Built once at construction so the hot path of `consume_bytes` /
     /// `release_bytes` does not allocate on every transition.
     metrics_labels: TenantLabels,
+    /// Pointer-identity stamp of the registry this context was registered
+    /// in, used by [`Self::check_capability`] to reject caps minted by a
+    /// *different* registry under the `strict-cap-binding` feature.
+    ///
+    /// `None` until the context is moved into
+    /// [`crate::TenantRegistry::register_with_capability`], which sets
+    /// the token before wrapping the context in an `Arc`. A `None` here
+    /// at `check_capability` time means the context was never registered
+    /// (or was constructed for a test that bypasses the registry); the
+    /// strict-binding check degrades gracefully — see the comment in
+    /// [`Self::check_capability`].
+    #[cfg(feature = "strict-cap-binding")]
+    pub(crate) registry_token: Option<std::sync::Arc<()>>,
 }
 
 impl TenantContext {
@@ -296,19 +368,43 @@ impl TenantContext {
     /// caller) and a `resource` string identifying the gated operation —
     /// the offended tenant id is implicit in which context the call
     /// landed on and is recorded by the surrounding span.
+    ///
+    /// Under the `strict-cap-binding` feature, an additional check
+    /// rejects caps minted by a *different* registry (by `Arc::ptr_eq` on
+    /// the per-registry token allocations). A context that was never
+    /// registered (no `registry_token` recorded) cannot ascribe blame to
+    /// a specific registry — in that mode the strict check is a no-op,
+    /// which preserves the existing behaviour for the few code paths
+    /// that synthesise a `TenantContext` directly via the builder (e.g.
+    /// unit tests inside this crate).
     fn check_capability(
         &self,
         cap: &TenantCapability,
         resource: &'static str,
     ) -> Result<(), TensorWasmError> {
-        if cap.tenant_id == self.tenant_id {
-            Ok(())
-        } else {
-            Err(TensorWasmError::TenantIsolationViolation {
+        if cap.tenant_id != self.tenant_id {
+            return Err(TensorWasmError::TenantIsolationViolation {
                 tenant_id: cap.tenant_id,
                 resource: resource.into(),
-            })
+            });
         }
+        #[cfg(feature = "strict-cap-binding")]
+        {
+            if let Some(ctx_token) = self.registry_token.as_ref() {
+                if !std::sync::Arc::ptr_eq(ctx_token, &cap.registry_token) {
+                    // The cap names the right tenant id, but was minted
+                    // by a different registry. Report the cap's tenant
+                    // id as the offender — the audit-flagged threat is
+                    // a holder of one registry's cap using it against a
+                    // namesake tenant in another registry.
+                    return Err(TensorWasmError::TenantIsolationViolation {
+                        tenant_id: cap.tenant_id,
+                        resource: resource.into(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Push the current `bytes_in_use` total into the per-tenant gauge
@@ -701,6 +797,12 @@ impl TenantContextBuilder {
             cu_context,
             metrics: self.metrics,
             metrics_labels,
+            // Stamped by `TenantRegistry::register_with_capability` after
+            // the context is moved into the registry but before it is
+            // Arc-wrapped; remains `None` for contexts the test harness
+            // constructs without going through the registry.
+            #[cfg(feature = "strict-cap-binding")]
+            registry_token: None,
         }
     }
 

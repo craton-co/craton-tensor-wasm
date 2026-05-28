@@ -89,8 +89,12 @@ impl UnifiedMemoryPool {
 
     /// Allocate `size` bytes aligned to `align` (must be a power of two).
     ///
-    /// Returns `Err(UnifiedError::Allocation(...))` if the slab is exhausted or
-    /// `align` is zero/not a power of two.
+    /// Returns `Err(UnifiedError::TooLarge { requested, limit })` when the
+    /// slab is exhausted (carrying the requested size and the pool capacity
+    /// so downstream layers can plumb the figures into
+    /// `TensorWasmError::MemoryExhausted` without parsing strings), or
+    /// `Err(UnifiedError::Allocation(...))` when `align` is zero / not a
+    /// power of two / exceeds the maximum alignment cap.
     pub fn allocate(&self, size: usize, align: usize) -> Result<PoolAllocation<'_>, UnifiedError> {
         if size == 0 {
             return Err(UnifiedError::ZeroSize);
@@ -124,10 +128,16 @@ impl UnifiedMemoryPool {
             .checked_add(size)
             .ok_or_else(|| UnifiedError::Allocation("offset overflow".into()))?;
         if end > self.slab.len() {
-            return Err(UnifiedError::Allocation(format!(
-                "pool exhausted: need {size} bytes (aligned offset {aligned_bump}), capacity {}",
-                self.slab.len()
-            )));
+            // Pool exhaustion is reported as the structured `TooLarge`
+            // variant so the `From<UnifiedError> for TensorWasmError` impl
+            // can route exhaustion to `MemoryExhausted { requested, limit }`
+            // with the real figures, not zeroed placeholders. The
+            // `requested` field reflects the caller-visible size; `limit` is
+            // the slab capacity so operators can size pools from telemetry.
+            return Err(UnifiedError::TooLarge {
+                requested: size as u64,
+                limit: self.slab.len() as u64,
+            });
         }
         st.bump = end;
         st.live += 1;
@@ -180,6 +190,23 @@ impl UnifiedMemoryPool {
 
     /// Reset the bump pointer back to zero. Safe to call only when there are
     /// no outstanding [`PoolAllocation`]s; returns an error otherwise.
+    ///
+    /// # One-shot teardown contract for Wasm-backing pools
+    ///
+    /// Pool slabs that ever served a
+    /// [`crate::wasm_memory::TensorWasmMemoryCreator`]-issued pool-backed Wasm
+    /// linear memory (`PooledLinearMemory`) are single-shot for the lifetime
+    /// of the pool, because `PoolAllocation` drop guards are intentionally
+    /// leaked at carve time to keep the bump pointer monotonic — see the
+    /// `std::mem::forget(alloc)` site in
+    /// [`crate::wasm_memory::TensorWasmMemoryCreator::new_memory`]. The
+    /// [`live_allocations`](Self::live_allocations) counter therefore stays
+    /// elevated for the remaining lifetime of the pool even after every Wasm
+    /// instance has been dropped, so `reset` on such a pool will permanently
+    /// fail. Operators wanting per-tenant resets should use a per-tenant
+    /// `UnifiedMemoryPool` instance (one pool per tenant, drop the pool when
+    /// the tenant departs) rather than expecting reuse-with-reset on a
+    /// shared pool.
     pub fn reset(&self) -> Result<(), UnifiedError> {
         let mut st = self.state.lock();
         if st.live != 0 {
@@ -284,11 +311,22 @@ mod tests {
     }
 
     #[test]
-    fn exhaustion_returns_error() {
+    fn exhaustion_returns_too_large_with_figures() {
+        // Exhaustion is now reported via the structured `TooLarge` variant
+        // (carrying the requested size and the slab capacity) so the
+        // `From<UnifiedError> for TensorWasmError` impl can route the
+        // failure to `MemoryExhausted { requested, limit }` without
+        // substring-matching on a message.
         let pool = UnifiedMemoryPool::new(128).unwrap();
         let _a = pool.allocate(64, 16).unwrap();
         let err = pool.allocate(128, 16).expect_err("should exhaust");
-        assert!(matches!(err, UnifiedError::Allocation(_)));
+        match err {
+            UnifiedError::TooLarge { requested, limit } => {
+                assert_eq!(requested, 128);
+                assert_eq!(limit, 128);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
     }
 
     #[test]

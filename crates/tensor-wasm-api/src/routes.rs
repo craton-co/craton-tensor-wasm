@@ -316,6 +316,22 @@ impl ApiError {
         }
     }
 
+    /// Construct a `501 Not Implemented` with the given `kind` and `message`.
+    ///
+    /// Used by feature scaffolds (notably the OpenAI-compatible gateway in
+    /// [`crate::openai`]) that need to expose a route surface today while the
+    /// underlying translation glue lands in a follow-up release. Clients can
+    /// rely on the `(status, kind)` pair to detect scaffold-mode responses
+    /// and degrade gracefully (e.g. by retrying against a Modal/Replicate
+    /// endpoint) without inspecting the human-readable `message`.
+    pub fn not_implemented(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            kind: kind.into(),
+            message: message.into(),
+        }
+    }
+
     /// Construct a `413 Payload Too Large` with `kind = "body_too_large"`.
     ///
     /// Returned when an inbound request body exceeds the global

@@ -32,6 +32,8 @@ fn snapshot_version_minus_one_is_rejected() {
             instance_id: InstanceId(1),
             created_unix_ms: 0,
             total_uncompressed_bytes: 0,
+            sequence_no: 0,
+            nonce: None,
         },
         crc32: payload_crc32(&[], &[], &[]),
     };

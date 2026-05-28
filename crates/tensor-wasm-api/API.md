@@ -124,9 +124,15 @@ as an unsigned 64-bit integer and forwarded to the executor as the owning
 
 * Absent header: defaults to tenant `0`.
 * Header present but not a valid `u64`: `400 Bad Request` with
-  `kind: "missing_tenant"`.
-* If `TENSOR_WASM_API_REQUIRE_TENANT=1` was set at startup, the header is mandatory
-  — absent requests are rejected with the same `kind`.
+  `kind: "invalid_tenant"`.
+* More than one `X-TensorWasm-Tenant` header on the same request:
+  `400 Bad Request` with `kind: "duplicate_tenant_header"`. This
+  closes a header-smuggling channel where a permissive upstream proxy
+  could forward both copies and downstream observers see a different
+  tenant than the gateway accepted.
+* If `TENSOR_WASM_API_REQUIRE_TENANT=1` was set at startup, the header
+  is mandatory — absent requests are rejected with `kind:
+  "missing_tenant"`.
 
 ### Request limits
 
@@ -261,7 +267,10 @@ may change between patch releases. Known `kind` values:
 | `invalid_base64`   | 400  | `wasm_b64` field is not valid standard base64.                           |
 | `invalid_wasm`     | 400  | Decoded Wasm bytes fail `wasmparser::validate` (short, bad magic, etc.). |
 | `missing_export`   | 400  | Module is missing both `_start` and `main`.                              |
-| `missing_tenant`   | 400  | `X-TensorWasm-Tenant` header missing/garbled when required.                    |
+| `missing_tenant`   | 400  | `X-TensorWasm-Tenant` header absent when required.                       |
+| `invalid_tenant`   | 400  | `X-TensorWasm-Tenant` header present but not a `u64`.                    |
+| `duplicate_tenant_header` | 400 | More than one `X-TensorWasm-Tenant` header on the same request.      |
+| `invalid_auth`     | 401  | `Authorization` header exceeds the maximum permitted length (1 KiB).     |
 | `unauthorized`     | 401  | Missing or unrecognised bearer token.                                    |
 | `tenant_scope_denied` | 403 | Bearer token is not scoped to the `X-TensorWasm-Tenant` named in the request. |
 | `not_found`        | 404  | Requested function or job id does not exist.                             |

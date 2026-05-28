@@ -365,6 +365,40 @@ unsafe impl LinearMemory for PooledLinearMemory {
     }
 }
 
+/// Tunable knobs for [`TensorWasmMemoryCreator`].
+///
+/// Operators with multi-tenant deployments may want a tighter per-instance
+/// linear-memory cap than the workspace-wide
+/// [`HARD_MAX_LINEAR_MEMORY_BYTES`] ceiling (4 GiB, matching the wasm32 spec
+/// maximum). This config exposes that knob without changing the absolute
+/// ceiling — `new_memory` always enforces `min(config.max_linear_memory_bytes,
+/// HARD_MAX_LINEAR_MEMORY_BYTES)`, so the const remains a hard upper bound
+/// that no configured value can exceed.
+#[derive(Debug, Clone)]
+pub struct MemoryCreatorConfig {
+    /// Maximum bytes any single Wasm linear memory may be backed by. Capped
+    /// by [`HARD_MAX_LINEAR_MEMORY_BYTES`]; values above the const are
+    /// silently clamped to the const. Defaults to [`HARD_MAX_LINEAR_MEMORY_BYTES`]
+    /// so default behaviour is unchanged.
+    pub max_linear_memory_bytes: usize,
+}
+
+impl Default for MemoryCreatorConfig {
+    fn default() -> Self {
+        Self {
+            max_linear_memory_bytes: HARD_MAX_LINEAR_MEMORY_BYTES,
+        }
+    }
+}
+
+impl MemoryCreatorConfig {
+    /// The effective per-instance cap: the smaller of the configured value
+    /// and the workspace's [`HARD_MAX_LINEAR_MEMORY_BYTES`] ceiling.
+    pub fn effective_max_linear_memory_bytes(&self) -> usize {
+        self.max_linear_memory_bytes.min(HARD_MAX_LINEAR_MEMORY_BYTES)
+    }
+}
+
 /// A [`MemoryCreator`] that hands out [`TensorWasmLinearMemory`] instances.
 ///
 /// Wrap in [`Arc`] and pass to `wasmtime::Config::with_host_memory`.
@@ -379,6 +413,8 @@ struct MemoryCreatorState {
     /// memories from this pool via [`UnifiedMemoryPool::allocate`]; if the
     /// slab is exhausted it falls back to a fresh [`UnifiedBuffer`].
     pool: Option<Arc<UnifiedMemoryPool>>,
+    /// Tunable knobs (per-instance cap, etc.). See [`MemoryCreatorConfig`].
+    config: MemoryCreatorConfig,
 }
 
 impl Default for TensorWasmMemoryCreator {
@@ -389,12 +425,24 @@ impl Default for TensorWasmMemoryCreator {
 
 impl TensorWasmMemoryCreator {
     /// Construct without an underlying pool. New memories allocate fresh
-    /// [`UnifiedBuffer`]s on every `new_memory` call.
+    /// [`UnifiedBuffer`]s on every `new_memory` call. Uses the default
+    /// [`MemoryCreatorConfig`] (per-instance cap =
+    /// [`HARD_MAX_LINEAR_MEMORY_BYTES`]).
     pub fn new(device_id: DeviceId) -> Self {
+        Self::with_config(device_id, MemoryCreatorConfig::default())
+    }
+
+    /// Construct without an underlying pool, with a custom
+    /// [`MemoryCreatorConfig`] (e.g. a tighter per-instance cap for
+    /// multi-tenant deployments). The configured cap is clamped to
+    /// [`HARD_MAX_LINEAR_MEMORY_BYTES`] — see
+    /// [`MemoryCreatorConfig::effective_max_linear_memory_bytes`].
+    pub fn with_config(device_id: DeviceId, config: MemoryCreatorConfig) -> Self {
         Self {
             inner: Arc::new(MemoryCreatorState {
                 device_id,
                 pool: None,
+                config,
             }),
         }
     }
@@ -409,10 +457,21 @@ impl TensorWasmMemoryCreator {
     /// reference and calling [`UnifiedMemoryPool::reset`]. See `new_memory`
     /// for the `unsafe` rationale.
     pub fn with_pool(device_id: DeviceId, pool: Arc<UnifiedMemoryPool>) -> Self {
+        Self::with_pool_and_config(device_id, pool, MemoryCreatorConfig::default())
+    }
+
+    /// Construct with both a pre-allocated pool and a custom
+    /// [`MemoryCreatorConfig`].
+    pub fn with_pool_and_config(
+        device_id: DeviceId,
+        pool: Arc<UnifiedMemoryPool>,
+        config: MemoryCreatorConfig,
+    ) -> Self {
         Self {
             inner: Arc::new(MemoryCreatorState {
                 device_id,
                 pool: Some(pool),
+                config,
             }),
         }
     }
@@ -425,6 +484,11 @@ impl TensorWasmMemoryCreator {
     /// The underlying pool, if one was provided at construction.
     pub fn pool(&self) -> Option<&Arc<UnifiedMemoryPool>> {
         self.inner.pool.as_ref()
+    }
+
+    /// The tunable configuration handed to this creator.
+    pub fn config(&self) -> &MemoryCreatorConfig {
+        &self.inner.config
     }
 }
 
@@ -512,6 +576,22 @@ unsafe impl MemoryCreator for TensorWasmMemoryCreator {
                     // holds the slab alive for the lifetime of the returned
                     // `PooledLinearMemory`, and the bump allocator never hands
                     // the same byte range to another allocation.
+                    //
+                    // # One-shot teardown contract
+                    //
+                    // Pool slabs that ever served a `PooledLinearMemory` are
+                    // single-shot for the lifetime of the pool, because
+                    // `PoolAllocation` drop guards are intentionally leaked
+                    // here to keep the bump pointer monotonic. The
+                    // `live_allocations()` counter therefore stays elevated
+                    // for the remaining lifetime of the pool — dropping the
+                    // `PooledLinearMemory` does NOT decrement it, and
+                    // [`UnifiedMemoryPool::reset`] will permanently refuse to
+                    // run on that pool. Operators wanting per-tenant resets
+                    // should use a per-tenant `UnifiedMemoryPool` instance
+                    // (one pool per tenant, drop the pool when the tenant
+                    // departs) rather than expecting reuse-with-reset on a
+                    // shared pool.
                     std::mem::forget(alloc);
                     return Ok(Box::new(PooledLinearMemory {
                         pool_keepalive: Arc::clone(pool),
@@ -664,9 +744,13 @@ mod tests {
         let creator = TensorWasmMemoryCreator::default();
         let mt = wasmtime::MemoryType::new(1, None);
         let big = HARD_MAX_LINEAR_MEMORY_BYTES + 1;
-        let err = creator
-            .new_memory(mt, 64 * 1024, Some(big), None, 0)
-            .expect_err("oversized module max must be refused");
+        // `new_memory` returns `Result<Box<dyn LinearMemory>, String>`. The Ok
+        // variant is not Debug (`dyn LinearMemory` doesn't derive Debug), so
+        // `expect_err` won't compile; pattern-match instead.
+        let err = match creator.new_memory(mt, 64 * 1024, Some(big), None, 0) {
+            Ok(_) => panic!("oversized module max must be refused"),
+            Err(e) => e,
+        };
         assert!(
             err.contains("hard cap"),
             "error must mention the hard cap; got: {err}"

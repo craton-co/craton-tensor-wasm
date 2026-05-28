@@ -113,6 +113,11 @@ async fn tenant_header_required_when_configured() {
 
 #[tokio::test]
 async fn tenant_header_garbage_is_400() {
+    // The header is PRESENT but unparseable. Distinguishing this from
+    // the absent-and-required case (`missing_tenant`) is important for
+    // dashboards: a spike in `invalid_tenant` indicates a client bug or
+    // probing attacker, whereas `missing_tenant` typically reflects a
+    // misconfigured client.
     let router = probe_router(TenantConfig::default());
     let req = Request::builder()
         .method(Method::GET)
@@ -125,7 +130,7 @@ async fn tenant_header_garbage_is_400() {
     let body = body_json(resp.into_body()).await;
     assert_eq!(
         body.pointer("/error/kind").and_then(Value::as_str),
-        Some("missing_tenant"),
+        Some("invalid_tenant"),
     );
 }
 
