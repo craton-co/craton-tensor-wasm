@@ -21,7 +21,9 @@ use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::types::{InstanceId, TenantId};
 use tensor_wasm_snapshot::reader::SnapshotReader;
 use tensor_wasm_snapshot::writer::{InstanceState, SnapshotWriter, DEFAULT_ZSTD_LEVEL};
-use tensor_wasm_snapshot::{SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN};
+use tensor_wasm_snapshot::{
+    SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN,
+};
 
 /// Fixed HMAC key used by both capture and restore in this test file. Stable
 /// across runs so any HMAC-keying regression surfaces deterministically.
@@ -47,15 +49,25 @@ fn tampered_trailer_fails_with_hmac_error_before_decoders_run() {
 
     assert!(
         blob.len() > SIGNATURE_TRAILER_LEN,
-        "expected v3 blob to be > 33 bytes, got {}",
+        "expected v3 blob to be > {} bytes (SIGNATURE_TRAILER_LEN), got {}",
+        SIGNATURE_TRAILER_LEN,
         blob.len(),
     );
 
-    // Sanity: the last 33 bytes really are the trailer (kind byte at -33).
+    // T8 sanity: the last `SIGNATURE_TRAILER_LEN` bytes are the trailer,
+    // laid out as `[V3_TRAILER_MAGIC: 4][kind: 1][sig: 32]`. The magic
+    // sits at offset `-SIGNATURE_TRAILER_LEN` and the kind byte sits
+    // immediately after the magic.
+    let trailer_start = blob.len() - SIGNATURE_TRAILER_LEN;
     assert_eq!(
-        blob[blob.len() - SIGNATURE_TRAILER_LEN],
+        &blob[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN],
+        &V3_TRAILER_MAGIC,
+        "writer must emit V3_TRAILER_MAGIC at the trailer position",
+    );
+    assert_eq!(
+        blob[trailer_start + V3_TRAILER_MAGIC_LEN],
         SIGNATURE_KIND_HMAC_SHA256,
-        "writer must emit the HMAC-SHA256 kind byte at the trailer position",
+        "writer must emit the HMAC-SHA256 kind byte after the trailer magic",
     );
 
     // Flip the last byte of the HMAC trailer (which is part of the 32-byte
@@ -109,8 +121,9 @@ fn valid_hmac_over_corrupted_payload_still_reaches_bincode() {
     // before that, the bincode decoder will fail trying to interpret the
     // wrong magic / version layout).
     //
-    // We then compute HMAC-SHA256(KEY, compressed_prefix) over those exact
-    // bytes and append `[SIGNATURE_KIND_HMAC_SHA256][32-byte sig]`. The
+    // We then compute HMAC-SHA256(KEY, compressed_prefix || V3_TRAILER_MAGIC
+    // || [SIGNATURE_KIND_HMAC_SHA256]) over those exact bytes and append
+    // `[V3_TRAILER_MAGIC][SIGNATURE_KIND_HMAC_SHA256][32-byte sig]`. The
     // result is a blob whose HMAC verifies cleanly with KEY — i.e. the
     // reader's "authenticate" step accepts it — but whose post-decompression
     // bincode decode (or magic check) must fail. That failure proves the
@@ -125,6 +138,11 @@ fn valid_hmac_over_corrupted_payload_still_reaches_bincode() {
 
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&KEY).expect("HMAC init");
     mac.update(&compressed_prefix);
+    // T8: writer mixes V3_TRAILER_MAGIC into the HMAC input as well, so
+    // a forged blob must match that ordering or the reader rejects it
+    // with "HMAC mismatch" and the test cannot reach the bincode path
+    // it is meant to exercise.
+    mac.update(&V3_TRAILER_MAGIC);
     // snapshot 1.1: the writer also authenticates the signature-kind byte
     // so the verifier expects it in the HMAC input. Mirror here so the
     // forged blob actually verifies and the test reaches the bincode path.
@@ -132,12 +150,20 @@ fn valid_hmac_over_corrupted_payload_still_reaches_bincode() {
     let sig = mac.finalize().into_bytes();
 
     let mut blob = compressed_prefix;
+    blob.extend_from_slice(&V3_TRAILER_MAGIC);
     blob.push(SIGNATURE_KIND_HMAC_SHA256);
     blob.extend_from_slice(sig.as_slice());
 
-    // Sanity: the trailer we just appended classifies the blob as v3.
+    // Sanity: the trailer we just appended classifies the blob as v3 — the
+    // magic prefix sits at `len - SIGNATURE_TRAILER_LEN` and the kind byte
+    // sits one V3_TRAILER_MAGIC_LEN further in.
+    let trailer_start = blob.len() - SIGNATURE_TRAILER_LEN;
     assert_eq!(
-        blob[blob.len() - SIGNATURE_TRAILER_LEN],
+        &blob[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN],
+        &V3_TRAILER_MAGIC,
+    );
+    assert_eq!(
+        blob[trailer_start + V3_TRAILER_MAGIC_LEN],
         SIGNATURE_KIND_HMAC_SHA256,
     );
 

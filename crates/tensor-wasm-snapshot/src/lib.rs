@@ -29,6 +29,6 @@ pub mod writer;
 
 pub use crate::format::{
     SignatureKind, HMAC_SHA256_SIG_LEN, SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN,
-    SNAPSHOT_VERSION_V2, SNAPSHOT_VERSION_V3,
+    SNAPSHOT_VERSION_V2, SNAPSHOT_VERSION_V3, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN,
 };
 pub use crate::writer::{limits, payload_crc32, Snapshot, SnapshotMetadata};

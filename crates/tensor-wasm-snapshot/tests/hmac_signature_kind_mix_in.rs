@@ -21,7 +21,9 @@ use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::types::{InstanceId, TenantId};
 use tensor_wasm_snapshot::reader::SnapshotReader;
 use tensor_wasm_snapshot::writer::{InstanceState, SnapshotWriter, DEFAULT_ZSTD_LEVEL};
-use tensor_wasm_snapshot::{SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN};
+use tensor_wasm_snapshot::{
+    SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN,
+};
 
 /// Fixed HMAC key — stable across runs so any regression surfaces
 /// deterministically rather than flaking on a particular seed.
@@ -58,27 +60,38 @@ fn forged_trailer_without_kind_byte_in_mac_input_is_rejected() {
     let prefix_len = real_blob.len() - SIGNATURE_TRAILER_LEN;
     let compressed_prefix = &real_blob[..prefix_len];
 
-    // Forgery: HMAC over the prefix ONLY — the kind byte is deliberately
-    // omitted from the MAC input. The real writer mixes it in at
-    // `writer.rs:452` (snapshot 1.1). A verifier that also omitted it would
-    // accept this blob; the real verifier (reader.rs:577) must reject.
+    // Forgery: HMAC over the prefix + V3_TRAILER_MAGIC only — the kind
+    // byte is deliberately omitted from the MAC input. The real writer
+    // mixes it in (snapshot 1.1). A verifier that also omitted it would
+    // accept this blob; the real verifier must reject. T8: we still
+    // include `V3_TRAILER_MAGIC` in the forged MAC input so the forgery
+    // is realistic — the kind-byte omission is the only difference from
+    // a valid signature, isolating exactly the property under test.
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&KEY).expect("HMAC init");
     mac.update(compressed_prefix);
+    mac.update(&V3_TRAILER_MAGIC);
     // NOTE: no `mac.update(&[SIGNATURE_KIND_HMAC_SHA256])` here — that omission
     // is the entire point of this test.
     let forged_sig = mac.finalize().into_bytes();
 
     let mut forged_blob: Vec<u8> = compressed_prefix.to_vec();
+    forged_blob.extend_from_slice(&V3_TRAILER_MAGIC);
     forged_blob.push(SIGNATURE_KIND_HMAC_SHA256);
     forged_blob.extend_from_slice(forged_sig.as_slice());
 
     // Sanity: the forged blob is the same total length and the trailer
-    // discriminator still classifies it as v3.
+    // discriminator (T8: 4-byte magic) still classifies it as v3.
     assert_eq!(forged_blob.len(), real_blob.len());
+    let trailer_start = forged_blob.len() - SIGNATURE_TRAILER_LEN;
     assert_eq!(
-        forged_blob[forged_blob.len() - SIGNATURE_TRAILER_LEN],
+        &forged_blob[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN],
+        &V3_TRAILER_MAGIC,
+        "forged blob must still classify as v3 via the trailer magic",
+    );
+    assert_eq!(
+        forged_blob[trailer_start + V3_TRAILER_MAGIC_LEN],
         SIGNATURE_KIND_HMAC_SHA256,
-        "forged blob must still classify as v3",
+        "forged blob's kind byte must still read as HMAC-SHA256",
     );
     // And the prefix is byte-identical to the real one.
     assert_eq!(&forged_blob[..prefix_len], compressed_prefix);
@@ -135,12 +148,15 @@ fn forged_trailer_with_kind_byte_in_mac_input_reaches_post_hmac_pipeline() {
 
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&KEY).expect("HMAC init");
     mac.update(&compressed_prefix);
-    // INCLUDING the kind byte — this is what the real writer does, and what
-    // the real verifier expects. The blob crosses the HMAC gate.
+    // INCLUDING both the trailer magic (T8) and the kind byte — this is
+    // what the real writer does, and what the real verifier expects. The
+    // blob crosses the HMAC gate.
+    mac.update(&V3_TRAILER_MAGIC);
     mac.update(&[SIGNATURE_KIND_HMAC_SHA256]);
     let sig = mac.finalize().into_bytes();
 
     let mut blob = compressed_prefix;
+    blob.extend_from_slice(&V3_TRAILER_MAGIC);
     blob.push(SIGNATURE_KIND_HMAC_SHA256);
     blob.extend_from_slice(sig.as_slice());
 

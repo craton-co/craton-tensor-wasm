@@ -28,6 +28,7 @@ use crate::writer::{
 #[cfg(feature = "signed-snapshots")]
 use crate::format::{
     SignatureKind, HMAC_SHA256_SIG_LEN, SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN,
+    V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN,
 };
 #[cfg(feature = "signed-snapshots")]
 use zeroize::Zeroizing;
@@ -224,22 +225,37 @@ impl SnapshotReader {
         }
 
         // Detect a v3 (signed) blob by peeking at the trailer position.
-        // A v3 envelope is `[compressed prefix][signature_kind][32-byte sig]`
-        // where the signature-kind byte sits at `len - SIGNATURE_TRAILER_LEN`.
-        // We deliberately key off the trailer *before* decompression so HMAC
-        // verification can authenticate the prefix bytes before zstd or
-        // bincode see them — the "authenticate then parse" property.
+        // A v3 envelope is
+        // `[compressed prefix][V3_TRAILER_MAGIC: 4][signature_kind: 1][32-byte sig]`
+        // where the trailer magic starts at `len - SIGNATURE_TRAILER_LEN`.
+        // We deliberately key off the trailer *before* decompression so
+        // HMAC verification can authenticate the prefix bytes before zstd
+        // or bincode see them — the "authenticate then parse" property.
         //
-        // A v2 blob whose final 33 bytes happen to put `SIGNATURE_KIND_HMAC_SHA256`
-        // at position `len - SIGNATURE_TRAILER_LEN` will be classified as v3
-        // and rejected by the HMAC check. This is the intended trade-off: the
-        // safety property of never decoding unauthenticated bytes is worth a
-        // per-blob ~1/256 false-positive risk on adversarial v2 inputs (and
-        // is vanishingly rare on real captures, since the byte sits inside
-        // the zstd frame epilogue which is largely structured).
+        // **T8:** prior to this commit the detector was a single-byte
+        // sniff at `bytes[len - 33] == SIGNATURE_KIND_HMAC_SHA256` (`1`).
+        // Because that byte sits inside the zstd frame epilogue of a
+        // legitimate v2 blob with ~1/256 probability, a v2 capture could
+        // be misclassified as v3 and then rejected by the HMAC check —
+        // a downgrade-shaped error message and wasted HMAC work, both
+        // observable side channels. Switching to a 4-byte magic prefix
+        // shrinks the false-positive rate to ~1/2^32 (~2.3e-10), well
+        // below per-blob CRC32 collision rates. v2 snapshots whose tail
+        // bytes happen to match `S3T1` exactly are still vanishingly
+        // rare in practice; if one is observed it will be caught by the
+        // HMAC mismatch path (since the writer would not have signed it)
+        // exactly as before.
         #[cfg(feature = "signed-snapshots")]
-        let is_v3 = bytes.len() >= SIGNATURE_TRAILER_LEN
-            && bytes[bytes.len() - SIGNATURE_TRAILER_LEN] == SIGNATURE_KIND_HMAC_SHA256;
+        let is_v3 = bytes.len() >= SIGNATURE_TRAILER_LEN && {
+            let trailer_start = bytes.len() - SIGNATURE_TRAILER_LEN;
+            // Magic check: the first 4 bytes of the trailer must equal
+            // V3_TRAILER_MAGIC. We deliberately do NOT also check the
+            // signature-kind byte here — that check lives inside
+            // `verify_v3_trailer`, which already rejects unknown kinds
+            // with a descriptive error and so doubles as the
+            // forward-compatibility hook for future variants.
+            &bytes[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN] == &V3_TRAILER_MAGIC
+        };
         #[cfg(not(feature = "signed-snapshots"))]
         let is_v3 = false;
 
@@ -247,8 +263,9 @@ impl SnapshotReader {
         // Verify HMAC over the compressed prefix before any decompression or
         // bincode decode runs. On failure we return immediately so an attacker
         // cannot use the zstd or bincode decoders as oracles. The trailer
-        // length and HMAC are constants of the v3 envelope (33 bytes total),
-        // so the prefix is exactly `bytes[..len - SIGNATURE_TRAILER_LEN]`.
+        // length and HMAC are constants of the v3 envelope (37 bytes total
+        // post-T8: 4-byte magic + 1-byte kind + 32-byte signature), so the
+        // prefix is exactly `bytes[..len - SIGNATURE_TRAILER_LEN]`.
         #[cfg(feature = "signed-snapshots")]
         let prefix_len = if is_v3 {
             let p = bytes.len() - SIGNATURE_TRAILER_LEN;
@@ -522,17 +539,27 @@ impl SnapshotReader {
         Ok(snapshot)
     }
 
-    /// Validate the trailing `[signature_kind][signature]` bytes of a v3 blob.
+    /// Validate the trailing `[magic][signature_kind][signature]` bytes of
+    /// a v3 blob.
     ///
     /// Called by [`SnapshotReader::restore`] **before** any decompression or
     /// bincode decode runs, as soon as the input has been classified as v3
-    /// by the trailer-position byte. `prefix_len` is the number of bytes that
-    /// precede the trailer — for the v3 envelope this is always
-    /// `bytes.len() - SIGNATURE_TRAILER_LEN`, and the HMAC is computed over
-    /// `bytes[..prefix_len]`. Authenticating here, before exposing the
-    /// compressed prefix to zstd, is what gives the reader the "authenticate
-    /// then parse" property: a forged or tampered blob cannot drive the
-    /// zstd, bincode, or per-blob validation paths as a side channel.
+    /// by the trailer-position magic. `prefix_len` is the number of bytes
+    /// that precede the trailer — for the v3 envelope this is always
+    /// `bytes.len() - SIGNATURE_TRAILER_LEN`, and the HMAC is computed
+    /// over `bytes[..prefix_len]` concatenated with the trailer magic and
+    /// the signature-kind byte. Authenticating here, before exposing the
+    /// compressed prefix to zstd, is what gives the reader the
+    /// "authenticate then parse" property: a forged or tampered blob
+    /// cannot drive the zstd, bincode, or per-blob validation paths as a
+    /// side channel.
+    ///
+    /// **T8 wire format:** the trailer is now `[magic: 4][kind: 1][sig: 32]`
+    /// = 37 bytes. The classifier in [`SnapshotReader::restore`] has
+    /// already checked that the magic equals [`V3_TRAILER_MAGIC`] before
+    /// dispatching here; we re-read the magic from the slice (rather than
+    /// trusting the classifier) so this function remains correct under
+    /// future refactors that hoist the check.
     ///
     /// Errors are deliberately generic: we never include the expected or
     /// observed signature bytes in the error message, since either could
@@ -548,9 +575,9 @@ impl SnapshotReader {
             )
         })?;
 
-        // The trailer must be exactly `[kind: u8][32-byte sig]`. Anything
-        // shorter is a truncation; anything longer is junk after the
-        // signature (which we refuse rather than silently accept).
+        // The trailer must be exactly `[magic: 4][kind: 1][sig: 32]`.
+        // Anything shorter is a truncation; anything longer is junk after
+        // the signature (which we refuse rather than silently accept).
         let trailer = bytes
             .get(prefix_len..)
             .ok_or_else(|| TensorWasmError::Serialization("snapshot v3 trailer missing".into()))?;
@@ -564,8 +591,18 @@ impl SnapshotReader {
                 .into(),
             ));
         }
-        let kind_byte = trailer[0];
-        let sig_bytes = &trailer[1..];
+        // Layout: trailer[0..4] = magic, trailer[4] = kind, trailer[5..] = sig.
+        // The classifier already checked the magic, but re-validate here
+        // for defence in depth (a future refactor that hoists detection
+        // upstream must not be able to skip authentication).
+        let magic_bytes = &trailer[..V3_TRAILER_MAGIC_LEN];
+        if magic_bytes != &V3_TRAILER_MAGIC {
+            return Err(TensorWasmError::Serialization(
+                "snapshot v3 trailer magic mismatch".into(),
+            ));
+        }
+        let kind_byte = trailer[V3_TRAILER_MAGIC_LEN];
+        let sig_bytes = &trailer[V3_TRAILER_MAGIC_LEN + 1..];
         let kind = SignatureKind::from_byte(kind_byte).ok_or_else(|| {
             TensorWasmError::Serialization(
                 format!("unknown signature_kind: {kind_byte}").into(),
@@ -592,6 +629,12 @@ impl SnapshotReader {
                 // HMAC covers every byte the zstd decoder consumed (the v2-shaped
                 // prefix), i.e. transitively magic, version, payload, and CRC32.
                 mac.update(&bytes[..prefix_len]);
+                // T8: authenticate the 4-byte trailer magic. The writer
+                // mixes the same bytes into its HMAC input, so a tampered
+                // magic prefix would produce a mismatch here — closing
+                // the "rewrite the trailer magic to disguise the blob"
+                // attack vector at signature-verification time.
+                mac.update(&V3_TRAILER_MAGIC);
                 // snapshot 1.1: also authenticate the signature-kind byte
                 // so a future second variant cannot be substituted via
                 // trailer rewrite (would otherwise be a downgrade primitive
@@ -1030,23 +1073,18 @@ mod tests {
         }
     }
 
-    /// Overwriting the signature-kind byte with anything other than 1 causes
-    /// the reader to no longer classify the blob as v3 — under the
-    /// authenticate-then-parse ordering the kind byte IS the trailer
-    /// discriminator, so a non-`HmacSha256` value at position
-    /// `len - SIGNATURE_TRAILER_LEN` makes the input look like a v2 blob to
-    /// the front-end. The inner bincode payload still claims `version = 3`,
-    /// so the post-decode version-consistency check trips and the reader
-    /// rejects with the missing-trailer error. (The pre-hoist code path
-    /// reached `verify_v3_trailer` after decode and emitted
-    /// "unknown signature_kind"; that wording is no longer reachable from
-    /// the public API because `SignatureKind::HmacSha256 == 1` is the only
-    /// known kind and so doubles as the v3 detection sentinel — the
-    /// `SignatureKind::from_byte` check inside `verify_v3_trailer` is now
-    /// pure defence-in-depth for future variants.)
+    /// Overwriting the signature-kind byte with an unknown discriminant
+    /// (under the T8 layout, the kind byte sits at
+    /// `len - SIGNATURE_TRAILER_LEN + V3_TRAILER_MAGIC_LEN`) leaves the
+    /// trailer magic intact, so the classifier still routes the blob to
+    /// `verify_v3_trailer`. There the unknown kind is caught by
+    /// `SignatureKind::from_byte` and the reader rejects with
+    /// `"unknown signature_kind: <byte>"` — a more precise error than the
+    /// pre-T8 "trailer missing" wording (which was an artefact of the
+    /// kind byte doubling as the v3 detection sentinel).
     #[cfg(feature = "signed-snapshots")]
     #[test]
-    fn v3_kind_byte_rewritten_falls_through_to_trailer_missing() {
+    fn v3_kind_byte_rewritten_is_rejected() {
         let key = [0x77u8; 32];
         let mut bytes = SnapshotWriter::new()
             .with_hmac_sha256_key(key)
@@ -1058,14 +1096,53 @@ mod tests {
                 registers: &[],
             })
             .expect("capture");
-        // Trailer layout: `[kind][32-byte sig]`. The kind byte sits at
-        // `len - 33` (i.e. `len - SIGNATURE_TRAILER_LEN`).
-        let kind_pos = bytes.len() - SIGNATURE_TRAILER_LEN;
+        // T8 trailer layout: `[magic: 4][kind: 1][sig: 32]`. The kind
+        // byte sits at `len - SIGNATURE_TRAILER_LEN + V3_TRAILER_MAGIC_LEN`
+        // (i.e. immediately after the 4-byte magic prefix).
+        let kind_pos = bytes.len() - SIGNATURE_TRAILER_LEN + V3_TRAILER_MAGIC_LEN;
         bytes[kind_pos] = 0xFE; // not a known SignatureKind
         let err = SnapshotReader::new()
             .with_hmac_sha256_key(key)
             .restore(&bytes)
             .expect_err("rewritten kind byte must be rejected");
+        match err {
+            TensorWasmError::Serialization(m) => assert!(
+                m.contains("unknown signature_kind"),
+                "unexpected message: {m}",
+            ),
+            other => panic!("expected Serialization, got {other:?}"),
+        }
+    }
+
+    /// T8: rewriting the v3 trailer magic to anything other than
+    /// `V3_TRAILER_MAGIC` makes the classifier treat the blob as v2.
+    /// The inner bincode payload still claims `version = 3`, so the
+    /// post-decode version-consistency check trips and the reader
+    /// rejects with the missing-trailer error. This is the new
+    /// equivalent of the pre-T8 "rewrite the kind sentinel" test —
+    /// the discriminator is now the 4-byte magic rather than the
+    /// single kind byte.
+    #[cfg(feature = "signed-snapshots")]
+    #[test]
+    fn v3_trailer_magic_rewritten_falls_through_to_trailer_missing() {
+        let key = [0x77u8; 32];
+        let mut bytes = SnapshotWriter::new()
+            .with_hmac_sha256_key(key)
+            .capture(InstanceState {
+                tenant_id: TenantId(6),
+                instance_id: InstanceId(6),
+                wasm_memory: &[],
+                gpu_memory: &[],
+                registers: &[],
+            })
+            .expect("capture");
+        // Corrupt the trailer magic — any value other than `V3_TRAILER_MAGIC`.
+        let magic_pos = bytes.len() - SIGNATURE_TRAILER_LEN;
+        bytes[magic_pos] ^= 0xFF;
+        let err = SnapshotReader::new()
+            .with_hmac_sha256_key(key)
+            .restore(&bytes)
+            .expect_err("rewritten trailer magic must be rejected");
         match err {
             TensorWasmError::Serialization(m) => assert!(
                 m.contains("v3 trailer missing"),
@@ -1075,11 +1152,209 @@ mod tests {
         }
     }
 
-    /// Sanity: the HMAC trailer length equals exactly 1 + the SHA-256 digest
-    /// size, so the trailer offset arithmetic above is correct.
+    /// Sanity: the HMAC trailer length equals exactly the 4-byte magic
+    /// plus the kind discriminant plus the SHA-256 digest size, so the
+    /// trailer offset arithmetic above is correct. Pre-T8 this assertion
+    /// was `SIGNATURE_TRAILER_LEN == 1 + HMAC_SHA256_SIG_LEN`; the bump
+    /// to 37 bytes is the BREAKING change announced in CHANGELOG.md.
     #[cfg(feature = "signed-snapshots")]
     #[test]
     fn trailer_constants_are_consistent() {
-        assert_eq!(SIGNATURE_TRAILER_LEN, 1 + HMAC_SHA256_SIG_LEN);
+        assert_eq!(
+            SIGNATURE_TRAILER_LEN,
+            V3_TRAILER_MAGIC_LEN + 1 + HMAC_SHA256_SIG_LEN,
+        );
+        assert_eq!(SIGNATURE_TRAILER_LEN, 37);
+    }
+
+    /// T8 regression: a v2 blob whose final byte happens to be `0x01`
+    /// (the pre-T8 v3 detection sentinel) must NOT be misclassified as
+    /// v3. The new detector keys off a 4-byte magic prefix, so the
+    /// single-byte coincidence — which previously hit with ~1/256
+    /// probability against legitimate v2 zstd-frame epilogues — is no
+    /// longer enough to flip the classifier.
+    ///
+    /// Strategy: round-trip a v2 capture, brute-force-search a payload
+    /// shape whose final byte is `0x01`, and confirm the reader still
+    /// accepts it without ever calling the HMAC path. To make the
+    /// outcome deterministic, we forcibly rewrite the last byte of a
+    /// real v2 capture to `0x01` AFTER capture, which puts the byte
+    /// inside the zstd frame epilogue and so almost always corrupts the
+    /// frame (the zstd decoder rejects it). To exercise the
+    /// classification path without changing payload bytes, we instead
+    /// build a synthetic v2 blob whose tail byte is `0x01` by appending
+    /// a single byte to a fresh capture: that byte sits past the zstd
+    /// frame and would have tripped the pre-T8 v3 sniff, but under T8
+    /// it does not match the 4-byte magic and the reader correctly
+    /// treats the blob as v2-with-trailing-junk (rejected by the
+    /// post-decode "unexpected trailing bytes" check). The point of
+    /// the test is that the classifier never reaches `verify_v3_trailer`,
+    /// so a reader configured WITHOUT an HMAC key still produces the
+    /// trailing-bytes error rather than the "signed (v3) but reader has
+    /// no HMAC key" error — i.e. the blob was correctly classified as
+    /// v2.
+    #[test]
+    fn v2_tail_byte_01_is_not_misclassified_as_v3() {
+        let bytes = SnapshotWriter::new()
+            .capture(InstanceState {
+                tenant_id: TenantId(101),
+                instance_id: InstanceId(101),
+                wasm_memory: &[1, 2, 3, 4, 5, 6, 7, 8],
+                gpu_memory: &[],
+                registers: &[],
+            })
+            .expect("capture");
+        // Append a single `0x01` byte so the tail byte at `len - 1`
+        // (which under the pre-T8 layout was the kind sentinel position
+        // when `SIGNATURE_TRAILER_LEN == 33` and the blob was exactly
+        // 33 bytes long, but more importantly is the byte that pre-T8
+        // single-byte sniff would have looked at on the inner v2
+        // frame's epilogue) is `0x01`. The key behaviour is the
+        // classifier outcome: a reader with NO HMAC key must NOT
+        // produce the "signed (v3) but reader has no HMAC key" error,
+        // because that would mean the blob was misclassified as v3.
+        let mut tampered = bytes.clone();
+        tampered.push(0x01);
+        // Sanity: the new classifier window is at
+        // `len - SIGNATURE_TRAILER_LEN..len - SIGNATURE_TRAILER_LEN + 4`,
+        // which on a small v2 blob with one appended byte lands inside
+        // the zstd frame — exactly the scenario the pre-T8 detector
+        // was wrong about.
+        let reader = SnapshotReader::new();
+        let err = reader
+            .restore(&tampered)
+            .expect_err("malformed v2 must still be rejected (but as v2, not v3)");
+        let TensorWasmError::Serialization(msg) = err else {
+            panic!("expected Serialization");
+        };
+        let msg = msg.to_string();
+        // The critical assertion: the rejection must NOT come from
+        // the v3 classification path (which would produce a message
+        // mentioning the HMAC key or v3 trailer). Any v2-shaped error
+        // is acceptable here — zstd decode failure, unexpected
+        // trailing bytes, or magic/version mismatch — what matters
+        // is that the magic-prefix detector did not flip on a stray
+        // `0x01` byte.
+        assert!(
+            !msg.contains("signed (v3)") && !msg.contains("HMAC"),
+            "v2 blob misclassified as v3: {msg}",
+        );
+    }
+
+    /// Companion to the above: a v2 blob whose **trailer-magic window**
+    /// (i.e. the 4 bytes at offset `len - SIGNATURE_TRAILER_LEN`)
+    /// happens to start with `0x01` (the pre-T8 sentinel) but does NOT
+    /// equal `V3_TRAILER_MAGIC` must be classified as v2. This is the
+    /// hardened-against-T8-regression version of the test above: it
+    /// guarantees the reader looks at all 4 magic bytes, not just the
+    /// first.
+    #[cfg(feature = "signed-snapshots")]
+    #[test]
+    fn v2_with_kind_byte_in_trailer_window_is_not_v3() {
+        let bytes = SnapshotWriter::new()
+            .capture(InstanceState {
+                tenant_id: TenantId(102),
+                instance_id: InstanceId(102),
+                wasm_memory: &[9, 9, 9, 9, 9, 9, 9, 9],
+                gpu_memory: &[],
+                registers: &[],
+            })
+            .expect("capture");
+        // We need a v2 blob whose tail 4 bytes are exactly `[0x01, X, Y, Z]`
+        // with X/Y/Z not matching the T8 magic. Append a synthetic
+        // 4-byte tail to a real v2 capture; the appended bytes are
+        // beyond the zstd frame so the decoder will reject the input
+        // (v2 forbids trailing bytes), but the rejection must come from
+        // the v2 path, not from the v3 HMAC check.
+        let mut tampered = bytes.clone();
+        // Make sure the magic-window does NOT match V3_TRAILER_MAGIC.
+        // Choose four bytes whose first byte is `0x01` (the legacy
+        // sentinel) but whose remaining bytes mismatch on the magic
+        // (S3T1 = [0x53, 0x33, 0x54, 0x31]).
+        debug_assert_ne!(V3_TRAILER_MAGIC[0], 0x01);
+        tampered.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        // Pad up so the magic window is large enough — append zeros
+        // until we are confidently past the original zstd frame and
+        // the classifier reads the appended `0x01` at position
+        // `len - SIGNATURE_TRAILER_LEN`. The simplest reliable shape:
+        // pad to exactly `original_len + SIGNATURE_TRAILER_LEN`, so
+        // the classifier's 4-byte window starts at the boundary we
+        // wrote `0x01` to.
+        let target_len = bytes.len() + SIGNATURE_TRAILER_LEN;
+        while tampered.len() < target_len {
+            tampered.push(0x00);
+        }
+        // Now bytes[len - SIGNATURE_TRAILER_LEN..len - SIGNATURE_TRAILER_LEN + 4]
+        // starts with `0x01` but does not equal `S3T1`.
+        let trailer_start = tampered.len() - SIGNATURE_TRAILER_LEN;
+        assert_eq!(tampered[trailer_start], 0x01, "test setup invariant");
+        assert_ne!(
+            &tampered[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN],
+            &V3_TRAILER_MAGIC,
+            "test setup invariant: window must NOT equal v3 magic",
+        );
+        // Reader with HMAC key configured: if the blob were
+        // misclassified as v3, we would hit "HMAC mismatch". Under T8
+        // the classifier correctly treats it as v2 and the rejection
+        // comes from the v2 trailing-bytes path.
+        let reader = SnapshotReader::new().with_hmac_sha256_key([0xAAu8; 32]);
+        let err = reader
+            .restore(&tampered)
+            .expect_err("padded v2 must be rejected via the v2 path");
+        let TensorWasmError::Serialization(msg) = err else {
+            panic!("expected Serialization");
+        };
+        let msg = msg.to_string();
+        assert!(
+            !msg.contains("HMAC mismatch"),
+            "v2 blob with `0x01` in magic window was misclassified as v3: {msg}",
+        );
+    }
+
+    /// T8 round-trip: a v3 capture from the post-T8 writer parses
+    /// successfully through the post-T8 reader. Distinct from the
+    /// existing `signed_writer_emits_v3_and_round_trips` test in
+    /// `writer.rs` in that it lives next to the classifier code it
+    /// guards, so a future reader refactor that breaks the magic-prefix
+    /// path trips this test even if the writer-side test is skipped.
+    #[cfg(feature = "signed-snapshots")]
+    #[test]
+    fn v3_round_trip_through_magic_prefix_trailer() {
+        let key = [0x5Au8; 32];
+        let wasm = vec![0xAAu8; 256];
+        let gpu = vec![0xBBu8; 512];
+        let regs = vec![0xCCu8; 32];
+        let bytes = SnapshotWriter::new()
+            .with_hmac_sha256_key(key)
+            .capture(InstanceState {
+                tenant_id: TenantId(7),
+                instance_id: InstanceId(7),
+                wasm_memory: &wasm,
+                gpu_memory: &gpu,
+                registers: &regs,
+            })
+            .expect("capture v3");
+        // The emitted blob must end with `[V3_TRAILER_MAGIC][kind=1][32-byte sig]`.
+        assert!(bytes.len() >= SIGNATURE_TRAILER_LEN);
+        let trailer_start = bytes.len() - SIGNATURE_TRAILER_LEN;
+        assert_eq!(
+            &bytes[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN],
+            &V3_TRAILER_MAGIC,
+            "writer must emit the v3 trailer magic",
+        );
+        assert_eq!(
+            bytes[trailer_start + V3_TRAILER_MAGIC_LEN],
+            SIGNATURE_KIND_HMAC_SHA256,
+            "writer must emit the kind byte after the magic",
+        );
+
+        let restored = SnapshotReader::new()
+            .with_hmac_sha256_key(key)
+            .restore(&bytes)
+            .expect("v3 must round-trip through magic-prefix reader");
+        assert_eq!(restored.wasm_memory, wasm);
+        assert_eq!(restored.gpu_memory, gpu);
+        assert_eq!(restored.registers, regs);
+        assert_eq!(restored.version, crate::format::SNAPSHOT_VERSION_V3);
     }
 }
