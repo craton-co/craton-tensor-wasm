@@ -1007,7 +1007,14 @@ impl TenantContextBuilder {
         mut self,
         cap: u64,
     ) -> Result<Self, tensor_wasm_mem::cuda_mem_pool::MemPoolError> {
-        let pool = tensor_wasm_mem::cuda_mem_pool::TenantMemPool::new(cap)?;
+        // T39: the driver pin now requires an explicit device ordinal.
+        // The tenant builder does not see a device index unless the
+        // optional `cuda` feature is on AND
+        // `with_cuda_device_index` was called; surfacing both options
+        // through this method would balloon the API. Default to
+        // ordinal 0 (matches the historical scaffold behaviour) and
+        // let the v0.5 cutover thread `cuda_device_index` through.
+        let pool = tensor_wasm_mem::cuda_mem_pool::TenantMemPool::new(0, cap)?;
         self.mem_pool = Some(Arc::new(pool));
         Ok(self)
     }

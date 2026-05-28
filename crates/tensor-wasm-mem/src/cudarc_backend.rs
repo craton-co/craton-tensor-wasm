@@ -139,7 +139,7 @@ fn device_cache() -> &'static Mutex<std::collections::HashMap<u32, Arc<CudaDevic
 /// process-lifetime reference so the primary context never drops to zero
 /// strong-count, which is exactly the keep-alive guarantee that protects
 /// other tenants' managed pointers.
-fn device_for(ordinal: u32) -> Result<Arc<CudaDevice>, UnifiedError> {
+pub(crate) fn device_for(ordinal: u32) -> Result<Arc<CudaDevice>, UnifiedError> {
     // Hot path: probe under the mutex; if present, hand out a clone and
     // release the lock immediately. The `Arc::clone` cost is one atomic
     // increment so the lock window is bounded by a hash lookup.
@@ -194,7 +194,7 @@ fn device_for(ordinal: u32) -> Result<Arc<CudaDevice>, UnifiedError> {
 /// fall through to the driver call, because every downstream `cuMem*`
 /// entry point would itself fail with `CUDA_ERROR_INVALID_CONTEXT` and
 /// the operator's first error message would be misleadingly downstream.
-fn ensure_context_bound(device: &Arc<CudaDevice>) -> Result<(), UnifiedError> {
+pub(crate) fn ensure_context_bound(device: &Arc<CudaDevice>) -> Result<(), UnifiedError> {
     device
         .bind_to_thread()
         .map_err(|e| UnifiedError::Cuda(format!("CudaDevice::bind_to_thread: {e:?}")))

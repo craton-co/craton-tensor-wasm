@@ -55,7 +55,7 @@ use tensor_wasm_mem::cuda_mem_pool::{MemPoolError, TenantMemPool};
 #[ignore = "requires CUDA hardware"]
 fn mem_pool_creates_with_release_threshold() {
     const CAP: u64 = 1024 * 1024;
-    let pool = TenantMemPool::new(CAP).expect("cuMemPoolCreate must succeed on CUDA host");
+    let pool = TenantMemPool::new(0, CAP).expect("cuMemPoolCreate must succeed on CUDA host");
     assert_eq!(
         pool.cap_bytes(),
         CAP,
@@ -88,7 +88,7 @@ fn mem_pool_creates_with_release_threshold() {
 fn mem_pool_drop_destroys() {
     const CAP: u64 = 1024 * 1024;
     {
-        let p = TenantMemPool::new(CAP).expect("first pool must construct");
+        let p = TenantMemPool::new(0, CAP).expect("first pool must construct");
         assert_eq!(p.cap_bytes(), CAP);
         // Drop at end of scope.
     }
@@ -97,7 +97,7 @@ fn mem_pool_drop_destroys() {
     // memory-constrained device; on a permissive host this assertion
     // is satisfied trivially. Either way the test pins the user-visible
     // post-condition: dropping a pool returns its budget to the driver.
-    let p2 = TenantMemPool::new(CAP).expect("second pool must construct after first drops");
+    let p2 = TenantMemPool::new(0, CAP).expect("second pool must construct after first drops");
     assert_eq!(p2.cap_bytes(), CAP);
 }
 
@@ -119,7 +119,7 @@ fn mem_pool_drop_destroys() {
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn mem_pool_cap_zero_returns_error() {
-    match TenantMemPool::new(0) {
+    match TenantMemPool::new(0, 0) {
         Ok(pool) => {
             // Driver accepted zero: document the post-condition.
             assert_eq!(

@@ -98,6 +98,18 @@ the v0.4+ tracking table in
 marks the eight rows below as 🟡 scaffold landed.
 
 ### Added
+- `tensor-wasm-mem` (T39): driver-level GPU memory cap via
+  `cuMemPool`. `TenantMemPool` now pins the cap via
+  `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)` at
+  pool creation and routes tenant allocations through
+  `cuMemAllocFromPoolAsync` (via the new
+  `UnifiedBuffer::new_in_tenant_pool`). Requires
+  `--features gpu-mem-pool` and CUDA 11.2+. The in-process counter
+  remains the primary accounting source; the driver pin is the
+  bypass-resistant second line of defence (closes the v0.3.7
+  "tenant obtained a raw CUDA driver handle" hole described in
+  [`docs/GPU-QUOTAS.md`](docs/GPU-QUOTAS.md) § "Security note"). See
+  [`crates/tensor-wasm-mem/src/cuda_mem_pool.rs`](crates/tensor-wasm-mem/src/cuda_mem_pool.rs).
 - `tensor-wasm-exec`: `WasmArg` enum + JSON ↔ `Val` codec +
   `TensorWasmExecutor::call_export_with_args` for typed multi-value
   guest exports (roadmap #1). See

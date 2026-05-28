@@ -302,6 +302,27 @@ mod backing {
         /// the pre-aliasing construction path inside
         /// [`Backing::allocate`].
         Cuda(cust::memory::UnifiedBuffer<u8>),
+
+        /// T39 driver-enforced tenant pool allocation
+        /// (`cuMemAllocFromPoolAsync` against a `TenantMemPool`).
+        ///
+        /// Distinct from [`Backing::Cuda`] because the free path goes
+        /// through `cuMemFreeAsync` on the tenant's pool handle rather
+        /// than cust's `cuMemFree_v2`. The held `Arc<TenantMemPool>`
+        /// keeps the pool (and its `cuMemPoolDestroy` deadline) alive
+        /// for the buffer's lifetime.
+        ///
+        /// # Safety
+        ///
+        /// Same aliasing rule as [`Backing::Cuda`]: the wrapped
+        /// `NonNull<u8>` aliases the parent
+        /// [`super::UnifiedBuffer`]'s `ptr` field; do NOT
+        /// pattern-match this variant from outside the construction
+        /// + drop paths in this module.
+        #[cfg(feature = "gpu-mem-pool")]
+        TenantPool(
+            super::TenantPoolBacking,
+        ),
     }
 
     /// Process-wide CUDA context init via cust::quick_init. cust 0.3
@@ -402,6 +423,27 @@ mod backing {
         /// are reserved for the pre-aliasing construction path inside
         /// [`Backing::allocate`].
         Cudarc(CudarcUnifiedBuffer),
+
+        /// T39 driver-enforced tenant pool allocation
+        /// (`cuMemAllocFromPoolAsync` against a `TenantMemPool`).
+        ///
+        /// Distinct from [`Backing::Cudarc`] because the free path
+        /// goes through `cuMemFreeAsync` on the tenant's pool handle
+        /// rather than `cuMemFree_v2`. The held `Arc<TenantMemPool>`
+        /// keeps the pool (and its `cuMemPoolDestroy` deadline) alive
+        /// for the buffer's lifetime.
+        ///
+        /// # Safety
+        ///
+        /// Same aliasing rule as [`Backing::Cudarc`]: the wrapped
+        /// `NonNull<u8>` aliases the parent
+        /// [`super::UnifiedBuffer`]'s `ptr` field; do NOT
+        /// pattern-match this variant from outside the construction
+        /// + drop paths in this module.
+        #[cfg(feature = "gpu-mem-pool")]
+        TenantPool(
+            super::TenantPoolBacking,
+        ),
     }
 
     impl Backing {
@@ -545,6 +587,65 @@ mod backing {
 // struct's `NonNull<u8>`.
 use backing::{Backing, IS_UVM_BACKED};
 
+/// T39 owning storage for a [`UnifiedBuffer`] allocated through a
+/// tenant-scoped `cuMemPool`.
+///
+/// Wraps the raw `NonNull<u8>` returned by
+/// `cuMemAllocFromPoolAsync` plus the `Arc<TenantMemPool>` whose
+/// release-threshold cap the driver is now enforcing. The `Drop` impl
+/// frees through `pool.deallocate` (`cuMemFreeAsync`) before the held
+/// `Arc` itself drops, so the pool's `cuMemPoolDestroy` cannot run
+/// while any of its allocations are still live.
+///
+/// Lives at parent-module scope so the per-feature `mod backing`
+/// blocks above can both name the same type — the cudarc-only build
+/// and the `unified-memory`-plus-`gpu-mem-pool` build share this one
+/// definition rather than each carrying their own copy.
+///
+/// # Safety
+///
+/// `ptr` aliases the parent [`UnifiedBuffer`]'s `ptr` field. Do NOT
+/// hand the inner pointer out via any accessor here — the pre-aliasing
+/// construction path inside [`UnifiedBuffer::new_in_tenant_pool`]
+/// captures the pointer, and from then on only the parent struct's
+/// `as_ptr` / `as_mut_ptr` are the legal access paths.
+#[cfg(feature = "gpu-mem-pool")]
+#[derive(Debug)]
+pub(crate) struct TenantPoolBacking {
+    ptr: NonNull<u8>,
+    pool: Arc<crate::cuda_mem_pool::TenantMemPool>,
+}
+
+#[cfg(feature = "gpu-mem-pool")]
+impl Drop for TenantPoolBacking {
+    fn drop(&mut self) {
+        // Free through the tenant pool. Mirrors the failure-handling
+        // discipline of [`crate::cudarc_backend::CudarcUnifiedBuffer::drop`]:
+        // drop cannot return an error, so a `cuMemFreeAsync` failure is
+        // logged at `error!` and the pointer is left orphaned. The
+        // tenant pool's release-threshold cap means a leaked
+        // allocation is still bounded by the cap; the v0.5 leak-audit
+        // story will unify this with `LEAKED_CUDA_ALLOCATIONS`.
+        if let Err(e) = self.pool.deallocate(self.ptr) {
+            tracing::error!(
+                target: "tensor_wasm_mem::cuda_mem_pool",
+                error = ?e,
+                pool_cap_bytes = self.pool.cap_bytes(),
+                "cuMemFreeAsync failed in TenantPoolBacking::drop -- \
+                 allocation leaked, bounded by pool cap",
+            );
+        }
+    }
+}
+
+// SAFETY: the inner pointer is owned by this struct and not shared
+// without explicit synchronisation; the `Arc<TenantMemPool>` is itself
+// `Send + Sync` (see `TenantMemPool`'s `unsafe impl`).
+#[cfg(feature = "gpu-mem-pool")]
+unsafe impl Send for TenantPoolBacking {}
+#[cfg(feature = "gpu-mem-pool")]
+unsafe impl Sync for TenantPoolBacking {}
+
 impl UnifiedBuffer {
     /// Allocate a new unified buffer of `size` bytes on the default device.
     ///
@@ -683,6 +784,79 @@ impl UnifiedBuffer {
                 Err(e.into())
             }
         }
+    }
+
+    /// T39 — allocate `size` bytes routed through the tenant's
+    /// driver-enforced [`TenantMemPool`].
+    ///
+    /// This is the bypass-resistant complement to
+    /// [`Self::new_on_with_tenant_context`]: instead of (or rather,
+    /// in addition to) the in-process `consume_gpu_bytes` counter,
+    /// the CUDA driver itself enforces the
+    /// `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` cap configured on the
+    /// pool. Over-cap allocations fail with
+    /// `CUDA_ERROR_OUT_OF_MEMORY` at the driver level, which this
+    /// constructor surfaces as
+    /// [`tensor_wasm_core::error::TensorWasmError::CudaError`] via
+    /// the [`UnifiedError`] → [`tensor_wasm_core::error::TensorWasmError`]
+    /// conversion.
+    ///
+    /// # Bytes layout
+    ///
+    /// `cuMemAllocFromPoolAsync` returns device-located uninitialised
+    /// memory. Unlike the unified-memory (`cuMemAllocManaged`) path,
+    /// this allocation is NOT host-addressable through normal
+    /// dereferencing — accessing the bytes from the CPU requires an
+    /// explicit copy or an event-synchronised stream. The Wasm
+    /// linear-memory path therefore CANNOT route through this
+    /// constructor today; the v0.5 cutover that splits managed-memory
+    /// from pooled-device-memory will introduce a separate
+    /// linear-memory variant for tenants that opt into the
+    /// driver-enforced path. For v0.4 this entry point is intended
+    /// for scratch/working-set buffers that live entirely on the
+    /// device.
+    ///
+    /// Gated behind `#[cfg(feature = "gpu-mem-pool")]`. The pool
+    /// handle MUST have been constructed for the same `device_id` you
+    /// pass here; the constructor does not double-check (cudarc's
+    /// `cuMemAllocFromPoolAsync` returns
+    /// `CUDA_ERROR_INVALID_DEVICE` on a mismatch, which we surface as
+    /// `UnifiedError::Cuda`).
+    #[cfg(feature = "gpu-mem-pool")]
+    pub fn new_in_tenant_pool(
+        pool: Arc<crate::cuda_mem_pool::TenantMemPool>,
+        size: usize,
+        device_id: DeviceId,
+    ) -> Result<Self, UnifiedError> {
+        if size == 0 {
+            return Err(UnifiedError::ZeroSize);
+        }
+        // Bypass the per-feature `Backing::allocate` machinery: the
+        // pool path is the *only* allocator here, and it does not
+        // zero-init (device-located memory is uninitialised at
+        // allocation). Callers that need a zero-filled buffer must
+        // memset themselves; we deliberately do NOT pay for a
+        // full-allocation memset here because the T39 use cases
+        // (working-set scratch buffers) overwrite the region
+        // immediately.
+        let ptr = pool.allocate(size)?;
+        let tp = TenantPoolBacking {
+            ptr,
+            pool: Arc::clone(&pool),
+        };
+        Ok(Self {
+            ptr,
+            size,
+            device_id,
+            backing: Backing::TenantPool(tp),
+            // No `tenant_ctx`: this constructor is the *driver*-pin
+            // entry point. The caller chooses whether to also stash
+            // an `Arc<TenantContext>` for in-process accounting via a
+            // wrapping path; conflating the two layers here would
+            // make the cap appear to be enforced twice on a single
+            // allocation and confuse `gpu_bytes_in_use` reporting.
+            tenant_ctx: None,
+        })
     }
 
     /// Length in bytes.

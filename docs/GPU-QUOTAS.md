@@ -1,8 +1,14 @@
 # GPU memory quotas
 
 Per-tenant GPU memory caps for Craton TensorWasm. Roadmap feature #8.
-Today (v0.3.7) the cap is **recorded and enforced in-process only**;
-the CUDA driver itself sees no cap until v0.4 wires `cuMemPool`.
+
+**Driver-level enforcement: LANDED in v0.3.7 (T39), requires
+`--features gpu-mem-pool`.** The in-process counter remains the
+primary accounting source; the driver pin is the bypass-resistant
+second line of defence (see "Security note" at the bottom of this
+doc). On builds without `gpu-mem-pool`, the cap is **recorded and
+enforced in-process only** — the v0.3.7 behaviour described in the
+"v0.3.7 — record-only behaviour" section continues to apply.
 
 ## Config knobs
 
@@ -50,26 +56,79 @@ would over-report utilisation. The pool's all-or-nothing teardown
 contract (see `UnifiedMemoryPool::reset`) already serves as the
 slab's lifecycle gate.
 
-## v0.4 — `cuMemPool` enforcement plan
+## v0.4 — `cuMemPool` driver-level enforcement (T39, LANDED)
 
 CUDA 11.2+ exposes `cuMemPool` APIs that let the driver enforce a
-hard per-pool memory cap. The plan:
+hard per-pool memory cap. T39 wires this through against cudarc 0.13.
 
-* At `TenantContext` construction (when `gpu_memory_bytes_cap` is
-  `Some`), call
-  `cuMemPoolSetAttribute(pool, CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, &bytes)`
-  on a tenant-owned pool. The release threshold backs the driver-side
-  cap on outstanding allocations.
-* Migrate the in-process `consume_gpu_bytes` / `release_gpu_bytes`
-  pair into a driver-call thin wrapper, surfacing the
-  `CUDA_ERROR_OUT_OF_MEMORY` driver return as the existing
-  `TensorWasmError::GpuMemoryExhausted`.
-* Keep the in-process counter as the always-correct accounting source
-  of truth; the driver cap is the bypass-resistant *additional* gate.
+### What landed
 
-This is gated on the cust → cudarc / cuda-oxide migration documented
-in [RFC 0001](../rfcs/0001-cuda-oxide-integration.md) — `cust 0.3.x`
-does not surface the `cuMemPool*` API.
+* `tensor-wasm-mem::cuda_mem_pool::TenantMemPool::new(device_ordinal,
+  cap_bytes)` now calls
+  `cuMemPoolCreate` followed by
+  `cuMemPoolSetAttribute(pool, CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+  &cap_bytes)`. The release threshold is the driver-side cap on
+  outstanding allocations from this pool.
+* The constructor uses the T26 per-ordinal device cache
+  (`tensor-wasm-mem::cudarc_backend::DEVICE_CACHE`) to retain the
+  primary context for the lifetime of the pool. Dropping the
+  `TenantMemPool` calls `cuMemPoolDestroy`; the held
+  `Arc<CudaDevice>` drops after the destroy so the primary context
+  outlives the destroy call.
+* `tensor-wasm-mem::unified::UnifiedBuffer::new_in_tenant_pool(pool,
+  size, device_id)` routes through `cuMemAllocFromPoolAsync` on the
+  null stream. The freed allocation goes through `cuMemFreeAsync` on
+  drop. The driver enforces the cap — over-cap allocations fail with
+  `CUDA_ERROR_OUT_OF_MEMORY`, surfaced as `UnifiedError::Cuda`.
+* `TenantContext.mem_pool: Option<Arc<TenantMemPool>>` carries the
+  pool handle through the tenant lifecycle. See
+  `TenantContextBuilder::with_driver_enforced_gpu_cap` for the
+  builder entry point.
+
+### What the in-process counter still does
+
+The in-process `consume_gpu_bytes` / `release_gpu_bytes` pair remains
+the always-correct accounting source of truth:
+
+* It bumps the per-tenant Prometheus gauge
+  (`tensor_wasm_gpu_memory_bytes_per_tenant`) on every transition.
+* It surfaces the structured `TensorWasmError::GpuMemoryExhausted
+  { requested, limit, current }` triple that the API layer maps to a
+  4xx response body without scraping a driver error string.
+
+The driver cap is the bypass-resistant *additional* gate: a workload
+that obtained a raw CUDA driver handle (out of scope for `wasi:cuda`,
+in scope for any future trusted-tenant deployment) cannot allocate
+past the pool cap even though it did not go through `consume_gpu_bytes`.
+
+### TOCTOU caveat (driver-API limitation)
+
+The threshold is set in a separate FFI call after the pool's
+creation. A racing observer can see the unprotected pool for ~µs
+between `cuMemPoolCreate` and `cuMemPoolSetAttribute`. Acceptable
+because (a) the only consumer of the pool handle in this codebase is
+the just-finished constructor, and (b) the in-process counter still
+applies as a second line of defence. cudarc 0.13's `CUmemPoolProps`
+struct doesn't carry the threshold inline, so this race is
+unavoidable in CUDA Driver API.
+
+### Operator alignment requirement
+
+The DRIVER-level pin must STRICTLY MATCH the in-process cap value.
+Pass the same `bytes` to BOTH
+`TenantContextBuilder::with_gpu_memory_bytes_cap(bytes)` AND
+`TenantContextBuilder::with_driver_enforced_gpu_cap(bytes)`. An
+alignment failure between the two is the operator's bug, not ours;
+the v0.4 builder does not auto-derive one from the other so the
+distinction stays explicit and auditable.
+
+### Gating
+
+`--features gpu-mem-pool` on `tensor-wasm-mem`. Strict-superset
+alias for `--features cudarc-backend` (cust 0.3.x has no
+`cuMemPool*` binding); the feature alias guarantees the resolver
+picks up `cuda_mem_pool` and `UnifiedBuffer::new_in_tenant_pool`
+together.
 
 The metric series naming will also be revisited in v0.4: today the
 CPU `consume_bytes` / `release_bytes` pair and the GPU

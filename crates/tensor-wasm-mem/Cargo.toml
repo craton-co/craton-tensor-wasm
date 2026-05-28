@@ -84,6 +84,18 @@ unified-memory = ["dep:cust"]
 # default; both backends coexist for the v0.2 spike. See
 # `docs/CUDARC-SPIKE.md` for the API mapping and cutover plan.
 cudarc-backend = ["dep:cudarc"]
+# T39 (v0.4): driver-level per-tenant GPU memory cap via
+# `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`.
+# Strict-superset alias for `cudarc-backend` — the `cuMemPool*` API
+# only exists on the cudarc side (cust 0.3.x has no binding) so
+# enabling this feature pulls cudarc in automatically. Operators turn
+# it on with `--features gpu-mem-pool` to make their intent explicit
+# on the command line; the alias guarantees the resolver picks up
+# `cuda_mem_pool` and the `UnifiedBuffer::new_in_tenant_pool` allocator
+# in one go. See `docs/GPU-QUOTAS.md` for the threat model the driver
+# pin closes (a tenant who obtained a raw CUDA driver handle and
+# bypassed the in-process `consume_gpu_bytes` counter).
+gpu-mem-pool = ["cudarc-backend"]
 # `cuda-oxide-backend` is the v0.5 cust-successor scaffold (RFC 0001 —
 # rfcs/0001-cuda-oxide-integration.md). It is intentionally **dep-less**:
 # enabling it exposes the `crate::cuda_oxide_backend` module (with the
