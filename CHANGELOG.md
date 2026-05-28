@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- exec: T37 — InstancePool wired through invoke path; per-(tenant, module-hash) channel with pre-spawn and reset-on-return.
 - tensor-wasm-cli + tensor-wasm-api + tensor-wasm-exec (T33): typed multi-value `--args` plumbed end-to-end. CLI `--args <JSON>` flag, HTTP `/invoke{,-async,-stream}` body `args: [...]` field, executor's `SpawnConfig::with_args` builder. JSON↔Val codec from v0.3.7 reused.
 - tensor-wasm-api (T41): OpenAI gateway request translator wired through to the internal invoke protocol. Configurable model→function map via TENSOR_WASM_API_OPENAI_MODEL_MAP. Streaming via T34's `/invoke-stream` plumbing (data: ... \n\ndata: [DONE]). Closes the v0.3.7 `501 openai_not_yet_wired` scaffold.
 - tensor-wasm-api (T34): /functions/{id}/invoke-stream now plumbed end-to-end through `StreamingContext`. Guest `wasi:tensor/host.emit-chunk` calls surface as SSE `event: chunk` frames. Honors T36 cooperative deadlines (DEADLINE-ELAPSED → final `event: error`). Replaces the 0.3.7 scaffold that emitted a single not_yet_wired frame.

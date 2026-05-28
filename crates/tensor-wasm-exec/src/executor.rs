@@ -25,7 +25,7 @@ use wasmtime::{ExternType, Module, ResourceLimiter, Store, Val};
 
 use crate::engine::TensorWasmEngine;
 use crate::instance::{TensorWasmInstance, InstanceState};
-use crate::instance_pool::InstancePool;
+use crate::instance_pool::{InstancePool, ModuleHash};
 use tensor_wasm_wasi_gpu::streaming::{add_streaming_to_linker, StreamingContext};
 
 /// Convert a wall-clock [`Duration`] into a number of epoch ticks suitable
@@ -800,6 +800,273 @@ impl TensorWasmExecutor {
         Ok(module)
     }
 
+    /// Internal: charge a live-instance slot if the engine cap is configured.
+    /// Returns an [`InstanceSlotGuard`] that rolls the increment back unless
+    /// `commit()` is called. Used by [`Self::spawn_instance`] and
+    /// [`Self::build_pooled_instance`] / [`Self::rebuild_pooled_from_module`]
+    /// so the pool's pre-spawn / reset paths share the same admission
+    /// accounting as the bare spawn path.
+    fn charge_instance_slot(&self) -> Result<InstanceSlotGuard, ExecError> {
+        if let Some(max) = self.engine.config().max_instances {
+            let new_count = self.instance_count.fetch_add(1, Ordering::AcqRel) + 1;
+            if new_count > max {
+                self.instance_count.fetch_sub(1, Ordering::Relaxed);
+                return Err(ExecError::CapacityExhausted {
+                    active: new_count,
+                    limit: max,
+                });
+            }
+        } else {
+            self.instance_count.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(InstanceSlotGuard::new(self.instance_count.clone()))
+    }
+
+    /// Internal: explicitly release a live-instance slot. Used by
+    /// [`InstancePool`] when an instance held in a warm channel is dropped
+    /// (channel full on release, reset failed, pool shutdown). Mirrors the
+    /// slot release that [`Self::terminate`] performs for the registered
+    /// case, but does not touch the registry — pooled-but-not-handed-out
+    /// instances were never registered.
+    pub(crate) fn release_instance_slot(&self) {
+        self.instance_count.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Internal: compile + instantiate a Wasm module without registering
+    /// the result in the executor registry. The admission slot is charged
+    /// (and never rolled back on the success path) so the caller —
+    /// [`InstancePool`] — can hold the instance in a warm channel and
+    /// account it against the per-engine live-instance cap.
+    ///
+    /// Returns the detached [`TensorWasmInstance`] plus the compiled
+    /// [`Module`] (cached by [`Self::compile_module_cached`], so it is
+    /// nearly free to keep around) plus the wasm BLAKE3 digest. The pool
+    /// uses the digest as half of its `(tenant_id, module_hash)` channel
+    /// key, and the [`Module`] for the cheap reset-on-release path
+    /// (re-instantiate from the cached compile, no Cranelift work).
+    ///
+    /// This is the shared implementation under both [`Self::spawn_instance`]
+    /// (which registers immediately) and [`InstancePool::acquire`] /
+    /// [`InstancePool::release`] (which hold the instance detached in a
+    /// channel). Every deadline / ticker / module-cap check from
+    /// [`Self::spawn_instance`] is preserved verbatim — the only behavioural
+    /// difference is the missing `instances.insert` at the end.
+    pub(crate) async fn build_pooled_instance(
+        &self,
+        cfg: &SpawnConfig,
+        wasm: &[u8],
+    ) -> Result<(TensorWasmInstance, Module, ModuleHash), ExecError> {
+        let slot_guard = self.charge_instance_slot()?;
+        // Compile (and cache) the module first; the cap check lives
+        // inside `compile_module_cached` so an oversized blob fails
+        // before the digest computation matters.
+        let module = self.compile_module_cached(wasm).await?;
+        // Compute the digest after the cap check so the pool key path
+        // stays consistent with the executor's module-cache key. BLAKE3
+        // is fast enough that doing it twice (here + cache) is
+        // negligible vs. the Cranelift compile we just elided on cache
+        // hit.
+        let digest = blake3::hash(wasm);
+        let module_hash: ModuleHash = *digest.as_bytes();
+        let inst = self
+            .instantiate_detached(cfg, &module)
+            .await?;
+        // A wasmtime instance was successfully created — count it
+        // against the monotonic spawn counter exactly once per genuine
+        // instantiation. The `active_instances` gauge moves only at
+        // registry insert / detach time (see `register_pooled_instance`
+        // and `detach_pooled_instance`).
+        if let Some(m) = &self.metrics {
+            m.instance_spawns_total().inc();
+        }
+        // Slot stays charged — defuse rollback so the pool's caller can
+        // either register the instance (commit it for real) or release
+        // the slot explicitly via [`Self::release_instance_slot`].
+        slot_guard.commit();
+        Ok((inst, module, module_hash))
+    }
+
+    /// Internal: build a detached instance from an already-cached [`Module`].
+    /// Used by the pool's reset path: drop the spent instance, re-instantiate
+    /// from the same compiled module (skipping the Cranelift step entirely),
+    /// and stash the fresh instance back in the warm channel.
+    ///
+    /// The slot is charged on success and the caller decides whether to
+    /// release it ([`Self::release_instance_slot`]) or register it
+    /// ([`Self::register_pooled_instance`]).
+    pub(crate) async fn rebuild_pooled_from_module(
+        &self,
+        cfg: &SpawnConfig,
+        module: &Module,
+    ) -> Result<TensorWasmInstance, ExecError> {
+        let slot_guard = self.charge_instance_slot()?;
+        let inst = self.instantiate_detached(cfg, module).await?;
+        if let Some(m) = &self.metrics {
+            m.instance_spawns_total().inc();
+        }
+        slot_guard.commit();
+        Ok(inst)
+    }
+
+    /// Internal: shared instantiation logic. Builds the [`Store`], wires the
+    /// limiter, arms the start-function epoch deadline, and runs
+    /// `Instance::new_async` (with or without a streaming linker, matching
+    /// [`SpawnConfig::streaming`]). Does NOT touch the registry or the
+    /// admission counter — callers must pair this with
+    /// [`Self::charge_instance_slot`] / [`Self::register_pooled_instance`].
+    async fn instantiate_detached(
+        &self,
+        cfg: &SpawnConfig,
+        module: &Module,
+    ) -> Result<TensorWasmInstance, ExecError> {
+        let max_memory_bytes = self.engine.config().max_memory_bytes;
+        let mut state = InstanceState::new(cfg.tenant_id, InstanceId(0))
+            .with_memory_limit(max_memory_bytes);
+        if let Some(ref s) = cfg.streaming {
+            state = state.with_streaming(s.clone());
+        }
+        if let Some(d) = cfg.deadline {
+            state = state
+                .with_deadline(Instant::now() + d)
+                .with_deadline_duration(d);
+        }
+        let tick = self.engine.config().epoch_tick;
+        let epoch_deadline_ticks = match cfg.deadline {
+            Some(d) => duration_to_epoch_ticks(d, tick),
+            None => u64::MAX,
+        };
+        let max_start_ticks = {
+            let d_ms = MAX_START_FN_DURATION.as_millis();
+            let t_ms = tick.as_millis().max(1);
+            let ticks_u128 = d_ms.div_ceil(t_ms).max(1);
+            u64::try_from(ticks_u128).unwrap_or(u64::MAX)
+        };
+        let start_deadline_ticks = epoch_deadline_ticks.min(max_start_ticks);
+        let deadline_class_applies =
+            cfg.deadline.is_some() || MAX_START_FN_DURATION > Duration::ZERO;
+        if deadline_class_applies && !self.engine.is_epoch_ticker_running() {
+            let flag = self
+                .ticker_warned
+                .get_or_init(|| AtomicBool::new(false));
+            if !flag.swap(true, Ordering::AcqRel) {
+                tracing::error!(
+                    target: "tensor_wasm_exec::executor",
+                    "epoch ticker not running — refusing spawn; call `engine.spawn_epoch_ticker()` before serving traffic",
+                );
+            }
+            return Err(ExecError::EpochTickerNotRunning);
+        }
+        check_module_memory_within_cap(module, max_memory_bytes)?;
+        let mut store = Store::new(self.engine.inner(), state);
+        store.limiter(|state| &mut state.limiter as &mut dyn ResourceLimiter);
+        store.set_epoch_deadline(start_deadline_ticks);
+        let instance = if cfg.streaming.is_some() {
+            let mut linker: wasmtime::Linker<InstanceState> =
+                wasmtime::Linker::new(self.engine.inner());
+            add_streaming_to_linker(&mut linker).map_err(ExecError::Wasmtime)?;
+            linker
+                .instantiate_async(&mut store, module)
+                .await
+                .map_err(ExecError::Wasmtime)?
+        } else {
+            wasmtime::Instance::new_async(&mut store, module, &[]).await?
+        };
+        store.set_epoch_deadline(epoch_deadline_ticks);
+        Ok(TensorWasmInstance::new(store, instance))
+    }
+
+    /// Internal: register a previously-detached [`TensorWasmInstance`] in
+    /// the executor registry, allocating a fresh [`InstanceId`]. The slot
+    /// is assumed to already be charged (via
+    /// [`Self::charge_instance_slot`] or its [`InstanceSlotGuard::commit`]);
+    /// this method does NOT bump `instance_count`.
+    ///
+    /// Used by [`InstancePool::acquire`] to surface a warm-channel
+    /// instance through the standard [`InstanceId`] handle that
+    /// [`Self::call_export_with_args`] consumes.
+    pub(crate) fn register_pooled_instance(
+        &self,
+        mut inst: TensorWasmInstance,
+    ) -> Result<InstanceId, ExecError> {
+        let id = self.allocate_instance_id();
+        // Overwrite the placeholder InstanceId(0) baked in at
+        // instantiation time with the freshly-allocated registry id so
+        // host imports observing `caller.data().instance_id` see the
+        // same value the caller holds.
+        inst.store.data_mut().instance_id = id;
+        match self.instances.entry(id) {
+            Entry::Vacant(v) => {
+                v.insert(Arc::new(Mutex::new(inst)));
+            }
+            Entry::Occupied(_) => {
+                warn!(
+                    target: "tensor_wasm_exec::executor",
+                    %id,
+                    "instance id race after allocation (pool register); this is a serious bug",
+                );
+                return Err(ExecError::Wasmtime(wasmtime::Error::msg(
+                    "instance id collision after allocation",
+                )));
+            }
+        }
+        if let Some(m) = &self.metrics {
+            // Only the gauge moves here — `instance_spawns_total` is
+            // incremented at instantiate time inside
+            // [`Self::build_pooled_instance`] / [`Self::rebuild_pooled_from_module`]
+            // so the monotonic counter measures genuine wasmtime
+            // instantiations, not registry insertions (the pool can
+            // re-register the same underlying instance after a reset).
+            m.active_instances().inc();
+        }
+        Ok(id)
+    }
+
+    /// Internal: remove an instance from the registry, returning the
+    /// underlying [`TensorWasmInstance`] WITHOUT decrementing
+    /// `instance_count`. The slot remains charged so the caller —
+    /// [`InstancePool::release`] — can keep the instance alive in its
+    /// warm channel without churning the admission counter.
+    ///
+    /// Returns `None` if the id is unknown (already terminated / never
+    /// registered).
+    pub(crate) async fn detach_pooled_instance(
+        &self,
+        id: InstanceId,
+    ) -> Option<TensorWasmInstance> {
+        let (_, handle) = self.instances.remove(&id)?;
+        // Decrement the "active_instances" gauge: this is the moment the
+        // instance leaves the externally-visible registry. The
+        // `instance_spawns_total` counter is intentionally not paired
+        // with a decrement (it is monotonic), and `instance_terminations_total`
+        // is reserved for genuine terminate calls, not pool detach.
+        if let Some(m) = &self.metrics {
+            m.active_instances().dec();
+        }
+        // Unwrap the Arc<Mutex<_>>: the registry held the only outstanding
+        // strong reference (per-instance Mutexes are not cloned out of
+        // the DashMap value slot). If a concurrent call held the lock the
+        // `try_unwrap` would fail and we'd be holding a still-live
+        // `Arc<Mutex<TensorWasmInstance>>`; since we removed under
+        // `DashMap::remove` and the registry never hands out Arc clones,
+        // no other strong reference can exist.
+        match Arc::try_unwrap(handle) {
+            Ok(mutex) => Some(mutex.into_inner()),
+            Err(_arc) => {
+                // Should not happen: the registry held the only strong
+                // reference. If it does (e.g. a future refactor leaks
+                // an Arc), the safe behaviour is to drop our reference
+                // and skip the pool path — the slot leak is preferable
+                // to a use-after-detach.
+                warn!(
+                    target: "tensor_wasm_exec::executor",
+                    %id,
+                    "detach_pooled_instance: outstanding Arc reference; instance leaked",
+                );
+                None
+            }
+        }
+    }
+
     /// Compile + instantiate a Wasm module. Returns the assigned [`InstanceId`].
     ///
     /// # Deadline / ticker contract
@@ -825,200 +1092,25 @@ impl TensorWasmExecutor {
         cfg: SpawnConfig,
         wasm: &[u8],
     ) -> Result<InstanceId, ExecError> {
-        // Admission control (exec S-10). Bump the live-instance counter
-        // BEFORE doing any compile / instantiate work; if the new total
-        // exceeds the engine cap, roll back immediately and surface a
-        // typed `CapacityExhausted` so the API layer can map it to 503.
-        //
-        // The fetch_add must precede the limit check so concurrent spawns
-        // see a consistent atomic view: if two threads both observe `N-1`
-        // active when the cap is `N`, both pre-incrementing produces
-        // `N` and `N+1` respectively — the second one fails the check
-        // and rolls back. Doing the read+check+inc separately would let
-        // both threads pass and overshoot the cap.
-        if let Some(max) = self.engine.config().max_instances {
-            let new_count = self.instance_count.fetch_add(1, Ordering::AcqRel) + 1;
-            if new_count > max {
-                self.instance_count.fetch_sub(1, Ordering::Relaxed);
-                return Err(ExecError::CapacityExhausted {
-                    active: new_count,
-                    limit: max,
-                });
-            }
-        } else {
-            // No cap configured — still bump so `instances_len` stays
-            // accurate. The drop guard below covers rollback on any
-            // subsequent error path.
-            self.instance_count.fetch_add(1, Ordering::AcqRel);
-        }
-        // Rollback guard for every failure path between here and the
-        // registry insert. `commit()` is called only after the instance
-        // is published into `self.instances`.
+        // Refactored to share the detached compile+instantiate path
+        // (`build_pooled_instance`) with [`InstancePool`]. The semantics
+        // are byte-for-byte preserved: admission control runs first
+        // (with rollback on failure), then compile / instantiate /
+        // register. The split lets the pool reuse the heavy work
+        // without the registry insert when holding warm instances in a
+        // channel.
+        let (inst, _module, _module_hash) = self.build_pooled_instance(&cfg, wasm).await?;
+        // `build_pooled_instance` returns with the slot committed (charged),
+        // so a failure between here and the registry insert must release
+        // the slot explicitly. Wrap it in a `defer`-style guard so any
+        // `?` from `register_pooled_instance` does not leak the count.
         let slot_guard = InstanceSlotGuard::new(self.instance_count.clone());
-
-        let id = self.allocate_instance_id();
-        tracing::Span::current().record("instance_id", tracing::field::display(id));
-        let max_memory_bytes = self.engine.config().max_memory_bytes;
-        let mut state =
-            InstanceState::new(cfg.tenant_id, id).with_memory_limit(max_memory_bytes);
-        if let Some(ref s) = cfg.streaming {
-            state = state.with_streaming(s.clone());
-        }
-        if let Some(d) = cfg.deadline {
-            // Seed the absolute deadline at spawn time so the first call has
-            // a meaningful window even if it fires before `call_export` gets
-            // a chance to re-arm (which it always does in practice, but the
-            // invariant is "deadline is set whenever deadline_duration is").
-            // The per-call re-arm in `call_export` keeps subsequent calls
-            // honest — without it a second call inherits the elapsed window
-            // from the first and the timeout report degenerates to 0/0.
-            state = state
-                .with_deadline(Instant::now() + d)
-                .with_deadline_duration(d);
-        }
-        // Translate the SpawnConfig deadline (a wall-clock Duration) into the
-        // number of epoch ticks after which Wasmtime should interrupt execution.
-        //
-        // Wasmtime's `Store::set_epoch_deadline(ticks_beyond_current)` is
-        // *relative* to the engine's current epoch — i.e. the deadline trips
-        // once `Engine::increment_epoch` has fired that many more times since
-        // this call. That's exactly the semantics we want: each Store starts
-        // fresh, and the ticker drives the only progression of the counter.
-        let tick = self.engine.config().epoch_tick;
-        let epoch_deadline_ticks = match cfg.deadline {
-            Some(d) => duration_to_epoch_ticks(d, tick),
-            // No deadline → effectively unbounded. u64::MAX is fine: the
-            // engine's epoch counter would need ~5.8 billion years at 10 ms/
-            // tick to reach it, so the deadline will never trip in practice.
-            None => u64::MAX,
-        };
-        // Separate epoch budget for the *start* function (and anything else
-        // that runs inside `Instance::new_async`). Without this cap, a
-        // `SpawnConfig { deadline: None, .. }` would set the epoch deadline
-        // to `u64::MAX`, so an infinite-loop start function would burn
-        // forever inside `new_async`. The instance is not registered with
-        // the executor until that call returns, so `terminate` cannot
-        // reach it — the only thing that can interrupt the loop is the
-        // epoch deadline. Cap at the MIN of the caller's per-call deadline
-        // (if any) and `MAX_START_FN_DURATION`.
-        let max_start_ticks = {
-            let d_ms = MAX_START_FN_DURATION.as_millis();
-            let t_ms = tick.as_millis().max(1);
-            let ticks_u128 = d_ms.div_ceil(t_ms).max(1);
-            u64::try_from(ticks_u128).unwrap_or(u64::MAX)
-        };
-        let start_deadline_ticks = epoch_deadline_ticks.min(max_start_ticks);
-        // Refuse the spawn if the ticker is down AND any deadline-class
-        // bound would otherwise apply. Pre-fix this only logged a
-        // one-shot `tracing::error!` and continued, which could wedge
-        // a runaway guest forever: with the epoch counter frozen,
-        // neither the per-call deadline nor the start-function cap
-        // can fire, and `terminate` cannot reach an instance that
-        // never returned from `Instance::new_async`. The honest
-        // alternative is to fail fast so operators can fix the
-        // ticker setup before serving traffic.
-        //
-        // Note: `MAX_START_FN_DURATION` always applies (every spawn
-        // runs `Instance::new_async`), so today this guard effectively
-        // requires the ticker for every spawn — including those with
-        // `deadline: None`. The check still consults `cfg.deadline`
-        // so the intent is documented at the call site: a future
-        // change that makes the start-function cap opt-in would
-        // narrow the requirement to only deadline-carrying spawns.
-        let deadline_class_applies =
-            cfg.deadline.is_some() || MAX_START_FN_DURATION > Duration::ZERO;
-        if deadline_class_applies && !self.engine.is_epoch_ticker_running() {
-            // One-shot operator log so the failure mode is visible
-            // even when the caller swallows the typed error.
-            let flag = self
-                .ticker_warned
-                .get_or_init(|| AtomicBool::new(false));
-            if !flag.swap(true, Ordering::AcqRel) {
-                tracing::error!(
-                    target: "tensor_wasm_exec::executor",
-                    "epoch ticker not running — refusing spawn; call `engine.spawn_epoch_ticker()` before serving traffic",
-                );
-            }
-            return Err(ExecError::EpochTickerNotRunning);
-        }
-        let module = self.compile_module_cached(wasm).await?;
-
-        // Pre-instantiation memory cap (closes mem-H5 / exec-S-2 / exec-S-10).
-        // Wasmtime's `ResourceLimiter::memory_growing` fires only on
-        // `memory.grow`, not on the initial allocation a module declares
-        // with `(memory N M)`. A guest could therefore force a multi-GiB
-        // allocation at instantiation time without ever calling
-        // `memory.grow` — and the per-store `TensorWasmResourceLimiter`
-        // would never see it. Walk every exported AND imported memory
-        // type and reject the spawn if its initial OR maximum size
-        // exceeds the engine's configured cap. We use the memory type's
-        // own `page_size()` so this stays correct for both the wasm32
-        // default 64 KiB pages and any future custom-page-size proposal
-        // memory types Wasmtime accepts.
-        check_module_memory_within_cap(&module, max_memory_bytes)?;
-
-        let mut store = Store::new(self.engine.inner(), state);
-        // Cap linear-memory growth at the engine-configured maximum. The
-        // limiter lives inside the store payload (`InstanceState::limiter`)
-        // so wasmtime can borrow it without any extra heap allocation per
-        // `memory.grow` call. The explicit return type pins the trait
-        // object coercion so type inference doesn't choose the concrete
-        // `&mut TensorWasmResourceLimiter`.
-        store.limiter(|state| &mut state.limiter as &mut dyn ResourceLimiter);
-        // Use the *start*-function deadline for the instantiation phase.
-        store.set_epoch_deadline(start_deadline_ticks);
-        // Branch on the streaming opt-in (T34, roadmap feature #2).
-        // Without streaming, preserve the historical empty-imports
-        // `Instance::new_async` path — every existing /invoke caller
-        // and every test using `SpawnConfig::for_tenant` keeps the
-        // exact same instantiation surface. With streaming, build a
-        // `Linker<InstanceState>` and register the
-        // `wasi:tensor/host` host functions so a guest that imports
-        // `emit-chunk` / `flush` link-resolves and emits land on the
-        // gateway-held `mpsc::Receiver<Vec<u8>>`.
-        let instance = if cfg.streaming.is_some() {
-            let mut linker: wasmtime::Linker<InstanceState> =
-                wasmtime::Linker::new(self.engine.inner());
-            add_streaming_to_linker(&mut linker).map_err(ExecError::Wasmtime)?;
-            linker
-                .instantiate_async(&mut store, &module)
-                .await
-                .map_err(ExecError::Wasmtime)?
-        } else {
-            wasmtime::Instance::new_async(&mut store, &module, &[]).await?
-        };
-        // Restore the per-call deadline budget so subsequent
-        // `call_export` invocations get the full configured deadline
-        // (or unbounded `u64::MAX` when the caller did not supply one).
-        store.set_epoch_deadline(epoch_deadline_ticks);
-        let bi = TensorWasmInstance::new(store, instance);
-        // Final occupancy check via `Entry::Vacant` — `allocate_instance_id`
-        // already guards against active collisions, but a concurrent
-        // `spawn_instance` racing on the same retry sequence is still
-        // theoretically possible. `Vacant` insertion is atomic.
-        match self.instances.entry(id) {
-            Entry::Vacant(v) => {
-                v.insert(Arc::new(Mutex::new(bi)));
-            }
-            Entry::Occupied(_) => {
-                warn!(
-                    target: "tensor_wasm_exec::executor",
-                    %id,
-                    "instance id race after allocation; this is a serious bug — please file an issue",
-                );
-                // slot_guard drops here → rollback counter.
-                return Err(ExecError::Wasmtime(wasmtime::Error::msg(
-                    "instance id collision after allocation",
-                )));
-            }
-        }
-        // Instance is now live in the registry — defuse the rollback
-        // guard so the admission slot stays charged until `terminate`.
+        let id = self.register_pooled_instance(inst)?;
+        // Successful register: defuse the rollback so the slot stays
+        // charged until `terminate`. (Without this defuse the guard's
+        // Drop would decrement the count we just committed.)
         slot_guard.commit();
-        if let Some(m) = &self.metrics {
-            m.instance_spawns_total().inc();
-            m.active_instances().inc();
-        }
+        tracing::Span::current().record("instance_id", tracing::field::display(id));
         info!(target: "tensor_wasm_exec::executor", tenant = %cfg.tenant_id, instance = %id, "instance spawned");
         Ok(id)
     }
@@ -1251,6 +1343,68 @@ impl TensorWasmExecutor {
         self.call_export_with_args_then_terminate(id, export, &[])
             .await
             .map(|_| ())
+    }
+
+    /// High-level "invoke" entry point: spawn (or draw from the warm pool),
+    /// call the export, return the result, and clean up the instance —
+    /// all in a single async call.
+    ///
+    /// When an [`InstancePool`] is attached via [`Self::with_instance_pool`],
+    /// this routes through [`InstancePool::acquire`] / [`InstancePool::release`]
+    /// so the per-(tenant, module-hash) warm channel absorbs the
+    /// compile+instantiate cost on the hot path (T37). Without a pool
+    /// attached, behaviour is identical to
+    /// [`Self::spawn_instance`] + [`Self::call_export_with_args_then_terminate`]
+    /// — every existing caller of that pair sees no semantic change.
+    ///
+    /// Mirrors the routes layer's invoke / invoke-stream / invoke-async
+    /// pattern: a single `(wasm, cfg, export, args)` shot, no caller-side
+    /// id juggling. T34's streaming and T36's back-pressure /
+    /// deadline-near semantics propagate unchanged — the
+    /// [`SpawnConfig::streaming`] context flows through `acquire`, and
+    /// per-call deadline re-arming happens inside `call_export_with_args`
+    /// regardless of which path produced the instance.
+    ///
+    /// Pool-side invariant: streaming spawns are NEVER recycled, even
+    /// when a pool is attached — the streaming context is one-shot
+    /// (the gateway's channel receiver is drained for the duration of
+    /// the SSE response and then dropped). [`InstancePool::release`]
+    /// drops the instance instead of returning it to the warm channel
+    /// when `SpawnConfig::streaming.is_some()`.
+    pub async fn invoke(
+        &self,
+        cfg: SpawnConfig,
+        wasm: &[u8],
+        export: &str,
+        args: &[WasmArg],
+    ) -> Result<serde_json::Value, ExecError> {
+        if let Some(pool) = self.pool.clone() {
+            // Pool path (T37): acquire a warm (or freshly-spawned)
+            // instance, call, then release. Release routes through the
+            // pool's reset path — on success a fresh replacement
+            // instance returns to the warm channel; on streaming opt-in
+            // or reset failure the slot is released without
+            // replenishment.
+            let pooled = pool.acquire(self, wasm, cfg.clone()).await?;
+            // Capture the id by value so the subsequent `release`
+            // (which consumes `pooled`) and the call below see the
+            // same handle.
+            let id = pooled.id();
+            let result = self.call_export_with_args(id, export, args).await;
+            // Release regardless of call outcome — a guest trap should
+            // not poison the warm pool (the pool's reset re-instantiates
+            // from the cached module, so post-trap state is irrelevant).
+            // Streaming spawns are dropped (never recycled) inside
+            // `release`.
+            pool.release(self, pooled, &cfg).await;
+            result
+        } else {
+            // No pool attached — preserve the historical spawn + call
+            // + terminate flow verbatim, including the auto-terminate
+            // drop guard (api S-20).
+            let id = self.spawn_instance(cfg, wasm).await?;
+            self.call_export_with_args_then_terminate(id, export, args).await
+        }
     }
 
     /// Argument-aware sibling of [`Self::call_export_then_terminate`].

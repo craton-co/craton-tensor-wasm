@@ -20,6 +20,7 @@ tensor-wasm-jit = { workspace = true }
 tensor-wasm-mem = { workspace = true }
 tensor-wasm-wasi-gpu = { workspace = true }
 blake3.workspace = true
+crossbeam-channel.workspace = true
 dashmap.workspace = true
 futures.workspace = true
 lru.workspace = true
