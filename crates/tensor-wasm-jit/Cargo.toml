@@ -98,6 +98,26 @@ cuda-oxide-backend = ["dep:pliron"]
 # (W4.x's CI image will satisfy this; the default workstation build will
 # not).
 pliron-llvm-backend = ["cuda-oxide-backend", "dep:pliron-llvm"]
+# test-utils exposes the `lowering_test_support` module so external test
+# harnesses (and our own integration tests in `tests/`) can reuse the
+# Cranelift fixture builders. Strictly opt-in — the symbols are NOT part
+# of the stable public surface and are liable to change in any 0.x.y
+# release. The crate's own unit tests see the module via `cfg(test)`;
+# integration tests under `tests/` opt in via the `[[test]]`
+# `required-features` block below. No extra dependencies.
+test-utils = []
+
+# Integration test that uses fixtures from `lowering_test_support`. We
+# pin the feature set here so the test only runs when both
+# `cuda-oxide-backend` (which gates all wave-2 lowering modules) AND
+# `test-utils` (which gates the fixture module itself) are enabled.
+# Local invocation:
+#   cargo test -p tensor-wasm-jit \
+#     --features "cuda-oxide-backend test-utils" --test lowering_e2e
+[[test]]
+name = "lowering_e2e"
+path = "tests/lowering_e2e.rs"
+required-features = ["cuda-oxide-backend", "test-utils"]
 
 [package.metadata.docs.rs]
 all-features = true

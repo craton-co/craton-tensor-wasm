@@ -34,6 +34,12 @@ The host implementation lives in [`tensor_wasm_exec::jit_dispatch`](../tensor-wa
 |---|---|---|
 | `auto-offload` | no | Reserved for CUDA-side wiring tested under `--features cuda`. The pipeline itself is always compiled in. |
 | `cuda-oxide-backend` | no | Gates the [`pliron_dialect`](src/pliron_dialect.rs) scaffold module — the Cranelift IR → Pliron `dialect-mir` lowering surface tracked in [RFC 0001](../../rfcs/0001-cuda-oxide-integration.md) step 4. v0.3.1 ships scaffold only (`StubLowerer` + mapping table + final trait signature); the real lowering lands in v0.4 once the workspace toolchain bumps to satisfy cuda-oxide's `nightly-2026-04-03` pin. No extra deps today. |
+| `pliron-llvm-backend` | no | Strict superset of `cuda-oxide-backend` that pulls in `pliron-llvm` 0.15 (and therefore `llvm-sys = "221"`, which needs a system LLVM 221 install) to wire the stage-2 `twasm.* → llvm.*` rewrite in `pliron_ptx`. Intended for W4.x CI images; the default workstation build will not satisfy the `llvm-sys` link step. |
+| `test-utils` | no | Re-exports the internal `lowering_test_support` module (Cranelift fixture builders for the wave-2 lowering passes). Strictly opt-in: external consumers should treat the surface as unstable, since fixture signatures track the in-progress IR and may change in any 0.x.y release. The crate's own unit tests pick the module up via `cfg(test)`; the `lowering_e2e` integration test opts in via `required-features = ["cuda-oxide-backend", "test-utils"]`. No extra deps. |
+
+### Unstable `pliron_*` surface
+
+The `pliron_dialect`, `pliron_lowering`, and `pliron_ptx` modules are gated on `cuda-oxide-backend` and additionally marked `#[doc(hidden)]`. They host the in-progress W3.x/W4.x scaffolding (today: ~700 lines of `NotYetWired` stubs) that the v0.4 author will fill in. Names, signatures, and behaviour inside these modules are NOT covered by semver compatibility until tensor-wasm-jit reaches 1.0 — external consumers should not import from them.
 
 See [docs/BUILD.md](../../docs/BUILD.md) for the project-wide flag taxonomy.
 

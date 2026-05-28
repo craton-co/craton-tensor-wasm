@@ -143,10 +143,25 @@ pub struct CachedKernel {
     pub compiled: CompiledHandle,
     /// BLAKE3 over `ptx.text` (jit S-3). Recomputed and compared on every
     /// `get`. See the type-level doc for the threat model.
+    ///
+    /// The field is `pub` for backward compatibility with the v0.1 struct-
+    /// literal constructors but is hidden from generated docs and excluded
+    /// from the stable surface; prefer the [`Self::integrity_hash`]
+    /// accessor for read access and [`Self::new`] for construction.
+    #[doc(hidden)]
     pub integrity_hash: [u8; 32],
 }
 
 impl CachedKernel {
+    /// Borrow the stored BLAKE3 integrity hash over `ptx.text`. Prefer this
+    /// over reaching for the (hidden) field directly — the field is
+    /// retained as `pub` for source compatibility only and may be sealed
+    /// to `pub(crate)` in a future minor release.
+    #[must_use]
+    pub fn integrity_hash(&self) -> &[u8; 32] {
+        &self.integrity_hash
+    }
+
     /// Construct a `CachedKernel`, computing `integrity_hash` from
     /// `ptx.text`. This is the only way to obtain a correct-by-
     /// construction value; the older struct-literal pattern still works
