@@ -180,7 +180,7 @@ mod tests {
         headers.insert("traceparent", "abc".parse().unwrap());
         let ex = HeaderMapExtractor(&headers);
         assert_eq!(ex.get("traceparent"), Some("abc"));
-        assert!(ex.keys().iter().any(|k| *k == "traceparent"));
+        assert!(ex.keys().contains(&"traceparent"));
     }
 
     #[test]

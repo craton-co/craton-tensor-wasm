@@ -222,15 +222,12 @@ static T16_HOST_WARN_FIRED: AtomicBool = AtomicBool::new(false);
 /// (the integration test suite alone rebuilds the router dozens of
 /// times); operators see exactly one log line per process.
 fn maybe_warn_host_validation_disabled() {
-    let tokens_set = std::env::var(ENV_API_TOKENS)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+    let tokens_set = std::env::var(ENV_API_TOKENS).is_ok_and(|v| !v.is_empty());
     if !tokens_set {
         return;
     }
     let trusted_hosts_set = std::env::var(ENV_TRUSTED_HOSTS)
-        .map(|v| !TrustedHosts::from_raw(&v).is_empty())
-        .unwrap_or(false);
+        .is_ok_and(|v| !TrustedHosts::from_raw(&v).is_empty());
     if trusted_hosts_set {
         return;
     }

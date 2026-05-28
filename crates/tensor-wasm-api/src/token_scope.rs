@@ -310,8 +310,7 @@ pub fn parse_tokens_env(env_value: &str) -> ParsedTokens {
             in_tenant_list = has_colon
                 && trimmed
                     .split_once(':')
-                    .map(|(_, rest)| rest.trim().starts_with("tenant="))
-                    .unwrap_or(false);
+                    .is_some_and(|(_, rest)| rest.trim().starts_with("tenant="));
         }
     }
     if !current.is_empty() {
