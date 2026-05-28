@@ -27,7 +27,7 @@
 //! on-disk namespace cleanly.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -55,6 +55,30 @@ pub const ARTIFACT_HEADER_LEN: usize = 16 + 4 + 32;
 /// `DEFAULT_ZSTD_LEVEL` so the two stores converge on the same setting.
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
+/// Hard ceiling on the size of an individual payload accepted by
+/// [`DiskArtifactStore::put`].
+///
+/// Without this cap an attacker who can drive `put` could request an
+/// allocation proportional to an arbitrary input length, exhausting
+/// process memory. 256 MiB matches the snapshot reader's
+/// `MAX_DECOMPRESSED_BYTES` so the store's ingest ceiling lines up with
+/// the largest legitimately-restorable snapshot today.
+pub const MAX_PAYLOAD_LEN: usize = 256 * 1024 * 1024;
+
+/// Hard ceiling on the size of the decompressed body emitted by
+/// [`DiskArtifactStore::get`].
+///
+/// Defends against zstd "zip bomb" inputs that decompress at very high
+/// ratios (a few MB of attacker-controlled bytes can otherwise expand
+/// to gigabytes). The decoder is driven through
+/// [`std::io::Read::take`] with a probe of `MAX_DECOMPRESSED_LEN + 1`
+/// so we can distinguish "exactly cap" (allowed) from ">cap" (rejected)
+/// without ever allocating past the cap. Sized larger than
+/// [`MAX_PAYLOAD_LEN`] so a legitimate round-trip can still expand
+/// slightly past the put-side cap due to compression accounting; the
+/// snapshot reader uses a tighter 256 MiB cap for its own scenario.
+pub const MAX_DECOMPRESSED_LEN: usize = 1024 * 1024 * 1024;
+
 /// Errors returned by [`ArtifactStore`] implementations.
 ///
 /// `Io` deliberately collapses the inner [`std::io::Error`] into a
@@ -76,6 +100,15 @@ pub enum ArtifactError {
     HashMismatch { expected: String, actual: String },
     #[error("zstd decompression failed: {0}")]
     Decompression(String),
+    /// Either the payload handed to `put` exceeded [`MAX_PAYLOAD_LEN`],
+    /// or the body handed to `get` decompressed to more than
+    /// [`MAX_DECOMPRESSED_LEN`] bytes. Carries the offending size and
+    /// the cap that was tripped so operators can tell which side of the
+    /// round-trip refused the request. Both fields are `usize` (i.e.
+    /// `Eq`) so this variant stays compatible with any future
+    /// `PartialEq` derive on [`ArtifactError`].
+    #[error("artifact too large: {actual} bytes exceeds cap of {limit} bytes")]
+    TooLarge { actual: usize, limit: usize },
     #[error("I/O error")]
     Io,
 }
@@ -206,6 +239,25 @@ impl DiskArtifactStore {
 
 impl ArtifactStore for DiskArtifactStore {
     fn put(&self, payload: &[u8]) -> Result<ContentHash, ArtifactError> {
+        // Reject oversized payloads BEFORE any allocation or I/O. An
+        // attacker who can drive `put` could otherwise request an
+        // allocation proportional to `payload.len()` (via the framed
+        // buffer below) and OOM the process. The check is on the
+        // already-borrowed `payload` slice — we do not materialise the
+        // caller's bytes ourselves — so this is a pure refusal, not a
+        // second allocation.
+        if payload.len() > MAX_PAYLOAD_LEN {
+            warn!(
+                target: "tensor_wasm_artifacts",
+                actual = payload.len(),
+                limit = MAX_PAYLOAD_LEN,
+                "rejecting oversized payload"
+            );
+            return Err(ArtifactError::TooLarge {
+                actual: payload.len(),
+                limit: MAX_PAYLOAD_LEN,
+            });
+        }
         std::fs::create_dir_all(&self.dir).map_err(|e| {
             warn!(
                 target: "tensor_wasm_artifacts",
@@ -317,7 +369,21 @@ impl ArtifactStore for DiskArtifactStore {
 
         // HMAC verification: split off the trailing tag, recompute over
         // the prefix, compare in constant time.
-        let hmac_start = bytes.len() - ARTIFACT_HMAC_LEN;
+        //
+        // Defence-in-depth: the upstream `bytes.len() < HEADER_LEN +
+        // HMAC_LEN` gate already guarantees `bytes.len() >=
+        // ARTIFACT_HMAC_LEN`, so the subtraction below could be a
+        // straight `-`. Using `checked_sub` means a future relaxation
+        // of that gate (e.g. moving it after the magic check, or
+        // accidentally widening it) cannot turn this into a panic on
+        // attacker-controlled input. The fallback maps to `BadMagic`
+        // because reaching this point with an under-length buffer
+        // would mean the framing is structurally broken in the same
+        // way a missing magic implies.
+        let hmac_start = bytes
+            .len()
+            .checked_sub(ARTIFACT_HMAC_LEN)
+            .ok_or(ArtifactError::BadMagic)?;
         let (prefix, tag_bytes) = bytes.split_at(hmac_start);
         let expected = hmac_tag(&self.hmac_key, prefix);
         use subtle::ConstantTimeEq;
@@ -339,12 +405,50 @@ impl ArtifactStore for DiskArtifactStore {
             return Err(ArtifactError::BadHmac);
         }
 
-        // Decompress the body that sits between the header and the HMAC tag.
+        // Decompress the body that sits between the header and the HMAC
+        // tag. Use a streaming decoder with a hard ceiling via
+        // `Read::take` so a zstd "zip bomb" (a tiny compressed blob
+        // that decompresses to gigabytes — ratios past 30000x are
+        // achievable) cannot grow the destination buffer past
+        // `MAX_DECOMPRESSED_LEN`. We deliberately probe one byte past
+        // the cap so the round-trip can decompress to exactly the cap
+        // (allowed) while strictly-larger outputs are detected and
+        // rejected. Mirrors the pattern in
+        // `tensor_wasm_snapshot::reader` (see its `cap`/`probe_limit`
+        // block).
         let body = &prefix[ARTIFACT_HEADER_LEN..];
-        let payload = zstd::decode_all(body).map_err(|e| {
+        let cap = MAX_DECOMPRESSED_LEN;
+        let probe_limit = u64::try_from(cap)
+            .ok()
+            .and_then(|c| c.checked_add(1))
+            .unwrap_or(u64::MAX);
+        let decoder = zstd::stream::read::Decoder::new(body).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed");
+            ArtifactError::Decompression(e.to_string())
+        })?;
+        // Pre-size to a small constant (1 MiB, capped by `cap`) to avoid
+        // grow-by-doubling churn while still refusing to trust any
+        // attacker-supplied frame-size hint. The `Take` ceiling
+        // guarantees we cannot allocate past `cap + 1` bytes regardless.
+        let initial_capacity = cap.min(1024 * 1024);
+        let mut payload: Vec<u8> = Vec::with_capacity(initial_capacity);
+        decoder.take(probe_limit).read_to_end(&mut payload).map_err(|e| {
             warn!(target: "tensor_wasm_artifacts", error = %e, "zstd decode failed");
             ArtifactError::Decompression(e.to_string())
         })?;
+        if payload.len() > cap {
+            warn!(
+                target: "tensor_wasm_artifacts",
+                file = %path.display(),
+                actual = payload.len(),
+                limit = cap,
+                "rejecting oversized decompressed payload (possible zstd bomb)"
+            );
+            return Err(ArtifactError::TooLarge {
+                actual: payload.len(),
+                limit: cap,
+            });
+        }
 
         // Defence-in-depth: recompute the content hash from the
         // decoded payload and compare to both the requested key AND the
