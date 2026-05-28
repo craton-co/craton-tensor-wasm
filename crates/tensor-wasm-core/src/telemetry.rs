@@ -181,6 +181,70 @@ mod tests {
         assert_ne!(LogLevel::Info, LogLevel::Debug);
         assert_ne!(LogLevel::Trace, LogLevel::Auto);
     }
+
+    // --- B5.1: `build_filter` env-var fallback contract -----------------
+    //
+    // `build_filter(LogLevel::Auto)` is the path the API binary and CLI
+    // take in production: it consults `TENSOR_WASM_LOG` first, then
+    // `RUST_LOG`, then falls back to `info`. The two tests below pin
+    // both the malformed-input and the unset-env paths against the
+    // `info` default so a regression that silently drops the fallback
+    // (and leaves the subscriber filtering at the much-louder default
+    // `trace`-equivalent, or panics on bad input) breaks here.
+    //
+    // `temp_env::with_var` scopes the mutation to the closure body and
+    // restores the prior value when it returns, so the tests cannot
+    // leak env-var state into the rest of the suite. We also scope
+    // `RUST_LOG` so a developer-laptop default does not perturb the
+    // assertion.
+
+    #[test]
+    fn build_filter_falls_back_to_info_on_malformed_env() {
+        // A malformed directive must NOT panic — `build_filter` is
+        // called from the very first lines of `init`, before any
+        // diagnostics are wired up, so a panic here would be the
+        // hardest possible failure mode. The fallback path returns the
+        // default `info` filter.
+        temp_env::with_vars(
+            [
+                ("TENSOR_WASM_LOG", Some("not-a-valid-filter")),
+                // Also clear RUST_LOG so the local developer env (which
+                // may set it to `debug`) does not perturb the assertion.
+                // Explicit `None::<&str>` annotation keeps the array
+                // homogeneous in the `Option<&str>` element type.
+                ("RUST_LOG", None::<&str>),
+            ],
+            || {
+                let filter = build_filter(LogLevel::Auto);
+                let rendered = format!("{filter}");
+                assert!(
+                    rendered.contains("info"),
+                    "expected `info` fallback for malformed env directive, got: {rendered}",
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn build_filter_uses_default_when_env_unset() {
+        // Neither `TENSOR_WASM_LOG` nor `RUST_LOG` set — the default
+        // `info` filter must apply. This pins the contract documented
+        // on `LogLevel::Auto`.
+        temp_env::with_vars(
+            [
+                ("TENSOR_WASM_LOG", None::<&str>),
+                ("RUST_LOG", None::<&str>),
+            ],
+            || {
+                let filter = build_filter(LogLevel::Auto);
+                let rendered = format!("{filter}");
+                assert!(
+                    rendered.contains("info"),
+                    "expected `info` default with both env vars unset, got: {rendered}",
+                );
+            },
+        );
+    }
 }
 
 /// Initialise the global tracing subscriber with an additional OTLP exporter.

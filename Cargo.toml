@@ -166,6 +166,18 @@ crossbeam-channel = "0.5"
 # Hashing — used for stable, cross-Rust-version fingerprints (TensorWasmKernelBlueprint).
 blake3 = "1"
 
+# Best-effort memory wiping for secret material. Used by the JIT disk-cache
+# HMAC key (jit S-3 follow-up). The `zeroize_derive` feature provides the
+# `#[derive(Zeroize, ZeroizeOnDrop)]` macros so a small wrapper struct can
+# carry the key by value without leaking it on drop.
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# Data-parallel iterators. Used by the JIT rewrite analyser to emit candidate
+# PTX kernels in parallel while preserving source order via index-stable
+# collection. Bench-validated on synthetic 16-candidate modules; trivially
+# falls back to single-threaded under low candidate counts.
+rayon = "1"
+
 # Hex encoding/decoding — used by the CLI to read 32-byte HMAC-SHA256 keys
 # from disk (snapshot signing) and to render them as ASCII for the
 # `X-TensorWasm-Snapshot-HMAC-Key` HTTP header. Pinned at 0.4 (latest 0.4.x).

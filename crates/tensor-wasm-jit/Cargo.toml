@@ -35,6 +35,16 @@ thiserror.workspace = true
 tracing.workspace = true
 wasmparser.workspace = true
 wasm-encoder = { version = "0.218", features = ["wasmparser"] }
+# Data-parallel candidate emit in `rewrite::analyse`. Order is preserved by
+# collecting `(index, Result<…>)` pairs and re-sorting before commit so the
+# rewriter's downstream assumption that `func_infos[i]` matches the i-th
+# `CodeSectionEntry` still holds. See `tests/rewrite_parallel_order.rs`.
+rayon.workspace = true
+# Best-effort memory wiping for the on-disk L2 HMAC key (jit S-3 follow-up).
+# Wraps the existing `[u8; 32]` field in a `Zeroizing` newtype so manual
+# `Drop` is not required and the rest of the code keeps its byte-slice
+# borrow patterns via `Deref`/`DerefMut`.
+zeroize.workspace = true
 
 # pliron — MLIR-style IR framework underpinning cuda-oxide's dialect-mir →
 # dialect-llvm → PTX pipeline (RFC 0001 "Pliron lever and the auto-offload

@@ -47,6 +47,7 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use thiserror::Error;
 use tracing::{debug, info};
 use wasm_encoder::reencode::Reencode;

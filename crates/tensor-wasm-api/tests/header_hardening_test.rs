@@ -33,6 +33,20 @@
 //!   rejects these at construction; the test documents the contract
 //!   and asserts the fallback in [`parse_bearer_credentials`] returns
 //!   the same `unauthorized` envelope as a malformed value would.
+//! * **`missing_tenant_when_required`** — the
+//!   `TENSOR_WASM_API_REQUIRE_TENANT=1` env-var path resolves to a
+//!   `TenantConfig` whose `require_header` is `true`, and an absent
+//!   header surfaces as `400 missing_tenant`. Pins the env-var loader
+//!   independently from the explicit-extension variant exercised by
+//!   `invalid_tenant_header_distinct_from_missing` (Case A).
+//! * **`authorization_with_embedded_nul_rejected`** — a NUL byte
+//!   inside the `Authorization` value (e.g. `Bearer abc\0def`) is
+//!   rejected by [`axum::http::HeaderValue::from_bytes`] before the
+//!   value can even enter a `Request`. The hyper layer relies on
+//!   this guarantee to keep CRLF / NUL out of downstream consumers
+//!   (audit log fields, span attributes, log lines); the test pins
+//!   the contract so a future http-crate relaxation could not
+//!   silently re-open the channel.
 
 use std::sync::Arc;
 

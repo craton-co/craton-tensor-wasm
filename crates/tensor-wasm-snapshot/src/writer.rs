@@ -19,6 +19,8 @@ use tracing::{debug, instrument};
 
 #[cfg(feature = "signed-snapshots")]
 use crate::format::{SIGNATURE_KIND_HMAC_SHA256, SNAPSHOT_VERSION_V3};
+#[cfg(feature = "signed-snapshots")]
+use zeroize::Zeroizing;
 
 /// Magic bytes that identify a TensorWasm snapshot blob.
 ///
@@ -279,7 +281,15 @@ pub struct InstanceState<'a> {
 /// `Debug` is implemented manually to redact `hmac_key` — a derived `Debug`
 /// would print all 32 key bytes via `{:?}` and expose the signing secret
 /// any time a caller writes `tracing::debug!(?writer)` or similar.
-#[derive(Clone, Copy, Default)]
+///
+/// `Copy` is intentionally NOT derived when the `signed-snapshots` feature
+/// is enabled: the HMAC key is wrapped in [`zeroize::Zeroizing`] so its
+/// backing bytes are scrubbed on drop, and `Zeroizing<T>` is never `Copy`
+/// (a `Copy` would silently duplicate the secret and skip the scrub on
+/// the original). The no-feature build keeps `Copy` for backward
+/// compatibility — no secret material is present there.
+#[cfg_attr(not(feature = "signed-snapshots"), derive(Copy))]
+#[derive(Clone, Default)]
 pub struct SnapshotWriter {
     /// zstd compression level to use. Defaults to [`DEFAULT_ZSTD_LEVEL`].
     pub zstd_level: i32,
@@ -290,8 +300,13 @@ pub struct SnapshotWriter {
     /// not pay 33 bytes of state per writer instance. The field is `pub(crate)`
     /// rather than `pub` so callers cannot read the key back out by name
     /// once they have configured it.
+    ///
+    /// Wrapped in [`zeroize::Zeroizing`] so the 32 key bytes are
+    /// overwritten when the writer is dropped — best-effort defence
+    /// against the key surviving in swap-backed memory or in the
+    /// allocator's freelist after the writer has gone out of scope.
     #[cfg(feature = "signed-snapshots")]
-    pub(crate) hmac_key: Option<[u8; 32]>,
+    pub(crate) hmac_key: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl std::fmt::Debug for SnapshotWriter {
@@ -362,8 +377,13 @@ impl SnapshotWriter {
     #[cfg(feature = "signed-snapshots")]
     #[cfg_attr(docsrs, doc(cfg(feature = "signed-snapshots")))]
     #[must_use]
-    pub const fn with_hmac_sha256_key(mut self, key: [u8; 32]) -> Self {
-        self.hmac_key = Some(key);
+    pub fn with_hmac_sha256_key(mut self, key: [u8; 32]) -> Self {
+        // Wrap the key in `Zeroizing` so the 32 bytes are scrubbed when the
+        // writer drops. `Zeroizing::new` is not `const`, so this constructor
+        // is no longer `const fn`. Existing callers were all runtime sites
+        // (no `const` callers exist in-tree); see the `with_hmac_sha256_key`
+        // grep audit in the commit that introduced the wrapper.
+        self.hmac_key = Some(Zeroizing::new(key));
         self
     }
 
@@ -471,7 +491,11 @@ impl SnapshotWriter {
         if let Some(ref key) = self.hmac_key {
             use hmac::{Hmac, Mac};
             use sha2::Sha256;
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).map_err(|_| {
+            // `key` is `&Zeroizing<[u8; 32]>`; `Zeroizing` is
+            // `Deref<Target = [u8; 32]>`, so `&key[..]` borrows the full
+            // 32-byte slice without copying. The zeroizing wrapper still
+            // owns the bytes — they're scrubbed when `self` drops.
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key[..]).map_err(|_| {
                 // `new_from_slice` only errors on invalid key length; ours is a
                 // fixed [u8; 32], so this branch is unreachable in practice.
                 // We still translate the error rather than panic, and keep the

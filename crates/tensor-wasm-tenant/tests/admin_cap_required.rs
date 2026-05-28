@@ -46,9 +46,16 @@ fn new_returns_a_cap_alongside_the_registry() {
 #[test]
 fn independent_constructions_yield_independent_caps() {
     // Each `new()` mints a fresh cap. The two registries hold disjoint
-    // DashMap shards (the `Arc<DashMap<...>>` is allocated fresh inside
-    // `Default::default`), so admin operations against one are visible
-    // only when invoked with that registry's own cap.
+    // DashMap shards, so admin operations against one are visible only
+    // when invoked with that registry's own cap.
+    //
+    // The cap-interchangeability assertion (cap_a used against reg_b)
+    // describes the default-feature behaviour: caps are an opaque
+    // "you-hold-*some*-cap" token, not a tag tied to a specific
+    // registry. Under `--features strict-cap-binding` the cap is bound
+    // to its minting registry by `Arc::ptr_eq`, and cross-registry use
+    // is refused with [`RegistryError::CapabilityFromForeignRegistry`];
+    // that flavour is exercised by `tests/cap_binding_strict.rs`.
     let (reg_a, cap_a) = TenantRegistry::new();
     let (reg_b, cap_b) = TenantRegistry::new();
     assert!(reg_a.is_empty());
@@ -57,20 +64,27 @@ fn independent_constructions_yield_independent_caps() {
     reg_a.register(make_ctx(100)).unwrap();
     reg_b.register(make_ctx(200)).unwrap();
 
-    // Both caps work against their own registry — and crucially the type
-    // system did NOT reject `cap_a` being used against `reg_b` (the cap
-    // is an opaque token, not a tag tied to a specific registry). The
-    // security boundary here is "you must hold *some* cap minted by
-    // `TenantRegistry::new`", not "your cap must match this exact
-    // registry". That is sufficient to prevent unauthenticated callers
-    // (e.g. user-facing API handlers that never see a cap) from
-    // enumerating or evicting tenants.
+    // Both caps work against their own registry — this holds in both
+    // strict and non-strict modes.
     assert_eq!(reg_a.len(&cap_a), 1);
     assert_eq!(reg_b.len(&cap_b), 1);
 
     // Each registry only sees its own tenant.
     assert!(reg_a.get(TenantId(200), &cap_a).is_none());
     assert!(reg_b.get(TenantId(100), &cap_b).is_none());
+
+    // Non-strict mode: a cap from registry A is also accepted by
+    // registry B (the security boundary is "*some* cap" rather than
+    // "this exact registry's cap"). Strict mode flips this to a hard
+    // refusal — see `tests/cap_binding_strict.rs`.
+    #[cfg(not(feature = "strict-cap-binding"))]
+    {
+        // `cap_a` works against `reg_b` (opaque-token contract).
+        assert_eq!(reg_b.len(&cap_a), 1);
+        let snap_via_a = reg_b.tenants(&cap_a);
+        assert_eq!(snap_via_a.len(), 1);
+        assert_eq!(snap_via_a[0].id(), TenantId(200));
+    }
 
     // And the caps are independently usable — one going out of scope
     // does not invalidate the other (they share no allocation).

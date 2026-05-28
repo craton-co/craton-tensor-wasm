@@ -32,6 +32,7 @@ use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
 use tensor_wasm_core::types::TenantId;
+use zeroize::Zeroizing;
 
 use crate::ir::TensorWasmKernelBlueprint;
 use crate::ptx_emit::EmittedPtx;
@@ -458,8 +459,13 @@ impl KernelCache {
 /// recomputed HMAC does not match. Without the key (or with a different
 /// key) the loader treats every existing entry as a miss, so rotating
 /// the key invalidates the disk cache without requiring an `rm -rf`.
-/// The key is held by value inside the [`DiskCache`]; manual zeroization
-/// on drop is a future-work item.
+///
+/// The caller-supplied `hmac_key` field is plain `[u8; 32]` for ergonomic
+/// construction; once handed to [`KernelCache::with_disk_persistence`] the
+/// bytes are copied into a private `Zeroizing<[u8; 32]>` inside
+/// [`DiskCache`] which wipes them on drop. The caller's own copy is the
+/// caller's responsibility (e.g. construct via `Zeroizing::new` upstream
+/// and let it drop after the call).
 #[derive(Debug, Clone)]
 pub struct DiskCacheConfig {
     /// Directory where the L2 cache files live. Created lazily on first
@@ -467,6 +473,8 @@ pub struct DiskCacheConfig {
     pub dir: PathBuf,
     /// 32-byte HMAC-keyed-BLAKE3 key. MUST be process-stable across the
     /// cache's lifetime and SHOULD be treated as a server-side secret.
+    /// The long-lived copy held by the cache is zeroized on drop; this
+    /// field is the construction-time hand-off only.
     pub hmac_key: [u8; 32],
 }
 
@@ -498,7 +506,16 @@ pub struct DiskCacheConfig {
 /// present in the filename's hash-derived stem) so a load can detect a
 /// renamed file early without paying the HMAC cost.
 struct DiskCache {
-    cfg: DiskCacheConfig,
+    /// Directory the cache writes to. Cloned out of the supplied
+    /// [`DiskCacheConfig`] so we can drop the original config (and its
+    /// plain `[u8; 32]` copy of the key) and keep only the zeroizing
+    /// copy below as the long-lived owner.
+    dir: PathBuf,
+    /// 32-byte HMAC-keyed-BLAKE3 key, wiped on drop. `Zeroizing` Derefs
+    /// to `[u8; 32]` so the existing `&self.hmac_key[..]` and
+    /// `blake3::keyed_hash(&self.hmac_key, …)` call sites work
+    /// unchanged after going through `&*self.hmac_key`.
+    hmac_key: Zeroizing<[u8; 32]>,
 }
 
 /// V1 magic (legacy on-disk records). Read-only: treated as a miss so the
@@ -515,7 +532,15 @@ const DISK_CACHE_HMAC_LEN: usize = 32;
 
 impl DiskCache {
     fn new(cfg: DiskCacheConfig) -> Self {
-        Self { cfg }
+        // Move the key bytes into a `Zeroizing` newtype so the long-lived
+        // copy is wiped on `DiskCache::drop`. The caller's `DiskCacheConfig`
+        // still holds a plain `[u8; 32]` copy until the value passed in
+        // here is dropped at the end of this constructor — there's no way
+        // to avoid that without changing the public API.
+        Self {
+            dir: cfg.dir,
+            hmac_key: Zeroizing::new(cfg.hmac_key),
+        }
     }
 
     /// Build the on-disk path for a key. Hash the full key (including
@@ -523,6 +548,28 @@ impl DiskCache {
     /// on the same blueprint+sm and so the file name itself does not
     /// leak the blueprint fingerprint to anyone with directory-list
     /// access.
+    ///
+    /// The filename is also prefixed with the first 8 bytes of
+    /// `blake3::hash(hmac_key)` so two `KernelCache`s pointed at the
+    /// same directory but configured with different HMAC keys produce
+    /// *disjoint* paths. Without this prefix the two writers would
+    /// race on the same final path (`tmp.persist` overwrites whichever
+    /// landed first) and both readers would then fail the HMAC check
+    /// on each other's writes — every put-then-get round-trip would
+    /// look like a miss in steady state.
+    ///
+    /// The 8-byte HMAC-key fingerprint is NOT the key itself: it's
+    /// `blake3::hash(key)` truncated, which is already publicly
+    /// observable (anyone with directory-list access can read the
+    /// filename). The actual MAC trailer still gates load — partitioning
+    /// just avoids the inter-key collision, it is not a confidentiality
+    /// boundary.
+    ///
+    /// Format: `{key_prefix:016x}-{cache_key_hex}.ptxbin`. The key
+    /// prefix leads so `ls`-style directory listings group entries by
+    /// the writing key — handy for operators rotating keys (each
+    /// rotation lands under a new prefix and the old generation is
+    /// trivially `rm`-able by prefix glob).
     fn path_for(&self, key: &CacheKey) -> PathBuf {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"tensor-wasm-jit::DiskCache::path::v1\0");
@@ -532,19 +579,27 @@ impl DiskCache {
         hasher.update(&key.emit_config_hash.to_le_bytes());
         let h = hasher.finalize();
         // First 16 bytes (32 hex chars) is plenty of entropy for filenames.
-        let hex_stem: String = h
+        let cache_key_hex: String = h
             .as_bytes()
             .iter()
             .take(16)
             .map(|b| format!("{b:02x}"))
             .collect();
-        self.cfg.dir.join(format!("{hex_stem}.ptxbin"))
+        // First 8 bytes of blake3(hmac_key), packed LE → u64 → 16 hex chars.
+        // `&self.hmac_key[..]` Deref-borrows the underlying `[u8; 32]` and
+        // takes the full slice; `Zeroizing` is `Deref<Target=[u8; 32]>`.
+        let key_fp = blake3::hash(&self.hmac_key[..]);
+        let mut key_fp_le = [0u8; 8];
+        key_fp_le.copy_from_slice(&key_fp.as_bytes()[..8]);
+        let key_prefix = u64::from_le_bytes(key_fp_le);
+        self.dir
+            .join(format!("{key_prefix:016x}-{cache_key_hex}.ptxbin"))
     }
 
     /// Write a kernel to disk under an HMAC-keyed integrity tag.
     fn put(&self, key: &CacheKey, kernel: &CachedKernel) -> std::io::Result<()> {
         use std::io::Write;
-        std::fs::create_dir_all(&self.cfg.dir)?;
+        std::fs::create_dir_all(&self.dir)?;
         let ptx_bytes = kernel.ptx.text.as_bytes();
         let (grid_x, block_x) = kernel.ptx.launch_geometry;
         let mut buf = Vec::with_capacity(
@@ -565,13 +620,16 @@ impl DiskCache {
         // the `hmac` + `sha2` deps into this crate just for the disk
         // cache; the security argument is identical (BLAKE3-keyed is a
         // strong MAC).
-        let tag = blake3::keyed_hash(&self.cfg.hmac_key, &buf);
+        // `blake3::keyed_hash` takes `&[u8; 32]`. `Zeroizing` implements
+        // `Deref<Target=[u8; 32]>` so Rust's deref-coercion lowers
+        // `&Zeroizing<[u8; 32]>` to `&[u8; 32]` at the call site.
+        let tag = blake3::keyed_hash(&self.hmac_key, &buf);
         buf.extend_from_slice(tag.as_bytes());
         // Atomic write: create the temp file in the same directory, then
         // rename onto the final path so a partial write never leaves a
         // half-formed entry that a concurrent reader could trip over.
         let final_path = self.path_for(key);
-        let tmp = tempfile::NamedTempFile::new_in(&self.cfg.dir)?;
+        let tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
         tmp.as_file().write_all(&buf)?;
         tmp.persist(&final_path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -635,7 +693,7 @@ impl DiskCache {
         }
         let hmac_start = bytes.len() - DISK_CACHE_HMAC_LEN;
         let (prefix, tag_bytes) = bytes.split_at(hmac_start);
-        let expected = blake3::keyed_hash(&self.cfg.hmac_key, prefix);
+        let expected = blake3::keyed_hash(&self.hmac_key, prefix);
         // Constant-time HMAC compare. The stdlib `==` / `PartialEq` impl on
         // `[u8; N]` and `&[u8]` short-circuits on the first mismatch — a
         // classic timing oracle that lets an attacker recover a forged MAC

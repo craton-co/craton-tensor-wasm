@@ -51,6 +51,42 @@ fn io_kind_name(err: &io::Error) -> String {
     format!("{:?}", err.kind())
 }
 
+/// Returns `true` if an [`std::io::ErrorKind`] is plausibly transient and
+/// the caller should retry the I/O operation. Used by
+/// [`TensorWasmError::is_retryable`] to differentiate `Io(_)` errors that
+/// should map to `503 Service Unavailable` (retryable) from those that
+/// should map to `500 Internal Server Error` or a tenant-side 4xx (hard
+/// miss).
+///
+/// The retryable set is intentionally narrow — every kind not listed
+/// here defaults to non-retryable so a future addition to
+/// `std::io::ErrorKind` does not silently flip a hard error into a
+/// `503`. Kinds in the retryable set:
+///
+/// * [`io::ErrorKind::WouldBlock`] — non-blocking socket / fd would
+///   block; the canonical retry-now kind.
+/// * [`io::ErrorKind::TimedOut`] — operation deadline expired; the
+///   underlying resource may recover.
+/// * [`io::ErrorKind::Interrupted`] — signal-interrupted syscall
+///   (`EINTR`); restarting almost always succeeds.
+/// * [`io::ErrorKind::WriteZero`] — short write; a follow-up write may
+///   drain the rest.
+/// * [`io::ErrorKind::ConnectionReset`], [`io::ErrorKind::ConnectionAborted`],
+///   [`io::ErrorKind::BrokenPipe`] — peer dropped the connection;
+///   re-establishing and retrying may succeed.
+fn is_retryable_io_kind(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WriteZero
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
 /// The unified error type for every TensorWasm crate.
 ///
 /// Variants are deliberately broad — host-level code matches on the variant to
@@ -155,11 +191,20 @@ impl TensorWasmError {
     /// `WasmCompile` and `TenantIsolationViolation` are *not* retryable —
     /// recompiling identical bytes will fail identically, and an isolation
     /// breach is a hard policy decision rather than a transient condition.
+    ///
+    /// `Io(_)` is classified by inspecting [`std::io::Error::kind`]: transient
+    /// kinds (`WouldBlock`, `TimedOut`, `Interrupted`, `WriteZero`, the
+    /// connection-reset family) flag as retryable, while hard-miss kinds
+    /// (`NotFound`, `PermissionDenied`, `AlreadyExists`, ...) do not. The
+    /// per-kind classifier is more useful than a blanket `Io(_) -> true`
+    /// because the API layer otherwise returns `503` for hard 404-class
+    /// failures and the CLI's retry loop spins on doomed requests.
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            TensorWasmError::KernelTimeout { .. } | TensorWasmError::Io(_) | TensorWasmError::MemoryExhausted { .. }
-        )
+        match self {
+            TensorWasmError::KernelTimeout { .. } | TensorWasmError::MemoryExhausted { .. } => true,
+            TensorWasmError::Io(err) => is_retryable_io_kind(err.kind()),
+            _ => false,
+        }
     }
 
     /// Returns the inner diagnostic string for the four variants that wrap a
@@ -385,6 +430,36 @@ mod tests {
         assert!(
             !e.is_retryable(),
             "TenantIsolationViolation must not be flagged as retryable",
+        );
+    }
+
+    #[test]
+    fn io_error_is_retryable_wouldblock_true() {
+        // `WouldBlock` is the canonical retry-now I/O kind — pending a
+        // socket send buffer or a non-blocking file descriptor. The
+        // `is_retryable()` classifier must surface it as retryable so
+        // the API layer renders `503 Service Unavailable` rather than
+        // `500 Internal Server Error` (and so the CLI's retry loop
+        // engages instead of bailing out).
+        let e = TensorWasmError::Io(io::Error::from(io::ErrorKind::WouldBlock));
+        assert!(
+            e.is_retryable(),
+            "Io(WouldBlock) must be classified as retryable",
+        );
+    }
+
+    #[test]
+    fn io_error_is_retryable_notfound_false() {
+        // `NotFound` is a hard miss — retrying the same path will fail
+        // identically. The classifier must NOT flag it as retryable;
+        // otherwise the API layer would return `503 Service
+        // Unavailable` for what should be a permanent `404`-class
+        // failure and the CLI's retry loop would spin on a doomed
+        // request.
+        let e = TensorWasmError::Io(io::Error::from(io::ErrorKind::NotFound));
+        assert!(
+            !e.is_retryable(),
+            "Io(NotFound) must NOT be classified as retryable",
         );
     }
 

@@ -1387,3 +1387,150 @@ mod tests {
         assert!(!labels.target.is_empty());
     }
 }
+
+#[cfg(test)]
+mod tests_b51 {
+    //! Additional coverage added in batch B5.1 (per docs/ROADMAP.md).
+    //!
+    //! The tests in this module pin the `RouteAllowlist` direct-surface
+    //! contract, the `StatusTable` boundary behaviour, and the validation
+    //! paths of `HttpRequestLabels::try_new` / `try_new_with_allowlist` —
+    //! all of which were previously covered only transitively through the
+    //! HTTP metrics middleware in `tensor-wasm-api`. Pinning them inside
+    //! `tensor-wasm-core` means a future change to the cardinality
+    //! contract breaks here, in the crate that owns the type, rather than
+    //! in a downstream test that happens to exercise the code path.
+    //!
+    //! Tests that mutate the process-global `ROUTE_ALLOWLIST` are gated
+    //! with `#[ignore]` so they do not race against one another or
+    //! against the rest of the suite. Run them explicitly with
+    //! `cargo test -p tensor-wasm-core -- --ignored process_global` if you
+    //! want to exercise the one-shot registration path.
+
+    use super::*;
+
+    // --- RouteAllowlist direct surface ----------------------------------
+
+    #[test]
+    fn route_allowlist_direct_surface_lookup_hit_and_miss() {
+        let alw = RouteAllowlist::new(&["/healthz", "/metrics"]);
+        // Hit: returns the matched `&'static str` (the validator hands
+        // this back to callers as a zero-copy `Cow::Borrowed`).
+        assert_eq!(alw.lookup("/healthz"), Some("/healthz"));
+        assert_eq!(alw.lookup("/metrics"), Some("/metrics"));
+        // Miss: not in the allow-list.
+        assert_eq!(alw.lookup("/unknown"), None);
+        // Lookup is case-sensitive (`/Healthz` is NOT the same template
+        // as `/healthz`).
+        assert_eq!(alw.lookup("/Healthz"), None);
+        // `.routes()` returns the registered slice in declaration order.
+        assert_eq!(alw.routes(), &["/healthz", "/metrics"]);
+    }
+
+    // --- StatusTable boundary behaviour ---------------------------------
+    //
+    // The static lives at `super::STATUS_STR` and exposes a `get(code)
+    // -> Option<&'static str>` that returns the decimal rendering of the
+    // status code (e.g. `"100"`, `"599"`) when the code is in the
+    // standard `100..=599` HTTP range, and `None` otherwise. The tests
+    // below pin both ends of the range and a value well outside it.
+
+    #[test]
+    fn status_table_boundaries() {
+        // In-range values render as their decimal string.
+        assert_eq!(STATUS_STR.get(100), Some("100"));
+        assert_eq!(STATUS_STR.get(599), Some("599"));
+        // Out-of-range values return `None` (the fallback bucket).
+        assert_eq!(STATUS_STR.get(99), None);
+        assert_eq!(STATUS_STR.get(600), None);
+        assert_eq!(STATUS_STR.get(u16::MAX), None);
+    }
+
+    // --- HttpRequestLabels::try_new* validation -------------------------
+
+    #[test]
+    #[ignore = "process-global allowlist; mutually exclusive with `register_route_allowlist_is_one_shot`"]
+    fn try_new_rejects_unknown_route() {
+        // Note: this test mutates the process-global `ROUTE_ALLOWLIST`
+        // via `register_route_allowlist`. It is gated with `#[ignore]`
+        // so it cannot race with `register_route_allowlist_is_one_shot`
+        // or with any other test that also registers the global. Run
+        // it explicitly via `cargo test -- --ignored` against a fresh
+        // process. The `try_new_with_allowlist` path (exercised by
+        // `try_new_rejects_lowercase_method` and
+        // `try_new_rejects_status_outside_1xx_5xx`) covers the same
+        // validation logic without touching the global, and is the
+        // recommended path for non-binary callers.
+        let _ = register_route_allowlist(&["/known"]);
+        let err = HttpRequestLabels::try_new("/unknown", "GET", 200).unwrap_err();
+        match err {
+            LabelError::UnknownRoute { route } => assert_eq!(route, "/unknown"),
+            other => panic!("expected UnknownRoute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_new_rejects_lowercase_method() {
+        // The validator's method check is case-sensitive (the API
+        // middleware normalises to uppercase before calling). Verify
+        // that `"get"` fails with `InvalidMethod` carrying the offending
+        // string, while the corresponding uppercase value passes.
+        let alw = RouteAllowlist::new(&["/x"]);
+        let err = HttpRequestLabels::try_new_with_allowlist("/x", "get", 200, Some(&alw))
+            .unwrap_err();
+        match err {
+            LabelError::InvalidMethod { method } => assert_eq!(method, "get"),
+            other => panic!("expected InvalidMethod, got {other:?}"),
+        }
+        // Sanity: the uppercase form is accepted (proves the failure
+        // really is the case sensitivity, not some other validation).
+        assert!(
+            HttpRequestLabels::try_new_with_allowlist("/x", "GET", 200, Some(&alw)).is_ok(),
+            "uppercase `GET` must pass the validator",
+        );
+    }
+
+    #[test]
+    fn try_new_rejects_status_outside_1xx_5xx() {
+        // The validator accepts the standard HTTP range `100..=599` and
+        // rejects anything else with `InvalidStatus` carrying the
+        // offending numeric code. Exercise both boundary misses.
+        let alw = RouteAllowlist::new(&["/x"]);
+        for bad in [99u16, 600u16] {
+            let err =
+                HttpRequestLabels::try_new_with_allowlist("/x", "GET", bad, Some(&alw))
+                    .unwrap_err();
+            match err {
+                LabelError::InvalidStatus { status } => assert_eq!(status, bad),
+                other => panic!("expected InvalidStatus for {bad}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "process-global allowlist; mutually exclusive with other tests that touch ROUTE_ALLOWLIST"]
+    fn register_route_allowlist_is_one_shot() {
+        // The process-global slot is intentionally write-once so
+        // dashboards and alert rules can rely on a stable `route` label
+        // set for the lifetime of the process. The second call must
+        // fail with `AllowlistAlreadyRegistered` regardless of whether
+        // the first call won the race (a previous test in this process
+        // may already have registered a different list — that still
+        // forces the second call here to fail with the same error,
+        // which is what we assert).
+        let _ = register_route_allowlist(&["/foo"]);
+        let err = register_route_allowlist(&["/bar"]).unwrap_err();
+        assert!(
+            matches!(err, LabelError::AllowlistAlreadyRegistered),
+            "expected AllowlistAlreadyRegistered, got {err:?}",
+        );
+    }
+
+    // NOTE: `default_http_metrics_config_matches_new` from the B5.1
+    // task description lives in `tensor-wasm-api`, not in this crate —
+    // `HttpMetricsLayerConfig` is defined in
+    // `crates/tensor-wasm-api/src/http_metrics.rs` and is not reachable
+    // from `tensor-wasm-core` (which would otherwise introduce a
+    // reverse dependency on the API layer). The analogous test belongs
+    // in `tensor-wasm-api`'s own test suite; tracked separately.
+}

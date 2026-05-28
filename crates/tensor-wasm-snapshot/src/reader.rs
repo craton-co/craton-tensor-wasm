@@ -29,6 +29,8 @@ use crate::writer::{
 use crate::format::{
     SignatureKind, HMAC_SHA256_SIG_LEN, SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN,
 };
+#[cfg(feature = "signed-snapshots")]
+use zeroize::Zeroizing;
 
 /// Reverse of [`SnapshotWriter`](crate::writer::SnapshotWriter) — turns a
 /// compressed byte blob back into an in-memory [`Snapshot`].
@@ -53,7 +55,16 @@ use crate::format::{
 /// `Debug` is implemented manually to redact `hmac_key` — a derived `Debug`
 /// would print all 32 key bytes via `{:?}` and expose the signing secret
 /// any time a caller writes `tracing::debug!(?reader)` or similar.
-#[derive(Clone, Copy)]
+///
+/// `Copy` is intentionally NOT derived when the `signed-snapshots` feature
+/// is enabled: the HMAC verification key is wrapped in
+/// [`zeroize::Zeroizing`] so its backing bytes are scrubbed on drop, and
+/// `Zeroizing<T>` is never `Copy` (a `Copy` would silently duplicate the
+/// secret and skip the scrub on the original). The no-feature build keeps
+/// `Copy` for backward compatibility — no secret material is present
+/// there.
+#[cfg_attr(not(feature = "signed-snapshots"), derive(Copy))]
+#[derive(Clone)]
 pub struct SnapshotReader {
     /// Hard ceiling on bytes the streaming zstd decoder is allowed to emit
     /// before being aborted. Bounds the attacker's memory budget independent
@@ -61,8 +72,13 @@ pub struct SnapshotReader {
     max_decompressed: usize,
     /// HMAC-SHA256 key used to verify v3 signatures. `None` -> v3 inputs
     /// are rejected.
+    ///
+    /// Wrapped in [`zeroize::Zeroizing`] so the 32 key bytes are
+    /// overwritten when the reader is dropped — best-effort defence
+    /// against the key surviving in swap-backed memory or in the
+    /// allocator's freelist after the reader has gone out of scope.
     #[cfg(feature = "signed-snapshots")]
-    hmac_key: Option<[u8; 32]>,
+    hmac_key: Option<Zeroizing<[u8; 32]>>,
     /// When `true`, v2 (unsigned) inputs are rejected even if otherwise
     /// well-formed. Allows operators to enforce signature-only restores
     /// without compiling a separate binary.
@@ -115,8 +131,11 @@ impl SnapshotReader {
     #[cfg(feature = "signed-snapshots")]
     #[cfg_attr(docsrs, doc(cfg(feature = "signed-snapshots")))]
     #[must_use]
-    pub const fn with_hmac_sha256_key(mut self, key: [u8; 32]) -> Self {
-        self.hmac_key = Some(key);
+    pub fn with_hmac_sha256_key(mut self, key: [u8; 32]) -> Self {
+        // Wrap in `Zeroizing` so the 32 bytes are scrubbed when the reader
+        // drops. `Zeroizing::new` is not `const`, so this constructor is no
+        // longer `const fn`. All existing call-sites are runtime contexts.
+        self.hmac_key = Some(Zeroizing::new(key));
         self
     }
 
@@ -560,7 +579,11 @@ impl SnapshotReader {
                 use sha2::Sha256;
                 use subtle::ConstantTimeEq;
 
-                let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).map_err(|_| {
+                // `key` is `&Zeroizing<[u8; 32]>`. `Zeroizing` is
+                // `Deref<Target = [u8; 32]>`, so `&key[..]` borrows the full
+                // 32-byte slice without copying the secret out of the
+                // zeroizing wrapper.
+                let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key[..]).map_err(|_| {
                     // [u8; 32] is always a valid HMAC-SHA256 key length; this
                     // branch is unreachable but we translate rather than
                     // panic and keep the key out of the message.

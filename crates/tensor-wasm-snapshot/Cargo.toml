@@ -31,6 +31,12 @@ cust = { workspace = true, optional = true }
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 subtle = { version = "2", optional = true }
+# Best-effort scrub of the in-memory HMAC key on drop. Wraps the 32-byte key
+# field in `zeroize::Zeroizing` so swap-backed memory is overwritten when
+# the writer/reader is dropped. Gated behind `signed-snapshots` since
+# the field itself only exists under that feature — keeps the no-feature
+# build dep-surface identical to before.
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -50,7 +56,7 @@ cuda = ["dep:cust"]
 # When enabled (the default), `SnapshotWriter::with_hmac_sha256_key` and
 # `SnapshotReader::with_hmac_sha256_key` become available; without it the
 # writer/reader continue to handle only the unsigned v2 wire format.
-signed-snapshots = ["dep:hmac", "dep:sha2", "dep:subtle"]
+signed-snapshots = ["dep:hmac", "dep:sha2", "dep:subtle", "dep:zeroize"]
 
 [package.metadata.docs.rs]
 all-features = false

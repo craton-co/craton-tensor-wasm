@@ -66,6 +66,14 @@ wasmparser.workspace = true
 [dev-dependencies]
 futures = { workspace = true }
 http-body-util = "0.1"
+# `temp-env` scopes process env-var mutations to a closure and serialises
+# concurrent users behind an internal Mutex. The header-hardening tests
+# use this for the `TENSOR_WASM_API_REQUIRE_TENANT=1` path (see
+# `tests/header_hardening_test.rs::missing_tenant_when_required`) rather
+# than raw `std::env::set_var` / `remove_var` — the latter became `unsafe`
+# in Rust 2024 and parallel mutation of the process env from tests is
+# undefined behaviour.
+temp-env.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-test.workspace = true
 tower = { workspace = true, features = ["util"] }

@@ -47,6 +47,19 @@ pub enum RegistryError {
     /// [`TenantRegistry::collect_tombstones`] before retrying.
     #[error("tenant {0} cannot be re-registered while an orphan Arc<TenantContext> is still alive")]
     OrphanStillAlive(TenantId),
+    /// An admin-cap-gated method was invoked with a
+    /// [`RegistryAdminCapability`] that was minted by a *different*
+    /// `TenantRegistry`. Only emitted when the `strict-cap-binding` feature
+    /// is enabled; without it, caps from independent registries are
+    /// interchangeable (the surface invariant has always been "you must
+    /// hold *some* cap" rather than "your cap must match this exact
+    /// registry"). Strict mode is the recommended posture for multi-tenant
+    /// deployments where two independent `TenantRegistry` instances live
+    /// in the same process — see the `## Cap binding` section in the crate
+    /// README for the upgrade path.
+    #[cfg(feature = "strict-cap-binding")]
+    #[error("capability was minted by a different TenantRegistry; refusing cross-registry operation")]
+    CapabilityFromForeignRegistry,
 }
 
 /// Decision returned by [`TenantRegistry::mps_or_fallback`].
@@ -102,17 +115,52 @@ pub const MPS_PIPE_DIRECTORY_ENV: &str = "CUDA_MPS_PIPE_DIRECTORY";
 /// Capabilities are not cloneable on purpose: an operator that delegates
 /// admin authority to a sub-system passes a `&RegistryAdminCapability`
 /// reference rather than handing out independent copies.
+///
+/// # Registry binding (`strict-cap-binding` feature)
+///
+/// Under the `strict-cap-binding` feature, every admin capability also
+/// carries an `Arc<()>` token that points to its minting registry's
+/// per-instance allocation. Comparison is by `Arc::ptr_eq`, so a cap
+/// minted by registry A is rejected with
+/// [`RegistryError::CapabilityFromForeignRegistry`] when presented
+/// against registry B even though both caps statically have the same
+/// type. Without this feature the cap is an opaque "you-hold-*some*-cap"
+/// token; the foreign-cap test at
+/// `tests/admin_cap_required.rs::independent_constructions_yield_independent_caps`
+/// asserts the legacy behaviour.
 #[derive(Debug)]
 pub struct RegistryAdminCapability {
     _seal: (),
+    /// Pointer-identity stamp of the registry that minted this capability.
+    /// Only present under the `strict-cap-binding` feature; the field
+    /// disappears entirely (zero memory cost, no API surface) when the
+    /// feature is off, preserving 0.3 ABI for embedders that don't opt
+    /// into the strict mode.
+    #[cfg(feature = "strict-cap-binding")]
+    pub(crate) registry_token: std::sync::Arc<()>,
 }
 
 impl RegistryAdminCapability {
     /// Mint a fresh capability. Crate-private so external crates cannot
     /// forge admin authority over a `TenantRegistry` they did not
-    /// construct.
+    /// construct. The non-strict-binding signature is unchanged.
+    #[cfg(not(feature = "strict-cap-binding"))]
     pub(crate) fn mint() -> Self {
         Self { _seal: () }
+    }
+
+    /// Mint a fresh capability bound to the minting registry's
+    /// `registry_token` (an `Arc::clone` of the registry's per-instance
+    /// allocation). Comparison at admin-method call time is by
+    /// `Arc::ptr_eq`; two registries that happen to allocate
+    /// `Arc::new(())` at the same address would still be distinct
+    /// allocations and `ptr_eq` would return `false`.
+    #[cfg(feature = "strict-cap-binding")]
+    pub(crate) fn mint(registry_token: std::sync::Arc<()>) -> Self {
+        Self {
+            _seal: (),
+            registry_token,
+        }
     }
 }
 
@@ -137,6 +185,19 @@ pub struct TenantRegistry {
     /// [`Self::collect_tombstones`] or implicitly on a successful
     /// re-register.
     tombstones: Arc<DashMap<TenantId, Weak<TenantContext>>>,
+    /// Per-instance identity token used to bind capabilities to this
+    /// specific registry under the `strict-cap-binding` feature.
+    ///
+    /// Allocated fresh inside [`Self::new`] and cloned (cheap `Arc::clone`)
+    /// into every cap minted by this registry. Cloning the registry
+    /// itself shares the same token allocation, which is what we want:
+    /// `Arc::clone(&reg)` is the documented way to hand the same registry
+    /// to a subsystem, and caps minted against either handle must
+    /// continue to work against the other. Two *independent*
+    /// `TenantRegistry::new()` calls produce two distinct allocations,
+    /// so `Arc::ptr_eq` on the tokens identifies registry provenance.
+    #[cfg(feature = "strict-cap-binding")]
+    registry_token: Arc<()>,
 }
 
 impl TenantRegistry {
@@ -149,11 +210,19 @@ impl TenantRegistry {
     /// `DashMap`, but does NOT clone the cap — admin authority stays with
     /// whoever the original constructor handed it to.
     pub fn new() -> (Self, RegistryAdminCapability) {
+        #[cfg(feature = "strict-cap-binding")]
+        let registry_token: Arc<()> = Arc::new(());
         let reg = Self {
             inner: Arc::new(DashMap::new()),
             tombstones: Arc::new(DashMap::new()),
+            #[cfg(feature = "strict-cap-binding")]
+            registry_token: Arc::clone(&registry_token),
         };
-        (reg, RegistryAdminCapability::mint())
+        #[cfg(feature = "strict-cap-binding")]
+        let cap = RegistryAdminCapability::mint(registry_token);
+        #[cfg(not(feature = "strict-cap-binding"))]
+        let cap = RegistryAdminCapability::mint();
+        (reg, cap)
     }
 
     /// Insert `ctx` into the registry.
@@ -187,7 +256,7 @@ impl TenantRegistry {
     /// tenant's accounting is untouched.
     pub fn register_with_capability(
         &self,
-        ctx: TenantContext,
+        #[allow(unused_mut)] mut ctx: TenantContext,
     ) -> Result<(Arc<TenantContext>, TenantCapability), RegistryError> {
         let id = ctx.id();
         // tenant 1.6 #9: refuse re-registration while an orphan Arc from a
@@ -202,15 +271,49 @@ impl TenantRegistry {
         }
         // Orphan (if any) is gone; clear the tombstone so the slot is free.
         self.tombstones.remove(&id);
+        // Under `strict-cap-binding` stamp the context with this
+        // registry's token *before* wrapping it in `Arc`, so the
+        // `check_capability` path can compare token identity at every
+        // `consume_bytes_with_capability` / `release_bytes_with_capability`
+        // call.
+        #[cfg(feature = "strict-cap-binding")]
+        {
+            ctx.registry_token = Some(Arc::clone(&self.registry_token));
+        }
         let entry = self.inner.entry(id);
         match entry {
             dashmap::mapref::entry::Entry::Occupied(_) => Err(RegistryError::AlreadyRegistered(id)),
             dashmap::mapref::entry::Entry::Vacant(slot) => {
                 let arc = Arc::new(ctx);
                 slot.insert(Arc::clone(&arc));
+                #[cfg(feature = "strict-cap-binding")]
+                let cap = TenantCapability::mint(id, Arc::clone(&self.registry_token));
+                #[cfg(not(feature = "strict-cap-binding"))]
                 let cap = TenantCapability::mint(id);
                 Ok((arc, cap))
             }
+        }
+    }
+
+    /// Verify that `cap` was minted by *this* registry's [`Self::new`]
+    /// call. No-op when `strict-cap-binding` is disabled (the 0.3
+    /// behaviour: caps from independent registries are interchangeable);
+    /// under the feature, returns
+    /// [`RegistryError::CapabilityFromForeignRegistry`] on mismatch and
+    /// every admin method calls this before doing any work.
+    ///
+    /// We compare with `Arc::ptr_eq` on the per-registry token allocation
+    /// rather than hashing addresses: two registries that happen to
+    /// recycle the same heap address sequentially would still be distinct
+    /// allocations from `Arc::clone`'s point of view (each `Arc::new(())`
+    /// is its own refcount block), so `ptr_eq` is the only correct
+    /// comparison.
+    #[cfg(feature = "strict-cap-binding")]
+    fn check_admin_cap(&self, cap: &RegistryAdminCapability) -> Result<(), RegistryError> {
+        if Arc::ptr_eq(&self.registry_token, &cap.registry_token) {
+            Ok(())
+        } else {
+            Err(RegistryError::CapabilityFromForeignRegistry)
         }
     }
 
@@ -219,11 +322,23 @@ impl TenantRegistry {
     /// Gated behind [`RegistryAdminCapability`] because an unrestricted
     /// `get` lets any holder of an `Arc<TenantRegistry>` enumerate other
     /// tenants' contexts by id and mutate their quota counters.
+    ///
+    /// Under the `strict-cap-binding` feature an additional runtime check
+    /// rejects caps minted by a different registry; mismatch is observed
+    /// here as `None`. The strict-mode test
+    /// (`tests/cap_binding_strict.rs`) calls the typed [`Self::get_strict`]
+    /// variant for explicit error propagation; this method preserves the
+    /// `Option`-returning signature for the 0.3 line.
     pub fn get(
         &self,
         tenant_id: TenantId,
-        _cap: &RegistryAdminCapability,
+        cap: &RegistryAdminCapability,
     ) -> Option<Arc<TenantContext>> {
+        #[cfg(feature = "strict-cap-binding")]
+        {
+            self.check_admin_cap(cap).ok()?;
+        }
+        let _ = cap;
         self.inner.get(&tenant_id).map(|r| Arc::clone(r.value()))
     }
 
@@ -231,12 +346,20 @@ impl TenantRegistry {
     ///
     /// Gated behind [`RegistryAdminCapability`]: without this, any holder
     /// of an `Arc<TenantRegistry>` could evict arbitrary tenants from the
-    /// registry, breaking their kernel pipelines.
+    /// registry, breaking their kernel pipelines. Under the
+    /// `strict-cap-binding` feature, a foreign cap is observed as `None`
+    /// here (no eviction happens). Use [`Self::unregister_strict`] when
+    /// the explicit error propagation is required.
     pub fn unregister(
         &self,
         tenant_id: TenantId,
-        _cap: &RegistryAdminCapability,
+        cap: &RegistryAdminCapability,
     ) -> Option<Arc<TenantContext>> {
+        #[cfg(feature = "strict-cap-binding")]
+        {
+            self.check_admin_cap(cap).ok()?;
+        }
+        let _ = cap;
         let removed = self.inner.remove(&tenant_id).map(|(_, v)| v);
         if let Some(ref arc) = removed {
             // tenant 1.6 #9: track the orphan so a future re-register can
@@ -256,7 +379,16 @@ impl TenantRegistry {
     /// to keep the tombstone map from growing with every churned tenant.
     /// Callers do not normally need to invoke it manually — a successful
     /// re-`register` of a now-clean id implicitly clears its tombstone.
-    pub fn collect_tombstones(&self, _cap: &RegistryAdminCapability) -> usize {
+    /// Under the `strict-cap-binding` feature, a foreign cap silently
+    /// returns `0` (no pruning happens).
+    pub fn collect_tombstones(&self, cap: &RegistryAdminCapability) -> usize {
+        #[cfg(feature = "strict-cap-binding")]
+        {
+            if self.check_admin_cap(cap).is_err() {
+                return 0;
+            }
+        }
+        let _ = cap;
         let mut pruned = 0;
         self.tombstones.retain(|_id, weak| {
             if weak.strong_count() == 0 {
@@ -274,9 +406,65 @@ impl TenantRegistry {
     /// Gated behind [`RegistryAdminCapability`] because the count is a
     /// global property of the registry that should not leak across the
     /// tenant boundary — a tenant counting its peers is itself a
-    /// side-channel.
-    pub fn len(&self, _cap: &RegistryAdminCapability) -> usize {
+    /// side-channel. Under the `strict-cap-binding` feature, a foreign
+    /// cap is observed as `0` here (no enumeration). Use
+    /// [`Self::len_strict`] for explicit error propagation.
+    pub fn len(&self, cap: &RegistryAdminCapability) -> usize {
+        #[cfg(feature = "strict-cap-binding")]
+        {
+            if self.check_admin_cap(cap).is_err() {
+                return 0;
+            }
+        }
+        let _ = cap;
         self.inner.len()
+    }
+
+    /// Strict-mode variant of [`Self::get`] that returns a typed error
+    /// on foreign-cap mismatch instead of collapsing it into `None`.
+    /// Only available under the `strict-cap-binding` feature; the
+    /// non-strict line has no foreign-cap concept so the variant would be
+    /// vacuous.
+    #[cfg(feature = "strict-cap-binding")]
+    pub fn get_strict(
+        &self,
+        tenant_id: TenantId,
+        cap: &RegistryAdminCapability,
+    ) -> Result<Option<Arc<TenantContext>>, RegistryError> {
+        self.check_admin_cap(cap)?;
+        Ok(self.inner.get(&tenant_id).map(|r| Arc::clone(r.value())))
+    }
+
+    /// Strict-mode variant of [`Self::unregister`].
+    #[cfg(feature = "strict-cap-binding")]
+    pub fn unregister_strict(
+        &self,
+        tenant_id: TenantId,
+        cap: &RegistryAdminCapability,
+    ) -> Result<Option<Arc<TenantContext>>, RegistryError> {
+        self.check_admin_cap(cap)?;
+        let removed = self.inner.remove(&tenant_id).map(|(_, v)| v);
+        if let Some(ref arc) = removed {
+            self.tombstones.insert(tenant_id, Arc::downgrade(arc));
+        }
+        Ok(removed)
+    }
+
+    /// Strict-mode variant of [`Self::len`].
+    #[cfg(feature = "strict-cap-binding")]
+    pub fn len_strict(&self, cap: &RegistryAdminCapability) -> Result<usize, RegistryError> {
+        self.check_admin_cap(cap)?;
+        Ok(self.inner.len())
+    }
+
+    /// Strict-mode variant of [`Self::tenants`].
+    #[cfg(feature = "strict-cap-binding")]
+    pub fn tenants_strict(
+        &self,
+        cap: &RegistryAdminCapability,
+    ) -> Result<Vec<Arc<TenantContext>>, RegistryError> {
+        self.check_admin_cap(cap)?;
+        Ok(self.inner.iter().map(|r| Arc::clone(r.value())).collect())
     }
 
     /// `true` when no tenants are registered.
@@ -293,8 +481,18 @@ impl TenantRegistry {
     ///
     /// Gated behind [`RegistryAdminCapability`] because the snapshot
     /// enumerates every registered tenant — a primitive that, in the wrong
-    /// hands, defeats the whole point of multi-tenant isolation.
-    pub fn tenants(&self, _cap: &RegistryAdminCapability) -> Vec<Arc<TenantContext>> {
+    /// hands, defeats the whole point of multi-tenant isolation. Under
+    /// the `strict-cap-binding` feature, a foreign cap returns an empty
+    /// `Vec` (no enumeration). Use [`Self::tenants_strict`] for explicit
+    /// error propagation.
+    pub fn tenants(&self, cap: &RegistryAdminCapability) -> Vec<Arc<TenantContext>> {
+        #[cfg(feature = "strict-cap-binding")]
+        {
+            if self.check_admin_cap(cap).is_err() {
+                return Vec::new();
+            }
+        }
+        let _ = cap;
         self.inner.iter().map(|r| Arc::clone(r.value())).collect()
     }
 

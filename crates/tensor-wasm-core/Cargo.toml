@@ -37,6 +37,11 @@ otlp = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", 
 [dev-dependencies]
 tokio.workspace = true
 serde_json.workspace = true
+# `temp-env` provides scoped environment-variable mutation for the
+# `telemetry::build_filter` tests (B5.1). The crate restores the prior
+# value when the closure returns, so concurrent tests that observe
+# `TENSOR_WASM_LOG` / `RUST_LOG` cannot leak state into one another.
+temp-env = "0.3"
 
 [package.metadata.docs.rs]
 # docs.rs builds the documentation with every Cargo feature enabled so the
