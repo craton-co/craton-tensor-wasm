@@ -83,6 +83,7 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/functions/{id}"),
     ("POST", "/functions/{id}/invoke"),
     ("POST", "/functions/{id}/invoke-async"),
+    ("POST", "/functions/{id}/invoke-stream"),
     ("GET", "/jobs/{id}"),
     // OpenAI-compat shim (B4.9). Scaffold routes that return 501 with
     // the OpenAI-shape error envelope. See

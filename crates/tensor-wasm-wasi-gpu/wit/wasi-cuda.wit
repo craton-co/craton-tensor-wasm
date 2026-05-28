@@ -1,23 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
 //
-// wasi:cuda/host@0.2.0 — TensorWasm's explicit GPU kernel-launch API for Wasm
-// guests. The on-the-wire ABI is the function-import form described in
-// `crates/tensor-wasm-wasi-gpu/src/abi.rs`; this WIT is the Component-Model
-// equivalent and is the authoritative description of the interface for
-// tooling that consumes WIT (wit-bindgen, jco, etc.).
+// In-crate copy of the WIT contracts produced by this crate. Two distinct
+// packages live here:
 //
-// Keep this file and `crates/tensor-wasm-wasi-gpu/src/abi.rs` in lockstep —
-// every constant, every function signature, every error code must match.
+//   * `wasi:cuda@0.2.0` — the explicit GPU kernel-launch API (matches
+//     `crates/tensor-wasm-wasi-gpu/src/abi.rs` and `host.rs`). This file is
+//     the authoritative copy; the workspace-root `wit/wasi-cuda.wit` mirrors
+//     it for tooling that consumes WIT from the workspace root.
+//
+//   * `wasi:tensor@0.1.0` — the streaming output surface (roadmap feature
+//     #2 / v0.3.7 scaffold). Used by the HTTP gateway to flush LLM-style
+//     token streams to clients as Server-Sent Events or chunked-transfer
+//     bytes. Implementation lives in `src/streaming.rs`; the actual
+//     mid-execution streaming wiring lands in v0.4.
+//
+// Keep this file and the matching Rust modules in lockstep — every
+// constant, every function signature, every error code must match.
 //
 // Version history:
-// - 0.1.0 (v0.1.0 era): launch rejected non-empty args with
+// - wasi:cuda 0.1.0 (v0.1.0 era): launch rejected non-empty args with
 //   kernel-args-unsupported; the dynamic-argv path was a documented stub.
-// - 0.2.0 (v0.3.x): W1.1 typed-argv lowering landed; kernel-args-unsupported
-//   is reserved for sanity-cap rejections (>4 KiB / >128 entries) only.
-//   `launch` now accepts the tag-then-value wire format described in
-//   `crates/tensor-wasm-wasi-gpu/src/kernel_args.rs`. Wire-incompatible
-//   with 0.1.0 guests that relied on the launch-with-empty-args behavior.
+// - wasi:cuda 0.2.0 (v0.3.x): W1.1 typed-argv lowering landed;
+//   kernel-args-unsupported is reserved for sanity-cap rejections only.
+//   `launch` accepts the tag-then-value wire format. Wire-incompatible
+//   with 0.1.0 guests.
+// - wasi:tensor 0.1.0 (v0.3.7): roadmap feature #2 scaffold — WIT contract
+//   + buffered StreamingContext landed; mid-execution streaming through
+//   the axum response path scheduled for v0.4.
 
 package wasi:cuda@0.2.0;
 
@@ -76,6 +86,7 @@ interface host {
   /// Exceeding any cap returns `quota-exceeded`.
   load-ptx: func(ptx: list<u8>, entry: string) -> result<kernel-id, abi-error>;
 
+<<<<<<< HEAD
   /// Launch a previously-loaded kernel.
   ///
   /// Grid and block dimensions must be positive and obey the hardware

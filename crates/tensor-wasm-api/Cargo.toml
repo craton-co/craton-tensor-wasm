@@ -22,6 +22,13 @@ tensor-wasm-core = { workspace = true }
 tensor-wasm-exec = { workspace = true }
 base64 = "0.22"
 dashmap.workspace = true
+# futures: needed by the streaming `/invoke-stream` handler to build an
+# `impl Stream<Item = Result<Event, _>>` that axum's `Sse` wraps, and an
+# `impl Stream<Item = Result<Bytes, _>>` that `Body::from_stream` wraps
+# on the non-SSE branch. The dev-dependency line below stays so existing
+# tests that pull in `futures::future` helpers keep working without an
+# `extern crate` shim.
+futures = { workspace = true }
 hyper.workspace = true
 # ipnet: parse the `TENSOR_WASM_API_TRUSTED_XFCC_PROXIES` allowlist as a list
 # of IPv4/IPv6 IPs or CIDR ranges so the audit middleware only consults the
@@ -64,7 +71,10 @@ uuid.workspace = true
 wasmparser.workspace = true
 
 [dev-dependencies]
-futures = { workspace = true }
+# futures: now declared as a regular [dependencies] entry above for the
+# streaming `/invoke-stream` handler. The dev-dependency block keeps no
+# duplicate entry — Cargo resolves both `cfg(test)` and `cfg(not(test))`
+# code against the same crate version.
 http-body-util = "0.1"
 # `temp-env` scopes process env-var mutations to a closure and serialises
 # concurrent users behind an internal Mutex. The header-hardening tests

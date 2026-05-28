@@ -101,6 +101,7 @@ pub const DEFAULT_ROUTE_ALLOWLIST: &[&str] = &[
     "/functions/:id",
     "/functions/:id/invoke",
     "/functions/:id/invoke-async",
+    "/functions/:id/invoke-stream",
     "/jobs/:id",
     // OpenAI-compat shim (B4.9). Scaffold routes that return 501 today
     // and wire model → function translation in v0.4. See
@@ -273,6 +274,7 @@ mod tests {
             "/functions/:id",
             "/functions/:id/invoke",
             "/functions/:id/invoke-async",
+            "/functions/:id/invoke-stream",
             "/jobs/:id",
         ] {
             assert!(allow.allows(r), "default allow-list missing {r}");

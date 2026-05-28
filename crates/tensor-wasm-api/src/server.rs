@@ -23,7 +23,7 @@ use crate::middleware::{
 use crate::rate_limit::{rate_limit, RateLimitConfig, RateLimiter};
 use crate::routes::{
     create_function, delete_function, get_job, healthz, invoke_function, invoke_function_async,
-    metrics, AppState,
+    invoke_function_stream, metrics, AppState,
 };
 use crate::trace_propagation::{inject_trace_id_header, install_w3c_propagator};
 
@@ -266,6 +266,13 @@ pub fn build_router_with_trusted_proxies(
     let invoke_router = Router::new()
         .route("/functions/:id/invoke", post(invoke_function))
         .route("/functions/:id/invoke-async", post(invoke_function_async))
+        // Streaming invoke (roadmap feature #2, v0.3.7 scaffold): shares
+        // the same concurrency budget as the other invoke variants
+        // because it ultimately drives the same executor.
+        .route(
+            "/functions/:id/invoke-stream",
+            post(invoke_function_stream),
+        )
         .layer(concurrency_limit_layer(INVOKE_CONCURRENCY_LIMIT));
     let write_router = Router::new()
         .route("/functions", post(create_function))
