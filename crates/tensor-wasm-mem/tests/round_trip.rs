@@ -44,7 +44,11 @@ fn pool_disjoint_allocations() {
 
 #[test]
 fn pool_round_trip_after_reset() {
-    let pool = UnifiedMemoryPool::new(8 * 1024).unwrap();
+    // `reset` takes `&mut self` (audit T4) — the binding must be `mut` so the
+    // test can rewind the bump pointer between the allocation and remaining-
+    // capacity assertions. The allocations are dropped at the end of the
+    // inner block, so no `&self` borrow is live at the `reset` call site.
+    let mut pool = UnifiedMemoryPool::new(8 * 1024).unwrap();
     {
         let _a = pool.allocate(1024, 16).unwrap();
         let _b = pool.allocate(1024, 16).unwrap();

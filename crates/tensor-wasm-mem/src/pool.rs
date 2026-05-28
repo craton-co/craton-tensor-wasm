@@ -209,6 +209,24 @@ impl UnifiedMemoryPool {
     /// Reset the bump pointer back to zero. Safe to call only when there are
     /// no outstanding [`PoolAllocation`]s; returns an error otherwise.
     ///
+    /// # Why `&mut self` (audit T4)
+    ///
+    /// `reset` rewinds the bump pointer so the next `allocate` will hand out
+    /// byte ranges that overlap with regions previously issued. If `reset`
+    /// took `&self`, a caller could legitimately hold a `&[u8]` derived from
+    /// an earlier allocation (or a raw pointer obtained via the slab base) at
+    /// the moment of reset, and a subsequent `allocate` would alias that
+    /// borrow with freshly-issued memory — a use-after-rewind UB hazard that
+    /// is invisible to the borrow checker because the bump pointer move only
+    /// requires a shared borrow of the interior `Mutex`. Requiring `&mut
+    /// self` reflects the actual aliasing contract: no other borrow of
+    /// `self` (and therefore no live `PoolAllocation`, no `slab_ptr`-derived
+    /// raw pointer that has been turned into a slice, etc.) may coexist with
+    /// a reset. Callers holding the pool through `Arc<UnifiedMemoryPool>`
+    /// must either drop every clone but one (so `Arc::get_mut` succeeds) or
+    /// switch to a per-tenant pool — see the one-shot teardown contract
+    /// below.
+    ///
     /// # One-shot teardown contract for Wasm-backing pools
     ///
     /// Pool slabs that ever served a
@@ -225,7 +243,7 @@ impl UnifiedMemoryPool {
     /// `UnifiedMemoryPool` instance (one pool per tenant, drop the pool when
     /// the tenant departs) rather than expecting reuse-with-reset on a
     /// shared pool.
-    pub fn reset(&self) -> Result<(), UnifiedError> {
+    pub fn reset(&mut self) -> Result<(), UnifiedError> {
         let mut st = self.state.lock();
         if st.live != 0 {
             return Err(UnifiedError::Allocation(format!(
@@ -244,7 +262,28 @@ impl UnifiedMemoryPool {
     }
 
     /// Raw pointer to the start of the slab (intended for tests / FFI).
-    pub fn slab_ptr(&self) -> *const u8 {
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is only valid:
+    ///
+    /// 1. While `self` (or any borrow of it, including `Arc` keepalives) is
+    ///    alive — the slab is freed when the pool is dropped.
+    /// 2. While no `&mut self` method on the pool executes — notably
+    ///    [`Self::reset`], which rewinds the bump pointer and would let a
+    ///    subsequent [`Self::allocate`] hand out a `PoolAllocation` whose
+    ///    `&mut [u8]` aliases any slice the caller may have constructed
+    ///    from this pointer.
+    /// 3. Reads/writes through the pointer must not overlap any currently
+    ///    live [`PoolAllocation`]'s `[offset, offset + size)` byte range,
+    ///    since `PoolAllocation::as_mut_slice` proves uniqueness over that
+    ///    range and a parallel raw-pointer write would form an illegal
+    ///    `&mut` / `*mut` alias.
+    ///
+    /// The accessor is `pub(crate)` so external code cannot derive a slice
+    /// that outlives a future `reset()`; in-crate callers (tests, FFI
+    /// glue) must still satisfy the conditions above at every use site.
+    pub(crate) unsafe fn slab_ptr(&self) -> *const u8 {
         self.slab.as_ptr()
     }
 }
@@ -359,20 +398,39 @@ mod tests {
 
     #[test]
     fn reset_only_when_empty() {
-        let pool = UnifiedMemoryPool::new(256).unwrap();
+        // `reset` now takes `&mut self` (audit T4). The type system already
+        // refuses to reset while a `PoolAllocation` borrow is live — there is
+        // no longer a way to call `reset` with `&self`-derived aliases alive
+        // through ordinary safe code. But the runtime live-count guard inside
+        // `reset` still matters for the `wasm_memory::TensorWasmMemoryCreator`
+        // path that intentionally `mem::forget`s the `PoolAllocation` to keep
+        // the bump pointer monotonic across pooled Wasm instances; for that
+        // caller the borrow is gone but the live counter is sticky, so the
+        // runtime check is the last line of defence. Simulate that scenario
+        // here by forgetting an allocation to bump the live count without
+        // holding a borrow that would conflict with `&mut pool`.
+        let mut pool = UnifiedMemoryPool::new(256).unwrap();
         let a = pool.allocate(64, 1).unwrap();
+        // `mem::forget` releases the borrow without running `Drop`, so the
+        // live counter stays at 1 while `&mut pool` becomes obtainable.
+        std::mem::forget(a);
         assert!(
             pool.reset().is_err(),
-            "reset must fail while allocations live"
+            "reset must fail while the live-allocations counter is non-zero"
         );
-        drop(a);
+        // Walk the counter back down by hand (we forgot the drop guard) so
+        // we can exercise the success path. This mirrors what production
+        // callers cannot do — they leak deliberately — and is fine inside a
+        // unit test where we own the pool exclusively.
+        pool.release(0, 64);
         pool.reset().expect("reset must succeed when empty");
         assert_eq!(pool.remaining(), pool.capacity());
     }
 
     #[test]
     fn issued_total_is_sticky_across_reset() {
-        let pool = UnifiedMemoryPool::new(1024).unwrap();
+        // See `reset_only_when_empty` for why this binding is `mut`.
+        let mut pool = UnifiedMemoryPool::new(1024).unwrap();
         {
             let _a = pool.allocate(64, 1).unwrap();
             let _b = pool.allocate(64, 1).unwrap();
@@ -426,7 +484,8 @@ mod tests {
         // `UnifiedMemoryPool::allocate`.
         const SIZE: usize = 4 * 1024; // 4 KiB — large enough to detect any
                                        // off-by-one in the memset bounds.
-        let pool = UnifiedMemoryPool::new(64 * 1024).unwrap();
+        // `reset` now takes `&mut self` (audit T4); see `reset_only_when_empty`.
+        let mut pool = UnifiedMemoryPool::new(64 * 1024).unwrap();
 
         // Tenant A: poison every byte with the sentinel.
         {
