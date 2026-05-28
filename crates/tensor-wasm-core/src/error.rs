@@ -214,6 +214,40 @@ pub enum TensorWasmError {
     /// surfaced via `Debug`.
     #[error("serialization error")]
     Serialization(Box<str>),
+
+    /// A snapshot was rejected by the reader's freshness check
+    /// ([`max_age`](../tensor_wasm_snapshot/reader/struct.SnapshotReader.html#method.with_max_age)).
+    ///
+    /// Distinct from [`Self::Serialization`] so dashboards, alerts, and
+    /// audit logs can pin replay-attempt rejections separately from
+    /// generic format errors. All three fields are millisecond
+    /// timestamps (or a millisecond duration); the variant carries
+    /// enough context for an operator to triage a clock-skew false
+    /// positive without consulting any other field on the snapshot.
+    ///
+    /// Introduced in T9 alongside
+    /// [`tensor_wasm_snapshot::reader::SnapshotReader::with_max_age`].
+    /// The freshness check is **opt-in** — operators must set
+    /// `max_age` on their reader to receive this error; the default
+    /// reader continues to accept arbitrarily old snapshots for
+    /// backward compatibility with v0.3.x captures.
+    #[error(
+        "snapshot too old: created {created_unix_ms} ms, now {now_unix_ms} ms, \
+         max age {max_age_ms} ms"
+    )]
+    SnapshotTooOld {
+        /// Wall-clock time the snapshot was captured, in milliseconds
+        /// since the Unix epoch (from
+        /// `SnapshotMetadata::created_unix_ms`).
+        created_unix_ms: u64,
+        /// Reader-side wall-clock time at the moment freshness was
+        /// checked, in milliseconds since the Unix epoch.
+        now_unix_ms: u64,
+        /// Maximum age the reader was configured to accept, in
+        /// milliseconds (`max_age` as passed to
+        /// `SnapshotReader::with_max_age`).
+        max_age_ms: u64,
+    },
 }
 
 impl TensorWasmError {
@@ -274,6 +308,7 @@ impl TensorWasmError {
             TensorWasmError::TenantIsolationViolation { .. } => "tenant_isolation",
             TensorWasmError::Io(_) => "io",
             TensorWasmError::Serialization(_) => "serialization",
+            TensorWasmError::SnapshotTooOld { .. } => "snapshot_too_old",
         }
     }
 }
