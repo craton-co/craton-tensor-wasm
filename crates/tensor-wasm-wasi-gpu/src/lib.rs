@@ -20,3 +20,9 @@ pub mod async_dispatch;
 pub mod host;
 pub mod kernel_args;
 pub mod registry;
+pub mod streaming;
+
+pub use streaming::{
+    add_streaming_to_linker, HasStreaming, StreamingContext, FN_EMIT_CHUNK, FN_FLUSH,
+    MAX_CHUNK_BYTES, MAX_TOTAL_STREAM_BYTES, STREAMING_MODULE,
+};

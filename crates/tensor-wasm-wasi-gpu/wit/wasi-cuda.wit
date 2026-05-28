@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
+//
+// In-crate copy of the WIT contracts produced by this crate. Two distinct
+// packages live here:
+//
+//   * `wasi:cuda@0.2.0` — the explicit GPU kernel-launch API (matches
+//     `crates/tensor-wasm-wasi-gpu/src/abi.rs` and `host.rs`). This file is
+//     the authoritative copy; the workspace-root `wit/wasi-cuda.wit` mirrors
+//     it for tooling that consumes WIT from the workspace root.
+//
+//   * `wasi:tensor@0.1.0` — the streaming output surface (roadmap feature
+//     #2 / v0.3.7 scaffold). Used by the HTTP gateway to flush LLM-style
+//     token streams to clients as Server-Sent Events or chunked-transfer
+//     bytes. Implementation lives in `src/streaming.rs`; the actual
+//     mid-execution streaming wiring lands in v0.4.
+//
+// Keep this file and the matching Rust modules in lockstep — every
+// constant, every function signature, every error code must match.
+//
+// Version history:
+// - wasi:cuda 0.1.0 (v0.1.0 era): launch rejected non-empty args with
+//   kernel-args-unsupported; the dynamic-argv path was a documented stub.
+// - wasi:cuda 0.2.0 (v0.3.x): W1.1 typed-argv lowering landed;
+//   kernel-args-unsupported is reserved for sanity-cap rejections
+//   (>4 KiB / >128 entries) only. `launch` now accepts the tag-then-value
+//   wire format described in `crates/tensor-wasm-wasi-gpu/src/kernel_args.rs`.
+//   Wire-incompatible with 0.1.0 guests that relied on the
+//   launch-with-empty-args behavior.
+// - wasi:tensor 0.1.0 (v0.3.7): roadmap feature #2 scaffold — WIT contract
+//   + buffered StreamingContext landed; mid-execution streaming through
+//   the axum response path scheduled for v0.4.
+
+package wasi:cuda@0.2.0;
+
+interface host {
+  /// Negative i32 error codes returned by every host call. Numeric values
+  /// match `tensor_wasm_wasi_gpu::abi::AbiError`.
+  enum abi-error {
+    /// CUDA is not available on this host (no toolkit / no driver).
+    not-available,
+    /// A pointer / length pair pointed outside the caller's linear memory.
+    invalid-pointer,
+    /// Wasi-cuda was passed a kernel-id that is not registered (or that
+    /// belongs to another instance).
+    invalid-kernel,
+    /// `load-ptx` was called with bytes that ptxas rejected.
+    malformed-ptx,
+    /// The CUDA driver returned an error during a launch / sync.
+    launch-failed,
+    /// Resource limits (max kernels per instance, etc.) were exceeded.
+    quota-exceeded,
+    /// Generic internal error.
+    internal,
+    /// Launch grid / block dimensions exceeded hardware caps or were
+    /// non-positive.
+    invalid-dimensions,
+    /// Caller passed a structurally invalid argument that is neither a
+    /// memory-region issue nor a dimensions issue.
+    invalid-args,
+    /// Caller passed a well-formed, in-bounds kernel-argument buffer
+    /// that exceeds the host's sanity caps — total argv bytes greater
+    /// than `MAX_KERNEL_ARGS_BYTES` (4 KiB) or more than
+    /// `MAX_KERNEL_ARGS` (128) tagged records. The W1.1 typed-argv
+    /// lane (see `launch`) accepts arbitrary scalar + pointer argv
+    /// below these caps; this code is reserved for cap busts and is
+    /// kept distinct from `invalid-args` so guests can tell "your
+    /// input shape is too big for the host to accept" from "your
+    /// input bytes are malformed."
+    kernel-args-unsupported,
+  }
+
+  /// Opaque handle to a compiled PTX kernel. Scoped to the calling
+  /// instance — reusing a `kernel-id` across instances is rejected with
+  /// `invalid-kernel`.
+  type kernel-id = u64;
+
+  /// Compile a PTX module and return a handle.
+  ///
+  /// `ptx` is the full PTX source, `entry` is the name of the kernel
+  /// entry point symbol inside that source.
+  ///
+  /// Hard caps enforced by the host (see `tensor_wasm_wasi_gpu::abi`):
+  ///   * `MAX_PTX_BYTES` = 8 MiB per call.
+  ///   * `MAX_KERNELS_PER_INSTANCE` = 256 live kernels per instance.
+  ///   * `MAX_TOTAL_PTX_BYTES` = 64 * `MAX_PTX_BYTES` aggregate per
+  ///     instance.
+  /// Exceeding any cap returns `quota-exceeded`.
+  load-ptx: func(ptx: list<u8>, entry: string) -> result<kernel-id, abi-error>;
+
+  /// Launch a previously-loaded kernel. See the workspace-root copy of
+  /// this file for the full launch-arg / dimensions documentation; this
+  /// in-crate copy keeps the signature minimal to reduce drift surface.
+  launch: func(
+    kernel: kernel-id,
+    grid: tuple<u32, u32, u32>,
+    block: tuple<u32, u32, u32>,
+    shared-mem: u32,
+    args: list<u8>,
+  ) -> result<_, abi-error>;
+
+  /// Block until all outstanding GPU work on the calling context has
+  /// finished. On no-CUDA hosts this is a no-op.
+  sync: func() -> result<_, abi-error>;
+
+  /// Most recent error message recorded by any wasi-cuda call on this
+  /// instance, as a UTF-8 string. Empty string means no error recorded.
+  last-error: func() -> string;
+}
+
+world tensor-wasm-wasi-cuda {
+  import host;
+}

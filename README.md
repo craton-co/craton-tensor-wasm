@@ -143,6 +143,7 @@ For the complete sitemap (every Markdown doc in this repo, grouped by purpose wi
 | [docs/BUILD.md](docs/BUILD.md) | Build matrix + feature flags |
 | [crates/tensor-wasm-api/API.md](crates/tensor-wasm-api/API.md) | REST API reference |
 | [docs/CLI.md](docs/CLI.md) | CLI reference |
+| [docs/STREAMING.md](docs/STREAMING.md) | Streaming `/invoke-stream` (SSE / chunked) — roadmap feature #2 |
 | [docs/WASMTIME-FORK.md](docs/WASMTIME-FORK.md) | Why we don't fork Wasmtime |
 | [docs/WASMTIME-UPGRADE.md](docs/WASMTIME-UPGRADE.md) | Wasmtime upgrade cadence policy (W2.9) |
 

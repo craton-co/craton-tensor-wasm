@@ -238,7 +238,8 @@ impl TokenScopeView {
 /// Catalogue of state-mutating actions recognised by the audit log.
 ///
 /// Tag strings (`create_function`, `delete_function`, `invoke_function`,
-/// `invoke_function_async`) are part of the public contract.
+/// `invoke_function_async`, `invoke_function_stream`) are part of the
+/// public contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditAction {
@@ -250,6 +251,13 @@ pub enum AuditAction {
     InvokeFunction,
     /// `POST /functions/{id}/invoke-async` — fire-and-forget invocation.
     InvokeFunctionAsync,
+    /// `POST /functions/{id}/invoke-stream` — streaming invocation
+    /// (SSE / chunked-transfer). Roadmap feature #2 — see
+    /// `docs/STREAMING.md`. The audit record carries the same
+    /// `function_id` / `tenant` shape as the other invoke actions so
+    /// operators can correlate streaming and non-streaming invocations
+    /// uniformly.
+    InvokeFunctionStream,
 }
 
 impl AuditAction {
@@ -271,6 +279,9 @@ impl AuditAction {
             (&Method::POST, ["functions", _id, "invoke"]) => Some(AuditAction::InvokeFunction),
             (&Method::POST, ["functions", _id, "invoke-async"]) => {
                 Some(AuditAction::InvokeFunctionAsync)
+            }
+            (&Method::POST, ["functions", _id, "invoke-stream"]) => {
+                Some(AuditAction::InvokeFunctionStream)
             }
             _ => None,
         }
@@ -754,7 +765,8 @@ pub async fn audit_log_middleware(
 }
 
 /// Recover the function id from a `/functions/{id}` or
-/// `/functions/{id}/invoke[-async]` path, if present and a valid UUID.
+/// `/functions/{id}/invoke[-async|-stream]` path, if present and a
+/// valid UUID.
 fn parse_function_id_from_path(path: &str) -> Option<Uuid> {
     let trimmed = path.trim_start_matches('/');
     let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
@@ -849,6 +861,13 @@ mod tests {
                 "/functions/f47ac10b-58cc-4372-a567-0e02b2c3d479/invoke-async",
             ),
             Some(AuditAction::InvokeFunctionAsync),
+        );
+        assert_eq!(
+            AuditAction::classify(
+                &Method::POST,
+                "/functions/f47ac10b-58cc-4372-a567-0e02b2c3d479/invoke-stream",
+            ),
+            Some(AuditAction::InvokeFunctionStream),
         );
     }
 
