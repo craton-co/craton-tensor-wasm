@@ -71,6 +71,29 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// tokens accepted by [`bearer_auth`]. Empty / unset = dev mode pass-through.
 pub const ENV_API_TOKENS: &str = "TENSOR_WASM_API_TOKENS";
 
+/// Environment variable carrying a comma-separated allowlist of bearer
+/// tokens that are additionally permitted to call `POST /kernels` (the
+/// kernel-publish scope — see [`KernelPublishTokens`]).
+///
+/// Empty / unset = no token is permitted to publish. In that case
+/// `POST /kernels` returns `403 kernel_publish_scope_required`. The
+/// `/kernels` GET routes are unaffected — every authenticated tenant may
+/// list and resolve.
+///
+/// Each entry must be a raw bearer token string that also appears in
+/// [`ENV_API_TOKENS`] (otherwise [`bearer_auth`] would 401 the request
+/// before scope evaluation runs). Allowlisting a token here that is not
+/// in `TENSOR_WASM_API_TOKENS` is harmless — the request never reaches
+/// the scope gate — but logically nonsensical.
+///
+/// Closes the T1 security finding: previously `POST /kernels` accepted
+/// any allowlisted bearer (or any caller in dev mode), letting a
+/// tenant-1 token publish kernels that every other tenant could then
+/// resolve. The publish gate is now distinct from the API allowlist so
+/// operators can hand out tenant tokens widely while restricting
+/// publish authority to a small set of trusted clients.
+pub const ENV_KERNEL_PUBLISH_TOKENS: &str = "TENSOR_WASM_API_KERNEL_PUBLISH_TOKENS";
+
 /// Maximum byte length permitted for an inbound `Authorization` header
 /// value before [`bearer_auth`] will even attempt to parse it.
 ///
@@ -230,6 +253,87 @@ fn strip_default_port(host_lc: &str) -> Option<&str> {
 fn env_trusted_hosts_fallback() -> TrustedHosts {
     static ONCE: std::sync::OnceLock<TrustedHosts> = std::sync::OnceLock::new();
     ONCE.get_or_init(TrustedHosts::from_env).clone()
+}
+
+/// Allowlist of bearer tokens permitted to call `POST /kernels`.
+///
+/// Internally stores the [`crate::rate_limit::TokenId`] of each
+/// allowlisted bearer (the `xxhash64` digest used elsewhere for rate
+/// limiting), NOT the raw token string. Keeping `TokenId`s here means
+/// the value can flow through `axum::Extension` and tracing without
+/// risking the raw secret leaking into a span attribute or audit
+/// record, and `allows()` reduces to a hash-set lookup.
+///
+/// The list is empty by default — that is the safe posture: with no
+/// publish-scoped tokens configured, `POST /kernels` returns
+/// `403 kernel_publish_scope_required`. Dev mode (empty
+/// `TENSOR_WASM_API_TOKENS`) is even stricter: the publish handler
+/// rejects outright with `kernel_publish_disabled_in_dev_mode` to deny
+/// the unauthenticated-attacker path the security review flagged.
+///
+/// Sourced from [`ENV_KERNEL_PUBLISH_TOKENS`] at server startup; tests
+/// drive it directly via [`KernelPublishTokens::from_tokens`] so they
+/// do not poison the process environment.
+#[derive(Debug, Clone, Default)]
+pub struct KernelPublishTokens {
+    /// Stable token identifiers permitted to publish kernels. Stored as
+    /// `Arc<HashSet<...>>` so cheap clones into request extensions and
+    /// per-request reads stay allocation-free.
+    token_ids: Arc<std::collections::HashSet<crate::rate_limit::TokenId>>,
+}
+
+impl KernelPublishTokens {
+    /// Parse the allowlist from [`ENV_KERNEL_PUBLISH_TOKENS`]. Splits on
+    /// `,`, trims surrounding whitespace, drops empty entries, hashes
+    /// each remaining entry into a [`crate::rate_limit::TokenId`]. Unset
+    /// / empty env var yields the empty allowlist — every `POST
+    /// /kernels` is rejected with `kernel_publish_scope_required`.
+    pub fn from_env() -> Self {
+        let raw = std::env::var(ENV_KERNEL_PUBLISH_TOKENS).unwrap_or_default();
+        Self::from_raw(&raw)
+    }
+
+    /// Parse a comma-separated string as if it were the env variable.
+    /// Public for the explicit-construction path used by tests.
+    pub fn from_raw(raw: &str) -> Self {
+        let token_ids = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(crate::rate_limit::TokenId::from_bearer)
+            .collect();
+        Self {
+            token_ids: Arc::new(token_ids),
+        }
+    }
+
+    /// Construct from an iterator of raw bearer-token strings. Used by
+    /// integration tests that drive the publish-scope path directly.
+    pub fn from_tokens<I, S>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let token_ids = iter
+            .into_iter()
+            .map(|s| crate::rate_limit::TokenId::from_bearer(s.as_ref()))
+            .collect();
+        Self {
+            token_ids: Arc::new(token_ids),
+        }
+    }
+
+    /// `true` when no entries are configured. With an empty allowlist
+    /// the kernel-publish gate denies every `POST /kernels` — the safe
+    /// default.
+    pub fn is_empty(&self) -> bool {
+        self.token_ids.is_empty()
+    }
+
+    /// `true` when `token_id` is permitted to publish kernels.
+    pub fn allows(&self, token_id: crate::rate_limit::TokenId) -> bool {
+        self.token_ids.contains(&token_id)
+    }
 }
 
 /// Middleware: reject requests whose `Host` header (or HTTP/2

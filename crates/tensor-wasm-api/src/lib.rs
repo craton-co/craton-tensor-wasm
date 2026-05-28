@@ -96,9 +96,10 @@ pub use http_metrics::{
     UNKNOWN_ROUTE,
 };
 pub use middleware::{
-    normalize_method, sanitize_path, AuthConfig, CorsConfig, TenantConfig, TrustedHosts,
-    ENV_API_TOKENS, ENV_CORS_ALLOWED_ORIGINS, ENV_REQUIRE_TENANT, ENV_TRUSTED_HOSTS,
-    HEADER_TENANT, MAX_AUTH_HEADER_BYTES, MAX_PATH_LEN, MAX_REQUEST_BODY_BYTES,
+    normalize_method, sanitize_path, AuthConfig, CorsConfig, KernelPublishTokens, TenantConfig,
+    TrustedHosts, ENV_API_TOKENS, ENV_CORS_ALLOWED_ORIGINS, ENV_KERNEL_PUBLISH_TOKENS,
+    ENV_REQUIRE_TENANT, ENV_TRUSTED_HOSTS, HEADER_TENANT, MAX_AUTH_HEADER_BYTES, MAX_PATH_LEN,
+    MAX_REQUEST_BODY_BYTES,
 };
 pub use openai::{
     ChatCompletionsRequest, ChatMessage, CompletionsRequest, OpenAiError, OpenAiErrorBody,
@@ -109,7 +110,8 @@ pub use rate_limit::{
 pub use routes::{ApiError, AppState, FunctionRecord, JobRecord, JobStatus};
 pub use server::{
     build_router, build_router_with_audit, build_router_with_config,
-    build_router_with_full_config, build_router_with_trusted_proxies, serve,
+    build_router_with_full_config, build_router_with_kernel_publish_tokens,
+    build_router_with_trusted_proxies, serve,
 };
 pub use token_scope::{
     parse_token_entry, parse_tokens_env, ParsedTokens, ScopeParseError, TenantScope, TokenScope,
