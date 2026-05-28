@@ -85,9 +85,9 @@ pub use http_metrics::{
     UNKNOWN_ROUTE,
 };
 pub use middleware::{
-    normalize_method, sanitize_path, AuthConfig, CorsConfig, TenantConfig, ENV_API_TOKENS,
-    ENV_CORS_ALLOWED_ORIGINS, ENV_REQUIRE_TENANT, HEADER_TENANT, MAX_PATH_LEN,
-    MAX_REQUEST_BODY_BYTES,
+    normalize_method, sanitize_path, AuthConfig, CorsConfig, TenantConfig, TrustedHosts,
+    ENV_API_TOKENS, ENV_CORS_ALLOWED_ORIGINS, ENV_REQUIRE_TENANT, ENV_TRUSTED_HOSTS,
+    HEADER_TENANT, MAX_PATH_LEN, MAX_REQUEST_BODY_BYTES,
 };
 pub use rate_limit::{
     AuthContext, PerTenantRateLimitConfig, RateLimitConfig, RateLimiter, TokenId,

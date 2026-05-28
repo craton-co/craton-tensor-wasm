@@ -88,41 +88,177 @@ pub const HEADER_TENANT: &str = "X-TensorWasm-Tenant";
 /// whose `Host` is not in the allowlist with `400 Bad Request`.
 pub const ENV_TRUSTED_HOSTS: &str = "TENSOR_WASM_API_TRUSTED_HOSTS";
 
-/// Snapshot of the trusted-hosts allowlist parsed from
-/// [`ENV_TRUSTED_HOSTS`]. Empty (default) = accept any host.
-fn trusted_hosts() -> Vec<String> {
-    static ONCE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    ONCE.get_or_init(|| match std::env::var(ENV_TRUSTED_HOSTS) {
-        Ok(raw) => raw
+/// Parsed `Host` allowlist used by [`host_validate`].
+///
+/// Closes api S-30 (lack of Host validation). The previous implementation
+/// cached the parsed env value in a process-wide `OnceLock`, which made
+/// tests that wanted to vary the allowlist unable to do so (the first test
+/// to touch the cell froze it for every later test in the same process).
+///
+/// Now the allowlist travels through `axum::Extension<TrustedHosts>`:
+/// [`crate::server::build_router_with_audit`] inserts a `from_env()` value
+/// at build time; tests can override by inserting a different value into
+/// the router extensions. Tests that bypass the server builder still get
+/// the env-var fallback (cached per-process in a private `OnceLock` so the
+/// per-request cost stays zero), but an explicit extension always wins.
+///
+/// Precedence: **explicit `axum::Extension<TrustedHosts>` > env-var
+/// fallback (`TENSOR_WASM_API_TRUSTED_HOSTS`)**.
+#[derive(Debug, Clone, Default)]
+pub struct TrustedHosts(Arc<Vec<String>>);
+
+impl TrustedHosts {
+    /// Parse the allowlist from [`ENV_TRUSTED_HOSTS`]. Splits on `,`,
+    /// trims surrounding whitespace, drops empty entries, and lowercases
+    /// each remaining entry for case-insensitive matching. Unset / empty
+    /// env var yields an empty list (= [`Self::allow_all`]).
+    pub fn from_env() -> Self {
+        let raw = std::env::var(ENV_TRUSTED_HOSTS).unwrap_or_default();
+        Self::from_raw(&raw)
+    }
+
+    /// Helper: parse a comma-separated string as if it were the env
+    /// variable. Public for the explicit-construction path used by tests.
+    pub fn from_raw(raw: &str) -> Self {
+        let parsed: Vec<String> = raw
             .split(',')
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| !s.is_empty())
-            .collect(),
-        Err(_) => Vec::new(),
-    })
-    .clone()
+            .collect();
+        Self(Arc::new(parsed))
+    }
+
+    /// Explicit "no allowlist" constructor — every Host value is admitted
+    /// (the legacy default when the env var is unset).
+    pub fn allow_all() -> Self {
+        Self(Arc::new(Vec::new()))
+    }
+
+    /// Construct from an iterator of allowlist entries. Entries are
+    /// lowercased on insertion so case-insensitive matching in
+    /// [`Self::contains`] is just a byte comparison.
+    pub fn from_hosts<I, S>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let parsed: Vec<String> = iter
+            .into_iter()
+            .map(|s| s.into().trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        Self(Arc::new(parsed))
+    }
+
+    /// `true` when no entries are configured — every host is admitted.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// `true` when the supplied host (raw value from `Host:` or
+    /// `:authority`) matches one of the allowlist entries.
+    ///
+    /// Matching rules:
+    ///
+    /// * **Case-insensitive exact match** on the supplied host.
+    /// * If the supplied host carries a default-port suffix (`:80` or
+    ///   `:443`) and no allowlist entry contains a `:`, the port is
+    ///   stripped before comparison. This lets operators list bare
+    ///   hostnames (`api.example.com`) and still admit clients that
+    ///   include the default port in the `Host` header. If any
+    ///   allowlist entry contains a port, we do an exact match on the
+    ///   full `host:port` string — the operator chose to be specific.
+    pub fn contains(&self, host: &str) -> bool {
+        if self.0.is_empty() {
+            return true;
+        }
+        let host_lc = host.trim().to_ascii_lowercase();
+        if self.0.iter().any(|allowed| allowed == &host_lc) {
+            return true;
+        }
+        // Default-port strip: only apply when no allowlist entry carries
+        // a port (otherwise the operator's port-bound entry must match
+        // exactly).
+        let allow_has_port = self.0.iter().any(|a| a.contains(':'));
+        if allow_has_port {
+            return false;
+        }
+        if let Some(stripped) = strip_default_port(&host_lc) {
+            return self.0.iter().any(|allowed| allowed == stripped);
+        }
+        false
+    }
 }
 
-/// Middleware: reject requests whose `Host` header is not in the
-/// [`ENV_TRUSTED_HOSTS`] allowlist. No-op when the allowlist is empty.
+/// Strip a trailing `:80` or `:443` from a (already-lowercased) host
+/// string. Returns `None` if no default-port suffix is present.
+fn strip_default_port(host_lc: &str) -> Option<&str> {
+    for suffix in [":443", ":80"] {
+        if let Some(stripped) = host_lc.strip_suffix(suffix) {
+            return Some(stripped);
+        }
+    }
+    None
+}
+
+/// Per-process cached env-var fallback for [`host_validate`] when no
+/// `axum::Extension<TrustedHosts>` is present. Tests that drive the
+/// middleware through the server builder always get an explicit
+/// extension and never touch this; tests that bypass the builder
+/// (e.g. wrap `host_validate` with `axum::middleware::from_fn` directly)
+/// see the env value parsed once.
+fn env_trusted_hosts_fallback() -> TrustedHosts {
+    static ONCE: std::sync::OnceLock<TrustedHosts> = std::sync::OnceLock::new();
+    ONCE.get_or_init(TrustedHosts::from_env).clone()
+}
+
+/// Middleware: reject requests whose `Host` header (or HTTP/2
+/// `:authority` pseudo-header) is not in the configured allowlist.
 ///
-/// Closes api S-30. Should be layered AFTER trace/CORS (so the response is
-/// still observable) but BEFORE bearer_auth (so an attacker probing for
-/// valid hosts cannot also probe for valid tokens). The probe router
-/// inherits this gate too; operators with split-Host probes can simply
-/// omit the env var.
+/// Source of truth for the allowlist:
+///
+/// 1. `axum::Extension<TrustedHosts>` if present on the request — the
+///    server builder inserts this from
+///    [`TrustedHosts::from_env`] at startup, and tests can override.
+/// 2. Otherwise, a per-process env-var fallback parsed once from
+///    `TENSOR_WASM_API_TRUSTED_HOSTS`.
+///
+/// Empty allowlist (no entries / env unset) = pass-through.
+///
+/// Host extraction order:
+///
+/// 1. `Host:` request header.
+/// 2. If absent, `req.uri().authority()` — the URI carries the HTTP/2
+///    `:authority` pseudo-header in `hyper`'s normalised request form.
+/// 3. If both absent and the allowlist is non-empty, respond `400`.
+///
+/// Closes api S-30. Should be layered AFTER trace/CORS (so the response
+/// is still observable) but BEFORE bearer_auth (so an attacker probing
+/// for valid hosts cannot also probe for valid tokens). The probe
+/// router inherits this gate too; operators with split-Host probes can
+/// simply omit the env var.
 pub async fn host_validate(req: Request, next: Next) -> Response {
-    let allow = trusted_hosts();
+    let allow = req
+        .extensions()
+        .get::<TrustedHosts>()
+        .cloned()
+        .unwrap_or_else(env_trusted_hosts_fallback);
     if allow.is_empty() {
         return next.run(req).await;
     }
-    let host = req
+    // 1) Try the `Host:` header first (HTTP/1.1 canonical path).
+    let host_header = req
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_ascii_lowercase());
+        .map(|s| s.to_owned());
+    // 2) Fall back to the URI authority (HTTP/2 `:authority` pseudo-header
+    //    surfaces here in hyper's normalised request form).
+    let authority = req.uri().authority().map(|a| a.as_str().to_owned());
+    let host = host_header.or(authority);
+
     match host {
-        Some(h) if allow.iter().any(|allowed| allowed == &h) => next.run(req).await,
+        Some(h) if allow.contains(&h) => next.run(req).await,
         _ => envelope(
             StatusCode::BAD_REQUEST,
             "bad_request",
