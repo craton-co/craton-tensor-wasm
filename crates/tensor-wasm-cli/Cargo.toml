@@ -19,7 +19,7 @@ name = "tensor-wasm"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "fs", "io-util"] }
 clap.workspace = true
 clap_complete.workspace = true
 clap_mangen = "0.2"
@@ -47,9 +47,19 @@ futures.workspace = true
 # rename it atomically onto `--output`. Promoted from dev-only because
 # the streaming fix needs it in the production path.
 tempfile.workspace = true
+# `tokio-util`'s `ReaderStream` wraps a `tokio::fs::File` into a chunked
+# `Stream<Item = Result<Bytes, _>>` so `snapshot restore` and (future)
+# upload paths can feed `reqwest::Body::wrap_stream` instead of buffering
+# whole archives in RAM (cli fix 1: streaming restore body).
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 wat.workspace = true
 assert_cmd = "2"
 predicates = "3"
 insta = "=1.42"
+# `temp-env` scopes env-var mutations to a closure so tests don't rely on
+# the bare `std::env::set_var` API, which is `unsafe` in Rust 2024 and not
+# safe under parallel test execution. Used by the `cmd::tests` env-var
+# tests in `src/cmd/mod.rs`.
+temp-env.workspace = true

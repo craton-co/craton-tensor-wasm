@@ -394,8 +394,21 @@ async fn restore(
         refuse_hmac_key_on_plaintext(server)?;
     }
 
-    let bytes = std::fs::read(input)
-        .with_context(|| format!("reading snapshot file {}", input.display()))?;
+    // cli fix 1: stream the archive off disk rather than slurping the entire
+    // file (capped at 256 MiB) into a `Vec<u8>` before handing it to reqwest.
+    // The previous `std::fs::read(input)` path peaked at ~256 MiB resident
+    // for the buffer plus whatever reqwest's body machinery allocated on top;
+    // the streaming `ReaderStream + Body::wrap_stream` shape keeps the
+    // working set bounded to ~one tokio file-read chunk regardless of
+    // archive size. The matching `Content-Length` header is set explicitly
+    // from the stat we already did above so the server sees a length-prefix
+    // and can pre-size its receive buffer (otherwise reqwest falls back to
+    // chunked transfer encoding when the body has no known length).
+    let file = tokio::fs::File::open(input)
+        .await
+        .with_context(|| format!("opening snapshot file {}", input.display()))?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = reqwest::Body::wrap_stream(stream);
 
     let url = format!("{}/instances/restore", super::server_base(server));
     let client = ctx.build_client(Duration::from_secs(120))?;
@@ -403,6 +416,11 @@ async fn restore(
     let mut req = client
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        // `meta.len()` is u64; `HeaderValue` impls `TryFrom<u64>` but
+        // formatting to a decimal string here avoids any ambiguity over
+        // whichever reqwest version is resolved and is what every other
+        // HTTP client does on the wire anyway.
+        .header(reqwest::header::CONTENT_LENGTH, meta.len().to_string())
         .header("X-TensorWasm-As-Instance", as_instance);
     if let Some(hex_key) = &hmac_key_hex {
         req = req.header(HMAC_KEY_HEADER, hex_key);
@@ -411,7 +429,7 @@ async fn restore(
         req = req.header(REQUIRE_SIGNATURE_HEADER, "true");
     }
     let resp = ctx
-        .apply(req.body(bytes))
+        .apply(req.body(body))
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
