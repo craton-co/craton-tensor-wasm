@@ -94,8 +94,9 @@ encoded on the wire* — the entire zstd frame).
 |   )                                                      |
 | )                                                        |  <- end of zstd frame
 +----------------------------------------------------------+
-| signature_kind: u8 = SIGNATURE_KIND_HMAC_SHA256 (= 1)    |
-| signature:      [u8; 32]  -- HMAC-SHA256 output          |
+| trailer_magic:  [u8; 4] = V3_TRAILER_MAGIC = b"S3T1"     |
+| signature_kind: u8      = SIGNATURE_KIND_HMAC_SHA256 (1) |
+| signature:      [u8; 32] -- HMAC-SHA256 output           |
 +----------------------------------------------------------+
 ```
 
@@ -107,25 +108,51 @@ that:
    trailer cleanly — there is no "garbage at end of frame" error path.
 2. The reader can detect the trailer's location with a single cheap
    constant-offset read: a v3 blob is classified by checking that
-   `input[input.len() - SIGNATURE_TRAILER_LEN] == SIGNATURE_KIND_HMAC_SHA256`.
-   This lets the reader **authenticate before decoding** — HMAC verifies
-   the compressed prefix before any zstd or bincode work runs on it. No
-   length prefix is needed; the trailer is fixed-length (33 bytes today)
-   and the `SignatureKind` discriminant is forward-compatible.
+   `input[input.len() - SIGNATURE_TRAILER_LEN..input.len() - SIGNATURE_TRAILER_LEN + 4]
+   == V3_TRAILER_MAGIC`. This lets the reader **authenticate before
+   decoding** — HMAC verifies the compressed prefix before any zstd or
+   bincode work runs on it. No length prefix is needed; the trailer is
+   fixed-length (37 bytes today: 4-byte magic + 1-byte kind + 32-byte
+   signature) and the `SignatureKind` discriminant is forward-compatible.
+
+#### T8 — magic-prefix detector (BREAKING)
+
+Prior to T8 the v3 detector was a **single-byte** sniff:
+`input[input.len() - 33] == SIGNATURE_KIND_HMAC_SHA256` (i.e. `== 1`).
+Because that byte sat inside the zstd frame epilogue of a legitimate v2
+blob with ~1/256 probability, a v2 capture could be misclassified as v3
+and then rejected by the HMAC check. The mis-classified blob never
+parsed — but the downgrade-shaped error message and the wasted HMAC
+work were both observable side channels. T8 prepends a 4-byte
+`V3_TRAILER_MAGIC` (`b"S3T1"`, "Snapshot 3 Trailer v1") to the trailer
+and uses *that* as the classifier, shrinking the false-positive rate to
+~1/2^32. The `SNAPSHOT_VERSION_V3` revision number is **not** bumped —
+the magic prefix is itself the discriminator and the inner bincode
+payload is byte-identical to the pre-T8 v3 shape.
+
+The new trailer layout is **not** backward-compatible with v3 blobs
+produced by pre-T8 writers (whose 33-byte trailer lacks the magic
+prefix and so fails the classifier). Operators with archived pre-T8 v3
+captures must re-sign them with a current writer; v2 snapshots are
+unaffected.
 
 ### HMAC inputs
 
 ```
-HMAC-SHA256(key, prefix_bytes)
+HMAC-SHA256(key, prefix_bytes || V3_TRAILER_MAGIC || [signature_kind])
 ```
 
 where `prefix_bytes` is `input[..input.len() - SIGNATURE_TRAILER_LEN]` —
 i.e. the complete v2-shaped envelope, magic and version and CRC32
-included, every byte the zstd decoder would later see. Because every
-byte of the v2 envelope is authenticated, an attacker cannot strip the
-trailer and re-encode the payload as v2 without the reader noticing
-(provided the operator has called `SnapshotReader::require_signature` to
-refuse the unsigned envelope).
+included, every byte the zstd decoder would later see. The HMAC input
+also covers the 4-byte `V3_TRAILER_MAGIC` and the 1-byte
+`signature_kind` discriminant so that an attacker who rewrites the
+trailer header (e.g. to disguise the blob or to substitute a future
+signature kind) is caught at verification time. Because every byte of
+the v2 envelope and the trailer header is authenticated, an attacker
+cannot strip the trailer and re-encode the payload as v2 without the
+reader noticing (provided the operator has called
+`SnapshotReader::require_signature` to refuse the unsigned envelope).
 
 ### Validation order
 
@@ -187,9 +214,11 @@ plan.
 |----------|-------|------------|
 | `SNAPSHOT_VERSION_V2` | `2` | `format.rs` |
 | `SNAPSHOT_VERSION_V3` | `3` | `format.rs` |
+| `V3_TRAILER_MAGIC` | `b"S3T1"` (4 bytes) | `format.rs` |
+| `V3_TRAILER_MAGIC_LEN` | `4` | `format.rs` |
 | `SIGNATURE_KIND_HMAC_SHA256` | `1` | `format.rs` |
 | `HMAC_SHA256_SIG_LEN` | `32` | `format.rs` |
-| `SIGNATURE_TRAILER_LEN` | `33` (= `1 + HMAC_SHA256_SIG_LEN`) | `format.rs` |
+| `SIGNATURE_TRAILER_LEN` | `37` (= `V3_TRAILER_MAGIC_LEN + 1 + HMAC_SHA256_SIG_LEN`) | `format.rs` |
 
 ## Platform
 
@@ -204,7 +233,7 @@ documents.
 |--------------------|---------|-----------------|
 | `1` | Initial release. Fields: `magic`, `version`, `wasm_memory`, `gpu_memory`, `registers`, `metadata`. No `crc32`, no enforced size caps. | Itself only. |
 | `2` *(current writer default)* | Added `Snapshot::crc32` (computed as described above). Added the `limits` size caps and reader enforcement. Switched byte blobs to `serde_bytes` for zero-copy write — wire-identical to the prior `Vec<u8>` encoding. | Itself, and v3 readers (which accept both). |
-| `3` | Adds an HMAC-SHA256 trailer after the zstd frame (`[signature_kind: u8][32-byte signature]`). The inner `version` field is `3`; the inner bincode payload is otherwise identical to v2. The HMAC covers the full v2-shaped prefix. Produced by writers that have had `SnapshotWriter::with_hmac_sha256_key` called; refused by readers without an HMAC key. | Itself only. v2 readers (pre-v0.3.6) refuse v3 because the `version` field is unknown to them. |
+| `3` | Adds an HMAC-SHA256 trailer after the zstd frame (`[V3_TRAILER_MAGIC: 4][signature_kind: u8][32-byte signature]` = 37 bytes; pre-T8 = `[signature_kind: u8][32-byte signature]` = 33 bytes, see T8 note below). The inner `version` field is `3`; the inner bincode payload is otherwise identical to v2. The HMAC covers the full v2-shaped prefix concatenated with the trailer magic and the kind byte. Produced by writers that have had `SnapshotWriter::with_hmac_sha256_key` called; refused by readers without an HMAC key. **T8 (BREAKING):** the trailer was bumped from 33 to 37 bytes by prepending `V3_TRAILER_MAGIC` (`b"S3T1"`) to replace the ~1/256 false-positive single-byte trailer sniff with a ~1/2^32 magic-prefix check. The `SNAPSHOT_VERSION_V3` number is unchanged; the magic prefix is itself the discriminator. Pre-T8 v3 captures no longer parse and must be re-signed with a current writer. | Itself only (post-T8 trailer shape). v2 readers (pre-v0.3.6) refuse v3 because the `version` field is unknown to them. |
 
 A `version` mismatch (anything other than `2` or `3`) is a hard error;
 the reader does not attempt to migrate older snapshots in place. Re-

@@ -24,7 +24,9 @@ use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::types::{InstanceId, TenantId};
 use tensor_wasm_snapshot::reader::SnapshotReader;
 use tensor_wasm_snapshot::writer::{InstanceState, SnapshotWriter, DEFAULT_ZSTD_LEVEL};
-use tensor_wasm_snapshot::{SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN};
+use tensor_wasm_snapshot::{
+    SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN,
+};
 
 const KEY: [u8; 32] = [0x9Cu8; 32];
 
@@ -72,18 +74,24 @@ fn two_concatenated_zstd_frames_under_valid_hmac_are_rejected() {
 
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&KEY).expect("HMAC init");
     mac.update(&concatenated_prefix);
+    // T8: writer mixes V3_TRAILER_MAGIC into the HMAC input. The forgery
+    // must match that ordering so the HMAC gate accepts.
+    mac.update(&V3_TRAILER_MAGIC);
     mac.update(&[SIGNATURE_KIND_HMAC_SHA256]);
     let sig = mac.finalize().into_bytes();
 
     let mut forged_blob = concatenated_prefix;
+    forged_blob.extend_from_slice(&V3_TRAILER_MAGIC);
     forged_blob.push(SIGNATURE_KIND_HMAC_SHA256);
     forged_blob.extend_from_slice(sig.as_slice());
 
-    // Sanity: the discriminator at the trailer position still classifies
-    // the blob as v3 (otherwise we would not reach the single-frame guard).
+    // Sanity: the 4-byte trailer magic at the trailer position still
+    // classifies the blob as v3 (otherwise we would not reach the
+    // single-frame guard).
+    let trailer_start = forged_blob.len() - SIGNATURE_TRAILER_LEN;
     assert_eq!(
-        forged_blob[forged_blob.len() - SIGNATURE_TRAILER_LEN],
-        SIGNATURE_KIND_HMAC_SHA256,
+        &forged_blob[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN],
+        &V3_TRAILER_MAGIC,
     );
 
     let err = SnapshotReader::new()
@@ -126,14 +134,12 @@ fn two_concatenated_zstd_frames_as_v2_are_rejected() {
         })
         .expect("capture v2");
 
-    // Append a second valid zstd frame. The trailing byte of the second
-    // frame must NOT equal `SIGNATURE_KIND_HMAC_SHA256` at the trailer
-    // offset, otherwise the reader misclassifies the blob as v3. We pick
-    // a payload that, after zstd framing, lands a non-`0x01` byte at the
-    // (len - SIGNATURE_TRAILER_LEN) offset. If the harvested byte happens
-    // to equal 1, we fall back to the v3 rejection assertion — the
-    // single-frame guard fires either way and the test still pins the
-    // contract.
+    // Append a second valid zstd frame. Under T8 the v3 detector keys
+    // off the 4-byte V3_TRAILER_MAGIC at offset `len - SIGNATURE_TRAILER_LEN`,
+    // so the probability of a false-positive v3 classification on a
+    // random byte sequence is ~1/2^32 (vanishing). We still compute the
+    // classification dynamically and branch on the diagnostic — both
+    // outcomes prove the reader refuses the concatenated shape.
     let second_payload = b"a totally distinct payload that lives in frame two";
     let second_frame = zstd::encode_all(&second_payload[..], DEFAULT_ZSTD_LEVEL)
         .expect("zstd encode second frame");
@@ -142,8 +148,10 @@ fn two_concatenated_zstd_frames_as_v2_are_rejected() {
     glued.extend_from_slice(&real_blob);
     glued.extend_from_slice(&second_frame);
 
-    let classified_as_v3 = glued.len() >= SIGNATURE_TRAILER_LEN
-        && glued[glued.len() - SIGNATURE_TRAILER_LEN] == SIGNATURE_KIND_HMAC_SHA256;
+    let classified_as_v3 = glued.len() >= SIGNATURE_TRAILER_LEN && {
+        let trailer_start = glued.len() - SIGNATURE_TRAILER_LEN;
+        &glued[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN] == &V3_TRAILER_MAGIC
+    };
 
     let err = SnapshotReader::new()
         .restore(&glued)

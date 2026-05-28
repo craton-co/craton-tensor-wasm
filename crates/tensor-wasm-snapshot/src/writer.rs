@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
 #[cfg(feature = "signed-snapshots")]
-use crate::format::{SIGNATURE_KIND_HMAC_SHA256, SNAPSHOT_VERSION_V3};
+use crate::format::{SIGNATURE_KIND_HMAC_SHA256, SNAPSHOT_VERSION_V3, V3_TRAILER_MAGIC};
 #[cfg(feature = "artifact-backing")]
 use crate::format::SNAPSHOT_VERSION_V2;
 #[cfg(feature = "signed-snapshots")]
@@ -541,11 +541,21 @@ impl SnapshotWriter {
             .finish()
             .map_err(|e| TensorWasmError::Serialization(format!("zstd finish: {e}").into()))?;
 
-        // v3: append [signature_kind = 1][HMAC-SHA256(key, compressed_prefix)].
-        // The HMAC covers the entire v2-shaped prefix (i.e. every byte written
-        // so far, which transitively covers magic, version, payload, and CRC32
-        // because they are all encoded inside the bincode/zstd frame). The
-        // key never leaves this scope and is never written to the trace span.
+        // v3: append [magic = V3_TRAILER_MAGIC][signature_kind = 1]
+        // [HMAC-SHA256(key, compressed_prefix || magic || kind)].
+        // The HMAC covers the entire v2-shaped prefix (i.e. every byte
+        // written so far, which transitively covers magic, version, payload,
+        // and CRC32 because they are all encoded inside the bincode/zstd
+        // frame) **plus** the new 4-byte trailer magic and the
+        // signature-kind discriminant. Including the trailer magic in the
+        // HMAC input means an attacker cannot rewrite the magic bytes to
+        // disguise a v3 blob as something else without invalidating the
+        // signature. The key never leaves this scope and is never written
+        // to the trace span.
+        //
+        // T8 (this commit) bumps the trailer from `[kind][sig]` (33 bytes)
+        // to `[magic][kind][sig]` (37 bytes). The change is BREAKING for
+        // any v3 blob produced by a pre-T8 writer.
         #[cfg(feature = "signed-snapshots")]
         if let Some(ref key) = self.hmac_key {
             use hmac::{Hmac, Mac};
@@ -562,6 +572,12 @@ impl SnapshotWriter {
                 TensorWasmError::Serialization("HMAC init failed".into())
             })?;
             mac.update(&compressed);
+            // T8: authenticate the trailer magic too. A reader that observes
+            // `V3_TRAILER_MAGIC` and then verifies HMAC must see the same
+            // bytes the writer signed, otherwise a magic-rewrite would
+            // become a downgrade primitive once a future trailer revision
+            // exists.
+            mac.update(&V3_TRAILER_MAGIC);
             // snapshot 1.1: include the signature-kind discriminant byte in
             // the HMAC input so a future second variant (e.g. Ed25519)
             // cannot be substituted via trailer rewrite — that would
@@ -572,7 +588,11 @@ impl SnapshotWriter {
             // the same commit).
             mac.update(&[SIGNATURE_KIND_HMAC_SHA256]);
             let sig = mac.finalize().into_bytes();
-            compressed.reserve(1 + sig.len());
+            // Reserve once for the full trailer (magic + kind + signature)
+            // so the trailing extend never reallocates and the writer's
+            // peak memory footprint is unchanged from pre-T8.
+            compressed.reserve(V3_TRAILER_MAGIC.len() + 1 + sig.len());
+            compressed.extend_from_slice(&V3_TRAILER_MAGIC);
             compressed.push(SIGNATURE_KIND_HMAC_SHA256);
             compressed.extend_from_slice(sig.as_slice());
         }
@@ -823,11 +843,18 @@ mod tests {
             })
             .expect("capture");
 
-        // Trailer is exactly 33 bytes: `[1][32-byte sig]`.
+        // T8: trailer is now `[magic: 4][kind: 1][sig: 32]` = 37 bytes.
+        // The magic sits at `len - SIGNATURE_TRAILER_LEN` and the kind
+        // byte sits at `len - SIGNATURE_TRAILER_LEN + V3_TRAILER_MAGIC_LEN`.
         assert!(bytes.len() >= crate::format::SIGNATURE_TRAILER_LEN + 4);
+        let trailer_start = bytes.len() - crate::format::SIGNATURE_TRAILER_LEN;
         assert_eq!(
-            bytes[bytes.len() - crate::format::SIGNATURE_TRAILER_LEN],
-            crate::format::SIGNATURE_KIND_HMAC_SHA256
+            &bytes[trailer_start..trailer_start + crate::format::V3_TRAILER_MAGIC_LEN],
+            &crate::format::V3_TRAILER_MAGIC,
+        );
+        assert_eq!(
+            bytes[trailer_start + crate::format::V3_TRAILER_MAGIC_LEN],
+            crate::format::SIGNATURE_KIND_HMAC_SHA256,
         );
 
         // Decompress just the prefix to confirm the inner version reads as v3.

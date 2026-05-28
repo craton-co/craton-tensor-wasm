@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security (BREAKING)
-- `tensor-wasm-jit`: kernel registry signing envelope bumped to v2.
+- `tensor-wasm-jit` (T12): kernel registry signing envelope bumped to v2.
   The v0.3.7 (v1) envelope concatenated `name || 0x00 || version
   || 0x00 || sm_le || digest`, which (a) left `publisher` and
   `published_unix_ms` outside the HMAC — anyone with publish
@@ -21,6 +21,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under the v1 envelope must be re-signed — they will fail
   verification under v2.** See
   [`crates/tensor-wasm-jit/src/registry.rs`](crates/tensor-wasm-jit/src/registry.rs).
+- `tensor-wasm-snapshot` (T8): replace the v3 trailer single-byte
+  sniff with a 4-byte magic prefix (`V3_TRAILER_MAGIC = b"S3T1"`).
+  Pre-T8 the reader classified a blob as v3 by checking
+  `bytes[len - 33] == 0x01`; because that byte sits inside the zstd
+  frame epilogue of a legitimate v2 blob with ~1/256 probability, v2
+  captures could be misclassified as v3 and rejected by the HMAC path
+  (a downgrade-shaped error and observable side channel). The new
+  detector requires a 4-byte magic at `bytes[len - 37..len - 33]`,
+  shrinking the false-positive rate to ~1/2^32. **BREAKING** for any
+  v3 snapshot written by a pre-T8 writer: the trailer grew from 33
+  bytes (`[kind][sig]`) to 37 bytes (`[magic][kind][sig]`) and the
+  HMAC input now also covers the trailer magic, so archived pre-T8
+  v3 captures will not parse and must be re-signed with a current
+  writer. v2 snapshots are unaffected; their wire format is
+  unchanged. The `SNAPSHOT_VERSION_V3` revision number is **not**
+  bumped — the magic prefix is itself the discriminator and the
+  inner bincode payload is byte-identical to the pre-T8 v3 shape.
+  See `crates/tensor-wasm-snapshot/FORMAT.md` § "T8 — magic-prefix
+  detector (BREAKING)".
 
 ### Roadmap
 - 13 new strategic feature directions added under docs/PATH-TO-V1.md#post-v036-strategic-features; tracked in ACTIONABLE-ITEMS-PENDING.md.
