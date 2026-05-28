@@ -17,8 +17,8 @@ use crate::middleware::{
     bearer_auth, body_limit_layer, concurrency_limit_layer, cors_layer, host_validate,
     tenant_scope, INVOKE_CONCURRENCY_LIMIT, PROBE_CONCURRENCY_LIMIT, READ_CONCURRENCY_LIMIT,
     WRITE_CONCURRENCY_LIMIT,
-    timeout_layer, trace_layer_with_propagation, AuthConfig, CorsConfig, TenantConfig,
-    TrustedHosts, MAX_REQUEST_BODY_BYTES,
+    timeout_layer, trace_layer_with_propagation, AuthConfig, CorsConfig, KernelPublishTokens,
+    TenantConfig, TrustedHosts, MAX_REQUEST_BODY_BYTES,
 };
 use crate::rate_limit::{rate_limit, RateLimitConfig, RateLimiter};
 use crate::routes::{
@@ -148,6 +148,72 @@ pub fn build_router_with_trusted_proxies(
     cors: CorsConfig,
     trusted_proxies: TrustedProxies,
 ) -> Router {
+    // Defer to the kernel-publish-tokens variant, reading the
+    // production default from the env. Existing callers that pre-date
+    // the kernel-publish gate keep their call site untouched.
+    build_router_full(
+        state,
+        auth,
+        tenant,
+        limiter,
+        audit,
+        cors,
+        trusted_proxies,
+        KernelPublishTokens::from_env(),
+    )
+}
+
+/// Build the router with every override exposed, including the explicit
+/// [`KernelPublishTokens`] allowlist for `POST /kernels`.
+///
+/// This is the lowest-level public builder. Integration tests use it to
+/// exercise the kernel-publish authorization gate without poisoning the
+/// process environment via `TENSOR_WASM_API_KERNEL_PUBLISH_TOKENS`.
+/// Production code reaches it transitively from
+/// [`build_router_with_trusted_proxies`], which reads
+/// [`KernelPublishTokens::from_env`] internally.
+///
+/// All other parameters behave identically to
+/// [`build_router_with_trusted_proxies`].
+pub fn build_router_with_kernel_publish_tokens(
+    state: Arc<AppState>,
+    auth: AuthConfig,
+    tenant: TenantConfig,
+    limiter: RateLimiter,
+    audit: AuditConfig,
+    cors: CorsConfig,
+    trusted_proxies: TrustedProxies,
+    kernel_publish_tokens: KernelPublishTokens,
+) -> Router {
+    build_router_full(
+        state,
+        auth,
+        tenant,
+        limiter,
+        audit,
+        cors,
+        trusted_proxies,
+        kernel_publish_tokens,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_router_full(
+    state: Arc<AppState>,
+    auth: AuthConfig,
+    tenant: TenantConfig,
+    limiter: RateLimiter,
+    audit: AuditConfig,
+    cors: CorsConfig,
+    trusted_proxies: TrustedProxies,
+    kernel_publish_tokens: KernelPublishTokens,
+) -> Router {
+    // When `kernel-registry-api` is OFF the kernel router below is not
+    // built, so the parameter is unused on that build axis. Drop it
+    // explicitly under cfg-off to silence the unused-variables lint
+    // without poking holes in attribute placement.
+    #[cfg(not(feature = "kernel-registry-api"))]
+    let _ = kernel_publish_tokens;
     // Wire the W3C Trace Context propagator globally. Idempotent across
     // calls; safe to invoke on every router rebuild (tests do that
     // routinely). Without this, the tower `trace_layer_with_propagation`
@@ -343,13 +409,38 @@ pub fn build_router_with_trusted_proxies(
 
     // Kernel registry routes (B6.4 — roadmap feature #3 server-side).
     // The endpoints are write-class (publish) and read-class (list /
-    // resolve), so we put them behind the same `WRITE_CONCURRENCY_LIMIT`
-    // budget the function-mutating endpoints use. Bearer auth still
-    // applies; tenant resolution does NOT because the kernel registry
-    // is operator-scope (one HMAC key across the deployment), not
-    // tenant-scope. Mounted alongside the openai router for the same
-    // reason: it would otherwise trip `tenant_scope`'s `missing_tenant`
-    // 400 on operator deploys without `X-TensorWasm-Tenant`.
+    // resolve); we put them behind the same `WRITE_CONCURRENCY_LIMIT`
+    // budget the function-mutating endpoints use.
+    //
+    // **T1 security fix.** Earlier scaffolding mounted these OUTSIDE
+    // `tenant_scope` on the rationale that the kernel registry is
+    // operator-scope (one HMAC key per deployment). That rationale was
+    // wrong for two reasons: (1) the `publish_kernel` handler took the
+    // tenant extension as `Option<...>` and ignored it, so any
+    // allowlisted token — including a tenant-1 token, or any caller at
+    // all in dev mode — could publish; (2) the documented
+    // `kernel-publish` scope check was unimplemented. Both holes are
+    // now closed:
+    //
+    //   * The router sits under `bearer_auth` + `tenant_scope` so the
+    //     handler can rely on the tenant being established and on the
+    //     caller having cleared the API token allowlist.
+    //   * An `axum::Extension<KernelPublishTokens>` carries the parsed
+    //     `TENSOR_WASM_API_KERNEL_PUBLISH_TOKENS` allowlist into the
+    //     handler. `publish_kernel` rejects dev-mode calls outright
+    //     (`kernel_publish_disabled_in_dev_mode`) and any non-
+    //     publish-scoped token with `kernel_publish_scope_required`.
+    //     GET routes admit any authenticated tenant.
+    //
+    // Inserting the publish-tokens extension at the kernel router level
+    // (rather than `common_layers`) keeps the surface tight — every
+    // other route is oblivious to it. The list value flows in via the
+    // `kernel_publish_tokens` parameter so tests can call
+    // [`build_router_with_kernel_publish_tokens`] with an explicit
+    // allowlist (no env poisoning); production callers reach
+    // [`build_router_with_trusted_proxies`], which fills the parameter
+    // from `TENSOR_WASM_API_KERNEL_PUBLISH_TOKENS` via
+    // [`KernelPublishTokens::from_env`].
     //
     // The routes are gated behind the `kernel-registry-api` feature so
     // the default build keeps the dep graph lean. Operators flip
@@ -368,10 +459,25 @@ pub fn build_router_with_trusted_proxies(
             "/kernels/:name/:version",
             get(crate::kernels::resolve_kernel),
         )
-        .layer(concurrency_limit_layer(WRITE_CONCURRENCY_LIMIT))
+        // Layer ordering mirrors the protected_router stack (which the
+        // `rate_limit_runs_after_bearer_auth` integration test pins as
+        // first `.layer(...)` = outermost in axum's `Router::layer`).
+        // bearer_auth runs first so the AuthContext is in the request
+        // extensions for the rest of the stack; tenant_scope then
+        // installs the TenantId. The KernelPublishTokens extension and
+        // the concurrency limit are layered last (inner-most) so they
+        // sit just above the handler — the publish-scope check reads
+        // KernelPublishTokens directly via `Extension<...>` in the
+        // handler signature, so the layer that installs it must run
+        // BEFORE the handler but AFTER any layer that might short-
+        // circuit (auth / rate-limit) — which is exactly where putting
+        // it innermost lands.
         .layer(axum::middleware::from_fn(bearer_auth))
+        .layer(axum::middleware::from_fn(tenant_scope))
         .layer(axum::middleware::from_fn(rate_limit))
-        .layer(axum::middleware::from_fn(audit_log_middleware));
+        .layer(axum::middleware::from_fn(audit_log_middleware))
+        .layer(axum::Extension(kernel_publish_tokens))
+        .layer(concurrency_limit_layer(WRITE_CONCURRENCY_LIMIT));
 
     let router = protected_router
         .merge(probe_router)
