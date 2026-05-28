@@ -98,6 +98,13 @@ cuda-oxide-backend = ["dep:pliron"]
 # (W4.x's CI image will satisfy this; the default workstation build will
 # not).
 pliron-llvm-backend = ["cuda-oxide-backend", "dep:pliron-llvm"]
+# differential-oracle gates the `differential` module — the roadmap
+# feature #6 ("differential JIT correctness oracle") scaffold. v0.3.6
+# only compiles the harness types; the v0.4 wiring against the
+# self-hosted CUDA runner brings the real two-path runner. See
+# `docs/DIFFERENTIAL-ORACLE.md` for the implementation plan and the
+# Post-v0.3.6 strategic features section in `docs/PATH-TO-V1.md`.
+differential-oracle = []
 
 [package.metadata.docs.rs]
 all-features = true

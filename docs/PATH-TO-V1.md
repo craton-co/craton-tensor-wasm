@@ -18,9 +18,10 @@ together define the bar.
 4. [The five-milestone path](#the-five-milestone-path)
 5. [Per-area workstreams](#per-area-workstreams)
 6. [Open decisions to resolve before v1.0](#open-decisions-to-resolve-before-v10)
-7. [Risk register](#risk-register)
-8. [Effort and timeline (caveated)](#effort-and-timeline-caveated)
-9. [Out of scope — deferred to v2.0](#out-of-scope--deferred-to-v20)
+7. [Post-v0.3.6 strategic features](#post-v036-strategic-features)
+8. [Risk register](#risk-register)
+9. [Effort and timeline (caveated)](#effort-and-timeline-caveated)
+10. [Out of scope — deferred to v2.0](#out-of-scope--deferred-to-v20)
 
 ---
 
@@ -404,6 +405,46 @@ Quarterly nightly bumps proposed, aligned with Wasmtime releases.
 Decision: how do we communicate breaking nightly changes to users?
 Proposed: every nightly bump is a minor-version bump for v0.x; for
 v1.x, nightly bumps that don't break user code are patch releases.
+
+---
+
+## Post-v0.3.6 strategic features
+
+These are scoped items the v0.3.6 → v0.5 window opens up. None of them
+block v0.5-beta exit on their own, but each closes a specific
+"audit-bait" objection the external auditor is likely to raise. Items
+are listed in expected scaffold-land order; the cross-link points at
+the in-tree spec doc where the scaffold landed first.
+
+1. **Kernel ABI freeze + versioning policy** — stable `.ptxbin`
+   container with explicit ABI version byte; covered by the cache
+   integrity tests today, formalised post-v0.3.6.
+2. **Snapshot replay-protection cross-version matrix** — v0.3.6
+   landed the per-snapshot nonce + tenant-scoped epoch fields. v0.4
+   adds the end-to-end matrix that exercises the policy across
+   N-1 / N / N+1 minor versions.
+3. **Tenant-quota fairness model formalisation** — the back-pressure
+   semaphore is the current implementation; the formalised model
+   (proportional-share or weighted fair queueing) lands as an RFC.
+4. **MPS production-readiness checklist** — the feature flag exists;
+   the checklist that says "ship MPS as default at v1.0 or stay
+   behind the flag" lands here.
+5. **WASI-GPU surface lock** — freeze the host-fn signatures so
+   third-party guests can ship against v0.5-beta without breakage.
+6. **Differential JIT correctness oracle** — runs every
+   `auto_offload` candidate on both the Wasmtime CPU interpreter and
+   the JIT PTX path and asserts bit-identity. Lowest-cost,
+   highest-credibility security item on the v0.5 pre-audit
+   checklist. Scaffold lives in
+   [`crates/tensor-wasm-jit/src/differential.rs`](../crates/tensor-wasm-jit/src/differential.rs);
+   spec doc at [`docs/DIFFERENTIAL-ORACLE.md`](DIFFERENTIAL-ORACLE.md).
+7. **Reproducible-build attestation** — SLSA Level 3 ambition;
+   pre-staged by [`docs/REPRODUCIBLE-BUILDS.md`](REPRODUCIBLE-BUILDS.md)
+   and the W4.3 SBOM workflow.
+
+Items 1-5 and 7 are tracked elsewhere in this document or in their own
+spec docs; item 6 is new in v0.3.6 and is cross-linked from
+[`docs/DIFFERENTIAL-ORACLE.md`](DIFFERENTIAL-ORACLE.md).
 
 ---
 
