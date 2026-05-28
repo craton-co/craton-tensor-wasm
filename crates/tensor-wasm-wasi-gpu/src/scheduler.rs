@@ -27,9 +27,11 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use wasmtime::{Caller, Linker};
+
+use crate::async_dispatch::DEADLINE_NEAR_WINDOW;
 
 /// WIT package/module name guests import from: `wasi:scheduler/host@0.1.0`.
 ///
@@ -90,6 +92,24 @@ pub struct SchedulerContext {
     /// — each linker registration clones the context, and we want all
     /// clones to share the same counter.
     yield_count: Arc<AtomicU32>,
+    /// Optional absolute deadline expressed as an `Instant`, used to
+    /// keep the guest's yield-verdicts in lockstep with the
+    /// back-pressure semaphore's acquire decisions (T36).
+    ///
+    /// When set, this takes precedence over `deadline_ms` for the
+    /// `yield_now()` verdict and the `deadline_remaining_ms()`
+    /// readout: both consult the same wall-clock target the executor
+    /// installed on [`crate::async_dispatch::BackPressure`] via
+    /// [`crate::async_dispatch::BackPressure::with_deadline_hint`].
+    /// Without this, a guest could observe CONTINUE from `yield()`
+    /// while the back-pressure path was already rejecting acquires
+    /// with `DeadlineNear` — a confusing split-brain.
+    ///
+    /// `None` means "use the legacy `started_at + deadline_ms`
+    /// computation", preserving every existing call site that
+    /// constructs a [`SchedulerContext`] via
+    /// [`SchedulerContext::new`] / [`SchedulerContext::unbounded`].
+    bp_deadline_instant: Option<Instant>,
 }
 
 impl SchedulerContext {
@@ -104,7 +124,42 @@ impl SchedulerContext {
             started_at: Instant::now(),
             deadline_ms,
             yield_count: Arc::new(AtomicU32::new(0)),
+            bp_deadline_instant: None,
         }
+    }
+
+    /// Install an absolute `Instant` deadline that the guest's
+    /// `yield()` and `deadline-remaining-ms` queries will consult in
+    /// lockstep with the [`crate::async_dispatch::BackPressure`]
+    /// acquire path.
+    ///
+    /// Builder method — consumes `self` and returns the modified
+    /// context. The executor calls this at spawn / call time with the
+    /// same `Instant` it hands to `BackPressure::with_deadline_hint`
+    /// so the two surfaces never disagree.
+    ///
+    /// Passing `None` clears any previously-installed instant
+    /// deadline; the context then falls back to the legacy
+    /// `started_at + deadline_ms` computation.
+    pub fn with_bp_deadline_instant(mut self, deadline: Option<Instant>) -> Self {
+        self.bp_deadline_instant = deadline;
+        self
+    }
+
+    /// Mutate the absolute `Instant` deadline in place (used by the
+    /// executor on the per-call re-arm path — see
+    /// [`SchedulerContext::rearm_with_instant`]).
+    pub fn set_bp_deadline_instant(&mut self, deadline: Option<Instant>) {
+        self.bp_deadline_instant = deadline;
+    }
+
+    /// Borrow the installed `Instant` deadline, if any. Mirrors
+    /// [`Self::with_bp_deadline_instant`] — used by the executor to
+    /// hand the same value to
+    /// [`crate::async_dispatch::BackPressure::with_deadline_hint`]
+    /// so the two surfaces agree.
+    pub fn bp_deadline_instant(&self) -> Option<Instant> {
+        self.bp_deadline_instant
     }
 
     /// Construct a context with no deadline. Equivalent to
@@ -127,6 +182,19 @@ impl SchedulerContext {
         // Tests that need a fresh count construct a fresh context.
     }
 
+    /// Re-arm both the start instant AND the absolute `Instant`
+    /// deadline that drives the back-pressure-aligned query path.
+    ///
+    /// Called by the executor at the top of each `call_export` with
+    /// the same `Instant` it installs on
+    /// [`crate::async_dispatch::BackPressure::with_deadline_hint`],
+    /// keeping the two surfaces in lockstep across back-to-back
+    /// invocations.
+    pub fn rearm_with_instant(&mut self, deadline: Option<Instant>) {
+        self.started_at = Instant::now();
+        self.bp_deadline_instant = deadline;
+    }
+
     /// Update the deadline budget. Used when the embedder swaps the
     /// configured deadline between calls (rare; the typical pattern
     /// is one deadline per instance for its lifetime).
@@ -140,8 +208,39 @@ impl SchedulerContext {
     /// host-function closure without further synchronisation. The
     /// counter uses `Ordering::Relaxed` because it is a telemetry
     /// surface only, not a happens-before signal.
+    ///
+    /// When [`Self::bp_deadline_instant`] is set (T36 — the executor
+    /// installed an `Instant` aligned with the back-pressure
+    /// semaphore), the verdict is derived from that `Instant` so
+    /// guests and the BackPressure agree on the trip point:
+    ///
+    /// - `now >= deadline` → [`YIELD_CODE_STOP`].
+    /// - `now >= deadline - DEADLINE_NEAR_WINDOW`
+    ///   → [`YIELD_CODE_DEADLINE_APPROACHING`] (matches the window
+    ///   the BackPressure uses to refuse new acquires).
+    /// - else → [`YIELD_CODE_CONTINUE`].
+    ///
+    /// On the legacy `deadline_ms` path (no `bp_deadline_instant`
+    /// installed) the historical `SUGGESTED_YIELD_THRESHOLD_MS`
+    /// approaching window applies — preserving every existing
+    /// [`SchedulerContext::new`] / [`SchedulerContext::unbounded`]
+    /// behaviour byte-for-byte.
     pub fn yield_now(&self) -> u32 {
         self.yield_count.fetch_add(1, Ordering::Relaxed);
+        // Prefer the BP-aligned Instant deadline when present so the
+        // guest's verdicts agree with what BackPressure is doing
+        // right now. Falls through to the legacy `deadline_ms` path
+        // when no Instant has been installed.
+        if let Some(d) = self.bp_deadline_instant {
+            let now = Instant::now();
+            return if now >= d {
+                YIELD_CODE_STOP
+            } else if d.saturating_duration_since(now) <= DEADLINE_NEAR_WINDOW {
+                YIELD_CODE_DEADLINE_APPROACHING
+            } else {
+                YIELD_CODE_CONTINUE
+            };
+        }
         match self.deadline_ms {
             None => YIELD_CODE_CONTINUE,
             Some(total) => {
@@ -168,6 +267,20 @@ impl SchedulerContext {
     /// and saturating to the same sentinel keeps the wire shape
     /// stable.
     pub fn deadline_remaining_ms(&self) -> u32 {
+        // BP-aligned Instant path (T36) takes precedence so the
+        // remaining-budget readout matches whatever the back-pressure
+        // semaphore is using. Without this, a guest could see a
+        // non-zero remaining-ms reading while BackPressure was
+        // already refusing acquires under `DeadlineElapsed`.
+        if let Some(d) = self.bp_deadline_instant {
+            let now = Instant::now();
+            let remaining = d.saturating_duration_since(now);
+            let remaining_ms = remaining.as_millis();
+            // Cap at u32::MAX - 1 so the unbounded sentinel
+            // (u32::MAX) stays distinguishable from a finite (but
+            // very large) remaining budget.
+            return u32::try_from(remaining_ms).unwrap_or(u32::MAX.saturating_sub(1));
+        }
         match self.deadline_ms {
             None => u32::MAX,
             Some(total) => {
@@ -382,6 +495,67 @@ mod tests {
     fn default_is_unbounded() {
         let ctx = SchedulerContext::default();
         assert_eq!(ctx.deadline_ms(), None);
+        assert_eq!(ctx.yield_now(), YIELD_CODE_CONTINUE);
+    }
+
+    // ----------------------------------------------------------------
+    // T36 — Instant-aligned deadline tests.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn bp_deadline_instant_drives_yield_now() {
+        // Far-future Instant → CONTINUE.
+        let ctx = SchedulerContext::new(None)
+            .with_bp_deadline_instant(Some(Instant::now() + Duration::from_secs(60)));
+        assert_eq!(ctx.yield_now(), YIELD_CODE_CONTINUE);
+
+        // Inside the NEAR window (30 ms < 50 ms) → APPROACHING.
+        let ctx = SchedulerContext::new(None)
+            .with_bp_deadline_instant(Some(Instant::now() + Duration::from_millis(30)));
+        let code = ctx.yield_now();
+        assert!(
+            code == YIELD_CODE_DEADLINE_APPROACHING || code == YIELD_CODE_STOP,
+            "expected APPROACHING or STOP near the deadline, got {code}"
+        );
+
+        // Past the deadline → STOP.
+        let ctx = SchedulerContext::new(None)
+            .with_bp_deadline_instant(Some(Instant::now() - Duration::from_millis(5)));
+        assert_eq!(ctx.yield_now(), YIELD_CODE_STOP);
+    }
+
+    #[test]
+    fn bp_deadline_instant_drives_remaining_ms() {
+        // Bounded readout: 200 ms from now → remaining ≤ 200, > 0.
+        let ctx = SchedulerContext::new(None)
+            .with_bp_deadline_instant(Some(Instant::now() + Duration::from_millis(200)));
+        let r = ctx.deadline_remaining_ms();
+        assert!(r > 0 && r <= 200, "remaining {r} not in (0, 200]");
+
+        // Past deadline → 0.
+        let ctx = SchedulerContext::new(None)
+            .with_bp_deadline_instant(Some(Instant::now() - Duration::from_millis(50)));
+        assert_eq!(ctx.deadline_remaining_ms(), 0);
+    }
+
+    #[test]
+    fn bp_deadline_instant_takes_precedence_over_ms() {
+        // Both fields set; the Instant path wins so guests and the
+        // BackPressure agree.
+        let ctx = SchedulerContext::new(Some(1_000_000))
+            .with_bp_deadline_instant(Some(Instant::now() - Duration::from_millis(5)));
+        assert_eq!(ctx.yield_now(), YIELD_CODE_STOP);
+        assert_eq!(ctx.deadline_remaining_ms(), 0);
+    }
+
+    #[test]
+    fn rearm_with_instant_swaps_both_fields() {
+        let mut ctx = SchedulerContext::new(Some(50));
+        assert!(ctx.bp_deadline_instant().is_none());
+        let d = Instant::now() + Duration::from_millis(500);
+        ctx.rearm_with_instant(Some(d));
+        assert_eq!(ctx.bp_deadline_instant(), Some(d));
+        // The Instant path is now driving the verdict.
         assert_eq!(ctx.yield_now(), YIELD_CODE_CONTINUE);
     }
 }

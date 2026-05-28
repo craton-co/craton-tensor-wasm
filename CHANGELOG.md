@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+<<<<<<< HEAD
 - tensor-wasm-jit (T38): proptest harness driving `DifferentialOracle` against matmul/vector_add/conv2d blueprints + per-kernel tolerance table. Host-only verdicts run end-to-end today; CUDA GPU verdicts marked `#[ignore]` pending S22 runner.
 
 ### Security
@@ -76,6 +77,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inner bincode payload is byte-identical to the pre-T8 v3 shape.
   See `crates/tensor-wasm-snapshot/FORMAT.md` § "T8 — magic-prefix
   detector (BREAKING)".
+=======
+- tensor-wasm-wasi-gpu (T36): cooperative deadline ↔ back-pressure integration. The executor's per-invocation Instant deadline now drives both `SchedulerContext` query verdicts AND `BackPressure` acquire rejections (DEADLINE_NEAR_WINDOW = 50ms before deadline).
+>>>>>>> worktree-agent-a0050ac59d0d5f8da
 
 ### Roadmap
 - 13 new strategic feature directions added under docs/PATH-TO-V1.md#post-v036-strategic-features; tracked in ACTIONABLE-ITEMS-PENDING.md.
