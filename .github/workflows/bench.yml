@@ -36,7 +36,7 @@ jobs:
       - name: Run benches (short)
         run: |
           mkdir -p bench-results
-          cargo bench --workspace -- --output-format bencher --warm-up-time 1 --measurement-time 5 \
+          cargo bench --workspace -- --output-format bencher --warm-up-time 3 --measurement-time 5 \
             | tee bench-results/current.txt
       - name: Compare against baseline
         if: hashFiles('bench-results/baseline.json') != ''
