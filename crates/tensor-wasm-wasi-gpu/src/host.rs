@@ -909,8 +909,14 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
     // the hot path. `&BackPressure` outlives the borrow because the
     // `WasiCudaContext` (which owns the Arc<BackPressure>) is held by the
     // wasmtime `Caller` for the duration of this async fn.
+    // `acquire_borrowed` returns `Err(QuotaExceeded)` synchronously when
+    // the cap is the cap-0 sentinel (no permits will ever be issued), so a
+    // guest authored against a back-pressure-disabled embedder surfaces
+    // the saturation error rather than hanging the wasm fiber forever.
+    // Any other cap behaves as before: the await suspends until a permit
+    // is released by a finishing dispatch.
     let bp = caller.data().wasi_cuda().back_pressure.clone();
-    let _permit = bp.acquire_borrowed().await;
+    let _permit = bp.acquire_borrowed().await?;
 
     // Resolve argv now, after the permit has been acquired. Pointer args
     // are resolved against the caller's current linear-memory snapshot;

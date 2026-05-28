@@ -51,7 +51,9 @@
 use tensor_wasm_core::types::InstanceId;
 use tensor_wasm_wasi_gpu::abi::{AbiError, FN_LAUNCH, MODULE};
 use tensor_wasm_wasi_gpu::host::{add_to_linker, HasWasiCuda, WasiCudaContext};
-use tensor_wasm_wasi_gpu::kernel_args::{encode_argv, LoweredArg, LoweredArgSnapshot};
+use tensor_wasm_wasi_gpu::kernel_args::{
+    build_kernel_param_storage, encode_argv, LoweredArg, LoweredArgSnapshot,
+};
 use tensor_wasm_wasi_gpu::registry::KernelEntry;
 
 struct TestStore {
@@ -432,11 +434,15 @@ async fn pointer_argv_out_of_bounds_returns_invalid_pointer() {
     // end (we export 4 pages here, so the highest valid offset for a
     // zero-length pointer is exactly 256 KiB, but a 16-byte read at
     // offset 250000 spans into OOB).
-    let expected = vec![LoweredArg::Ptr {
-        host_ptr: std::ptr::null(),
-        len: 1024,
-        guest_offset: 4 * 65536 - 256, // straddles end of 4 pages
-    }];
+    //
+    // `LoweredArg::Ptr` is `#[non_exhaustive]`, so out-of-crate callers
+    // (including this integration test) cannot construct via struct-
+    // literal syntax — they go through `ptr_for_encoding`, which stamps
+    // a null host_ptr placeholder the parser subsequently overwrites.
+    let expected = vec![LoweredArg::ptr_for_encoding(
+        /* guest_offset */ 4 * 65536 - 256, // straddles end of 4 pages
+        /* len */ 1024,
+    )];
     let argv = encode_argv(&expected);
     let wat = build_launch_wat(&argv, 1024, kid);
     let wasm = wat::parse_str(&wat).unwrap();
@@ -520,16 +526,8 @@ async fn pointer_argv_real_cuda_launch() {
     ctx.enable_wasi_cuda();
     let kid = register_stub_kernel(&ctx, owner, "pointer_copy");
     let argv = encode_argv(&[
-        LoweredArg::Ptr {
-            host_ptr: std::ptr::null(),
-            len: 1024,
-            guest_offset: 0,
-        },
-        LoweredArg::Ptr {
-            host_ptr: std::ptr::null(),
-            len: 1024,
-            guest_offset: 2048,
-        },
+        LoweredArg::ptr_for_encoding(0, 1024),
+        LoweredArg::ptr_for_encoding(2048, 1024),
         LoweredArg::U32(256),
     ]);
     let wat = build_launch_wat(&argv, 8192, kid);
@@ -647,21 +645,9 @@ async fn vector_add_end_to_end_real_ptx_real_kernel() {
         }
 
         let argv = encode_argv(&[
-            LoweredArg::Ptr {
-                host_ptr: std::ptr::null(),
-                len: REGION_BYTES as u32,
-                guest_offset: A_OFFSET as u32,
-            },
-            LoweredArg::Ptr {
-                host_ptr: std::ptr::null(),
-                len: REGION_BYTES as u32,
-                guest_offset: B_OFFSET as u32,
-            },
-            LoweredArg::Ptr {
-                host_ptr: std::ptr::null(),
-                len: REGION_BYTES as u32,
-                guest_offset: C_OFFSET as u32,
-            },
+            LoweredArg::ptr_for_encoding(A_OFFSET as u32, REGION_BYTES as u32),
+            LoweredArg::ptr_for_encoding(B_OFFSET as u32, REGION_BYTES as u32),
+            LoweredArg::ptr_for_encoding(C_OFFSET as u32, REGION_BYTES as u32),
             LoweredArg::U32(N as u32),
         ]);
         let wat = build_vector_add_launch_wat(
@@ -795,21 +781,9 @@ async fn dispatch_pipeline_compiles_against_real_module_bytes() {
     let kid = register_stub_kernel(&ctx, owner, "vector_add");
 
     let argv = encode_argv(&[
-        LoweredArg::Ptr {
-            host_ptr: std::ptr::null(),
-            len: REGION_BYTES as u32,
-            guest_offset: A_OFFSET as u32,
-        },
-        LoweredArg::Ptr {
-            host_ptr: std::ptr::null(),
-            len: REGION_BYTES as u32,
-            guest_offset: B_OFFSET as u32,
-        },
-        LoweredArg::Ptr {
-            host_ptr: std::ptr::null(),
-            len: REGION_BYTES as u32,
-            guest_offset: C_OFFSET as u32,
-        },
+        LoweredArg::ptr_for_encoding(A_OFFSET as u32, REGION_BYTES as u32),
+        LoweredArg::ptr_for_encoding(B_OFFSET as u32, REGION_BYTES as u32),
+        LoweredArg::ptr_for_encoding(C_OFFSET as u32, REGION_BYTES as u32),
         LoweredArg::U32(N as u32),
     ]);
     let wat = build_vector_add_launch_wat(
@@ -875,4 +849,84 @@ async fn dispatch_pipeline_compiles_against_real_module_bytes() {
         recorded.len()
     );
     assert!(matches!(recorded[3], LoweredArg::U32(n) if n == N as u32));
+}
+
+/// Regression: `build_kernel_param_storage` must lay out every slot
+/// inside a single contiguous backing buffer.
+///
+/// The pre-v0.3.4 implementation boxed each scalar argument into its
+/// own `Box<[u8]>`, costing one heap allocation per arg — 16 separate
+/// allocations for a 16-arg kernel on the launch hot path. The fix
+/// switched to a single `Vec<u8>` (frozen into a `Box<[u8]>`) plus a
+/// pointer table indexing into it. This test pins the shape so a
+/// future refactor that reintroduces per-arg boxing fails loudly: it
+/// builds a 16-scalar argv (one of every supported scalar tag, plus
+/// padding) and asserts every slot pointer lies inside the
+/// `backing()` slice.
+#[test]
+fn build_kernel_param_storage_uses_single_backing_buffer() {
+    // 16 scalars covering every tag the marshaller handles, with
+    // duplicates of the wider types to push past the 16-arg threshold
+    // the original allocation-explosion bug operated on.
+    let args = vec![
+        LoweredArg::I32(1),
+        LoweredArg::I64(2),
+        LoweredArg::F32(3.0),
+        LoweredArg::F64(4.0),
+        LoweredArg::U32(5),
+        LoweredArg::U64(6),
+        LoweredArg::I32(7),
+        LoweredArg::I64(8),
+        LoweredArg::F32(9.0),
+        LoweredArg::F64(10.0),
+        LoweredArg::U32(11),
+        LoweredArg::U64(12),
+        LoweredArg::I32(13),
+        LoweredArg::I64(14),
+        LoweredArg::F32(15.0),
+        LoweredArg::F64(16.0),
+    ];
+    assert_eq!(args.len(), 16);
+
+    let storage = build_kernel_param_storage(&args);
+    assert_eq!(storage.len(), args.len());
+
+    let backing = storage.backing();
+    let slot_ptrs = storage.slot_ptrs();
+    assert_eq!(
+        slot_ptrs.len(),
+        args.len(),
+        "one pointer slot per argument"
+    );
+
+    // Every slot pointer must land inside the contiguous `backing`
+    // buffer. We compute the byte-offset between the slot pointer and
+    // the start of `backing` and assert it is in `[0, backing.len())`.
+    // A pre-v0.3.4 implementation would produce slots that point into
+    // 16 disjoint heap allocations; their offsets would be either
+    // outside the buffer's address range (unsigned wraparound to a
+    // huge value) or simply unrelated to it.
+    let base = backing.as_ptr() as usize;
+    let end = base + backing.len();
+    for (i, &slot) in slot_ptrs.iter().enumerate() {
+        let slot_addr = slot as usize;
+        assert!(
+            slot_addr >= base && slot_addr < end,
+            "slot {i} pointer {slot:p} is not inside backing buffer \
+             [{base:#x}, {end:#x}) — per-arg boxing has regressed"
+        );
+    }
+
+    // Sanity floor: a single backing buffer for 16 scalars should
+    // comfortably fit inside one allocation worth of bytes. The exact
+    // size depends on alignment padding, but it must be at least the
+    // sum of the value bytes (4 + 8 + 4 + 8 + 4 + 8 = 36 bytes per
+    // half × 2 halves = 72 bytes minimum, with padding making the real
+    // total a bit larger). Keep the assertion loose so a benign
+    // alignment-pad change does not flake the test.
+    assert!(
+        backing.len() >= 72,
+        "backing buffer too small for 16 scalars; got {}",
+        backing.len()
+    );
 }
