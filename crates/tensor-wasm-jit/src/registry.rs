@@ -71,10 +71,24 @@ pub struct KernelManifest {
     pub sm_version: u32,
     /// BLAKE3 hash of the PTX text. Content-addresses the artifact.
     pub digest: [u8; 32],
-    /// HMAC-SHA256 over the v2 canonical signed-bytes envelope — see
-    /// the module-level docstring for the exact layout. Covers
-    /// `name`, `version`, `publisher`, `published_unix_ms`,
-    /// `sm_version`, and `digest`.
+    /// HMAC-SHA256 tag computed over the canonical signed-bytes of
+    /// this manifest — see the module-level docstring for the exact
+    /// envelope layout (v2). Covers `name`, `version`, `publisher`,
+    /// `published_unix_ms`, `sm_version`, and `digest`.
+    ///
+    /// **The tag is PUBLIC by design.** It authenticates the
+    /// manifest's authorship (i.e. proves the holder of the publishing
+    /// HMAC key produced it) but is NOT a private signature in the
+    /// asymmetric-crypto sense and MUST NOT be treated as a secret.
+    /// `KernelManifest` deliberately derives `Serialize` / `Deserialize`
+    /// and the field is `pub` so the tag travels with the manifest
+    /// over the wire and through storage — that is the intended,
+    /// audited behaviour, not an oversight.
+    ///
+    /// What IS a secret is the HMAC key used to compute the tag (the
+    /// publisher's signing key); see `sign_manifest`. Leaking the
+    /// signing key — not the tag — is what would let an attacker
+    /// forge manifests.
     pub signature: [u8; 32],
     /// Wall-clock publish timestamp (Unix millis). Covered by the v2
     /// signature envelope — tampering with this field invalidates the
