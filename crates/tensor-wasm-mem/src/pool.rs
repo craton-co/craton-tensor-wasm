@@ -25,20 +25,33 @@ use crate::unified::{DeviceId, UnifiedBuffer, UnifiedError};
 /// # Pool teardown contract
 ///
 /// Slabs handed out as Wasm linear memory (via
-/// [`crate::wasm_memory::TensorWasmMemoryCreator`]) are *single-shot* for the
-/// lifetime of the pool: the `PoolAllocation` drop guard returned by
-/// [`Self::allocate`] is intentionally `std::mem::forget`-ed by the linear-
-/// memory creator, so the bump pointer never rewinds while pooled instances
-/// are live. This keeps the bump pointer monotonic across the pool's entire
-/// lifetime — there is no "reset between tenants" semantics.
+/// [`crate::wasm_memory::TensorWasmMemoryCreator`]) preserve the
+/// *monotonic bump* invariant for the lifetime of the pool: the
+/// `PoolAllocation` drop guard returned by [`Self::allocate`] is intentionally
+/// `std::mem::forget`-ed by the linear-memory creator, so the bump pointer
+/// never rewinds while pooled instances are alive. The bump pointer only
+/// rewinds via an explicit [`Self::reset`] call, which requires `&mut self`
+/// (every other `Arc<UnifiedMemoryPool>` clone dropped) AND `live == 0`
+/// (every issued `PoolAllocation` AND every pool-backed Wasm linear memory
+/// dropped).
 ///
-/// Operators that need per-tenant resets should construct a fresh
-/// `UnifiedMemoryPool` instance per tenant rather than reusing one across
-/// tenancy boundaries. The pinned behaviour lives in
-/// `crates/tensor-wasm-mem/tests/pool_teardown_contract.rs` (to be added in
-/// the v0.4 cutover) and the call-site rationale is recorded inline above
-/// the `std::mem::forget(alloc)` line in
-/// [`crate::wasm_memory::TensorWasmMemoryCreator::new_memory`].
+/// As of audit T6, `crate::wasm_memory::PooledLinearMemory`'s own `Drop`
+/// mirrors the `mem::forget(alloc)` effect by calling [`Self::release`]
+/// from its destructor: the bump pointer is *not* rewound (so any
+/// `base_ptr` held by other pool consumers stays valid), but the live
+/// counter is decremented so a future `reset()` can run once every issued
+/// memory has been dropped. Before T6 the counter stayed elevated forever
+/// once any pool-backed Wasm memory was issued, permanently blocking
+/// `reset()`; that left operators with no path to recycle a slab across
+/// tenants short of dropping the pool itself.
+///
+/// Operators that want per-tenant resets must still satisfy both gates
+/// (drop every `Arc<UnifiedMemoryPool>` clone except their own, and drop
+/// every issued memory) — alternately they can continue to use one pool
+/// per tenant and drop the pool wholesale. The pinned behaviour lives in
+/// `crates/tensor-wasm-mem/tests/pool_teardown_contract.rs` and the
+/// call-site rationale is recorded inline above the `std::mem::forget(alloc)`
+/// line in [`crate::wasm_memory::TensorWasmMemoryCreator::new_memory`].
 pub struct UnifiedMemoryPool {
     slab: UnifiedBuffer,
     state: Mutex<PoolState>,
@@ -224,25 +237,36 @@ impl UnifiedMemoryPool {
     /// raw pointer that has been turned into a slice, etc.) may coexist with
     /// a reset. Callers holding the pool through `Arc<UnifiedMemoryPool>`
     /// must either drop every clone but one (so `Arc::get_mut` succeeds) or
-    /// switch to a per-tenant pool — see the one-shot teardown contract
+    /// switch to a per-tenant pool — see the Wasm-backing teardown contract
     /// below.
     ///
-    /// # One-shot teardown contract for Wasm-backing pools
+    /// # Teardown contract for Wasm-backing pools (audit T6)
     ///
-    /// Pool slabs that ever served a
+    /// Pool slabs that served a
     /// [`crate::wasm_memory::TensorWasmMemoryCreator`]-issued pool-backed Wasm
-    /// linear memory (`PooledLinearMemory`) are single-shot for the lifetime
-    /// of the pool, because `PoolAllocation` drop guards are intentionally
-    /// leaked at carve time to keep the bump pointer monotonic — see the
-    /// `std::mem::forget(alloc)` site in
-    /// [`crate::wasm_memory::TensorWasmMemoryCreator::new_memory`]. The
-    /// [`live_allocations`](Self::live_allocations) counter therefore stays
-    /// elevated for the remaining lifetime of the pool even after every Wasm
-    /// instance has been dropped, so `reset` on such a pool will permanently
-    /// fail. Operators wanting per-tenant resets should use a per-tenant
-    /// `UnifiedMemoryPool` instance (one pool per tenant, drop the pool when
-    /// the tenant departs) rather than expecting reuse-with-reset on a
-    /// shared pool.
+    /// linear memory (`PooledLinearMemory`) remain resettable: although
+    /// `PoolAllocation` drop guards are intentionally leaked at carve time
+    /// to keep the bump pointer monotonic (see the `std::mem::forget(alloc)`
+    /// site in
+    /// [`crate::wasm_memory::TensorWasmMemoryCreator::new_memory`]),
+    /// `PooledLinearMemory`'s own `Drop` impl now mirrors the leak by calling
+    /// [`Self::release`] when the linear memory itself is torn down. The
+    /// [`live_allocations`](Self::live_allocations) counter therefore returns
+    /// to zero once every issued pool-backed Wasm memory has been dropped, at
+    /// which point `reset` succeeds (the existing `live > 0` guard below is
+    /// unchanged; what changed is that `live` is now actually allowed to
+    /// reach zero again). The bump pointer is NOT rewound by `Drop` —
+    /// monotonic-bump semantics are preserved between explicit `reset` calls,
+    /// so any in-flight reads through a `base_ptr` carved out earlier remain
+    /// valid until reset is *explicitly* invoked (and reset is gated by
+    /// `&mut self`, which the type system refuses while any other
+    /// `Arc<UnifiedMemoryPool>` keepalive exists).
+    ///
+    /// Operators wanting per-tenant resets can therefore either:
+    /// (a) drop every issued memory then call `reset` on a uniquely-owned
+    ///     pool, or
+    /// (b) continue to use one pool per tenant and drop the pool wholesale
+    ///     at tenant teardown.
     pub fn reset(&mut self) -> Result<(), UnifiedError> {
         let mut st = self.state.lock();
         if st.live != 0 {
@@ -256,8 +280,38 @@ impl UnifiedMemoryPool {
         Ok(())
     }
 
-    fn release(&self, _offset: usize, _size: usize) {
+    /// Decrement the `live` counter for an allocation at `[offset, offset+size)`.
+    ///
+    /// Does NOT rewind the bump pointer — monotonic-bump semantics are
+    /// preserved (the carved region remains logically claimed against the
+    /// slab's lifetime; only [`Self::reset`] rewinds, and only when
+    /// `live == 0`). The `offset` and `size` parameters are accepted so
+    /// future per-region debug-assertions can match them against a
+    /// shadow free-list; today they are only validated by the live-count
+    /// underflow assert.
+    ///
+    /// Called from:
+    ///
+    /// * [`PoolAllocation::drop`] — the safe borrow-based release path.
+    /// * [`crate::wasm_memory::PooledLinearMemory::drop`] — the
+    ///   `mem::forget`-mirror release path (audit T6: previously the
+    ///   counter was held elevated forever once any pool-backed Wasm
+    ///   memory was issued, permanently blocking [`Self::reset`]; now
+    ///   the Wasm memory's own `Drop` decrements the counter so a
+    ///   subsequent reset can run once every issued memory has been
+    ///   dropped).
+    ///
+    /// Calling this more times than [`Self::allocate`] was called is a
+    /// logic bug — the `debug_assert!` below catches it in debug builds.
+    /// In release builds the counter saturates at zero (defensive: an
+    /// under-count is still safer than wrapping `usize`).
+    pub(crate) fn release(&self, _offset: usize, _size: usize) {
         let mut st = self.state.lock();
+        debug_assert!(
+            st.live > 0,
+            "UnifiedMemoryPool::release called more times than allocate \
+             (would underflow live counter)"
+        );
         st.live = st.live.saturating_sub(1);
     }
 
@@ -405,10 +459,16 @@ mod tests {
         // `reset` still matters for the `wasm_memory::TensorWasmMemoryCreator`
         // path that intentionally `mem::forget`s the `PoolAllocation` to keep
         // the bump pointer monotonic across pooled Wasm instances; for that
-        // caller the borrow is gone but the live counter is sticky, so the
+        // caller the borrow is gone but the live counter is incremented, so the
         // runtime check is the last line of defence. Simulate that scenario
         // here by forgetting an allocation to bump the live count without
         // holding a borrow that would conflict with `&mut pool`.
+        //
+        // (Audit T6: in production, `PooledLinearMemory::Drop` calls
+        // `release()` to mirror this walk-down automatically, so a `reset`
+        // after every issued Wasm memory has been dropped will succeed.
+        // This unit test reproduces that walk-down by hand to keep the
+        // pool-module test self-contained.)
         let mut pool = UnifiedMemoryPool::new(256).unwrap();
         let a = pool.allocate(64, 1).unwrap();
         // `mem::forget` releases the borrow without running `Drop`, so the
@@ -419,9 +479,8 @@ mod tests {
             "reset must fail while the live-allocations counter is non-zero"
         );
         // Walk the counter back down by hand (we forgot the drop guard) so
-        // we can exercise the success path. This mirrors what production
-        // callers cannot do — they leak deliberately — and is fine inside a
-        // unit test where we own the pool exclusively.
+        // we can exercise the success path. In production, this is exactly
+        // what `PooledLinearMemory::Drop` does for pool-backed Wasm memories.
         pool.release(0, 64);
         pool.reset().expect("reset must succeed when empty");
         assert_eq!(pool.remaining(), pool.capacity());
