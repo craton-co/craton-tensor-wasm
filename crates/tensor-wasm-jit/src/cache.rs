@@ -53,19 +53,65 @@ pub struct CacheKey {
     pub blueprint: u64,
     /// CUDA compute capability (e.g. 80 for sm_80, 89 for sm_89).
     pub sm_version: u32,
+    /// Hash of the full [`crate::ptx_emit::EmitConfig`] used at emit time
+    /// (jit S-2). `sm_version` covers the compute capability number but NOT
+    /// the architecture suffix (e.g. `"sm_80"` vs `"sm_80a"`), the PTX
+    /// language version, or the `launch_bounds` flag — two `EmitConfig`s
+    /// that differ in any of those produce non-interchangeable PTX. Without
+    /// this field two such configs would collide on the same key and the
+    /// second caller would silently get the first caller's PTX.
+    ///
+    /// Callers that don't have an `EmitConfig` (rewriter pre-population,
+    /// benches) pass `0`. Construct via [`CacheKey::for_tenant`] (defaults
+    /// to `0`) or [`CacheKey::for_tenant_with_emit_config`] (computes a
+    /// stable hash over the config).
+    pub emit_config_hash: u64,
 }
 
 impl CacheKey {
-    /// Construct a tenant-scoped cache key. This is the only constructor
-    /// host-side dispatch should use — the `tenant_id` MUST come from
-    /// trusted store state (e.g. `InstanceState::tenant_id`), never from
-    /// guest-supplied fingerprint bytes. See the [`CacheKey`] docs for the
-    /// confused-deputy primitive this guards against.
+    /// Construct a tenant-scoped cache key with no `EmitConfig` hash.
+    ///
+    /// Equivalent to passing `emit_config_hash: 0` — appropriate for the
+    /// rewriter and bench paths that use the default emitter config. The
+    /// `tenant_id` MUST come from trusted store state (e.g.
+    /// `InstanceState::tenant_id`), never from guest-supplied fingerprint
+    /// bytes. See the [`CacheKey`] docs for the confused-deputy primitive
+    /// this guards against.
     pub fn for_tenant(tenant_id: TenantId, blueprint: u64, sm_version: u32) -> Self {
         Self {
             tenant_id: tenant_id.get(),
             blueprint,
             sm_version,
+            emit_config_hash: 0,
+        }
+    }
+
+    /// Construct a tenant-scoped cache key that also covers the emitter
+    /// config. Use this when the lookup must distinguish between
+    /// PTX-version variants, target-architecture suffixes, or
+    /// launch-bounds settings (jit S-2).
+    pub fn for_tenant_with_emit_config(
+        tenant_id: TenantId,
+        blueprint: u64,
+        sm_version: u32,
+        cfg: &crate::ptx_emit::EmitConfig,
+    ) -> Self {
+        let emit_config_hash = blake3::Hasher::new()
+            .update(b"tensor-wasm-jit::EmitConfig::v1\0")
+            .update(cfg.target.as_bytes())
+            .update(b"\0")
+            .update(cfg.ptx_version.as_bytes())
+            .update(b"\0")
+            .update(&[u8::from(cfg.launch_bounds)])
+            .finalize();
+        let bytes = emit_config_hash.as_bytes();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[..8]);
+        Self {
+            tenant_id: tenant_id.get(),
+            blueprint,
+            sm_version,
+            emit_config_hash: u64::from_le_bytes(buf),
         }
     }
 }

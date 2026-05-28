@@ -91,11 +91,43 @@ pub struct KernelHandle {
     pub module: Option<Arc<cust::module::Module>>,
 }
 
+/// Pick a random seed for [`KernelRegistry::next_id`] so that kernel ids are
+/// not trivially guessable (wasi-gpu 1.1).
+///
+/// Cross-tenant id forgery is already prevented by the owner-`InstanceId`
+/// check in [`KernelRegistry::lookup`], so this seed is defence-in-depth: it
+/// stops a guest from enumerating its own id space without bookkeeping (and,
+/// by extension, fingerprinting which ids exist by observing the
+/// `InvalidKernel`-vs-`InvalidDimensions` discrimination on `launch`).
+///
+/// The seed is sampled from the OS RNG. We reserve the high bit so callers
+/// reading the id as a signed `i64` from the WIT interface stay in the
+/// positive range, and we mask off the bottom 16 bits so the first few
+/// thousand registrations don't land suspiciously close to 0.
+fn random_kernel_id_seed() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    // `RandomState` seeds itself from the OS RNG on construction. Using two
+    // hashers gives us 64 bits of entropy without taking an explicit
+    // dependency on `rand` (which the workspace does not currently pull
+    // into this crate). The construction is `std`-only.
+    let mut h = RandomState::new().build_hasher();
+    h.write_u64(0xa5a5_a5a5_a5a5_a5a5);
+    let raw = h.finish();
+    // Clear the high bit (keep ids in the positive `i64` range) and the
+    // low 16 bits (avoid an obviously-small starting value). The +1 floor
+    // keeps the invariant `next_id != 0` so callers can reserve 0 as a
+    // sentinel if they wish.
+    (raw & 0x7fff_ffff_ffff_0000) | 1
+}
+
 impl KernelRegistry {
     /// Construct an empty registry.
     pub fn new() -> Self {
         Self {
-            next_id: AtomicU64::new(1),
+            // Seeded with `random_kernel_id_seed` so the id space is
+            // unguessable (wasi-gpu 1.1).
+            next_id: AtomicU64::new(random_kernel_id_seed()),
             entries: DashMap::new(),
             total_ptx_bytes: AtomicU64::new(0),
         }

@@ -64,6 +64,7 @@
 //! [`AbiError::InvalidPointer`]. The distinction keeps the error
 //! story crisp for guest debugging.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -149,7 +150,14 @@ pub struct WasiCudaContext {
     /// follows the broader WASI design ("imports without capability are
     /// inert") and lets the executor link wasi-cuda once at engine setup
     /// while still admitting per-instance policy decisions.
-    pub wasi_cuda_enabled: bool,
+    ///
+    /// Stored as an `AtomicBool` and gated behind `pub(crate)` (wasi-gpu 1.3)
+    /// so that an embedder cannot bypass [`Self::enable_wasi_cuda`] by
+    /// writing to the field directly, and so reads from any host-import
+    /// closure observe a consistent value even if the embedder ever shared
+    /// the context across threads. Use [`Self::wasi_cuda_enabled`] /
+    /// [`Self::enable_wasi_cuda`] / [`Self::disable_wasi_cuda`].
+    pub(crate) wasi_cuda_enabled: AtomicBool,
 }
 
 impl WasiCudaContext {
@@ -166,7 +174,7 @@ impl WasiCudaContext {
             last_error: Mutex::new(None),
             back_pressure: Arc::new(BackPressure::new()),
             last_lowered_args: Mutex::new(Vec::new()),
-            wasi_cuda_enabled: false,
+            wasi_cuda_enabled: AtomicBool::new(false),
         }
     }
 
@@ -183,7 +191,7 @@ impl WasiCudaContext {
             last_error: Mutex::new(None),
             back_pressure: bp,
             last_lowered_args: Mutex::new(Vec::new()),
-            wasi_cuda_enabled: false,
+            wasi_cuda_enabled: AtomicBool::new(false),
         }
     }
 
@@ -196,13 +204,25 @@ impl WasiCudaContext {
     /// linked host functions return [`AbiError::NotAvailable`] regardless
     /// of host CUDA support — see [`WasiCudaContext::wasi_cuda_enabled`].
     pub fn enable_wasi_cuda(&mut self) {
-        self.wasi_cuda_enabled = true;
+        self.wasi_cuda_enabled.store(true, Ordering::Release);
     }
 
-    /// `true` when [`WasiCudaContext::enable_wasi_cuda`] has been called
-    /// (or the field was pre-set on construction).
+    /// Revoke the wasi-cuda capability granted by
+    /// [`WasiCudaContext::enable_wasi_cuda`]. Subsequent host calls degrade
+    /// to [`AbiError::NotAvailable`]. Also clears any previously-recorded
+    /// `last_error` so flipping the capability cannot let a guest read
+    /// state recorded while the capability was disabled (wasi-gpu 1.5
+    /// follow-up).
+    pub fn disable_wasi_cuda(&mut self) {
+        self.wasi_cuda_enabled.store(false, Ordering::Release);
+        if let Ok(mut guard) = self.last_error.lock() {
+            *guard = None;
+        }
+    }
+
+    /// `true` when [`WasiCudaContext::enable_wasi_cuda`] has been called.
     pub fn wasi_cuda_enabled(&self) -> bool {
-        self.wasi_cuda_enabled
+        self.wasi_cuda_enabled.load(Ordering::Acquire)
     }
 
     fn record_error(&self, msg: impl Into<String>) {
@@ -337,7 +357,7 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
          entry_ptr: i32,
          entry_len: i32|
          -> i64 {
-            if !caller.data().wasi_cuda().wasi_cuda_enabled {
+            if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
                 caller
                     .data()
                     .wasi_cuda()
@@ -369,7 +389,7 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
         ): (i64, i32, i32, i32, i32, i32, i32, i32, i32, i32)|
          -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
             Box::new(async move {
-                if !caller.data().wasi_cuda().wasi_cuda_enabled {
+                if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
                     caller
                         .data()
                         .wasi_cuda()
@@ -396,7 +416,7 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
     )?;
 
     linker.func_wrap(MODULE, FN_SYNC, |caller: Caller<'_, T>| -> i32 {
-        if !caller.data().wasi_cuda().wasi_cuda_enabled {
+        if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
             caller
                 .data()
                 .wasi_cuda()
@@ -416,7 +436,7 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
     // backwards-compat but is now an unimported name from the guest's POV.
 
     linker.func_wrap(MODULE, FN_LAST_ERROR_LEN, |caller: Caller<'_, T>| -> i32 {
-        if !caller.data().wasi_cuda().wasi_cuda_enabled {
+        if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
             // Note: we do NOT call `record_error` here — the guest could
             // read that recorded message back via this same surface,
             // turning the gate into a leak channel. Returning the
@@ -438,7 +458,7 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
         MODULE,
         FN_LAST_ERROR_COPY,
         |mut caller: Caller<'_, T>, dst_ptr: i32, dst_len: i32| -> i32 {
-            if !caller.data().wasi_cuda().wasi_cuda_enabled {
+            if !caller.data().wasi_cuda().wasi_cuda_enabled.load(Ordering::Acquire) {
                 // See the matching note on FN_LAST_ERROR_LEN: keep the
                 // failure shape distinct from "no error" without recording
                 // anything the guest could subsequently observe.
