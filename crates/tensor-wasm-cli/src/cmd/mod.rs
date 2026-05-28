@@ -371,40 +371,51 @@ mod tests {
         assert_eq!(server_base("http://x:1///"), "http://x:1");
     }
 
-    use std::sync::Mutex;
-
-    // Serialize env-mutating tests: parallel `set_var` / `remove_var` is UB
-    // since process env is a global. Wrapping them in a Mutex is the
-    // standard fix for tests that genuinely need to poke env vars.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // cli fix 6: env-mutating tests now go through the `temp-env` crate
+    // rather than the bare `std::env::set_var` / `remove_var` APIs. Two
+    // reasons:
+    //   * From Rust 2024 onwards `std::env::set_var` is marked `unsafe`, so
+    //     the previous shape stops compiling on the workspace's pinned
+    //     nightly without an `unsafe { ... }` wrapper that papers over the
+    //     real soundness concern.
+    //   * Even before 2024, parallel `set_var` from multiple test threads
+    //     is documented UB. The hand-rolled `Mutex<()>` previously here
+    //     serialised *these three* tests against each other, but did
+    //     nothing about other tests in the same binary (or the binary's
+    //     dynamically-loaded deps) reading or writing env at the same time.
+    //     `temp_env::with_var` owns a process-global mutex internally that
+    //     covers every `with_var` call across the test binary, and it
+    //     restores the previous value on scope exit so a panicked test
+    //     can't leak state into the next.
 
     #[test]
     fn http_context_no_token_no_tenant_is_noop() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(TENSOR_WASM_TOKEN_ENV);
-        let ctx = HttpContext::from_env(0);
-        assert!(ctx.token.is_none());
-        assert_eq!(ctx.tenant, 0);
+        // `None` as the value asks `temp-env` to ensure the var is *unset*
+        // for the duration of the closure, restoring whatever was there
+        // before on return.
+        temp_env::with_var(TENSOR_WASM_TOKEN_ENV, None::<&str>, || {
+            let ctx = HttpContext::from_env(0);
+            assert!(ctx.token.is_none());
+            assert_eq!(ctx.tenant, 0);
+        });
     }
 
     #[test]
     fn http_context_picks_up_token_and_tenant() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var(TENSOR_WASM_TOKEN_ENV, "  abc123  ");
-        let ctx = HttpContext::from_env(42);
-        // Whitespace is trimmed.
-        assert_eq!(ctx.token.as_deref(), Some("abc123"));
-        assert_eq!(ctx.tenant, 42);
-        std::env::remove_var(TENSOR_WASM_TOKEN_ENV);
+        temp_env::with_var(TENSOR_WASM_TOKEN_ENV, Some("  abc123  "), || {
+            let ctx = HttpContext::from_env(42);
+            // Whitespace is trimmed.
+            assert_eq!(ctx.token.as_deref(), Some("abc123"));
+            assert_eq!(ctx.tenant, 42);
+        });
     }
 
     #[test]
     fn http_context_treats_empty_token_as_unset() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var(TENSOR_WASM_TOKEN_ENV, "   ");
-        let ctx = HttpContext::from_env(0);
-        assert!(ctx.token.is_none());
-        std::env::remove_var(TENSOR_WASM_TOKEN_ENV);
+        temp_env::with_var(TENSOR_WASM_TOKEN_ENV, Some("   "), || {
+            let ctx = HttpContext::from_env(0);
+            assert!(ctx.token.is_none());
+        });
     }
 
     #[test]

@@ -41,6 +41,7 @@
 //! the wider parser surface.
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -277,10 +278,20 @@ pub async fn run(args: ObserveArgs, ctx: &HttpContext) -> Result<()> {
         };
         let snap = Snapshot::from_metrics(&metrics, now);
         let board = render_board(&base, interval, &health, &metrics, &prev, &snap, fetch_err);
-        print!("{CLEAR_AND_HOME}{board}");
+        // cli fix 3: only emit the `\x1B[2J\x1B[H` clear-and-home escape when
+        // stdout is a TTY. Piped / redirected output (CI logs, `tee`, files)
+        // would otherwise capture the raw escape bytes and either render them
+        // as garbage or trip downstream parsers. In non-TTY mode we instead
+        // separate each board with a blank line so the stream stays readable.
+        let mut stdout = std::io::stdout();
+        if stdout.is_terminal() {
+            print!("{CLEAR_AND_HOME}{board}");
+        } else {
+            println!("\n{board}");
+        }
         // Flush so the terminal repaints before we sleep.
         use std::io::Write;
-        let _ = std::io::stdout().flush();
+        let _ = stdout.flush();
         prev = snap;
 
         // Sleep until the next tick, racing with Ctrl-C. The branch order is
@@ -375,11 +386,27 @@ fn render_board(
     // Liveness.
     match health {
         Health::Ok { body } => {
-            let trimmed = body.trim();
-            let status_word = if trimmed.contains("\"ok\"") {
-                "ok"
-            } else {
-                "200"
+            // cli fix 4: parse the body as JSON and check `body["status"]`
+            // rather than substring-matching `"ok"` against the raw bytes.
+            // The server-side handler emits `{"status":"ok"}` (see
+            // `tensor-wasm-api::routes::healthz`), and the substring shape
+            // tripped on any value (e.g. a future `"degraded":"ok"` flag,
+            // or whitespace variations like `"status" : "ok"`) that
+            // happened to contain the literal `"ok"`. Falling back to the
+            // raw 2xx case (`200`) when the body doesn't parse keeps the
+            // dashboard useful against pre-JSON servers or proxies that
+            // rewrite the body.
+            let status_word: String = match serde_json::from_str::<serde_json::Value>(body) {
+                Ok(v) => match v.get("status").and_then(|s| s.as_str()) {
+                    Some("ok") => "ok".to_string(),
+                    // A non-"ok" status string still came back as 2xx, so
+                    // the server *is* reachable; surface the value verbatim
+                    // (truncated) so the operator sees what the server
+                    // actually said.
+                    Some(other) => truncate(other, 12),
+                    None => "200".to_string(),
+                },
+                Err(_) => "200".to_string(),
             };
             s.push_str(&format!("liveness:   /healthz {status_word}\n"));
         }
@@ -443,10 +470,20 @@ fn render_board(
         for path in endpoints {
             let cur_v = cur.http_requests.get(&path).copied().unwrap_or(0.0);
             let prev_v = prev.http_requests.get(&path).copied().unwrap_or(0.0);
-            let rate = if dt_secs > 0.0 && cur_v >= prev_v {
-                (cur_v - prev_v) / dt_secs
+            // cli fix 5: distinguish "first scrape / no rate yet" from "the
+            // counter went backwards" (server restart between scrapes, or
+            // the underlying registry was reset). The previous shape
+            // collapsed both into `n/a`, hiding the much more interesting
+            // restart signal. We now emit `(reset)` explicitly when
+            // `cur_v < prev_v` so the operator knows to expect a request-rate
+            // dip on the next tick rather than chasing a phantom outage.
+            let rate_cell = if dt_secs <= 0.0 {
+                // No baseline scrape yet — leave the cell as `n/a`.
+                fmt_rate(f64::NAN)
+            } else if cur_v < prev_v {
+                "(reset)".to_string()
             } else {
-                f64::NAN
+                fmt_rate((cur_v - prev_v) / dt_secs)
             };
             let p50 = histogram_quantile(
                 metrics,
@@ -463,7 +500,7 @@ fn render_board(
             s.push_str(&format!(
                 "{:<24} {:>8}  {:>6}  {:>6}\n",
                 truncate(&path, 24),
-                fmt_rate(rate),
+                rate_cell,
                 fmt_latency(p50),
                 fmt_latency(p95),
             ));

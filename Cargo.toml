@@ -42,7 +42,11 @@ tensor-wasm-api = { path = "crates/tensor-wasm-api", version = "0.3.6" }
 
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
-tokio-util = "0.7"
+# tokio-util — `io` feature enables `ReaderStream`, used by the CLI to turn a
+# `tokio::fs::File` into a `Stream<Item = Result<Bytes, _>>` for streaming
+# uploads via `reqwest::Body::wrap_stream`. Pinned at 0.7 (matches the rest
+# of the tokio-stack version floor).
+tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -177,6 +181,12 @@ proptest = "1"
 tokio-test = "0.4"
 tempfile = "3"
 mockall = "0.13"
+# `temp-env` scopes a process env-var mutation to a closure and serialises
+# concurrent users behind an internal Mutex. The CLI crate's tests use this
+# instead of raw `std::env::set_var` / `remove_var`, both because the latter
+# became `unsafe` in Rust 2024 and because parallel mutation of process env
+# from tests is undefined behaviour. Pinned at 0.3 (latest 0.3.x).
+temp-env = "0.3"
 
 # Logging / time
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

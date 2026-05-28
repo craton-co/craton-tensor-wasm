@@ -15,16 +15,28 @@
 //! Auth/tenant headers (`Authorization: Bearer ...`, `X-TensorWasm-Tenant`) are
 //! attached by [`crate::cmd::HttpContext`] when configured. See `docs/CLI.md`.
 
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
+use base64::write::EncoderStringWriter;
 use clap::Args;
 use serde::Serialize;
 
 use super::HttpContext;
+
+/// Chunk size used when streaming the wasm file through the base64 encoder.
+/// 64 KiB matches the default `BufReader` capacity and keeps the working set
+/// bounded regardless of input size — the alternative (`std::fs::read` →
+/// `BASE64.encode(&bytes)`) holds two transient buffers of size N and ~4N/3
+/// in memory simultaneously, which at the 64 MiB deploy cap peaks at
+/// ~220 MiB and trips OOMs on small CI runners. Picking a multiple of 3
+/// avoids partial-group padding inside the inner loop (base64 encodes
+/// 3-byte groups into 4-byte output).
+const COPY_BUF_BYTES: usize = 64 * 1024 * 3;
 
 /// Largest `.wasm` file the CLI will read in deploy. Keeps the CLI from
 /// silently OOM-ing on a misconfigured `--file` path, and lines up with the
@@ -91,9 +103,17 @@ pub async fn run(args: DeployArgs, ctx: &HttpContext) -> Result<()> {
         );
     }
 
-    let bytes = std::fs::read(&args.file)
+    // cli fix 2: encode the wasm file into base64 in chunks rather than
+    // reading the whole file into a `Vec<u8>` and then base64-ing that into
+    // a fresh `String`. The previous shape held two transient buffers at
+    // once (raw bytes + base64 string) so at the 64 MiB cap peak memory ran
+    // to roughly 64 MiB + 88 MiB ≈ 152 MiB transient, with a brief 220 MiB
+    // spike during the encode allocation. Streaming through
+    // `EncoderStringWriter` produces a single `String` of the encoded
+    // payload (~88 MiB at the cap) and keeps the read buffer bounded to
+    // [`COPY_BUF_BYTES`] regardless of input size.
+    let wasm_b64 = encode_wasm_streaming(&args.file)
         .with_context(|| format!("reading wasm file {}", args.file.display()))?;
-    let wasm_b64 = BASE64.encode(&bytes);
 
     let url = format!("{}/functions", super::server_base(&args.server));
     let body = CreateFunctionRequest {
@@ -132,4 +152,38 @@ pub async fn run(args: DeployArgs, ctx: &HttpContext) -> Result<()> {
 
     println!("{id}");
     Ok(())
+}
+
+/// Stream a `.wasm` file off disk through a base64 encoder into a single
+/// `String`, reusing one fixed-size read buffer to keep peak memory bounded.
+///
+/// The output is a complete standard-alphabet, padded base64 string suitable
+/// for the `wasm_b64` field of [`CreateFunctionRequest`]. Errors propagate
+/// the underlying I/O failure (e.g. `EACCES`, `ENOENT`) and the caller is
+/// expected to wrap them with file-path context.
+///
+/// Implementation note: `EncoderStringWriter` buffers an in-progress 3-byte
+/// group internally between `write_all` calls and emits the final padding
+/// when `into_inner()` is called, so partial reads (the inner buffer not
+/// being a multiple of 3) are handled correctly without us having to align
+/// the read boundaries.
+fn encode_wasm_streaming(path: &std::path::Path) -> std::io::Result<String> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(COPY_BUF_BYTES, file);
+    let mut encoder = EncoderStringWriter::new(&BASE64);
+    let mut buf = vec![0u8; COPY_BUF_BYTES];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        // `EncoderStringWriter` implements `io::Write`; the `Write::write_all`
+        // contract matches what we want — buffer until the encoder has a
+        // whole 3-byte group to emit, then push 4 ASCII bytes into the inner
+        // `String`. Errors from `write_all` are infallible in practice (the
+        // sink is a `String`), but we propagate the `io::Error` shape for
+        // honest signatures.
+        std::io::Write::write_all(&mut encoder, &buf[..n])?;
+    }
+    Ok(encoder.into_inner())
 }
