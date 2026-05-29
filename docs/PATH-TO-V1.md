@@ -732,6 +732,38 @@ not calendar time.
   hosts, and operator UX all need design work before any code.
 - **Status:** not started.
 
+### Additional scaffolded items
+
+Smaller scaffolds and policy items that landed alongside the bets
+above. None are exit criteria for v0.4 on their own; each closes a
+specific "audit-bait" objection or supports an item in the lists
+above.
+
+- **Unified backing for tensor buffers** (`tensor-wasm-mem`, v0.3.5).
+  `UnifiedBacking` trait + `UvmAdvice` impls for the three buffer
+  shapes. See B5.4 and `docs/CUDA-OXIDE-CUTOVER.md`.
+- **Configurable per-instance linear-memory cap** — `max_linear_memory`
+  in `EngineConfig`. Landed in `tensor-wasm-mem`.
+- **Tenant-aware WASI-GPU back-pressure** — per-tenant queue depth
+  limits surfacing as `QuotaExceeded`. Scaffold in
+  `tensor-wasm-wasi-gpu`. The formalised fairness model
+  (proportional-share or weighted fair queueing) lands as an RFC.
+- **Snapshot replay-protection cross-version matrix** — v0.3.6 landed
+  the per-snapshot nonce + tenant-scoped epoch fields, verified on
+  restore (`tensor-wasm-snapshot`). v0.4 adds the end-to-end matrix
+  that exercises the policy across N-1 / N / N+1 minor versions.
+- **Kernel ABI freeze + versioning policy** — stable `.ptxbin`
+  container with explicit ABI version byte; covered by the cache
+  integrity tests today, formalised post-v0.3.6.
+- **WASI-GPU surface lock** — freeze the host-fn signatures so
+  third-party guests can ship against v0.5-beta without breakage.
+- **MPS production-readiness checklist** — the feature flag exists;
+  the checklist that says "ship MPS as default at v1.0 or stay behind
+  the flag" lands here.
+- **Reproducible-build attestation** — SLSA Level 3 ambition;
+  pre-staged by [`docs/REPRODUCIBLE-BUILDS.md`](REPRODUCIBLE-BUILDS.md)
+  and the W4.3 SBOM workflow.
+
 ---
 
 **Top priority for the v0.5-beta external-deploy gate: #10
