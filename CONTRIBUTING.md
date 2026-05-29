@@ -34,9 +34,27 @@ make ci
 ```
 
 `make ci` runs `cargo fmt --check`, `cargo clippy -- -D warnings`,
-`cargo check --workspace`, and `cargo test --workspace`. It is the exact
-set of checks the GitHub Actions workflow runs on every PR; running it
-locally before pushing keeps the feedback loop short.
+`cargo check --workspace`, and `cargo test --workspace` on your host
+toolchain — a fast subset of the PR gate. Running it before pushing keeps
+the feedback loop short.
+
+To reproduce the **full** GitHub Actions `ci` workflow (the Linux jobs:
+fmt, clippy, test, doc, `cargo-deny`, cuda-oxide-backend-check, openapi,
+actionlint) in a container pinned to the exact CI toolchain — handy when a
+job is green locally but red on CI, or when you develop on Windows/macOS —
+use the Docker wrapper:
+
+```sh
+scripts/ci-local.sh            # full CI; or e.g. scripts/ci-local.sh fmt clippy
+```
+```powershell
+scripts\ci-local.ps1           # PowerShell equivalent
+```
+
+It builds a cached CI image (`docker/ci.Dockerfile`) and runs each job with
+`RUSTFLAGS=-D warnings` and CUDA stub libs, exactly as CI does. The Linux
+build cache lives on Docker volumes, so it never touches your host `target/`.
+The macOS compile-test job is not reproduced (it needs a macOS host).
 
 If you only want a fast smoke test, `make build` and `make test` are
 both fine starting points.
