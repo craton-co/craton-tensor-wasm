@@ -457,8 +457,6 @@ fn tail_latency_bench(c: &mut Criterion) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn nearest_rank_known_distribution() {
         // 1..=100 sorted: P50 = 50, P95 = 95, P99 = 99, P99.9 = 100, max = 100.

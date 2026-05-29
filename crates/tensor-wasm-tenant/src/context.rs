@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tensor_wasm_core::error::TensorWasmError;
-use tensor_wasm_core::mem_pool::{DriverMemPool, MemPoolError};
+use tensor_wasm_core::mem_pool::DriverMemPool;
 use tensor_wasm_core::metrics::{TenantLabels, TensorWasmMetrics};
 use tensor_wasm_core::types::TenantId;
 
@@ -1475,6 +1475,10 @@ impl TenantContextBuilder {
 // shim's behaviour until the variants are removed in v0.4.
 mod tests {
     use super::*;
+    // Test-only: the mock `DriverMemPool` impl below returns this error type.
+    // Kept out of the module-level imports so the non-test lib build doesn't
+    // carry an unused import (the production paths use `DriverMemPool` only).
+    use tensor_wasm_core::mem_pool::MemPoolError;
 
     #[test]
     fn builder_defaults() {
