@@ -236,5 +236,33 @@ path = "tests/cache_verify_opt_out.rs"
 required-features = ["__unstable-test-internals"]
 
 [package.metadata.docs.rs]
-all-features = true
+# Do NOT use `all-features = true`: the `pliron-llvm-backend` feature pulls in
+# `pliron-llvm` 0.15, which carries a hard transitive dependency on
+# `llvm-sys = "221"`. That requires a system-wide LLVM 221 install (via
+# `LLVM_SYS_221_PREFIX`), which docs.rs's build environment does not provide,
+# so building it there would fail the link step and block all docs for this
+# crate. We therefore enumerate only the docs.rs-safe, pure-Rust features and
+# deliberately omit `pliron-llvm-backend`.
+#
+# Included features and why they're safe:
+#   auto-offload             — pure Rust, no deps.
+#   cuda-oxide-backend       — pulls `pliron` 0.15 (pure-Rust crates.io crate;
+#                              system LLVM is only required by pliron-llvm).
+#   kernel-registry          — pure-Rust crates (hmac, sha2, serde, serde_json,
+#                              bincode); no system libraries.
+#   differential-oracle      — pure Rust, no deps.
+#   test-utils               — pure Rust, no deps.
+#   __unstable-test-internals — pure Rust, no deps.
+#
+# Excluded:
+#   pliron-llvm-backend      — needs system LLVM 221 (llvm-sys = "221"),
+#                              unavailable on docs.rs.
+features = [
+    "auto-offload",
+    "cuda-oxide-backend",
+    "kernel-registry",
+    "differential-oracle",
+    "test-utils",
+    "__unstable-test-internals",
+]
 rustdoc-args = ["--cfg", "docsrs"]

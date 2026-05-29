@@ -29,7 +29,7 @@ By participating you agree to uphold its terms. Enforcement issues go to
 
 ```sh
 git clone https://github.com/craton-co/craton-tensor-wasm
-cd tensor-wasm
+cd craton-tensor-wasm
 make ci
 ```
 

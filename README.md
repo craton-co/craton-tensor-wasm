@@ -108,13 +108,26 @@ reference.
 | Feature | Default | Where | Purpose |
 |---|---|---|---|
 | `unified-memory` | off (CUDA-host only) | tensor-wasm-mem | Links `cust`; uses `cudaMallocManaged`. |
-| `pinned-host-memory` | off | tensor-wasm-mem | Page-locked fallback (rarely needed; default off path is plain heap). |
 | `cudarc-backend` | off | tensor-wasm-mem | Opt-in `cudarc` backend spike (W1.2). `cust` remains the default; see [`docs/CUDARC-SPIKE.md`](docs/CUDARC-SPIKE.md). |
-| `async-execution` | on | tensor-wasm-exec | Wasmtime async + epoch interruption. |
-| `cuda` | off | tensor-wasm-wasi-gpu, tensor-wasm-tenant | Real CUDA host functions / contexts. Typed argv lowering for scalar + pointer kernel args (W1.1). |
-| `auto-offload` | off | tensor-wasm-jit | Cranelift→PTX JIT pipeline. |
-| `mps` | off | tensor-wasm-tenant | Prefer NVIDIA MPS-backed shared contexts. |
+| `gpu-mem-pool` | off | tensor-wasm-mem | Driver-level per-tenant GPU memory cap via `cuMemPool*` (T39). Strict-superset alias of `cudarc-backend`; see [`docs/GPU-QUOTAS.md`](docs/GPU-QUOTAS.md). |
+| `mock-cuda` | off | tensor-wasm-mem | Hardware-free CUDA test doubles; makes GPU rollback / drop paths CI-runnable on a host with no GPU. |
+| `cuda-oxide-backend` | off | tensor-wasm-mem, tensor-wasm-jit | Dep-less v0.5 cust-successor scaffold module (RFC 0001). |
+| `cuda` | off | tensor-wasm-exec, tensor-wasm-wasi-gpu, tensor-wasm-snapshot, tensor-wasm-tenant | Real CUDA host functions / contexts / kernel launches. Typed argv lowering for scalar + pointer kernel args (W1.1). |
+| `auto-offload` | off | tensor-wasm-jit | Gates extra CUDA-side wiring for the JIT pipeline (the Cranelift→PTX pipeline itself is always compiled). |
+| `kernel-registry` | off | tensor-wasm-jit | Manifest verification + registry impls for the signed kernel registry. |
+| `pliron-llvm-backend` | off | tensor-wasm-jit | Stage-2 `twasm.*`→`llvm.*` rewrite via `pliron-llvm` (strict superset of `cuda-oxide-backend`; needs system LLVM). |
+| `differential-oracle` | off | tensor-wasm-jit | Differential JIT correctness oracle (proptest harness). |
+| `signed-snapshots` | on | tensor-wasm-snapshot | HMAC-SHA256 snapshot signing/verification (v3 wire format). |
+| `artifact-backing` | on | tensor-wasm-snapshot | Routes snapshot writes through the unified `DiskArtifactStore` envelope (T40). |
+| `mmap` | off | tensor-wasm-snapshot | `memmap2`-backed snapshot reads. |
+| `strict-cap-binding` | on | tensor-wasm-tenant | Gates the typed `*_strict` admin APIs (the capability-to-registry binding itself is always enforced). |
+| `kernel-registry-api` | off | tensor-wasm-api | Compiles the `kernels` module and wires `POST/GET /kernels` into the router (B6.4). |
 | `otlp` | off | tensor-wasm-core | OpenTelemetry OTLP exporter; trace IDs propagate end-to-end through HTTP → tenant lookup → snapshot restore → dispatch (W4.1). |
+
+Note: `async-execution` is not a build flag — Wasmtime async + epoch
+interruption is always-on behaviour. NVIDIA MPS-backed shared contexts
+are likewise selected at runtime (env/config), not via a cargo feature;
+see [`docs/MPS-SETUP.md`](docs/MPS-SETUP.md).
 
 Operational capabilities that ship on by default (no feature flag):
 

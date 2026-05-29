@@ -29,7 +29,7 @@ On disk a single artifact lives at `{content_hash_hex}.{key_fp_hex}.bin`, where 
 - `tempfile` — atomic temp-then-rename writes.
 - `zeroize` — best-effort scrub of the HMAC key on drop.
 - `parking_lot` — `Mutex` for the in-memory store.
-- `tracing`, `thiserror`, `serde`, `bincode` — supporting plumbing.
+- `tracing`, `thiserror`, `serde`, `serde_json` — supporting plumbing (`serde` + `serde_json` encode the `ArtifactMetadata` sidecar stored alongside each blob).
 
 ## Hardening
 

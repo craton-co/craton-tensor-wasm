@@ -120,14 +120,20 @@ A third option has appeared since W1.2 wrote the spike: NVlabs `cuda-oxide` v0.1
 
 ## tensor-wasm-api authentication surface
 
-**Status:** v0.1.0 ships a bearer-token gate via `TENSOR_WASM_API_TOKENS` env var and a `X-TensorWasm-Tenant` header for tenant scoping.
+**Status:** the v0.1.0 bearer-token gate (`TENSOR_WASM_API_TOKENS` + `X-TensorWasm-Tenant`) has been hardened over the v0.2–v0.3.7 line. The items the v0.1.0 register flagged as open are now mitigated:
 
-**Limitations:**
-- Static token allowlist (no token rotation, no per-token scopes).
-- No mTLS, no OIDC, no rate limiting per token.
-- `X-TensorWasm-Tenant` is trusted; cross-tenant isolation depends on operators not exposing the API to untrusted clients without an upstream auth proxy.
+**Mitigated since v0.1.0:**
+- **Per-token rate limiting (W1.4, v0.2):** `TENSOR_WASM_API_RATE_LIMIT_QPS` / `TENSOR_WASM_API_RATE_LIMIT_BURST` enable a per-bearer-token token bucket that returns `429` with `error.kind = rate_limited` and a `Retry-After` header. This replaces the old process-wide `ConcurrencyLimitLayer(64)` workaround. Unset/`0` keeps the limiter disabled (v0.1 behaviour). See [`crates/tensor-wasm-api/API.md#per-token-rate-limiting`](../crates/tensor-wasm-api/API.md).
+- **Per-tenant scoped bearer tokens (W2.1, v0.4):** tokens carry a `:tenant=*` or `:tenant=1,2,3` scope clause; invoke routes refuse cross-tenant access with `403` `error.kind = tenant_scope_denied`. `X-TensorWasm-Tenant` is now enforced against the token scope rather than blindly trusted. Bare (unscoped) tokens still authenticate but are coerced to wildcard scope and emit a startup deprecation warning (removal planned v1.0 — see [`docs/MIGRATION-v0-to-v1.md`](MIGRATION-v0-to-v1.md) §3).
+- **Structured audit log (W2.2, v0.4):** every state-mutating route emits one JSON record to the sink selected by `TENSOR_WASM_API_AUDIT_LOG` (stdout / `file:<path>` / `none`); 403 scope denials and 429 rate-limit rejections are captured. Schema and rotation in [`docs/AUDIT-LOG.md`](AUDIT-LOG.md).
+- **mTLS deployment guide (W2.8, v0.4):** an mTLS-terminating reverse proxy can front the gateway and forward the client-cert Subject DN via `X-Forwarded-Client-Cert`, which the audit middleware records as `client_cert_subject`. Recipe in [`docs/deployment/mtls.md`](deployment/mtls.md).
 
-**Recommendation:** deploy behind an authenticating reverse proxy (Cloudflare Access, AWS ALB + Cognito, OAuth2 Proxy) for any non-internal use.
+**Residual risk (still open):**
+- No built-in token rotation and no OIDC; the allowlist is still static env-var configuration.
+- mTLS is proxy-fronted only (Architecture B). Self-terminated mTLS (`serve_tls()`, Architecture A) is not yet implemented.
+- The `X-Forwarded-Client-Cert` header is parsed unconditionally — there is no trusted-proxy CIDR allowlist yet, so a caller that can reach the listener directly can spoof `client_cert_subject` (same shape as `X-Forwarded-For` spoofing). The mitigation is to bind the gateway to a private network and let only the trusted proxy reach it. See [`docs/AUDIT-LOG.md`](AUDIT-LOG.md) §6.2.
+
+**Recommendation:** for any non-internal use, still deploy behind an authenticating / mTLS-terminating reverse proxy (Cloudflare Access, AWS ALB + Cognito, OAuth2 Proxy, Envoy) and bind the gateway to a private network so the forwarded-header trust boundary holds.
 
 **Owner:** API + platform maintainers.
 
@@ -135,7 +141,7 @@ A third option has appeared since W1.2 wrote the spike: NVlabs `cuda-oxide` v0.1
 
 ## S22 deferred work
 
-The following items from the audit cycle remain open at v0.1.0:
+The following items from the audit cycle remain open as of v0.3.7:
 
 - **Differential testing** of tensor-wasm-jit against the wasmtime CPU path beyond the unit-test surface.
 - **Snapshot fuzz harness** for structure-aware mutation of valid snapshots (a byte-fuzz target exists at `fuzz/fuzz_targets/fuzz_snapshot_restore.rs`).

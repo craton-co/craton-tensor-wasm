@@ -6,20 +6,21 @@ Multi-tenant CUDA context management for Craton TensorWasm. Provides `TenantCont
 
 | Flag | Default | Description |
 |---|---|---|
-| `mps` | no | Prefer NVIDIA MPS-backed shared contexts when `/tmp/nvidia-mps` is present. |
 | `cuda` | no | Use real CUDA contexts (vs in-process stub for unit tests). |
 | `loom` | no | Swap `std::sync::atomic::AtomicU64` for `loom::sync::atomic::AtomicU64` on the `consume_bytes` / `release_bytes` CAS hot path so `tests/loom_consume_release.rs` can exhaustively explore the two-thread interleavings. Pure model-checking — do not enable in production builds. |
-| `strict-cap-binding` | no | Bind `RegistryAdminCapability` and `TenantCapability` to the `TenantRegistry` that minted them. With the flag off, caps are an opaque "you-hold-*some*-cap" token and a cap minted by registry A is accepted by registry B (the v0.3 default). With the flag on, foreign caps are rejected at the cap-check site. See [Cap binding](#cap-binding) below. |
+| `strict-cap-binding` | **yes** | Gates the typed `*_strict` admin error variants (e.g. `RegistryError::CapabilityFromForeignRegistry`) and the `cap_binding_strict` integration test. **It no longer toggles any security behaviour** — capability-to-registry binding is now unconditional (see [Cap binding](#cap-binding)). Kept in `default` so the `*_strict` surface is available out of the box. |
+
+NVIDIA MPS detection is unconditional — there is no feature flag for it. At runtime `TenantRegistry::mps_or_fallback` probes for the MPS control daemon (honouring `$CUDA_MPS_PIPE_DIRECTORY`, else `/tmp/nvidia-mps`) and returns `MpsDecision::Mps` when present, falling back to per-tenant contexts otherwise.
 
 See [docs/BUILD.md](../../docs/BUILD.md) for the project-wide flag taxonomy.
 
 ## Cap binding
 
-`TenantRegistry::new()` mints a `RegistryAdminCapability`; every successful `register_with_capability` call mints a per-tenant `TenantCapability`. Both gate the hot-path mutation methods (admin enumeration / eviction for the former, per-tenant `consume_bytes_with_capability` / `release_bytes_with_capability` for the latter). The default mode and the strict mode differ only in how those caps relate to the *specific* registry instance they came from.
+`TenantRegistry::new()` mints a `RegistryAdminCapability`; every successful `register_with_capability` call mints a per-tenant `TenantCapability`. Both gate the hot-path mutation methods (admin enumeration / eviction for the former, per-tenant `consume_bytes_with_capability` / `release_bytes_with_capability` for the latter).
 
-**Default mode (no `strict-cap-binding`):** capabilities are opaque tokens. A cap minted by registry A is accepted by registry B. Sufficient to prevent unauthenticated callers from enumerating tenants, but **not** sufficient to separate two independent registries running in the same process. Embedders that host more than one `TenantRegistry` are responsible for keeping the registry handles per-trust-domain.
+**Binding is unconditional — capabilities are always registry-scoped.** Every cap carries an `Arc<()>` token cloned from the minting registry's per-instance allocation, and every admin / quota check compares with `Arc::ptr_eq`. A cap minted by registry A is therefore rejected by registry B even when both name the same `TenantId`, and forged/foreign admin caps are refused — whether or not the `strict-cap-binding` feature is enabled, including in a release build with `default-features = false`. Two independent registries running in the same process are cleanly separated by construction; embedders no longer have to keep registry handles per-trust-domain to get isolation. Foreign-cap quota calls surface as [`TensorWasmError::TenantIsolationViolation`].
 
-**Strict mode (`--features strict-cap-binding`):** every cap carries an `Arc<()>` token cloned from the minting registry's per-instance allocation. The admin / quota check compares with `Arc::ptr_eq`. Foreign-cap admin calls surface as [`RegistryError::CapabilityFromForeignRegistry`] from the `*_strict` admin variants. Foreign-cap quota calls surface as [`TensorWasmError::TenantIsolationViolation`]. Recommended for multi-tenant deployments; v0.4 will flip this on by default.
+The `strict-cap-binding` feature (on by default) no longer toggles this security behaviour. It only gates the typed `*_strict` admin variants, which surface a foreign cap as [`RegistryError::CapabilityFromForeignRegistry`] rather than the generic refusal, plus the `cap_binding_strict` integration test.
 
 ## Per-tenant quotas
 

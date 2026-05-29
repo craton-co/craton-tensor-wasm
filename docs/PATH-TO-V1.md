@@ -13,7 +13,7 @@ together define the bar.
 ## Contents
 
 1. [What v1.0 means](#what-v10-means)
-2. [Where v0.1.0 stands today](#where-v010-stands-today)
+2. [Where v0.3.7 stands today](#where-v037-stands-today)
 3. [Anti-goals — what v1.0 does NOT promise](#anti-goals-what-v10-does-not-promise)
 4. [The five-milestone path](#the-five-milestone-path)
 5. [Per-area workstreams](#per-area-workstreams)
@@ -51,18 +51,18 @@ v0.x with more polish.
 
 ---
 
-## Where v0.1.0 stands today
+## Where v0.3.7 stands today
 
 This section is a snapshot, not a promise. Each row references the
 crate or doc that owns the gap.
 
-| Area | v0.1.0 state | Gap to v1.0 |
+| Area | v0.3.7 state | Gap to v1.0 |
 |---|---|---|
 | WASM execution (Wasmtime wrapper) | Solid; all 280+ tests green on host-only | None — the wrapper is the thinnest layer and is feature-complete |
 | Cold-start (snapshot/restore) | Implemented + tested; bounds-checked against zip bombs (Batch H) | Real cold-disk numbers from S22 runner; cross-version snapshot compat policy |
 | Kernel dispatch | Back-pressure semaphore + future scaffold; returns immediately on non-CUDA hosts | Real `cuLaunchKernel`-backed event sync on CUDA; measured P99 |
 | Auto-offload JIT | End-to-end working for matmul/vector_add/conv2d blueprints (Batch G); BLAKE3 cache | Broader blueprint set; coverage report on which patterns get offloaded |
-| Kernel-args marshalling | Returns `KernelArgsUnsupported` for `args_len > 0` (documented v0.1.0 contract — see [`RISKS.md`](RISKS.md)) | Full dynamic argv via `cuLaunchKernel`; v0.2 milestone |
+| Kernel-args marshalling | Returns `KernelArgsUnsupported` for `args_len > 0` (documented current contract — see [`RISKS.md`](RISKS.md)) | Full dynamic argv via `cuLaunchKernel`; v0.2 milestone |
 | Multi-tenant (TenantRegistry) | Quota gate works, MPS feature-gated | MPS production-tested; tenant-level metric isolation verified |
 | HTTP API | axum gateway with bearer auth + 64 MiB body limit (Batch J); async invoke via `JobRecord`; OpenAPI committed; per-token QPS rate limiting (W1.4, closed); scoped bearer tokens (W2.1, closed); structured audit log (W2.2, closed) | mTLS / OIDC remain v2 considerations |
 | CLI | Snapshot save/restore wired against API (Batch K); 22 lib tests + 19 smoke + 10 snapshots; `observe` subcommand (W1.5, closed); shell completions + man pages (W2.4, closed) | None remaining for v1.0 |
@@ -123,8 +123,8 @@ shippable, each has hard exit criteria, and each unblocks the next.
 ### v0.2.0 — "Real CUDA"
 
 **Theme.** The CUDA path moves from feature-gated stub to first-class
-supported configuration. Anything labeled "modeled" or "v0.1.0
-contract" in the v0.1.0 docs becomes "measured" or "implemented".
+supported configuration. Anything labeled "modeled" or "current
+contract" in the v0.3.7 docs becomes "measured" or "implemented".
 
 **Exit criteria.**
 
@@ -277,34 +277,6 @@ unless a beta-cycle bug demands it.
 
 ---
 
-## Post-v0.3.6 strategic features
-
-Features that landed as v0.3.x _scaffolds_ — surface-area-stable, but
-with the production wire (server endpoints, on-disk stores, control
-plane) deferred to v0.4 so a design partner can target them ahead of
-the parity port. Each item lives behind a feature flag in its owning
-crate so the default build doesn't pay the dep cost until the wire
-lands.
-
-1. **OpenAI gateway shim** (`tensor-wasm-api`, v0.3.6). Wired into the
-   router behind a route allowlist with an OpenAPI spec. See B5.6.
-2. **Unified backing for tensor buffers** (`tensor-wasm-mem`, v0.3.5).
-   `UnifiedBacking` trait + `UvmAdvice` impls for the three buffer
-   shapes. See B5.4 and `docs/CUDA-OXIDE-CUTOVER.md`.
-3. **Signed kernel registry** (`tensor-wasm-jit`, v0.3.7). HMAC-SHA256
-   `KernelManifest` records + in-memory `InMemoryRegistry`. CLI
-   surface (`tensor-wasm kernel publish|list|verify`) is staged but
-   exits with code 3 (`FEATURE_NOT_EXPOSED`) until v0.4 wires the
-   server-side `/kernels` route. See
-   [KERNEL-REGISTRY.md](KERNEL-REGISTRY.md).
-
-These items are deliberately NOT exit criteria for v0.4; they exist
-to let design partners build against a stable Rust + CLI surface
-ahead of the v0.4 wire. The "graduate from scaffold to wired" step
-moves to the relevant v0.4 milestone above.
-
----
-
 ## Per-area workstreams
 
 Cross-cuts the milestones above. These can be parallelized; each
@@ -445,46 +417,6 @@ v1.x, nightly bumps that don't break user code are patch releases.
 
 ---
 
-## Post-v0.3.6 strategic features
-
-These are scoped items the v0.3.6 → v0.5 window opens up. None of them
-block v0.5-beta exit on their own, but each closes a specific
-"audit-bait" objection the external auditor is likely to raise. Items
-are listed in expected scaffold-land order; the cross-link points at
-the in-tree spec doc where the scaffold landed first.
-
-1. **Kernel ABI freeze + versioning policy** — stable `.ptxbin`
-   container with explicit ABI version byte; covered by the cache
-   integrity tests today, formalised post-v0.3.6.
-2. **Snapshot replay-protection cross-version matrix** — v0.3.6
-   landed the per-snapshot nonce + tenant-scoped epoch fields. v0.4
-   adds the end-to-end matrix that exercises the policy across
-   N-1 / N / N+1 minor versions.
-3. **Tenant-quota fairness model formalisation** — the back-pressure
-   semaphore is the current implementation; the formalised model
-   (proportional-share or weighted fair queueing) lands as an RFC.
-4. **MPS production-readiness checklist** — the feature flag exists;
-   the checklist that says "ship MPS as default at v1.0 or stay
-   behind the flag" lands here.
-5. **WASI-GPU surface lock** — freeze the host-fn signatures so
-   third-party guests can ship against v0.5-beta without breakage.
-6. **Differential JIT correctness oracle** — runs every
-   `auto_offload` candidate on both the Wasmtime CPU interpreter and
-   the JIT PTX path and asserts bit-identity. Lowest-cost,
-   highest-credibility security item on the v0.5 pre-audit
-   checklist. Scaffold lives in
-   [`crates/tensor-wasm-jit/src/differential.rs`](../crates/tensor-wasm-jit/src/differential.rs);
-   spec doc at [`docs/DIFFERENTIAL-ORACLE.md`](DIFFERENTIAL-ORACLE.md).
-7. **Reproducible-build attestation** — SLSA Level 3 ambition;
-   pre-staged by [`docs/REPRODUCIBLE-BUILDS.md`](REPRODUCIBLE-BUILDS.md)
-   and the W4.3 SBOM workflow.
-
-Items 1-5 and 7 are tracked elsewhere in this document or in their own
-spec docs; item 6 is new in v0.3.6 and is cross-linked from
-[`docs/DIFFERENTIAL-ORACLE.md`](DIFFERENTIAL-ORACLE.md).
-
----
-
 ## Risk register
 
 Risks that could push v1.0 right or force a milestone re-cut.
@@ -529,31 +461,6 @@ Don't quote these dates externally. Quote milestones instead:
 the commitment; the date is a guess.
 
 ---
-
-## Post-v0.3.6 strategic features
-
-A small list of strategic features lined up between v0.3.6 and v0.4.0.
-Each is scoped, has a single owner module, and ships behind an opt-in
-config knob so existing deployments are unaffected until they elect
-to turn it on. Order is by expected impact on cold-start / hot-path
-latency; numbering is stable for cross-linking.
-
-1. **OpenAI-shim compatibility layer** — drop-in `/v1/completions`
-   surface that forwards into a TensorWasm tenant. Scaffold landed
-   in `tensor-wasm-api`; full streaming in v0.4.
-2. **Snapshot replay-protection** — monotonic snapshot epoch + nonce,
-   verified on restore. Scaffold landed in `tensor-wasm-snapshot`.
-3. **Tenant-aware WASI-GPU back-pressure** — per-tenant queue depth
-   limits surfacing as `QuotaExceeded`. Scaffold in
-   `tensor-wasm-wasi-gpu`.
-4. **Configurable per-instance linear-memory cap** — `max_linear_memory`
-   in `EngineConfig`. Landed in `tensor-wasm-mem`.
-5. **Pre-instantiated instance pool** — pre-spawn N instances per
-   `(tenant, module-hash)` tuple under MPS; draw from a
-   `crossbeam-channel` on `invoke`. Scaffold lives in
-   `tensor-wasm-exec::instance_pool`; see
-   [docs/INSTANCE-POOL.md](INSTANCE-POOL.md) for the v0.4
-   implementation plan and the reset-on-return contract.
 
 ## Out of scope — deferred to v2.0
 
@@ -863,7 +770,7 @@ place.
   becomes measured in v0.2
 - [BENCHMARKING.md](BENCHMARKING.md) — how external comparisons are
   expected to be conducted before v0.5
-- [RISKS.md](RISKS.md) — v0.1.0 known limitations and tracked
+- [RISKS.md](RISKS.md) — current known limitations and tracked
   upstream issues
 - [SECURITY.md](../SECURITY.md) — disclosure process (matures into
   the v1.0 CVE pipeline)
@@ -872,7 +779,7 @@ place.
 
 ---
 
-_Status: proposal, v0.1.0 era. This document is itself v0.x — expect
-it to change shape before v0.2 ships. Treat the milestone exit
+_Status: proposal, v0.3.7 baseline. This document is itself v0.x — expect
+it to change shape before v0.4 ships. Treat the milestone exit
 criteria as the contract; the calendar dates as guesses; the open
 decisions as the actual blockers._

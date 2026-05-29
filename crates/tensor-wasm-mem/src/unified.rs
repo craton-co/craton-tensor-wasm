@@ -231,6 +231,32 @@ pub struct UnifiedBuffer {
     /// CUDA allocation could be host-addressable yet still need a context
     /// to free, so the two concerns are tracked separately.
     host_zeroize_on_drop: bool,
+    /// Physical byte capacity of the underlying allocation on the HOST
+    /// (`Box<[u8]>`) backing.
+    ///
+    /// `size` is the *logical* (currently-used) length exposed by
+    /// [`Self::len`] / [`Self::as_slice`] / [`Self::as_mut_slice`];
+    /// `host_capacity` is how many bytes the backing allocation actually
+    /// owns. The invariant `size <= host_capacity` is upheld by every
+    /// constructor and by [`Self::try_grow_in_place`], which is what makes
+    /// it sound for the slice/`Drop` paths to keep bounding their
+    /// `from_raw_parts` over `self.ptr` with `self.size` — they only ever
+    /// view a prefix of the real allocation.
+    ///
+    /// For the standard host constructors (`new`, `new_on`,
+    /// `new_with_visible_window_on`, …) this equals `size`: the
+    /// `vec![0u8; size]` backing is exactly sized, so there is no spare
+    /// room and an in-place grow request necessarily falls back to the
+    /// realloc path. [`Self::new_host_with_capacity_on`] is the entry
+    /// point that allocates `capacity > size` physical bytes so that
+    /// subsequent [`Self::try_grow_in_place`] calls up to `capacity`
+    /// succeed without a realloc+copy — the per-spawn Wasm-linear-memory
+    /// win this field exists to enable.
+    ///
+    /// On the CUDA backings this field is bookkeeping only (set equal to
+    /// `size`); the CUDA in-place grow path is still deferred (see
+    /// [`Self::try_grow_in_place`]).
+    host_capacity: usize,
     /// Tenant context for GPU memory accounting. When `Some`, the
     /// buffer's `Drop` impl calls
     /// [`TenantContext::release_gpu_bytes`] for `size` bytes. Set only
@@ -761,6 +787,69 @@ impl UnifiedBuffer {
             // Audit (LOW): only the no-CUDA `Box<[u8]>` build can be
             // zeroized in `Drop` without a live CUDA context.
             host_zeroize_on_drop: IS_HOST_BACKED,
+            // Exactly-sized backing: no spare capacity, so logical ==
+            // physical and `try_grow_in_place` cannot grow without a
+            // realloc. See `new_host_with_capacity_on` for the spare-cap
+            // path.
+            host_capacity: size,
+            tenant_ctx: None,
+        })
+    }
+
+    /// Allocate a HOST (`Box<[u8]>`) buffer with `capacity` physical bytes
+    /// but only `size` bytes of *logical* length exposed.
+    ///
+    /// This is the entry point that makes [`Self::try_grow_in_place`]
+    /// genuinely grow in place: the backing owns `capacity` zeroed bytes,
+    /// [`Self::len`] / [`Self::as_slice`] / [`Self::as_mut_slice`] report
+    /// the `size`-byte prefix, and a later `try_grow_in_place(new_size)`
+    /// with `new_size <= capacity` bumps the logical length (zero-filling
+    /// the newly-exposed region per the H2 guarantee) without a
+    /// realloc+copy. The motivating case is
+    /// [`crate::wasm_memory::TensorWasmLinearMemory`]: reserve at
+    /// `max-pages` once, then satisfy each `memory.grow` as an in-place
+    /// logical bump instead of forcing the B5 option-(a) up-front
+    /// max-preallocate on every spawn.
+    ///
+    /// On the CUDA backings there is no host capacity concept, so this
+    /// degrades to an exactly-`size` allocation (`capacity` is clamped to
+    /// `size`) and `try_grow_in_place` remains deferred there. The whole
+    /// `capacity`-region is zero-initialised on the host path, so the H2
+    /// zero-on-grow guarantee holds for every byte that any future
+    /// in-place grow can expose.
+    ///
+    /// `capacity` is clamped up to `size` (a `capacity < size` request is
+    /// a caller bug; we never expose more than we own). `size == 0` is
+    /// rejected as [`UnifiedError::ZeroSize`], matching the other
+    /// constructors.
+    pub fn new_host_with_capacity_on(
+        size: usize,
+        capacity: usize,
+        device_id: DeviceId,
+    ) -> Result<Self, UnifiedError> {
+        if size == 0 {
+            return Err(UnifiedError::ZeroSize);
+        }
+        // Never expose more than the physical allocation owns.
+        let capacity = capacity.max(size);
+        // Allocate the full physical capacity. On the host path
+        // `Backing::allocate` zero-fills the entire `Box<[u8]>` regardless
+        // of the visible-window argument, so every byte the buffer can
+        // ever expose via an in-place grow is already zero (H2). On the
+        // CUDA paths the allocation is `capacity` bytes too, but the
+        // capacity is bookkeeping-only there because CUDA in-place grow is
+        // still deferred.
+        let (ptr, backing) = Backing::allocate(capacity, capacity)?;
+        Ok(Self {
+            ptr,
+            // Logical length starts at `size`; the rest of `capacity` is
+            // reserved spare that `try_grow_in_place` can later expose.
+            size,
+            device_id,
+            backing,
+            host_addressable: true,
+            host_zeroize_on_drop: IS_HOST_BACKED,
+            host_capacity: capacity,
             tenant_ctx: None,
         })
     }
@@ -843,6 +932,9 @@ impl UnifiedBuffer {
                 // Audit (LOW): only the no-CUDA `Box<[u8]>` build is
                 // zeroized on drop.
                 host_zeroize_on_drop: IS_HOST_BACKED,
+                // Exactly-sized backing: logical == physical, no spare
+                // capacity for an in-place grow.
+                host_capacity: size,
                 tenant_ctx: Some(tenant_ctx),
             }),
             Err(e) => {
@@ -943,6 +1035,9 @@ impl UnifiedBuffer {
             // CPU in `Drop` (needs a live CUDA context); leave it to the
             // pool's free path.
             host_zeroize_on_drop: false,
+            // Device-only allocation: no host capacity concept and no
+            // in-place grow on this path. Bookkeeping-equal to `size`.
+            host_capacity: size,
             // No `tenant_ctx`: this constructor is the *driver*-pin
             // entry point. The caller chooses whether to also stash
             // an `Arc<TenantContext>` for in-process accounting via a
@@ -954,8 +1049,23 @@ impl UnifiedBuffer {
     }
 
     /// Length in bytes.
+    ///
+    /// This is the *logical* (currently-used) length — the number of bytes
+    /// exposed by [`Self::as_slice`] / [`Self::as_mut_slice`]. On the host
+    /// backing it may be smaller than the physical allocation; see
+    /// [`Self::capacity`].
     pub fn len(&self) -> usize {
         self.size
+    }
+
+    /// Physical byte capacity of the underlying allocation.
+    ///
+    /// Equals [`Self::len`] for every buffer except those built via
+    /// [`Self::new_host_with_capacity_on`], where it reports the reserved
+    /// spare into which [`Self::try_grow_in_place`] can grow without a
+    /// realloc+copy. Always `>= len()`.
+    pub fn capacity(&self) -> usize {
+        self.host_capacity
     }
 
     /// True if zero-length. Always false for a successfully constructed buffer.
@@ -1040,22 +1150,58 @@ impl UnifiedBuffer {
         ((mixed >> 32) ^ (mixed & 0xFFFF_FFFF)) as u32
     }
 
-    /// Attempt to grow the buffer in place to `new_size` bytes.
+    /// Attempt to grow the buffer's logical length in place to `new_size`
+    /// bytes, without a realloc+copy.
     ///
-    /// **Status: scaffolded, not yet implemented.** Always returns
-    /// [`UnifiedError::Cuda`] with the documented `"in-place grow not
-    /// yet wired"` sentinel until the v0.4 cutover PR lands the real
-    /// `cuMemAddressReserve` + `cuMemMap` path. Until then,
-    /// [`crate::TensorWasmLinearMemory`] continues to follow the B5
-    /// option-(a) behavior: pre-allocate at `max-pages` and grow_to
-    /// is a logical-size bump up to the cap. See B5's
-    /// `grow_up_to_preallocated_cap_succeeds_beyond_fails` test for
-    /// the current contract.
+    /// # Behaviour by backing
     ///
-    /// # Background
+    /// **HOST (`Box<[u8]>`, the no-CUDA default build) — implemented.**
+    /// Succeeds iff `new_size <= self.capacity()` (the physical bytes the
+    /// backing already owns). On success the logical length
+    /// ([`Self::len`]) is bumped to `new_size` and the newly-exposed region
+    /// `[old_len, new_size)` is zero-filled to uphold the H2 zero-on-grow
+    /// guarantee, then `Ok(())` is returned. A shrink (`new_size <=
+    /// old_len`) just lowers the logical length and zero-fills nothing.
+    /// When `new_size` exceeds the physical capacity there is no spare room
+    /// to grow into, so the call returns
+    /// [`UnifiedError::NotSupported`] (`feature = "try_grow_in_place"`,
+    /// `backing = "host-box"`) — a typed, NON-CUDA "would require realloc"
+    /// signal the caller uses to fall back to its realloc+copy path. The
+    /// exactly-sized constructors (`new`, `new_on`,
+    /// `new_with_visible_window_on`, …) leave no spare capacity, so a real
+    /// grow against them always takes that fallback;
+    /// [`Self::new_host_with_capacity_on`] is the constructor that reserves
+    /// spare capacity so the in-place path actually fires (the per-spawn
+    /// Wasm-linear-memory win — reserve at max once, then grow logically).
     ///
-    /// `cuMemAllocManaged` returns a fixed-size allocation; there is
-    /// no in-place grow. The CUDA Driver API alternative is:
+    /// **CUDA (`unified-memory` cust / `cudarc-backend`) — still deferred.**
+    /// Returns [`UnifiedError::Cuda`] with the documented
+    /// `"in-place grow not yet wired"` sentinel. `cuMemAllocManaged`
+    /// returns a fixed-size allocation with no in-place grow; the Driver
+    /// API alternative (`cuMemAddressReserve` + `cuMemCreate` + `cuMemMap`
+    /// + `cuMemSetAccess`, see the `TODO(v0.4)` below) is the remaining
+    /// work. We deliberately do NOT report a CUDA error on the host build:
+    /// the host path has no CUDA at all, so misclassifying its "no spare
+    /// capacity" outcome as a CUDA failure (the previous stub's bug) would
+    /// send callers down a driver-error branch that does not apply.
+    ///
+    /// # H2 / safety invariants
+    ///
+    /// `new_size` is never allowed to exceed the physical allocation:
+    /// success requires `new_size <= host_capacity`, preserving the
+    /// `size <= host_capacity` struct invariant that lets the slice and
+    /// `Drop` paths soundly bound their `from_raw_parts` over `self.ptr`
+    /// with `self.size`. The grown region is zeroed through the same
+    /// host-addressable `&mut [u8]` the caller would see, so no UB and no
+    /// stale residue is exposed. The grow is rejected on a non-host-
+    /// addressable buffer (device-only `new_in_tenant_pool` memory) because
+    /// it would need a host write into device memory — that path is CUDA
+    /// and so already returns the deferred sentinel.
+    ///
+    /// # TODO(v0.4): CUDA in-place grow via `cuMemAddressReserve`+`cuMemMap`
+    ///
+    /// Implemented: the HOST `Box<[u8]>` spare-capacity path above.
+    /// Deferred: the CUDA virtual-memory path:
     ///
     /// 1. `cuMemAddressReserve(size = max-pages, align)` — reserve a
     ///    virtual address window large enough for any future grow.
@@ -1069,7 +1215,7 @@ impl UnifiedBuffer {
     ///    `cuMemMap(va + initial_size, delta, handle_more)` +
     ///    `cuMemSetAccess(va, new_size, ReadWrite)`.
     ///
-    /// This is a v0.4 follow-up because:
+    /// Still a follow-up because:
     ///
     /// - The `cuMemAddressReserve` family is in `cust::sys` / cudarc
     ///   `sys::lib()` but neither crate has a safe wrapper, so the
@@ -1086,33 +1232,75 @@ impl UnifiedBuffer {
     ///   wrapper that obviates the bare driver API entirely, per
     ///   RFC 0001's "cuda-oxide host crates" inventory; waiting one
     ///   release cycle may save us the work.
-    ///
-    /// # Why scaffold this now
-    ///
-    /// So the v0.4 author has a concrete target signature + the four
-    /// known constraints listed above, rather than starting from a
-    /// blank canvas. The stub also lets callers (notably
-    /// `TensorWasmLinearMemory::grow_to`) feature-detect via the
-    /// returned error string instead of branching on `cfg(feature =
-    /// "in-place-grow")` ahead of time.
-    pub fn try_grow_in_place(&mut self, _new_size: usize) -> Result<(), UnifiedError> {
-        Err(UnifiedError::Cuda(
-            "in-place grow not yet wired -- see UnifiedBuffer::try_grow_in_place doc + \
-             RFC 0001 v0.4 follow-up. Until then TensorWasmLinearMemory uses the B5 \
-             option-(a) preallocate-at-max strategy."
-                .into(),
-        ))
+    pub fn try_grow_in_place(&mut self, new_size: usize) -> Result<(), UnifiedError> {
+        // CUDA backings: still deferred. Keep the documented sentinel so
+        // the v0.4 caller match site is stable. Reported as a CUDA error
+        // ONLY because the active backing IS CUDA here.
+        if IS_UVM_BACKED {
+            return Err(UnifiedError::Cuda(
+                "in-place grow not yet wired -- see UnifiedBuffer::try_grow_in_place doc + \
+                 RFC 0001 v0.4 follow-up. Until then TensorWasmLinearMemory uses the B5 \
+                 option-(a) preallocate-at-max strategy."
+                    .into(),
+            ));
+        }
+
+        // HOST (`Box<[u8]>`) path. A device-only (non-host-addressable)
+        // buffer cannot be grown by a host write; reject it the same way
+        // the slice accessors do, but as a typed error rather than a panic.
+        if !self.host_addressable {
+            return Err(UnifiedError::NotSupported {
+                feature: "try_grow_in_place",
+                backing: "host-box",
+            });
+        }
+
+        // No spare physical capacity to grow into: signal the caller to
+        // fall back to its realloc+copy path. NOT a CUDA error — there is
+        // no CUDA on this build.
+        if new_size > self.host_capacity {
+            return Err(UnifiedError::NotSupported {
+                feature: "try_grow_in_place",
+                backing: "host-box",
+            });
+        }
+
+        let old_size = self.size;
+        // Bump the logical length first so `as_mut_slice` exposes the
+        // newly-claimed bytes; the `size <= host_capacity` invariant is
+        // upheld by the capacity check above.
+        self.size = new_size;
+        if new_size > old_size {
+            // H2 zero-on-grow: zero exactly the freshly-exposed region
+            // `[old_size, new_size)`. These bytes were already zero-filled
+            // at allocation time (the host `Backing::allocate` /
+            // `new_host_with_capacity_on` zero the whole physical
+            // allocation), but a buffer may have been grown, shrunk, and
+            // re-grown, so re-zero unconditionally to keep the guarantee
+            // independent of prior history.
+            self.as_mut_slice()[old_size..new_size].fill(0);
+        }
+        Ok(())
     }
 
-    /// Whether [`Self::try_grow_in_place`] is implemented on this
-    /// build. Currently always `false`; flips to `true` when the v0.4
-    /// `cuMemAddressReserve` path lands.
+    /// Whether [`Self::try_grow_in_place`] is implemented on this build.
     ///
-    /// Callers (mainly `TensorWasmLinearMemory::grow_to`) probe this
-    /// to pick between in-place-grow + max-preallocate strategies
-    /// without scraping the error string.
+    /// `true` on the no-CUDA `Box<[u8]>` host build, where
+    /// [`Self::try_grow_in_place`] grows the logical length into reserved
+    /// physical capacity without a realloc (see
+    /// [`Self::new_host_with_capacity_on`]). `false` on the CUDA backings,
+    /// where the `cuMemAddressReserve` + `cuMemMap` path is still the v0.4
+    /// follow-up documented on `try_grow_in_place`.
+    ///
+    /// Callers (mainly `TensorWasmLinearMemory::grow_to`) probe this to
+    /// pick between the in-place-grow and max-preallocate strategies
+    /// without scraping the error string. Note that a `true` here means the
+    /// mechanism exists; an individual grow can still return
+    /// [`UnifiedError::NotSupported`] when the specific buffer has no spare
+    /// capacity, at which point the caller takes its realloc fallback.
     pub const fn supports_in_place_grow() -> bool {
-        false
+        // HOST build supports it; CUDA builds do not (yet).
+        !IS_UVM_BACKED
     }
 
     /// Whether this buffer is backed by CUDA Unified Memory (`cuMemAllocManaged`).
@@ -1306,15 +1494,19 @@ impl Drop for UnifiedBuffer {
         // into about-to-be-freed memory. This crate does not depend on the
         // `zeroize` crate (not in its Cargo.toml), so a manual volatile
         // memset is used instead.
-        if self.host_zeroize_on_drop && self.size > 0 {
-            // SAFETY: on the host-backed build `ptr` points to `size`
-            // valid, host-addressable, uniquely-owned bytes (proved by
-            // `&mut self` in `drop`). The backing `Box<[u8]>` is still
-            // alive — field drop runs only after this body returns — so
-            // the write targets live memory. `write_volatile` prevents the
-            // store from being optimised away.
+        if self.host_zeroize_on_drop && self.host_capacity > 0 {
+            // SAFETY: on the host-backed build `ptr` points to
+            // `host_capacity` valid, host-addressable, uniquely-owned bytes
+            // (proved by `&mut self` in `drop`). We zero the FULL physical
+            // capacity, not just the logical `size`: a buffer built via
+            // `new_host_with_capacity_on` (or grown-then-shrunk) owns spare
+            // bytes in `[size, host_capacity)` that may hold prior residue,
+            // and those bytes are about to be freed too. The backing
+            // `Box<[u8]>` is still alive — field drop runs only after this
+            // body returns — so the write targets live memory.
+            // `write_volatile` prevents the store from being optimised away.
             unsafe {
-                std::ptr::write_bytes(self.ptr.as_ptr(), 0u8, self.size);
+                std::ptr::write_bytes(self.ptr.as_ptr(), 0u8, self.host_capacity);
                 // A volatile re-read defeats dead-store elimination: it
                 // forces the zeroing store above to be observable.
                 let _ = std::ptr::read_volatile(self.ptr.as_ptr());
@@ -1396,24 +1588,121 @@ mod tests {
     }
 
     #[test]
-    fn try_grow_in_place_returns_documented_sentinel() {
-        // D1 scaffold contract: until v0.4 lands the
-        // cuMemAddressReserve + cuMemMap path, try_grow_in_place
-        // returns the documented sentinel and supports_in_place_grow()
-        // returns false. Callers that branch on the feature gate get
-        // the same answer either way.
-        assert!(!UnifiedBuffer::supports_in_place_grow());
-        // On the no-feature build we can construct the buffer to
-        // probe the API; on feature builds the same probe works
-        // because allocate succeeds. The error string is the public
-        // contract callers (TensorWasmLinearMemory::grow_to v0.4) match on.
+    fn try_grow_in_place_classifies_per_backing() {
+        // CUDA backings are still scaffolded: until v0.4 lands the
+        // cuMemAddressReserve + cuMemMap path they return the documented
+        // sentinel and supports_in_place_grow() is false. The HOST build
+        // implements in-place grow, so supports_in_place_grow() is true and
+        // an over-capacity grow returns the typed NON-CUDA NotSupported
+        // signal rather than a CUDA error.
+        assert_eq!(UnifiedBuffer::supports_in_place_grow(), !IS_UVM_BACKED);
+        // `new(64)` is exactly-sized (capacity == 64), so growing to 128 has
+        // no spare room and must fall back.
         let mut b = UnifiedBuffer::new(64).expect("alloc");
-        let err = b.try_grow_in_place(128).expect_err("scaffold must error");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("in-place grow not yet wired"),
-            "sentinel string changed; v0.4 caller match site must be updated: {msg}",
-        );
+        let err = b.try_grow_in_place(128).expect_err("over-cap must error");
+        if IS_UVM_BACKED {
+            // CUDA path: documented sentinel string, contract for the v0.4
+            // TensorWasmLinearMemory::grow_to caller match site.
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("in-place grow not yet wired"),
+                "sentinel string changed; v0.4 caller match site must be updated: {msg}",
+            );
+        } else {
+            // HOST path: typed realloc-fallback signal, NOT a CUDA error.
+            assert!(
+                matches!(
+                    err,
+                    UnifiedError::NotSupported {
+                        feature: "try_grow_in_place",
+                        backing: "host-box",
+                    }
+                ),
+                "host over-cap grow must return typed NotSupported, got {err:?}",
+            );
+        }
+    }
+
+    // ---- HOST (`Box<[u8]>`) in-place grow regression tests ----
+    //
+    // Gated to the no-CUDA default build: these exercise the
+    // spare-capacity path that only exists on the host backing.
+    #[cfg(all(not(feature = "unified-memory"), not(feature = "cudarc-backend")))]
+    mod host_in_place_grow {
+        use super::*;
+
+        #[test]
+        fn host_grow_into_reserved_capacity_succeeds_and_zero_fills() {
+            // Reserve 256 bytes physical, expose 64 logical.
+            let mut b = UnifiedBuffer::new_host_with_capacity_on(64, 256, DeviceId::default())
+                .expect("alloc with capacity");
+            assert_eq!(b.len(), 64);
+            assert_eq!(b.capacity(), 256);
+            // Write a non-zero sentinel into the visible window so we can
+            // prove the grow does NOT clobber existing bytes.
+            b.as_mut_slice().fill(0xAB);
+            // Grow in place to 200 (<= capacity): must succeed without realloc.
+            b.try_grow_in_place(200).expect("in-place grow within capacity");
+            assert_eq!(b.len(), 200);
+            assert_eq!(b.capacity(), 256, "capacity unchanged by in-place grow");
+            let s = b.as_slice();
+            // Pre-existing bytes preserved.
+            assert!(s[..64].iter().all(|&x| x == 0xAB), "existing bytes clobbered");
+            // H2: freshly-exposed region reads as zero.
+            assert!(s[64..200].iter().all(|&x| x == 0), "grown region not zeroed");
+        }
+
+        #[test]
+        fn host_grow_beyond_capacity_returns_not_supported() {
+            let mut b = UnifiedBuffer::new_host_with_capacity_on(64, 128, DeviceId::default())
+                .expect("alloc with capacity");
+            let err = b
+                .try_grow_in_place(129)
+                .expect_err("over-capacity must fall back");
+            assert!(
+                matches!(
+                    err,
+                    UnifiedError::NotSupported {
+                        feature: "try_grow_in_place",
+                        backing: "host-box",
+                    }
+                ),
+                "expected typed realloc-fallback signal, got {err:?}",
+            );
+            // The failed grow must not mutate the logical length.
+            assert_eq!(b.len(), 64);
+        }
+
+        #[test]
+        fn host_regrow_after_shrink_rezeros_exposed_region() {
+            let mut b = UnifiedBuffer::new_host_with_capacity_on(8, 64, DeviceId::default())
+                .expect("alloc with capacity");
+            // Grow to 64, dirty the whole window, then shrink back to 8.
+            b.try_grow_in_place(64).expect("grow to cap");
+            b.as_mut_slice().fill(0xFF);
+            b.try_grow_in_place(8).expect("shrink");
+            assert_eq!(b.len(), 8);
+            // Re-grow: the re-exposed [8, 64) region must read as zero even
+            // though it held 0xFF before the shrink (H2 holds independent of
+            // prior history).
+            b.try_grow_in_place(64).expect("re-grow to cap");
+            assert!(
+                b.as_slice()[8..64].iter().all(|&x| x == 0),
+                "re-grown region must be re-zeroed",
+            );
+        }
+
+        #[test]
+        fn host_exactly_sized_buffer_has_no_spare_capacity() {
+            // Sanity: the standard constructor leaves capacity == len, so a
+            // real grow always falls back.
+            let mut b = UnifiedBuffer::new(64).expect("alloc");
+            assert_eq!(b.capacity(), b.len());
+            assert!(b.try_grow_in_place(65).is_err());
+            // Growing to exactly the current size is a no-op success.
+            b.try_grow_in_place(64).expect("grow to current len is a no-op");
+            assert_eq!(b.len(), 64);
+        }
     }
 
     #[test]

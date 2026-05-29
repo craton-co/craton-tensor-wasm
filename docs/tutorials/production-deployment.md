@@ -278,7 +278,7 @@ code. Commit it to git; the secret stays out (`auth.existingSecret`
 references the Secret from [Step 2](#4-step-2-generate-auth-tokens)).
 
 ```yaml
-# tensor-wasm.values.yaml -- production overrides for the v0.1.0
+# tensor-wasm.values.yaml -- production overrides for the v0.3.7
 # reference workload on an NVIDIA L4 (sm_89) GPU node.
 
 image:
@@ -286,7 +286,7 @@ image:
   # registry is a placeholder" -- replace with your built image until
   # ghcr.io/craton-co is provisioned.
   repository: my-registry.example.com/tensor-wasm
-  tag: "0.1.0"
+  tag: "0.3.7"
   pullPolicy: IfNotPresent
 
 replicaCount: 1
@@ -330,7 +330,7 @@ gpu:
 # Match the node SM level. See docs/CUDA-SETUP.md "SM-level compatibility matrix".
 cuda: { arch: "sm_89" }
 
-# Production sizing for the v0.1.0 reference workload. Re-measure per
+# Production sizing for the v0.3.7 reference workload. Re-measure per
 # docs/DEPLOYMENT.md sec 7 "Multi-tenant capacity planning".
 resources:
   requests: { cpu: "500m", memory: "2Gi" }
@@ -748,7 +748,7 @@ board — wraps `GET /metrics` and `GET /healthz` and prints a live
 table. Perfect for a deploy window.
 
 ```bash
-# Build from source if not already (no published binary in v0.1.0):
+# Build from source if not already (no published binary in v0.3.7):
 cargo build --release -p tensor-wasm-cli
 
 # Port-forward avoids needing a client cert for every poll.
@@ -894,7 +894,7 @@ If the symptom is not above, triage in order:
 
 ---
 
-_Status: v0.3 release. End-to-end runnable against the v0.1.0 binary
+_Status: v0.3 release. End-to-end runnable against the v0.3.7 binary
 plus the W2.7 Helm chart; every `TODO (v0.4)` / `TODO (v0.5)` marker in
 a referenced doc is reflected here as a limitation, not a gap. Re-validate
 when the chart values, the SLO targets, or the mTLS doc change shape._

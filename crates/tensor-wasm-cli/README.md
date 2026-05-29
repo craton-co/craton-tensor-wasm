@@ -29,6 +29,7 @@ A binary distribution channel (Homebrew tap, signed release tarballs) is on the 
 | `tensor-wasm bench`           | Spawn/call/terminate `N` times locally and print P50/P95/P99/max latency.           |
 | `tensor-wasm snapshot save`   | Capture a running instance to a `.tensor-wasm` archive (requires API; see notes).          |
 | `tensor-wasm snapshot restore`| Restore an instance from a `.tensor-wasm` archive (requires API; see notes).               |
+| `tensor-wasm kernel`          | Publish, list, or verify entries in the signed kernel registry (`publish`/`list` POST/GET `/kernels`; `verify` re-signs an on-disk manifest locally). |
 | `tensor-wasm metrics`         | Fetch and print the Prometheus exposition page from a TensorWasm server.                  |
 | `tensor-wasm observe`         | Live operator dashboard over `/healthz` + `/metrics` (refreshes in place).          |
 | `tensor-wasm serve`           | Run the TensorWasm HTTP API gateway in-process; bind to `--addr` and serve until Ctrl-C.  |

@@ -36,21 +36,27 @@ fn long_running_wasm() -> Vec<u8> {
 // This test drops an in-flight `call_async` future whose guest is a
 // compute-bound infinite loop, expecting the outer `timeout(100ms)` to cancel
 // it mid-await so the `AutoTerminateGuard`'s Drop path runs. That can only
-// happen if the guest yields back to the async runtime mid-execution — i.e.
-// with cooperative epoch yielding (`Store::epoch_deadline_async_yield_and_update`).
-// The executor currently arms the epoch deadline in *trap* mode
-// (`set_epoch_deadline`), so a pure-compute guest never returns `Pending`: the
-// `call_async` poll blocks the worker until the deadline traps, the outer
-// timeout can never drop the future before then, and it is the clean-completion
-// path (not Drop-on-cancel) that removes the instance. On a single-threaded
-// runtime the symptom is worse — the epoch ticker is starved by the spinning
-// guest, the deadline never advances, and the test hangs indefinitely; the
-// multi_thread flavor below at least lets the ticker run. Until the executor
-// opts into async epoch yielding this test cannot exercise its intended path.
-// The happy-path cleanup is still covered by the sibling
+// happen if the guest yields back to the async runtime mid-execution — which
+// it now does: the executor arms the epoch deadline in cooperative-yield mode
+// (an `epoch_deadline_callback` returning `UpdateDeadline::Yield` between
+// ticks, with a hard wall-clock deadline backstop that traps), so a spinning
+// guest returns `Pending` every epoch tick. That lets the outer `timeout`
+// drop the `call_async` future mid-await, unwinding the guest and running the
+// `AutoTerminateGuard`'s `Drop` (the S-20 cleanup path). The multi_thread
+// flavor below is required: the executor's cooperative yield needs the async
+// runtime to regain control on a thread that the spinning guest is not
+// occupying, otherwise the epoch ticker is starved and the deadline never
+// advances. The happy-path cleanup is also covered by the sibling
 // `call_then_terminate_clean_path_also_removes_instance`.
-#[ignore = "needs cooperative epoch yield (async_yield_and_update) to drop a \
-            compute-bound guest mid-await; executor currently traps on deadline"]
+//
+// Wasmtime's epoch-interrupt of an infinite Wasm loop triggers a fiber
+// unwinding path that, on Windows, panics in a non-unwinding C-ABI frame
+// (`STATUS_STACK_BUFFER_OVERRUN`). Linux/macOS CI runs the test; Windows
+// developer machines skip it. Same caveat as `epoch_timeout.rs`.
+#[cfg_attr(
+    windows,
+    ignore = "wasmtime fiber unwinding on Windows panics on epoch interrupt"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_terminate_guard_releases_slot_on_future_drop() {
     let mut engine = TensorWasmEngine::new().expect("engine");

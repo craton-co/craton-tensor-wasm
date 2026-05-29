@@ -210,7 +210,6 @@ end to end before a real CVE arrives. Reports go to
 | [TESTING.md](TESTING.md) | B2.9 | Testing conventions across the workspace: unit/integration/CUDA/fuzz layers, the `#[ignore]` policy for hardware-gated tests, and the CI matrix that runs them. |
 | [FUZZING.md](FUZZING.md) | B2.9 | The `fuzz/` directory layout, per-target corpora, the nightly + weekly cron schedule, and the v0.5 24-hour gate that determines when a target counts as "covered". |
 | [runbooks/cve-disclosure-dry-run.md](runbooks/cve-disclosure-dry-run.md) | W5.5 | Manual procedure for rehearsing the CVE disclosure pipeline end-to-end on a test repository before a real CVE arrives. |
-| [SECURITY-AUDIT-RFP.md](SECURITY-AUDIT-RFP.md) | — | Procurement-grade RFP a sponsor can send to an external security firm (Trail of Bits / NCC Group / Cure53 / Doyensec) to commission the v0.5 PATH-TO-V1 external pen-test, with bracketed placeholders to fill in. |
 
 ## Governance and supply chain
 
@@ -236,7 +235,6 @@ mechanism that produces every other change that touches them.
 | [PATH-TO-V1.md](PATH-TO-V1.md) | — | The proposed five-milestone roadmap from the current v0.1.0 preview to a v1.0 production release, with explicit anti-goals and open decisions. |
 | [../rfcs/README.md](../rfcs/README.md) | W1.7 | Lightweight RFC process: one contributor writes a doc, opens a PR, gives reviewers a week, and a maintainer decides. |
 | [../rfcs/TEMPLATE.md](../rfcs/TEMPLATE.md) | W1.7 | The required starting point for a new RFC; copy to `rfcs/0000-short-kebab-slug.md` and fill in the sections in order. |
-| [DESIGN-PARTNER-PROGRAM.md](DESIGN-PARTNER-PROGRAM.md) | — | Outreach and program kit for recruiting v0.5 design partners (PATH-TO-V1 Open Decision #6): sponsor deliverables, partner asks, and a copy-pasteable application template. |
 
 ## Snapshots
 

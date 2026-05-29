@@ -20,10 +20,38 @@ Company**, but maintainer status is not contingent on employment with
 the sponsor. See [`GOVERNANCE.md`](GOVERNANCE.md#maintainer) for the
 role definition.
 
-## Placeholders are by design
+## Current status (v0.x)
 
-Every `TBD` cell in this file is **intentional**, not an unfinished
-draft. Each placeholder has a documented unblock trigger:
+During the v0.x preview window, **Craton TensorWasm is maintained by
+Craton Software Company (the organization)**, acting through the
+GitHub teams that hold review and merge rights on the repository.
+There are no individually-named maintainers yet; the org and its
+teams hold every role until the community grows and individual
+maintainers are onboarded under
+[`GOVERNANCE.md`](GOVERNANCE.md#maintainer-onboarding).
+
+The teams that currently hold these roles map one-to-one to
+[`.github/CODEOWNERS`](.github/CODEOWNERS):
+
+| Role / area | Held by (GitHub team) | Contact |
+|---|---|---|
+| General review & merge (all areas) | [`@craton-co/maintainers`](https://github.com/orgs/craton-co/teams/maintainers) | `security@craton.com.ar` |
+| Security committee (embargoed disclosures) | [`@craton-co/security`](https://github.com/orgs/craton-co/teams/security) | `security@craton.com.ar` |
+| Releases & publishing | [`@craton-co/release`](https://github.com/orgs/craton-co/teams/release) | `security@craton.com.ar` |
+
+Org and team handles — not invented individual names — are the source
+of truth while the project is in its v0.x phase. This keeps the file
+honest and consistent with the disclosure contract in
+[`SECURITY.md`](SECURITY.md) (which advertises a Security Committee
+reachable at `security@craton.com.ar`) and with the ownership rules
+encoded in [`.github/CODEOWNERS`](.github/CODEOWNERS).
+
+### How the named-individual slots fill in
+
+The per-person tables further down (Lead maintainer, Active
+maintainers, Security committee) read `TBD` **by design** — the v0.x
+convention is to not invent placeholder names for real people. Each
+has a documented unblock trigger:
 
 - **Lead maintainer** (1 slot): filled by internal selection from the
   active-maintainer pool per
@@ -31,20 +59,33 @@ draft. Each placeholder has a documented unblock trigger:
   "Lead maintainer" section below for the exact recruitment flow and
   what changes about decision-making while the slot is empty.
 - **Active maintainers** (registry): filled by the standard onboarding
-  RFC + simple-majority approval process in `GOVERNANCE.md`.
+  RFC + simple-majority approval process in `GOVERNANCE.md`. Until the
+  first individual is onboarded, the `@craton-co/maintainers` team
+  holds these rights on the org's behalf (the bootstrap arrangement).
 - **Security committee** (2 slots): a subset of active maintainers;
   filled after the active list has at least two members and the
-  committee is constituted per `SECURITY.md` §"Backport policy".
-- **Area ownership** (13 cells × 2 columns each = 26 placeholders):
-  filled as maintainers join. Until then, every area is jointly
-  reviewed; the absence of named owners is the binding rule, not a
+  committee is constituted per `SECURITY.md` §"Backport policy". Until
+  then the `@craton-co/security` team discharges the committee's
+  standing commitments.
+- **Area ownership**: filled as maintainers join. Until then, every
+  area is owned by the relevant team (see [Area ownership](#area-ownership));
+  the absence of *named* owners is the binding rule, not a
   documentation gap.
 
-The v0.x convention is: do not invent placeholder names. When a real
-person fills a slot, this file is amended in the same PR that adds
-them to `GOVERNANCE.md`-recognized rights (GH team, security
-mailing list, etc.). v1.0 will not ship while a quorum-blocking
-slot is still `TBD`; see `PATH-TO-V1.md` v1.0 exit criteria.
+### Effect on GOVERNANCE.md quorum/vote math
+
+[`GOVERNANCE.md`](GOVERNANCE.md#voting-rules) sizes quorum and
+vote thresholds against the count of **active maintainers** in this
+file. While that count is zero, the org/teams hold the roles and the
+quorum-based vote machinery is dormant rather than misleadingly
+"empty": there are no contested-vote participants because there are
+no named individuals yet, and PRs flow under the lazy-consensus /
+bootstrap arrangement reviewed by `@craton-co/maintainers`. As soon as
+individuals are onboarded, this file is amended in the same PR that
+grants their `GOVERNANCE.md`-recognized rights (GH team membership,
+security-disclosures group, etc.), and the quorum math becomes live.
+v1.0 will not ship while a quorum-blocking slot is still `TBD`; see
+`PATH-TO-V1.md` v1.0 exit criteria.
 
 
 
@@ -68,9 +109,10 @@ singleton.
 
 | Lead maintainer | Since |
 |---|---|
-| TBD | n/a |
+| _None yet — held by Craton Software Company during v0.x_ | n/a |
 
-While this slot reads `TBD`, the project has no lead. Contested
+While no individual lead is named, the project has no tiebreaker
+holder. Contested
 decisions in that state require a 2/3 majority of active maintainers
 and cannot be broken by tiebreaker; see
 [`GOVERNANCE.md`](GOVERNANCE.md#voting-rules) for the consequence on
@@ -91,12 +133,15 @@ below is the registry; the role definition is in
 
 | Maintainer | GitHub | Areas | Since |
 |---|---|---|---|
-| TBD | TBD | TBD | n/a |
+| Craton Software Company (org) | [`@craton-co/maintainers`](https://github.com/orgs/craton-co/teams/maintainers) | All (see [Area ownership](#area-ownership)) | v0.x bootstrap |
 
-This list is currently empty pending the first round of maintainer
-onboardings under the GOVERNANCE.md criteria. Until at least one
-active maintainer is listed, every PR is reviewed and merged by the
-commercial sponsor under the bootstrap arrangement described in
+No individual maintainers are listed yet, pending the first round of
+maintainer onboardings under the GOVERNANCE.md criteria. The row
+above records the reality during the v0.x window: review and merge
+rights are held by the `@craton-co/maintainers` team on behalf of the
+organization. Until at least one *individual* active maintainer is
+listed, every PR is reviewed and merged by the commercial sponsor
+through that team, under the bootstrap arrangement described in
 [`GOVERNANCE.md`](GOVERNANCE.md#purpose-and-scope). The bootstrap
 arrangement is not a substitute for the onboarding process; it is a
 holding pattern that ends as soon as the first nominee clears
@@ -121,12 +166,20 @@ and blocks any non-security release, per
 
 | Security committee member | Backup contact | Since |
 |---|---|---|
-| TBD | TBD | n/a |
-| TBD | TBD | n/a |
+| [`@craton-co/security`](https://github.com/orgs/craton-co/teams/security) (team — Craton Software Company) | `security@craton.com.ar` | v0.x bootstrap |
 
-Both slots are vacant pending maintainer recruitment. While the
-committee is below the two-member floor, embargoed reports sent to
-`security@craton.com.ar` are handled by the commercial sponsor under
+No individual committee members are named yet. During the v0.x
+window the `@craton-co/security` GitHub team — staffed by Craton
+Software Company — holds the committee role and is the entity behind
+the `security@craton.com.ar` disclosure address advertised in
+[`SECURITY.md`](SECURITY.md). This is consistent with
+[`.github/CODEOWNERS`](.github/CODEOWNERS), where `@craton-co/security`
+owns `SECURITY.md`, `docs/SECURITY-*.md`, and the isolation-critical
+`tensor-wasm-tenant` and `tensor-wasm-exec` crates.
+
+While no *individual* members fill the two named slots, embargoed
+reports sent to `security@craton.com.ar` are handled by the commercial
+sponsor through the `@craton-co/security` team under
 the same 72-hour acknowledgement and 90-day fix-or-workaround
 commitments documented in
 [`GOVERNANCE.md`](GOVERNANCE.md#standing-commitments). This is a
@@ -161,34 +214,50 @@ area; the backup handles reviews when the owner is unavailable and
 holds the recall path if the owner becomes inactive under
 [`GOVERNANCE.md`](GOVERNANCE.md#inactive).
 
-The thirteen areas below partition the repository. A maintainer may
-own or back up more than one area; the bound is honest review
-capacity, not a per-area headcount.
+The areas below partition the repository and cover all eleven
+workspace crates declared in [`Cargo.toml`](Cargo.toml) (`core`,
+`mem`, `exec`, `wasi-gpu`, `jit`, `snapshot`, `artifacts`, `tenant`,
+`api`, `cli`, `bench`) plus the supporting trees. A maintainer may own
+or back up more than one area; the bound is honest review capacity,
+not a per-area headcount.
 
-| Area | Owner | Backup |
+During the v0.x window, ownership is assigned to **GitHub teams**, not
+individuals, mirroring [`.github/CODEOWNERS`](.github/CODEOWNERS):
+`@craton-co/maintainers` is the default owner of every area, and the
+`@craton-co/security` team co-owns the isolation-critical and
+security-document areas (it is the CODEOWNERS reviewer for
+`tensor-wasm-tenant`, `tensor-wasm-exec`, `SECURITY.md`, and
+`docs/SECURITY-*.md`). `@craton-co/release` co-owns the release-path
+files (`Cargo.toml`, `CHANGELOG.md`).
+
+| Area | Owner (team) | Backup / co-owner (team) |
 |---|---|---|
-| `tensor-wasm-core` (error model, telemetry, public traits) | TBD | TBD |
-| `tensor-wasm-mem` (linear memory, unified buffer, isolation enum) | TBD | TBD |
-| `tensor-wasm-exec` (Wasmtime wrapper, dispatch, epoch timers) | TBD | TBD |
-| `tensor-wasm-wasi-gpu` (WASI-GPU host functions, WIT surface) | TBD | TBD |
-| `tensor-wasm-jit` (auto-offload, BLAKE3 cache, blueprints) | TBD | TBD |
-| `tensor-wasm-snapshot` (zstd+bincode capture/restore, schema) | TBD | TBD |
-| `tensor-wasm-tenant` (TenantRegistry, quotas, MPS plumbing) | TBD | TBD |
-| `tensor-wasm-api` (HTTP gateway, auth, OpenAPI) | TBD | TBD |
-| `tensor-wasm-cli` (`tensor-wasm` binary, completions, man pages) | TBD | TBD |
-| `tensor-wasm-bench` (criterion harness, baseline.json) | TBD | TBD |
-| `fuzz/` (cargo-fuzz targets, corpus management) | TBD | TBD |
-| `docs/` (PATH-TO-V1, SECURITY-AUDIT, runbooks, dashboards) | TBD | TBD |
-| `deploy/` (docker-compose, k8s manifests, Helm, CI workflows) | TBD | TBD |
+| `tensor-wasm-core` (error model, telemetry, public traits) | `@craton-co/maintainers` | `@craton-co/maintainers` |
+| `tensor-wasm-mem` (linear memory, unified buffer, isolation enum) | `@craton-co/maintainers` | `@craton-co/maintainers` |
+| `tensor-wasm-exec` (Wasmtime wrapper, dispatch, epoch timers) | `@craton-co/maintainers` | `@craton-co/security` |
+| `tensor-wasm-wasi-gpu` (WASI-GPU host functions, WIT surface) | `@craton-co/maintainers` | `@craton-co/maintainers` |
+| `tensor-wasm-jit` (auto-offload, BLAKE3 cache, blueprints) | `@craton-co/maintainers` | `@craton-co/maintainers` |
+| `tensor-wasm-snapshot` (zstd+bincode capture/restore, schema) | `@craton-co/maintainers` | `@craton-co/maintainers` |
+| `tensor-wasm-artifacts` (artifact store, packaging) | `@craton-co/maintainers` | `@craton-co/maintainers` |
+| `tensor-wasm-tenant` (TenantRegistry, quotas, MPS plumbing) | `@craton-co/maintainers` | `@craton-co/security` |
+| `tensor-wasm-api` (HTTP gateway, auth, OpenAPI) | `@craton-co/maintainers` | `@craton-co/maintainers` |
+| `tensor-wasm-cli` (`tensor-wasm` binary, completions, man pages) | `@craton-co/maintainers` | `@craton-co/maintainers` |
+| `tensor-wasm-bench` (criterion harness, baseline.json) | `@craton-co/maintainers` | `@craton-co/maintainers` |
+| `fuzz/` (cargo-fuzz targets, corpus management) | `@craton-co/maintainers` | `@craton-co/maintainers` |
+| `docs/` (PATH-TO-V1, runbooks, dashboards; `SECURITY-*` co-owned by security) | `@craton-co/maintainers` | `@craton-co/security` |
+| `deploy/` (docker-compose, k8s manifests, Helm, CI workflows) | `@craton-co/maintainers` | `@craton-co/maintainers` |
+| Release path (`Cargo.toml`, `CHANGELOG.md`) | `@craton-co/maintainers` | `@craton-co/release` |
 
-Every cell currently reads `TBD`. Owners are assigned as maintainers
-are onboarded under
+Cells name **teams** rather than individuals during v0.x. Individual
+owners are assigned as maintainers are onboarded under
 [`GOVERNANCE.md`](GOVERNANCE.md#maintainer-onboarding); the area is
 named on the nomination PR and recorded in this table on merge of the
-follow-up MAINTAINERS.md update.
+follow-up MAINTAINERS.md update, replacing the team handle for that
+row.
 
-Until an area has a named owner, PRs touching that area follow the
-bootstrap arrangement noted under [Active maintainers](#active-maintainers).
+Until an area has a named individual owner, PRs touching that area
+are reviewed by the owning team under the bootstrap arrangement noted
+under [Active maintainers](#active-maintainers).
 
 ## How to become a maintainer
 

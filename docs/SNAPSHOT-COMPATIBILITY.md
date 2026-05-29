@@ -41,28 +41,77 @@ them.
 
 The on-wire `crc32` field is an integrity check, not a security primitive.
 It catches storage bit-flips and accidental truncation; it does not
-authenticate the source. From v0.3.6 onward an **optional** HMAC-SHA256
-trailer (wire v3, see the matrix below and the
-[v2 → v3 migration](#v2--v3-migration-signed-snapshots) section) gives
-operators a way to authenticate snapshot bytes; the CRC32 stays in place
-as the cheap-and-always-on integrity check. Snapshots restored from
-untrusted peers should either be paired with a transport-layer signature
-(mTLS, signed manifest) or — preferred for v0.3.6+ — carry a v3 HMAC
-trailer signed with a key the reader holds.
+authenticate the source. From v0.3.6 onward an **optional** authenticator
+gives operators a way to authenticate snapshot bytes; the CRC32 stays in
+place as the cheap-and-always-on integrity check. Two authenticated wire
+formats exist (see the matrix below and the
+[v2 → v3 migration](#v2--v3-migration-signed-snapshots) section):
+
+- **wire v3** — a magic-prefixed trailer appended after the zstd frame,
+  carrying either an HMAC-SHA256 MAC (`signature_kind = 1`) or an
+  Ed25519 signature (`signature_kind = 2`).
+- **wire v4** — the unified content-addressed
+  [`tensor-wasm-artifacts`](../crates/tensor-wasm-artifacts/) envelope
+  (16-byte `b"twasm-artifact01"` magic prefix, BLAKE3 content hash,
+  mandatory HMAC-SHA256). This is what an HMAC-keyed writer now emits by
+  default — see the matrix and the default-write note below.
+
+Snapshots restored from untrusted peers should either be paired with a
+transport-layer signature (mTLS, signed manifest) or — preferred for
+v0.3.6+ — carry a v3 trailer or a v4 envelope authenticated with a key
+the reader holds.
 
 ## Format-version → behavior matrix
 
-| `SNAPSHOT_VERSION` | First release | Wire changes | Reader behavior |
-|--------------------|---------------|--------------|-----------------|
-| `1` | (pre-v0.1.0 development only) | Initial layout. No CRC, no enforced size caps. | Refused by every shipped reader; never reached `main` as a released format. |
-| `2` *(default-write through 0.3.6)* | v0.1.0 preview | Added `Snapshot::crc32`; enforced per-blob size caps (`limits::MAX_*_BYTES`); zero-copy write path via `serde_bytes` (wire-identical to plain `Vec<u8>` bincode). | Accepted by every shipped reader; remains the default-write format in v0.3.6 for backward compatibility. |
-| `3` *(opt-in, v0.3.6)* | v0.3.6 | Adds a 33-byte trailer after the v2 envelope: `[signature_kind: u8][signature: 32 bytes]`. `signature_kind = 1` is `HMAC-SHA256(key, v2_payload)`. The framing is otherwise identical to v2 — a v3 blob is exactly a v2 blob with 33 extra trailing bytes. | A v0.3.6+ reader accepts both `2` and `3` by default. `SnapshotReader::require_signature()` rejects `2`. Writers emit `3` only when `SnapshotWriter::with_hmac_sha256_key(key)` (or `--hmac-key-file` on the CLI) is set; the default writer still emits `2`. |
+The matrix tracks **wire formats**, not just the inner `SNAPSHOT_VERSION`
+field. v3 and v4 are distinguished by their framing (a magic-prefixed
+trailer / a leading-magic envelope) rather than by a bumped inner version
+byte: a v3 blob carries inner `version = 3`, and a v4 artifact envelope
+wraps an inner `version = 2` payload. The reader dispatches purely by
+magic — see [`FORMAT.md`](../crates/tensor-wasm-snapshot/FORMAT.md) for the
+exact byte layouts; this table is the cross-version compatibility view.
 
-Every entry adds a *new* version; existing rows are never removed. A
-reader from release N must support every version `2 ..= N` listed above
-once v0.5 freezes the wire format. Until then, the table also lists
-"pre-freeze" rows where a version is intentionally accepted by only one
-reader.
+| Wire format | First release | Framing changes | Reader behavior |
+|-------------|---------------|-----------------|-----------------|
+| `1` | (pre-v0.1.0 development only) | Initial layout. No CRC, no enforced size caps. | Refused by every shipped reader; never reached `main` as a released format. |
+| `2` | v0.1.0 preview | Added `Snapshot::crc32`; enforced per-blob size caps (`limits::MAX_*_BYTES`); zero-copy write path via `serde_bytes` (wire-identical to plain `Vec<u8>` bincode). Inner `version = 2`, bare `zstd(bincode(Snapshot))`. | Accepted by every shipped reader. Emitted by the default writer **only when no signing key is configured** (keyless fallback). |
+| `3` *(opt-in, v0.3.6+)* | v0.3.6 | Appends a **37-byte** magic-prefixed trailer after the zstd frame: `[V3_TRAILER_MAGIC = b"S3T1": 4][signature_kind: u8: 1][signature: 32]`. `signature_kind = 1` ⇒ HMAC-SHA256; `signature_kind = 2` ⇒ Ed25519 (then the signature is 64 bytes, total trailer 69 bytes — `ED25519_TRAILER_LEN`). Inner `version = 3`; the bincode payload is otherwise byte-identical to v2. **(T8, BREAKING):** the trailer was 33 bytes pre-T8 (`[signature_kind][signature]`, no magic prefix) and used a ~1/256 single-byte sniff; the `S3T1` prefix replaces it with a ~1/2³² magic check. Pre-T8 v3 captures no longer parse and must be re-signed. | A reader with the `signed-snapshots` feature accepts `2` and `3`. HMAC v3 needs `SnapshotReader::with_hmac_sha256_key(key)`; Ed25519 v3 needs `with_ed25519_verifying_key(key)`. `require_signature()` rejects unsigned `2`/`4`-without-key. Emitted when a key is configured **and** the legacy envelope is forced (or `artifact-backing` is compiled out); an Ed25519 key always routes through this inline path. |
+| `4` *(default-write when HMAC-keyed, v0.4 / T40)* | v0.4 (T40) | The unified `tensor-wasm-artifacts` envelope: `b"twasm-artifact01"(16) ‖ version(=1) ‖ blake3(payload)(32) ‖ zstd(bincode(Snapshot)) ‖ hmac_sha256(prefix)(32)`. The **inner** `Snapshot::version` is `2` (the outer envelope owns authentication, so no inner v3 trailer is written). Detected by the 16-byte leading magic, not by the inner version field. | Auto-detected by the leading magic before the legacy v3/v2 fall-through (requires `artifact-backing`). A tampered/wrong-key v4 blob is rejected here and is **not** retried as a legacy blob. Inner `version = 3` is rejected on this path; only `2` is accepted inside the envelope. |
+
+Every entry adds a *new* format; existing rows are never removed. A reader
+from release N must support every released format up to N once v0.5 freezes
+the wire format. Until then, the table also lists "pre-freeze" rows where a
+format is intentionally accepted by only one reader.
+
+### Default-write behavior (corrected)
+
+`artifact-backing` is a **default** cargo feature of `tensor-wasm-snapshot`
+(`default = ["signed-snapshots", "artifact-backing"]`). As a result, the
+default-write format depends on the writer's key configuration:
+
+- **HMAC-keyed writer** (`SnapshotWriter::with_hmac_sha256_key(key)`,
+  no `with_legacy_envelope()`): `SnapshotWriter::capture` routes through
+  the **v4 artifact envelope** by default (T40 cutover).
+- **Ed25519-keyed writer** (`with_ed25519_signing_key`): always emits the
+  **inline v3** envelope (`signature_kind = 2`) — the artifact envelope
+  authenticates with HMAC only, so an asymmetric signature has no slot
+  there.
+- **Keyless writer** (`SnapshotWriter::new()` with no signing key): falls
+  back to the unsigned **v2** envelope — the v4 envelope mandates an HMAC
+  key by construction. This keeps every in-tree keyless caller (proptest,
+  mem-conformance, bench) emitting v2 unchanged.
+- **Opt-out to legacy**: `SnapshotWriter::with_legacy_envelope()` or the
+  per-call `SnapshotWriter::capture_legacy(state)` keep emitting the
+  inline v2/v3 wire format even when `artifact-backing` is enabled.
+  Building `--no-default-features --features signed-snapshots` disables v4
+  emission at compile time.
+
+This supersedes the previous doc's claim that "v2 is the default-write
+through 0.3.6 / the default writer still emits v2" — an HMAC-keyed writer
+now defaults to v4. The workspace version is `0.3.7`
+([`Cargo.toml`](../Cargo.toml)); `FORMAT.md` labels the v4 cutover "default
+in v0.4 — T40" and it is live today because `artifact-backing` ships in the
+default feature set.
 
 ## Compat test architecture
 
@@ -158,9 +207,13 @@ A future PR that breaks compatibility breaks the test suite.
 ## v2 → v3 migration (signed snapshots)
 
 v0.3.6 introduces optional HMAC-SHA256 authentication for snapshots via
-a new wire format, v3. Because v3 is "v2 + 33 trailing bytes" and the
-v0.3.6+ reader accepts both versions, an operator can adopt signing
-**without** invalidating existing v2 archives on the read path. The
+a new wire format, v3. A v3 blob is a v2-shaped zstd frame followed by a
+**37-byte** magic-prefixed trailer (`[b"S3T1": 4][signature_kind: 1][sig:
+32]`; see [`FORMAT.md`](../crates/tensor-wasm-snapshot/FORMAT.md) for the
+exact layout and the T8 history of the pre-T8 33-byte trailer). Because
+the trailer sits *after* the zstd frame and the v0.3.6+ reader accepts
+both v2 and v3, an operator can adopt signing **without** invalidating
+existing v2 archives on the read path. The
 recommended four-step rollout below sequences the cross-tier changes
 so a v2 archive is never orphaned and so the strict-mode flip
 (`require_signature = true`) only happens once every archive in scope
@@ -255,6 +308,114 @@ has been re-captured. Production deployments planning to rotate
 sooner than the snapshot retention window should track this gap as a
 follow-up against the v0.3.7 milestone.
 
+## Ed25519 asymmetric signatures (wire v3, `signature_kind = 2`)
+
+The v3 trailer also supports an **asymmetric** signature. It reuses the
+same `V3_TRAILER_MAGIC` (`b"S3T1"`) and inner `version = 3` as the HMAC
+trailer; only the `signature_kind` byte (`2`) and the signature length
+(64 bytes, total trailer 69 bytes) differ. The signed message is
+byte-identical in shape to the HMAC input — `prefix_bytes ‖
+V3_TRAILER_MAGIC ‖ [signature_kind]` — so the whole v2-shaped frame, the
+magic, and the kind byte are all authenticated, and an attacker cannot
+rewrite the kind byte to `1` to attempt a cross-scheme downgrade.
+
+Asymmetric signing fits the **single-publisher, many-verifier** case:
+the publisher holds a private `ed25519_dalek::SigningKey`
+(`SnapshotWriter::with_ed25519_signing_key`); verifiers hold only the
+public `VerifyingKey` (`SnapshotReader::with_ed25519_verifying_key`), so
+a compromised verifier cannot mint snapshots. HMAC, by contrast, requires
+every verifier to hold the symmetric secret (which can also forge). The
+reader verifies with `verify_strict` (not the permissive `verify`),
+rejecting non-canonical signatures.
+
+Compatibility notes:
+
+- An Ed25519-keyed writer **always** emits the inline v3 envelope, never
+  v4 — the artifact envelope authenticates with HMAC only. If both an
+  Ed25519 and an HMAC key are configured on one writer, the Ed25519
+  trailer wins (the writer never double-signs).
+- The `SignatureKind` enum is `#[non_exhaustive]`, which is how Ed25519
+  was added without a wire-format break. The reader's trailer detector
+  probes both candidate lengths (69 then 37) and accepts the first whose
+  magic *and* kind byte are self-consistent with the probed length.
+
+## v4 artifact envelope (default for HMAC-keyed writers)
+
+Wire v4 is the unified content-addressed envelope from
+`tensor-wasm-artifacts`, gated by the (default) `artifact-backing`
+feature. On-disk shape (byte layout authoritative in
+[`FORMAT.md`](../crates/tensor-wasm-snapshot/FORMAT.md)):
+
+```text
+b"twasm-artifact01"(16) || version(=1) || blake3(payload)(32)
+                        || zstd(bincode(Snapshot)) || hmac_sha256(prefix)(32)
+```
+
+- **Inner version is `2`.** The outer envelope owns authentication, so no
+  inner v3 trailer is written; the reader rejects an inner `version = 3`
+  on this path.
+- **HMAC input order on the v3 *inline* path** is `prefix ‖
+  V3_TRAILER_MAGIC ‖ [signature_kind]`; the v4 envelope instead HMACs the
+  artifact-envelope prefix (magic ‖ version ‖ blake3 ‖ compressed payload)
+  per the artifact crate. Both authenticate before any decompressed byte
+  reaches the snapshot decoder ("authenticate then parse").
+- **Reader detection order:** (1) leading `b"twasm-artifact01"` ⇒ v4;
+  (2) `bytes[len-37..len-33] == b"S3T1"` ⇒ legacy v3; (3) otherwise ⇒
+  legacy v2. No version field is consulted until the envelope has
+  authenticated the bytes.
+- The legacy v2/v3 decoders remain accepted on the read side
+  **indefinitely** — every snapshot already on disk continues to load
+  byte-for-byte unchanged.
+
+A separate, also-`artifact-backing`-gated pair —
+`SnapshotWriter::capture_to_artifact_store` /
+`SnapshotReader::restore_from_artifact_store` — routes snapshots through a
+persistent `DiskArtifactStore` (atomic-rename, content-addressed, key
+-fingerprinted partitions). Its on-disk envelope is the same v4 shape; see
+[`FORMAT.md`](../crates/tensor-wasm-snapshot/FORMAT.md) §
+"Artifact-store backing" and
+[`ARTIFACT-STORE.md`](./ARTIFACT-STORE.md).
+
+## Replay / rollback / freshness protection
+
+The `SnapshotMetadata` fields `sequence_no: u64` and `nonce:
+Option<[u8; 16]>` are **live** (no longer reserved-but-inert), and a
+timestamp-freshness check is available. All three are **opt-in** and run
+**after** authentication and the structural checks, so for an
+authenticated v3/v4 blob the signature/MAC has already certified the
+fields — an attacker cannot rewrite them without re-signing.
+
+| Check | Writer opt-in | Reader opt-in | Rejection (`TensorWasmError`) |
+|-------|---------------|---------------|-------------------------------|
+| Sequence floor | `with_sequence_no(n)` (default `0`) | `with_min_sequence_no(floor)` | `Serialization("snapshot sequence_no … below floor …")` |
+| Nonce match | `with_nonce(bytes)` (default `None`) | `with_expected_nonce(bytes)` | `Serialization("snapshot nonce mismatch …" / "… nonce missing …")` |
+| Freshness | (uses `created_unix_ms`) | `with_max_age(duration)` (default `None`) | `SnapshotTooOld` when `now - created > max_age` |
+
+**Operator pattern — per-signing-key high-water mark:** track a persistent
+`last_seen` sequence number per signing key; construct the reader with
+`with_min_sequence_no(last_seen)` (or `last_seen + 1` to forbid replay of
+the exact last value) and, after a successful restore, set `last_seen =
+max(last_seen, restored.metadata.sequence_no)`. This closes the rollback
+window that `with_max_age` alone cannot: an attacker who replays a
+once-valid capture *inside* the `max_age` window still trips the sequence
+floor.
+
+## Compatibility: old reader ↔ new blob
+
+- **Old reader, new blob.** A pre-v0.4 reader (no `artifact-backing`) sees
+  a v4 blob's leading `twasm-artifact01` magic as unknown input — it does
+  not match the v2 bincode magic or the v3 trailer magic and is refused.
+  A pre-v0.3.6 (v2-only) reader refuses a v3 blob because the inner
+  `version = 3` is unknown to it. A reader built without
+  `signed-snapshots` cannot verify a v3 trailer at all.
+- **New reader, old blob.** A current reader auto-detects and accepts v2
+  and (with the appropriate key) v3, and reads v4 when `artifact-backing`
+  is compiled in — see the detection order above. Legacy v2/v3 reads are
+  supported indefinitely.
+- **Pre-T8 v3 blobs** (33-byte trailer, no `S3T1` prefix) fail the current
+  classifier and must be re-signed with a current writer; v2 snapshots are
+  unaffected by the T8 change.
+
 ## Migration paths supported
 
 The reader does **not** attempt in-place migration of older snapshots: a
@@ -266,11 +427,14 @@ restore the instance, then re-capture under the current binary. A
 `tensor-wasm-cli snapshot migrate` subcommand is **not** planned for v1.0; if
 the use case proves common in beta deployments, it becomes a v1.x item.
 
-The v2 → v3 migration above is the explicit exception: because v3 is a
-strict superset of v2 on the read path (the v0.3.6+ reader accepts
-both), no re-capture is *forced* at the format bump — operators
-re-capture on their own schedule and flip the reader to strict mode
-once that schedule completes.
+The v2 → v3 and v3/v4 transitions are the explicit exceptions: the v3
+trailer sits after a v2-shaped frame and the v4 envelope is detected by
+its own leading magic, so a current reader accepts v2, v3, and v4 side by
+side on the read path. No re-capture is *forced* at any of these format
+bumps — operators re-capture on their own schedule and flip the reader to
+strict mode once that schedule completes. (Pre-T8 v3 blobs are the one
+exception that *does* force a re-sign; see
+[old reader ↔ new blob](#compatibility-old-reader--new-blob).)
 
 ## Related docs
 

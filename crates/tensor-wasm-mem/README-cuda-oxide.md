@@ -13,9 +13,18 @@ port (per RFC 0001 "Rollout — v0.4 (parity)") has a clean target to fill in.
 
 ## What this feature does today
 
-- Pulls in three crates from NVIDIA Labs' [cuda-oxide
-  v0.1.0](https://github.com/NVlabs/cuda-oxide) release (published
-  2026-05-09): `cuda-host`, `cuda-core`, `cuda-async`.
+- Is intentionally **dep-less**. Enabling it pulls **no** cuda-oxide crate
+  into the resolved dependency graph — it ships the feature flag and the
+  scaffold module only. (The git-pinned cuda-oxide host crates that used to
+  ride a strict-superset `experimental-cuda-oxide-host-backend` feature were
+  REMOVED from the workspace for crates.io publishability, since crates.io
+  rejects `git` dependencies even when they are optional/feature-gated. They
+  will be re-added once cuda-oxide ships to crates.io — see
+  [RFC 0001](../../rfcs/0001-cuda-oxide-integration.md) and
+  [`docs/CUDA-OXIDE-CUTOVER.md`](../../docs/CUDA-OXIDE-CUTOVER.md).) Because it
+  adds no `git` dependency and needs no CUDA Toolkit or `libclang`,
+  `cargo check --features cuda-oxide-backend` builds cleanly on contributor
+  boxes.
 - Exposes the public type `tensor_wasm_mem::cuda_oxide_backend::CudaOxideUnifiedBuffer`
   and the free function `apply_advice` so downstream call sites can write
   backend-agnostic code today.

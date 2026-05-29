@@ -26,7 +26,7 @@ use base64::write::EncoderStringWriter;
 use clap::Args;
 use serde::Serialize;
 
-use super::HttpContext;
+use super::{HttpContext, OutputFormat};
 
 /// Chunk size used when streaming the wasm file through the base64 encoder.
 /// 64 KiB matches the default `BufReader` capacity and keeps the working set
@@ -54,6 +54,15 @@ pub struct DeployArgs {
     /// Tenant-supplied display name. Defaults to the file stem when omitted.
     #[arg(long)]
     pub name: Option<String>,
+    /// Output format: `text` (the deployed id printed bare, default) or `json`
+    /// (a stable machine-readable envelope carrying the deployed id, for
+    /// scripting / CI).
+    ///
+    /// `display_order` pinned so this sorts after the other local flags and
+    /// before the global TLS flags, keeping the help layout stable — matching
+    /// the `metrics` / `observe` / `bench` commands.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text, display_order = 800)]
+    pub output: OutputFormat,
 }
 
 /// JSON request body sent to `POST /functions`.
@@ -149,12 +158,35 @@ pub async fn run(args: DeployArgs, ctx: &HttpContext) -> Result<()> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("response missing `id` field: {text}"))?;
 
-    // T18: `id` was extracted from a server-supplied JSON envelope, so a
-    // malicious server can stuff ANSI escapes (or a literal CR) into the
-    // string. Sanitise before displaying so the response cannot rewrite
-    // the operator's terminal title bar or smuggle in a control byte.
-    println!("{}", super::sanitise_terminal_output(id));
+    match args.output {
+        OutputFormat::Text => {
+            // T18: `id` was extracted from a server-supplied JSON envelope, so
+            // a malicious server can stuff ANSI escapes (or a literal CR) into
+            // the string. Sanitise before displaying so the response cannot
+            // rewrite the operator's terminal title bar or smuggle in a
+            // control byte.
+            println!("{}", super::sanitise_terminal_output(id));
+        }
+        OutputFormat::Json => {
+            // Stable envelope `{ "id": "<...>" }`. The id is the same
+            // server-supplied string; sanitise it before embedding so a
+            // human eyeballing the JSON can't be hit by a smuggled control
+            // byte. Rendered compact (`to_string`) so the line stays
+            // greppable / pipeable, matching the `bench` / `metrics` /
+            // `observe` JSON convention.
+            println!("{}", deploy_to_json(id));
+        }
+    }
     Ok(())
+}
+
+/// Build the stable `--output json` envelope for a deploy response.
+///
+/// Shape: `{ "id": "<deployed-function-id>" }`. The id is sanitised of control
+/// bytes before embedding. Rendered compact (`to_string`) to match the JSON
+/// convention used by the other scriptable commands.
+fn deploy_to_json(id: &str) -> String {
+    serde_json::json!({ "id": super::sanitise_terminal_output(id) }).to_string()
 }
 
 /// Stream a `.wasm` file off disk through a base64 encoder into a single
@@ -189,4 +221,26 @@ fn encode_wasm_streaming(path: &std::path::Path) -> std::io::Result<String> {
         std::io::Write::write_all(&mut encoder, &buf[..n])?;
     }
     Ok(encoder.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deploy_to_json_carries_id() {
+        let out = deploy_to_json("fn-abc123");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON envelope");
+        assert_eq!(v["id"], "fn-abc123");
+    }
+
+    #[test]
+    fn deploy_to_json_sanitises_control_bytes_in_id() {
+        // A malicious server stuffing an ANSI escape into the id must not
+        // survive into the JSON envelope a human might eyeball.
+        let out = deploy_to_json("fn\x1b[31m1");
+        assert!(!out.contains('\x1b'), "ESC byte survived: {out:?}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON envelope");
+        assert_eq!(v["id"], "fn?[31m1");
+    }
 }

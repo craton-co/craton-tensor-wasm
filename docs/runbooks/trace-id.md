@@ -43,7 +43,7 @@ If a user reported the failure with a screenshot or HAR file, the
 `x-trace-id` header is in the response. From a `curl -i` capture:
 
 ```sh
-curl -i -X POST http://gateway:3000/functions/$ID/invoke -d '...' \
+curl -i -X POST http://gateway:8080/functions/$ID/invoke -d '...' \
   | grep -i '^x-trace-id'
 ```
 
@@ -51,7 +51,7 @@ If you are reproducing the failure yourself, send a fresh request and
 note the header:
 
 ```sh
-curl -sS -D - -X POST http://gateway:3000/functions/$ID/invoke -d '...' \
+curl -sS -D - -X POST http://gateway:8080/functions/$ID/invoke -d '...' \
   -o /dev/null | grep -i '^x-trace-id'
 ```
 
@@ -88,7 +88,7 @@ response stamp from the audit middleware.
 
 ## Step 3: open the trace in your OTLP backend
 
-If `TENSOR_WASM_OTLP_ENDPOINT` is set and the collector is healthy,
+If `OTEL_EXPORTER_OTLP_ENDPOINT` is set and the collector is healthy,
 the same trace id maps to a single distributed trace in Jaeger,
 Tempo, or Honeycomb. Paste the hex string into the backend's
 "Find by trace id" box. The expected span tree is documented in

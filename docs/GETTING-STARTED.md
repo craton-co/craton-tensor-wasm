@@ -35,7 +35,7 @@ The five steps below walk you from `git clone` to a deployed function answering 
 
 ```sh
 git clone https://github.com/craton-co/craton-tensor-wasm.git
-cd tensor-wasm
+cd craton-tensor-wasm
 cargo build --workspace
 ```
 

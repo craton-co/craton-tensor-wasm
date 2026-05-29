@@ -157,10 +157,13 @@ matches usually have a better answer elsewhere
   [`wasi:cuda/host@0.2.0`](../wit/wasi-cuda.wit) gives the guest
   `load_ptx`, `launch`, `sync`, and `last_error`, with bounds
   checks before any driver call and a back-pressure semaphore.
-  **Caveat:** v0.1.0 reaches the driver only for zero-argument
-  launches; non-empty kernel args return `KernelArgsUnsupported`
-  ([`RISKS.md`](RISKS.md)); v0.2 removes the restriction
-  ([`PATH-TO-V1.md`](PATH-TO-V1.md#v020--real-cuda)).
+  Kernel arguments are supported: the W1.1 typed-argv lowering
+  flattens scalar and pointer args into a tagged `(tag, value)`
+  wire format that the host parses, bounds-checks, and lowers into
+  `cuLaunchKernel`'s `void**` ([`CUDA-KERNELS.md`](CUDA-KERNELS.md#33-calling-convention)).
+  `KernelArgsUnsupported` is now reserved for sanity-cap busts only
+  (argv above 4 KiB or more than 128 records), not a blanket
+  rejection of non-empty args ([`RISKS.md`](RISKS.md)).
 - **You want a self-hosted serverless gateway without rolling your
   own.** The [`tensor-wasm-api`](../crates/tensor-wasm-api/API.md)
   axum gateway ships with bearer auth, per-tenant scoped tokens, a
@@ -320,21 +323,24 @@ tensor-wasm run path/to/foo.wasm --export _start    # Craton TensorWasm
 _start` for the WASI convention. Behavior on success is identical
 (exit 0, guest stdout reaches your terminal).
 
-### 7.2 The argument caveat (v0.1.0)
+### 7.2 Passing arguments
 
 ```bash
 wasmtime run foo.wasm --invoke 'add(1, 2)'     # values reach the guest
 wasmer run foo.wasm --invoke add -- 1 2        # values reach the guest
-# Craton TensorWasm: JSON is PARSED AND VALIDATED, but values do
-# NOT reach the guest. Executor only invokes `() -> ()` in v0.1.0.
+# Craton TensorWasm: JSON is parsed, each element lowered into the
+# matching wasm value type, and threaded into the guest via
+# call_export_with_args — an (i32, i32) -> i32 adder receives [1, 2].
 tensor-wasm run foo.wasm --export add --args '[1.0, 2.0]'
 ```
 
 Verified in
-[`crates/tensor-wasm-cli/src/cmd/run.rs`](../crates/tensor-wasm-cli/src/cmd/run.rs);
-argument lowering tracked for v0.2
-([`PATH-TO-V1.md`](PATH-TO-V1.md#v020--real-cuda)). If your CLI
-workload requires arg passthrough, defer migration.
+[`crates/tensor-wasm-cli/src/cmd/run.rs`](../crates/tensor-wasm-cli/src/cmd/run.rs).
+Each `--args` element lowers into the matching wasm value type
+(`i32` / `i64` / `f64` — `f32` is not selectable from JSON
+unambiguously) and is threaded into the executor's
+`call_export_with_args` path (see [§1.2](#12-the-cli-user) and
+[§ Typed exports](#typed-exports-v036--v037)).
 
 ### 7.3 AOT compile
 
@@ -352,8 +358,9 @@ compatibility.
 ### 7.4 Migration checklist (CLI)
 
 Replace `wasmtime run X.wasm` / `wasmer run X.wasm` with
-`tensor-wasm run X.wasm --export <name>`. If your workload uses
-non-empty args, stop and re-evaluate at v0.2. If you used AOT
+`tensor-wasm run X.wasm --export <name>`. If your workload passes
+arguments, supply them as a JSON array via `--args` (see
+[§7.2](#72-passing-arguments)). If you used AOT
 artifacts (`.cwasm`, `.wasmu`), switch to `tensor-wasm snapshot
 save` for warm-cache; the formats are not interchangeable. Wire
 `TENSOR_WASM_LOG` to your preferred filter (default `warn`).
@@ -446,8 +453,11 @@ pointers against the guest's linear memory *before* any driver call
 ([`wit/wasi-cuda.wit`](../wit/wasi-cuda.wit)). The benefit is
 isolation between mutually-distrusting workloads on one host; the
 cost is the bounds-check overhead (few hundred ns + back-pressure
-semaphore) and the v0.1.0 `KernelArgsUnsupported` limitation
-([`PATH-TO-V1.md`](PATH-TO-V1.md#v020--real-cuda) for the v0.2 fix).
+semaphore). Scalar and pointer kernel arguments reach the kernel
+via the W1.1 typed-argv wire format
+([`CUDA-KERNELS.md`](CUDA-KERNELS.md#33-calling-convention));
+`KernelArgsUnsupported` is now only a sanity cap (argv above 4 KiB
+or more than 128 records), not a blanket rejection of non-empty args.
 
 ### 9.2 From raw CUDA C++ to wasi:cuda
 
@@ -517,8 +527,9 @@ Read [`CUDA-SETUP.md`](CUDA-SETUP.md) end-to-end and run its §9
 verification script on the target host; read
 [`AUTO-OFFLOAD.md`](AUTO-OFFLOAD.md) to know which patterns the JIT
 pipeline offloads for you vs which you must emit PTX for yourself;
-determine whether your kernels need parameters, and if yes gate
-migration on v0.2 ([`PATH-TO-V1.md`](PATH-TO-V1.md#v020--real-cuda));
+for kernels that take parameters, pack the argv buffer per the W1.1
+typed-argv wire format
+([`CUDA-KERNELS.md`](CUDA-KERNELS.md#33-calling-convention));
 stand up MPS if you need spatial sharing across tenants
 ([`MPS-SETUP.md`](MPS-SETUP.md)); measure against the
 [`BENCHMARKING.md`](BENCHMARKING.md) dimension-3 recipe
@@ -611,8 +622,8 @@ need a code change; the import table is fixed in v0.1.0.
   `.wasm` source and snapshot inside TensorWasm.
 - **Does my Wasmtime CLI script work as-is?** Mostly. `tensor-wasm
   run X.wasm --export _start` is the closest analogue. The
-  `--args` flag exists but does not pass values to the guest in
-  v0.1.0; see [§7.2](#72-the-argument-caveat-v010). For AOT
+  `--args` flag accepts a JSON array and passes values to the guest;
+  see [§7.2](#72-passing-arguments). For AOT
   (`wasmtime compile`), use `tensor-wasm snapshot save` — same
   goal, different format.
 - **What's the perf overhead vs raw Wasmtime?** Within ~5% on
@@ -747,6 +758,7 @@ _Status: v0.4 release. Examples use the workspace-pinned Wasmtime
 renames. Re-validate when the v0.5 external comparisons land (the
 "~5% overhead vs upstream Wasmtime" claim in
 [§10](#10-operational-diff--what-you-give-up-what-you-gain) and
-[§12](#12-faqs) becomes measured) and when v0.2 removes the v0.1.0
-kernel-args limitation in
-[§9](#9-gpu-migration-no-precedent--raw-cuda--triton--cudarc--wgpu)._
+[§12](#12-faqs) becomes measured). The v0.1.0 kernel-args
+limitation referenced in earlier drafts of
+[§9](#9-gpu-migration-no-precedent--raw-cuda--triton--cudarc--wgpu)
+was lifted by the W1.1 typed-argv lowering._

@@ -40,6 +40,26 @@ A runbook in this directory without a corresponding entry in
 [`SLO.md`](../SLO.md) §7 is a documentation bug; report it in the
 sibling repo issue tracker rather than leaving it stranded.
 
+## Procedure / companion runbooks
+
+These documents are not triggered by an SLO alert, so they have no
+row in the table above. They are manual procedures or companion
+recipes the on-call runs deliberately. A runbook in this directory
+without a corresponding entry — in the table above *or* the list
+below — is a documentation bug.
+
+| Runbook | Purpose |
+|---|---|
+| [`disaster-recovery.md`](disaster-recovery.md) | Bring a deployment back online after a lost host, lost storage, or lost auth state. |
+| [`cve-disclosure-dry-run.md`](cve-disclosure-dry-run.md) | Rehearse the CVE disclosure pipeline end-to-end without an actual vulnerability. |
+| [`trace-id.md`](trace-id.md) | Companion recipe: pivot from a captured `x-trace-id` to the related logs and distributed trace. |
+| [`ghcr-registry-provisioning.md`](ghcr-registry-provisioning.md) | Sponsor-only procedure to provision the `ghcr.io/craton-co/tensor-wasm` container-registry namespace. |
+| [`self-hosted-cuda-runner.md`](self-hosted-cuda-runner.md) | Register the self-hosted GitHub Actions runner the `cuda` CI workflow requires. |
+
+(The two procedure runbooks already listed in the table above —
+[`rollback.md`](rollback.md) and [`oncall-paging.md`](oncall-paging.md)
+— remain there because [`SLO.md`](../SLO.md) §7 references them.)
+
 ## Runbook contract
 
 Every alert runbook in this directory uses the same nine H2 sections,

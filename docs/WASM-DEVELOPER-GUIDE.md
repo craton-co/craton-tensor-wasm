@@ -142,10 +142,23 @@ pub extern "C" fn vector_add_gpu(
     };
     if kernel_id < 0 { return -1; }
 
-    // Pack arguments as a flat array of pointer/scalar slots.
-    let args: [i64; 4] = [
-        a as i64, b as i64, out as i64, len as i64,
-    ];
+    // Pack arguments using the W1.1 typed-argv wire format: a flat
+    // concatenation of `(tag, value)` records with no padding. Each
+    // pointer arg is tagged 0x07 and carries a guest offset (u32) plus
+    // a byte length (u32); the `len` scalar is a u32 tagged 0x05. All
+    // values are little-endian. See CUDA-KERNELS.md §3.3 for the full
+    // tag table.
+    const TAG_U32: u8 = 0x05;
+    const TAG_PTR: u8 = 0x07;
+    let buf_bytes = (len * core::mem::size_of::<f32>()) as u32;
+    let mut args: Vec<u8> = Vec::with_capacity(9 * 3 + 5);
+    for ptr in [a as u32, b as u32, out as u32] {
+        args.push(TAG_PTR);
+        args.extend_from_slice(&ptr.to_le_bytes());
+        args.extend_from_slice(&buf_bytes.to_le_bytes());
+    }
+    args.push(TAG_U32);
+    args.extend_from_slice(&(len as u32).to_le_bytes());
 
     let block = 256i32;
     let grid = ((len as i32) + block - 1) / block;
@@ -156,7 +169,7 @@ pub extern "C" fn vector_add_gpu(
             grid, 1, 1,
             block, 1, 1,
             0,
-            args.as_ptr() as i32, (args.len() * 8) as i32,
+            args.as_ptr() as i32, args.len() as i32,
         )
     };
     if rc != 0 { return -2; }

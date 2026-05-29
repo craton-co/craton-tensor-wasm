@@ -40,12 +40,10 @@ the open architectural risks.
 
 ## Upstream contributions
 
-We are tracking
-[bytecodealliance/wasmtime#9876](https://github.com/bytecodealliance/wasmtime/issues/9876)
-(hypothetical issue placeholder), which would expose `cranelift::Module`'s
-CLIF passes as a public extension point — once that lands the simplified IR
-becomes optional and the project can opt into richer Cranelift integration
-without a fork.
+A known upstream limitation is that Cranelift does not currently expose
+`cranelift::Module`'s CLIF passes as a public extension point. Should
+upstream add such a hook, the simplified IR becomes optional and the
+project can opt into richer Cranelift integration without a fork.
 
 ---
 

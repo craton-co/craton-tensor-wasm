@@ -103,7 +103,7 @@ docker run -d --name tensor-wasm \
   --env-file /etc/tensor-wasm/env \
   -p 8080:8080 \
   -v /var/lib/tensor-wasm:/var/lib/tensor-wasm \
-  ghcr.io/craton-software/tensor-wasm:vX.Y.Z
+  ghcr.io/craton-co/tensor-wasm:vX.Y.Z
 
 # 4. Wait for /healthz.
 until curl -sf http://localhost:8080/healthz > /dev/null; do

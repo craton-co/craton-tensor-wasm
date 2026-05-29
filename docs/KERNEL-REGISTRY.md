@@ -199,7 +199,7 @@ disk-backed registry repeats the check on every read.
 ### Why HMAC and not Ed25519?
 
 The snapshot signing path (`tensor-wasm-snapshot`, see
-[SNAPSHOT-FORMAT.md](SNAPSHOT-FORMAT.md)) is already HMAC-SHA256. Reusing the same
+[SNAPSHOT-FORMAT.md](../crates/tensor-wasm-snapshot/FORMAT.md)) is already HMAC-SHA256. Reusing the same
 primitive avoids pulling a second curve implementation into the
 default build, and matches the operator threat model: "everyone with
 the key can produce signed artifacts" is the right answer for a
@@ -282,7 +282,7 @@ accepted, matching today's permissive `InMemoryRegistry` behaviour.
 
 - [PATH-TO-V1.md](PATH-TO-V1.md) — roadmap.
 - [SECURITY.md](../SECURITY.md) — threat model.
-- [SNAPSHOT-FORMAT.md](SNAPSHOT-FORMAT.md) — prior art on
+- [SNAPSHOT-FORMAT.md](../crates/tensor-wasm-snapshot/FORMAT.md) — prior art on
   HMAC-SHA256-signed artifacts (snapshots v3).
 - [CUDA-KERNELS.md](CUDA-KERNELS.md) — kernel authoring guide; the
   registry is the distribution channel for the kernels written using

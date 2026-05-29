@@ -25,7 +25,7 @@ by CUDA, and shipped as Apache-2.0 source.
 - Talk to the GPU through a typed `wasi:cuda` host interface
 - Multi-tenant by construction; one process serves many tenants
 - HTTP API + CLI + structured audit log + OpenTelemetry trace propagation
-- 92 commits, 7 tagged releases (`v0.3.1` → `v0.3.7`), 0 audit problems open
+- 9 tagged releases (`v0.1.0` → `v0.3.7`), 0 audit problems open
 
 <!-- Speaker note: the audience is somebody evaluating whether to deploy this
 in a real production stack. Not a VC pitch. Lead with what's shippable. -->
@@ -150,7 +150,11 @@ guest with three f32[64] arrays in linear memory, encodes typed argv
 though the kernel targets SM_80 (the CUDA driver JIT'd it up to SM_75).
 
 This is the test that proves the three pitch points work together on real
-silicon. If you want to see it run, that's the smoke test.
+silicon **for the non-wmma vector path**. Scope caveat: the RTX 2060 is
+SM_75, so the dev box cannot exercise the sm_80 `wmma`/MatMul Tensor-Core
+lowering at all — that path stays unproven on hardware pending an SM_89
+runner (see `docs/HARDWARE-GATED-WORK.md` § "Experimental wmma MatMul
+lowering"). If you want to see the vector path run, that's the smoke test.
 
 ---
 
@@ -217,9 +221,8 @@ the wrong choice. Saying so is what makes the wins credible.
   Cranelift→PTX lowering for the first batch of ops, cuda-async-backed
   `DispatchFuture` waker, in-place UVM grow via `cuMemAddressReserve`. See
   `docs/CUDA-OXIDE-CUTOVER.md` for the 8-step executable runbook.
-- **v0.5-beta**: external pen-test (RFP ready at `docs/SECURITY-AUDIT-RFP.md`)
-  + at least one named or anonymized production design partner (program kit
-  at `docs/DESIGN-PARTNER-PROGRAM.md`).
+- **v0.5-beta**: external pen-test + at least one named or anonymized
+  production design partner.
 - **v1.0**: API freeze + release engineering. 12-16 months from today per
   PATH-TO-V1.md "Effort and timeline (caveated)" — every estimate is wrong,
   but the milestone exit criteria are the commitment, not the dates.
@@ -257,18 +260,18 @@ wmma): add `--features cuda` to the test command and watch
 design changes go through it; bugfixes just open a PR. `CONTRIBUTING.md` has
 the dev-loop setup.
 
-**If you're a sponsor / corporation:** the
-`docs/DESIGN-PARTNER-PROGRAM.md` kit is ready to read. Reciprocal
-engagement: you get early access + named credit in v1.0 release notes; we
-get production validation data. Apply via `security@craton.com.ar`.
+**If you're a sponsor / corporation:** the v0.5 design-partner program is
+open. Reciprocal engagement: you get early access + named credit in v1.0
+release notes; we get production validation data. Apply via
+`security@craton.com.ar`.
 
 **If you're a security researcher:** `SECURITY.md` is the disclosure
 contract. 72h acknowledgement, 90-day coordinated disclosure, public
 findings table in `docs/SECURITY-AUDIT-v0.5.md` (post-pen-test).
 
-**If you're at a security firm reading this:** `docs/SECURITY-AUDIT-RFP.md`
-is sendable today. Sponsor maintainer fills in 11 bracketed placeholders
-and the RFP goes to firms.
+**If you're at a security firm reading this:** the v0.5 external pen-test
+is on the roadmap; reach out via `security@craton.com.ar` to discuss
+commissioning it.
 
 ---
 
@@ -325,10 +328,11 @@ A: Two real ones:
 │  CRATON TENSORWASM v0.3.7                                        │
 │  GPU-accelerated serverless WebAssembly runtime, in Rust         │
 │                                                                  │
-│  PROVEN ON REAL SILICON:                                         │
+│  PROVEN ON REAL SILICON (non-wmma vector path):                 │
 │    7/7 Wasm→wasi-cuda→cuLaunchKernel→readback tests pass         │
+│    (RTX 2060 = SM_75; sm_80 wmma/MatMul unproven, needs SM_89)   │
 │    70 test batches, 0 failures, 0 audit problems                 │
-│    5 tagged releases in 92 commits                               │
+│    9 tagged releases (v0.1.0 → v0.3.7)                           │
 │                                                                  │
 │  SHIPPED, USABLE TODAY:                                          │
 │    Auth (bearer + scoped tokens), rate limit, audit log          │
@@ -369,8 +373,6 @@ Everything pitched above has a doc behind it:
 - `docs/PATH-TO-V1.md` — the roadmap source-of-truth
 - `docs/SLO.md` — what we commit to numerically
 - `docs/BENCHMARKING.md` — how we measure (incl. anti-cheating rules)
-- `docs/SECURITY-AUDIT-RFP.md` — sponsor-sendable v0.5 audit RFP
-- `docs/DESIGN-PARTNER-PROGRAM.md` — partner outreach kit
 - `docs/CUDA-OXIDE-CUTOVER.md` — v0.4 cuda-oxide v0.2 cutover runbook
 - `docs/tutorials/production-deployment.md` — end-to-end production guide
 - `rfcs/0001-cuda-oxide-integration.md` — the v0.5 default-flip decision
