@@ -29,7 +29,8 @@ self-hosted runner once it lands (see `docs/CUDARC-SPIKE.md` for the
 concrete compile-friction status as of the 0.3.7 cut). See
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) and
 [`bench-results/tail-latency.json`](bench-results/tail-latency.json) for
-the honest measured numbers.
+the host-path bench numbers; GPU-side figures there are modeled estimates
+(clearly marked) until the S22 CUDA runner lands.
 
 What 0.3.7 ships on top of 0.1.0:
 
@@ -73,8 +74,11 @@ on a no-CUDA developer laptop.
 ### Run a sample Wasm function
 
 ```sh
-# Build a minimal Wasm fixture (or use one from tests/wasm-fixtures/)
-cargo run -p tensor-wasm-cli -- run path/to/vector_add.wasm --export add
+# Compile a `.wat` fixture to `.wasm` (the repo ships
+# tests/wasm-fixtures/matrix_multiply.wat), then run it. Substitute your
+# own module path and export name as needed.
+wat2wasm tests/wasm-fixtures/matrix_multiply.wat -o /tmp/matrix_multiply.wasm
+cargo run -p tensor-wasm-cli -- run /tmp/matrix_multiply.wasm --export matmul
 ```
 
 ### Spin up the HTTP API

@@ -35,8 +35,10 @@
 //!
 //! ## Error codes
 //!
-//! Mirrors the WIT contract in `wit/wasi-tensor.wit`:
-//! * `>= 0` — bytes accepted.
+//! Mirrors the WIT contract in `wit/wasi-tensor.wit`. Acceptance is
+//! all-or-nothing — the host forwards the whole chunk or none of it, so
+//! success is a flat `0` rather than a byte count:
+//! * `0`    — chunk fully accepted (the entire payload was forwarded).
 //! * `-1`   — streaming not enabled for this invocation.
 //! * `-2`   — guest tried to emit past the documented size cap.
 //! * `-3`   — downstream client disconnected (receiver dropped).
@@ -127,19 +129,32 @@ impl StreamingContext {
     ///   added to [`Self::bytes_emitted`].
     /// * `-1` if streaming is disabled (no channel attached).
     /// * `-2` if accepting this chunk would push the total past
-    ///   [`Self::max_total`]. The counter is rolled back so the
-    ///   per-invocation total reflects only successfully forwarded
-    ///   bytes.
+    ///   [`Self::max_total`]. The counter is rolled back afterward.
     /// * `-3` if the receiver has been dropped — the downstream HTTP
     ///   client disconnected. The counter is rolled back symmetrically.
+    ///
+    /// Concurrency note: the running total is maintained with an
+    /// optimistic `fetch_add` followed by a rollback on the failure
+    /// branches, so it reflects only successfully forwarded bytes *once
+    /// quiescent*. While concurrent emits are in flight, a reader of
+    /// [`Self::bytes_emitted`] may briefly observe a value above the bytes
+    /// actually forwarded — each in-flight emit can overshoot by its own
+    /// chunk size before its rollback lands, so with the per-call cap the
+    /// transient overshoot is bounded by roughly `2 * MAX_CHUNK_BYTES` per
+    /// racing emit. The overshoot is reconciled (rolled back) before each
+    /// failing call returns; it never causes the cap to under-count
+    /// accepted bytes.
     pub async fn emit_chunk(&self, bytes: Vec<u8>) -> i32 {
         let Some(s) = &self.sender else {
             return -1;
         };
         let added = bytes.len() as u64;
         // Optimistic-add + rollback-on-failure keeps the success path a
-        // single atomic op while preserving an accurate running total
-        // across the cap and receiver-dropped failure branches.
+        // single atomic op while keeping the running total accurate once
+        // quiescent. Under concurrency the total can transiently overshoot
+        // (each racing emit adds its chunk size before any rollback lands),
+        // bounded by ~2*MAX_CHUNK_BYTES per racing emit — see the
+        // `emit_chunk` doc comment.
         let new_total = self.bytes_emitted.fetch_add(added, Ordering::SeqCst) + added;
         if new_total > self.max_total {
             self.bytes_emitted.fetch_sub(added, Ordering::SeqCst);

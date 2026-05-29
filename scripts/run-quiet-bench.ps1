@@ -71,7 +71,15 @@ function Invoke-Bench($Name) {
     # Use $script:Stamp computed once at script entry so every bench in
     # this run shares the same `quiet-<ts>` baseline tag.
     $log = Join-Path $OutDir "$Name.log"
-    & cargo bench -p tensor-wasm-bench --bench $Name -- `
+    # dispatch_future_backends is only meaningful with --features cuda: the
+    # default build skips both backends (see bench-results\README.md). Pass
+    # the feature so the busy-poll path actually exercises the DispatchFuture
+    # loop rather than emitting two skip lines.
+    $ExtraArgs = @()
+    if ($Name -eq "dispatch_future_backends") {
+        $ExtraArgs = @("--features", "cuda")
+    }
+    & cargo bench -p tensor-wasm-bench --bench $Name @ExtraArgs -- `
         --sample-size $ElevatedSamples `
         --save-baseline "quiet-$script:Stamp" 2>&1 | Tee-Object -FilePath $log
 }
@@ -83,7 +91,10 @@ $Benches = @(
     "kernel_dispatch",
     "memory_bandwidth",
     "tail_latency",
-    "dispatch_future_backends"
+    "dispatch_future_backends",
+    "metrics_label_validation",
+    "call_export_args",
+    "streaming_invoke"
 )
 
 if ($BenchFilter -ne "") {

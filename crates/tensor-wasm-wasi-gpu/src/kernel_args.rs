@@ -870,6 +870,84 @@ mod tests {
     }
 
     #[test]
+    fn build_kernel_param_storage_encodes_bytes_and_alignment() {
+        // Byte-level guard (not just slot count): a mixed scalar + ptr argv
+        // must land each value in `backing()` natively-aligned and encoded
+        // with the platform's native byte order (the impl uses
+        // `to_ne_bytes`). We recover each slot's offset from `slot_ptrs()`
+        // relative to `backing().as_ptr()`, then check both the alignment of
+        // that offset and the bytes stored there.
+        let i32_val: i32 = -0x0102_0304;
+        let f64_val: f64 = 1234.5;
+        let u64_val: u64 = 0x00C0_FFEE_BABE_F00D;
+        // ptr_for_encoding stores a null host pointer; the slot therefore
+        // holds `0usize` worth of native bytes.
+        let args = vec![
+            LoweredArg::I32(i32_val),
+            LoweredArg::F64(f64_val),
+            LoweredArg::ptr_for_encoding(/* guest_offset */ 64, /* len */ 16),
+            LoweredArg::U64(u64_val),
+        ];
+
+        let storage = build_kernel_param_storage(&args);
+        assert_eq!(storage.len(), 4);
+
+        let backing = storage.backing();
+        let base = backing.as_ptr() as usize;
+        let slots = storage.slot_ptrs();
+        assert_eq!(slots.len(), 4);
+
+        // Resolve each slot pointer back to an offset inside `backing`.
+        let offset_of = |i: usize| -> usize {
+            let p = slots[i] as usize;
+            assert!(
+                p >= base && p <= base + backing.len(),
+                "slot {i} pointer escapes backing buffer"
+            );
+            p - base
+        };
+
+        let read = |off: usize, n: usize| -> &[u8] { &backing[off..off + n] };
+
+        // Slot 0: i32, 4-byte aligned, native bytes.
+        let off0 = offset_of(0);
+        assert_eq!(off0 % std::mem::align_of::<i32>(), 0, "i32 slot misaligned");
+        assert_eq!(read(off0, 4), &i32_val.to_ne_bytes());
+
+        // Slot 1: f64, 8-byte aligned, native bytes.
+        let off1 = offset_of(1);
+        assert_eq!(off1 % std::mem::align_of::<f64>(), 0, "f64 slot misaligned");
+        assert_eq!(read(off1, 8), &f64_val.to_ne_bytes());
+
+        // Slot 2: ptr — stores the resolved host pointer's usize bytes.
+        // For a null placeholder that is `0usize`.
+        let off2 = offset_of(2);
+        assert_eq!(
+            off2 % std::mem::align_of::<usize>(),
+            0,
+            "ptr slot misaligned"
+        );
+        assert_eq!(
+            read(off2, std::mem::size_of::<usize>()),
+            &(0usize).to_ne_bytes()
+        );
+
+        // Slot 3: u64, 8-byte aligned, native bytes.
+        let off3 = offset_of(3);
+        assert_eq!(off3 % std::mem::align_of::<u64>(), 0, "u64 slot misaligned");
+        assert_eq!(read(off3, 8), &u64_val.to_ne_bytes());
+
+        // Slots must be laid out in declaration order with no overlap: each
+        // slot's offset is strictly greater than the previous slot's end.
+        assert!(off1 >= off0 + 4, "f64 slot overlaps i32 slot");
+        assert!(off2 >= off1 + 8, "ptr slot overlaps f64 slot");
+        assert!(
+            off3 >= off2 + std::mem::size_of::<usize>(),
+            "u64 slot overlaps ptr slot"
+        );
+    }
+
+    #[test]
     fn arg_tag_value_bytes_pinned() {
         // Wire-format guard: bumping any of these is a breaking change.
         assert_eq!(ArgTag::I32.value_bytes(), 4);

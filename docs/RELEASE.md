@@ -11,7 +11,7 @@
 
 ## Release sequence
 1. `git checkout -b release/vX.Y.Z dev`
-2. Bump `workspace.package.version` and 8 internal dep `version = "X.Y.Z"` in workspace Cargo.toml.
+2. Bump `workspace.package.version` and the 9 internal dep `version = "X.Y.Z"` entries in workspace Cargo.toml.
 3. Update `CITATION.cff` (version + date-released).
 4. Move CHANGELOG `[Unreleased]` content under `[X.Y.Z] - YYYY-MM-DD`.
 5. PR `release/vX.Y.Z` → `dev` (CODEOWNERS gates).
@@ -19,8 +19,11 @@
 7. `git push origin dev vX.Y.Z` — release.yml workflow runs publish-dry-run + binary release + actual publish.
 
 ## Publish order
-core → mem → jit → wasi-gpu → snapshot → tenant → exec → api
-(rationale: dependency topology; verify with `cargo tree -e normal -p tensor-wasm-api`)
+core → artifacts → tenant → jit → mem → wasi-gpu → snapshot → exec → api
+(rationale: dependency topology — `tenant` precedes `mem` because `mem`
+depends on `tensor-wasm-tenant`, and `artifacts` precedes both `jit` and
+`snapshot` which depend on it; verify with
+`cargo tree -e normal -p tensor-wasm-api`)
 
 ## Post-release
 - [ ] Verify crates.io listings include LICENSE, README.

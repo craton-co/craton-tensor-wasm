@@ -69,7 +69,7 @@ graph TD
   bench[tensor-wasm-bench] -.dev-dep.-> core
 ```
 
-In S1 these dependencies are **not yet wired** in `Cargo.toml` — every crate's manifest is currently empty. Wiring happens incrementally as later sessions need it. This document describes the *planned end state*.
+These dependencies are fully wired in the workspace `Cargo.toml` as of v0.3.7; the graph above reflects the shipped crate topology.
 
 ## Per-crate module breakdown
 

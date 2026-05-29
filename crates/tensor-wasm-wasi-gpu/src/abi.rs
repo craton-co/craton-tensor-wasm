@@ -281,6 +281,85 @@ mod tests {
         }
     }
 
+    /// Drift guard: the in-crate authoritative `wit/wasi-cuda.wit` and the
+    /// workspace-root mirror `wit/wasi-cuda.wit` must carry a byte-identical
+    /// `interface host { ... }` body.
+    ///
+    /// Two copies of the cuda WIT exist:
+    ///   * `crates/tensor-wasm-wasi-gpu/wit/wasi-cuda.wit` — authoritative,
+    ///     `include_str!`'d by the tests above and shipped in the published
+    ///     crate tarball.
+    ///   * `<workspace-root>/wit/wasi-cuda.wit` — mirror for tooling that
+    ///     consumes WIT from the workspace root.
+    ///
+    /// The file *headers* legitimately differ (the in-crate copy documents
+    /// both `wasi:cuda` and `wasi:tensor`; the mirror is cuda-only), so we
+    /// compare only the `interface host` body — the part guests actually
+    /// bind against. If the mirror drifts (a signature/error-code edit
+    /// applied to one copy but not the other) this trips before downstream
+    /// `wit-bindgen` consumers see two different contracts.
+    ///
+    /// This is a *runtime* test (reads both files via `CARGO_MANIFEST_DIR`)
+    /// rather than a compile-time `include_str!("../../../wit/...")`: the
+    /// root path escapes the crate root, which `cargo publish` rejects when
+    /// packaging the tarball.
+    #[test]
+    fn cuda_wit_mirror_interface_body_matches() {
+        use std::path::Path;
+
+        /// Extract the `interface host { ... }` block (inclusive of the
+        /// opening `interface host {` line through its matching `}`), with
+        /// leading/trailing whitespace trimmed, so header differences and
+        /// surrounding blank lines do not register as drift.
+        fn interface_host_body(src: &str) -> String {
+            let start = src
+                .find("interface host {")
+                .expect("WIT must declare `interface host {`");
+            let rest = &src[start..];
+            // Walk brace depth to find the matching close brace.
+            let mut depth = 0usize;
+            let mut end = None;
+            for (idx, ch) in rest.char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(idx + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.expect("interface host block must be brace-balanced");
+            rest[..end].trim().to_string()
+        }
+
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let in_crate_path = Path::new(manifest).join("wit").join("wasi-cuda.wit");
+        // CARGO_MANIFEST_DIR is `<root>/crates/tensor-wasm-wasi-gpu`; the
+        // workspace root is two levels up.
+        let root_path = Path::new(manifest)
+            .join("..")
+            .join("..")
+            .join("wit")
+            .join("wasi-cuda.wit");
+
+        let in_crate = std::fs::read_to_string(&in_crate_path)
+            .unwrap_or_else(|e| panic!("read {in_crate_path:?}: {e}"));
+        let root = std::fs::read_to_string(&root_path)
+            .unwrap_or_else(|e| panic!("read {root_path:?}: {e}"));
+
+        assert_eq!(
+            interface_host_body(&in_crate),
+            interface_host_body(&root),
+            "wasi-cuda.wit `interface host` body drifted between the in-crate \
+             authoritative copy ({in_crate_path:?}) and the workspace-root \
+             mirror ({root_path:?}); update both so guests bind one contract."
+        );
+    }
+
     #[test]
     fn dimension_caps_are_plausible() {
         // Defensive sanity checks — bumping these accidentally would let

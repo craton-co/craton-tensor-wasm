@@ -40,8 +40,14 @@ fn main() {
     // PROFILE and TARGET are set by cargo for the build script's
     // execution environment. Re-emit them so the crate proper can
     // `env!("TENSOR_WASM_PROFILE")` / `env!("TENSOR_WASM_TARGET")`.
-    let profile = env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
-    let target = env::var("TARGET").unwrap_or_else(|_| "unknown".into());
+    //
+    // Route both through the same single-line filter `git_sha` /
+    // `rustc_version` get (`.lines().next()`). Defense-in-depth: an
+    // embedded newline in either value would otherwise terminate the
+    // `cargo:rustc-env=` directive and let the trailing bytes emit a
+    // second, attacker-controlled cargo directive.
+    let profile = env_single_line("PROFILE");
+    let target = env_single_line("TARGET");
 
     println!("cargo:rustc-env=TENSOR_WASM_GIT_SHA={}", git_sha);
     println!(
@@ -50,6 +56,23 @@ fn main() {
     );
     println!("cargo:rustc-env=TENSOR_WASM_PROFILE={}", profile);
     println!("cargo:rustc-env=TENSOR_WASM_TARGET={}", target);
+}
+
+/// Read environment variable `name` and return its first line, trimmed.
+///
+/// Falls back to the literal `"unknown"` when the variable is unset or
+/// its first line is empty. Mirrors the single-line discipline
+/// [`run_capture`] applies to `git` / `rustc` output so a value carrying
+/// an embedded newline cannot terminate the `cargo:rustc-env=` directive
+/// early and emit a second cargo directive from the trailing bytes.
+fn env_single_line(name: &str) -> String {
+    let raw = env::var(name).unwrap_or_default();
+    let first = raw.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        "unknown".into()
+    } else {
+        first.to_string()
+    }
 }
 
 /// Run `cmd args...` and return trimmed stdout on success.

@@ -280,8 +280,11 @@ async fn save(
 
     let status = resp.status();
     if !status.is_success() {
-        let text = resp
-            .text()
+        // T17: bound the in-memory error body so a malicious server cannot
+        // OOM the CLI on the failure path. Error envelopes are short; the
+        // streamed success path below is the only legitimate large-body
+        // channel.
+        let text = super::bounded_text(resp)
             .await
             .with_context(|| format!("reading error body from {url}"))?;
         if status == reqwest::StatusCode::NOT_FOUND && !looks_like_tensor_wasm_envelope(&text) {
@@ -552,10 +555,13 @@ fn local_err(msg: impl Into<String>) -> anyhow::Error {
 #[doc(hidden)]
 pub fn refuse_hmac_key_on_plaintext(server: &str) -> Result<()> {
     let Some((scheme, host)) = super::extract_scheme_host(server) else {
-        // `validate_server_url` is supposed to run first; if it didn't, fall
-        // back to silently allowing the call so the existing scheme-shape
-        // error elsewhere takes precedence over this defence-in-depth check.
-        return Ok(());
+        // Fail CLOSED: a secret-leakage gate must never pass on an
+        // unparseable URL. If we can't confirm the target is https:// or
+        // loopback, we cannot rule out plaintext exfiltration of the HMAC
+        // key, so refuse rather than risk sending it over the wire.
+        return Err(local_err(
+            "refusing to send HMAC key: could not parse server URL to confirm a safe (https:// or loopback) target",
+        ));
     };
     if scheme == "http" && !super::is_loopback_host(host) {
         return Err(local_err(

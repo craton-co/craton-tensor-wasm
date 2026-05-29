@@ -11,7 +11,7 @@ documentation = "https://docs.rs/tensor-wasm-core"
 readme = "README.md"
 description = "Foundational types, errors, metrics, and telemetry shared by every TensorWasm crate."
 keywords = ["wasm", "gpu", "runtime", "telemetry", "observability"]
-categories = ["wasm", "development-tools"]
+categories = ["development-tools", "api-bindings", "concurrency"]
 build = "build.rs"
 
 [lib]

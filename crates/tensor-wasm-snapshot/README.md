@@ -8,7 +8,7 @@ The on-disk wire layout (envelope, version history, size caps) is documented in 
 
 | Feature | Default | Effect |
 |---------|---------|--------|
-| `cuda`  | off     | Enables the GPU-side restore path (`reader::restore_to_gpu` and `reader::RestoredOnGpu`). Pulls in [`cust`](https://docs.rs/cust) and materialises the snapshot's `gpu_memory` blob directly into a `UnifiedBuffer<u8>` prefetched to the target device. Off by default so the crate builds on CUDA-less hosts. |
+| `cuda`  | off     | Enables the GPU-side restore path (`reader::restore_to_gpu`, `reader::restore_to_gpu_with`, and `reader::RestoredOnGpu`). Pulls in [`cust`](https://docs.rs/cust) and materialises the snapshot's `gpu_memory` blob directly into a `UnifiedBuffer<u8>` prefetched to the target device. `restore_to_gpu_with(&reader, ..)` lets callers supply a hardened `SnapshotReader` (cap / `require_signature` / HMAC key / max-age); `restore_to_gpu(..)` is a convenience wrapper that delegates through a default reader. Off by default so the crate builds on CUDA-less hosts. |
 | `signed-snapshots` | **on** | Compiles in HMAC-SHA256 sign/verify for the wire-v3 trailer. Off does not break v2 reads — the reader still accepts v2 — but disables both `SnapshotWriter::with_hmac_sha256_key` and `SnapshotReader::require_signature`, so a v3 blob can no longer be produced or verified. Operators who genuinely do not want the codepath compiled in can `--no-default-features` it off; most should leave it on. |
 
 See [docs/BUILD.md](../../docs/BUILD.md) for the project-wide flag taxonomy.
@@ -30,7 +30,7 @@ Internal crate dependencies: `tensor-wasm-core` (errors, tenant/instance ID type
 
 The reader is the hardened side of the API and treats every input as untrusted:
 
-- **Compressed-input cap**: rejected before zstd runs if larger than `limits::MAX_INPUT_BYTES` (~4 GiB).
+- **Compressed-input cap**: rejected before zstd runs if larger than `limits::MAX_INPUT_BYTES` (1 GiB).
 - **Decompressed-stream cap**: streamed through `zstd::stream::read::Decoder` wrapped in `Read::take`, default ceiling `limits::MAX_DECOMPRESSED_BYTES` (256 MiB). Override per-reader via `SnapshotReader::with_max_decompressed`.
 - **bincode allocation cap**: deserialised via `bincode::config::legacy().with_limit::<{ limits::MAX_TOTAL_PAYLOAD_BYTES }>()` (bincode 2.x compile-time const-generic limit), so a tampered `Vec<u8>` length field cannot drive the allocator past the static ceiling (sum of the per-blob caps + envelope slack). The per-blob caps below catch any oversized declared length that fits under the bincode ceiling.
 - **Per-blob caps**: each memory blob has an explicit `limits::MAX_*_BYTES` ceiling (Wasm 1 GiB, GPU 4 GiB, registers 1 MiB).
@@ -44,7 +44,7 @@ The CRC32 in the v2 envelope is an **integrity** check: it catches storage bit-f
 From v0.3.6 the crate ships an opt-in authenticity layer:
 
 - **Wire v2** (the default writer output) is unchanged. Bytes on disk match exactly what every v0.1.0+ reader has always restored.
-- **Wire v3** is `v2 + [signature_kind: u8][signature: 32 bytes]` — a 33-byte trailer carrying `HMAC-SHA256(key, v2_payload)` when `signature_kind = 1`. See [`FORMAT.md`](./FORMAT.md) for the byte-exact spec.
+- **Wire v3** is `v2 + [trailer_magic: 4 bytes][signature_kind: u8][signature: 32 bytes]` — a 37-byte magic-prefixed trailer carrying `HMAC-SHA256(key, v2_payload ++ trailer_magic ++ signature_kind)` when `signature_kind = 1`. See [`FORMAT.md`](./FORMAT.md) for the byte-exact spec.
 - **`SnapshotWriter::with_hmac_sha256_key(key)`** opts the writer into emitting v3. Without it, the writer emits v2 as before — a v0.3.6 deployment can adopt the API without changing what its writers produce, and roll out signing on its own schedule.
 - **`SnapshotReader`** accepts both v2 and v3 by default; if a key is configured it verifies v3 signatures but still allows unsigned v2 through. **`SnapshotReader::require_signature()`** is the strict-mode switch — it rejects v2 entirely and is the end-state for any deployment whose snapshot store is reachable from a network the operator does not fully control.
 

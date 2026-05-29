@@ -10,8 +10,8 @@ description = "Multi-tenant CUDA context management (MPS-backed or per-context f
 homepage = "https://github.com/craton-co/craton-tensor-wasm"
 documentation = "https://docs.rs/tensor-wasm-tenant"
 readme = "README.md"
-keywords = ["multi-tenant", "quota", "isolation", "cuda", "wasm"]
-categories = ["concurrency"]
+keywords = ["multi-tenant", "quota", "isolation", "gpu", "tenant"]
+categories = ["concurrency", "memory-management"]
 
 [package.metadata.docs.rs]
 all-features = false

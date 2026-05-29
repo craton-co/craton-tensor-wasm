@@ -23,10 +23,16 @@ interface host {
     /// flushes them to the HTTP client as Server-Sent Events (or chunked
     /// transfer-encoding bytes when the request didn't accept SSE).
     ///
-    /// Returns the number of bytes accepted, or a negative error code:
+    /// Returns 0 when the chunk is accepted (the full `bytes` payload is
+    /// forwarded — the host does not perform partial acceptance), or a
+    /// negative error code:
     ///   -1 = streaming not enabled for this invocation
     ///   -2 = guest tried to emit past the documented size cap
     ///   -3 = downstream client disconnected
+    /// The contract is all-or-nothing: a chunk is either fully accepted
+    /// (return 0) or fully rejected (negative code). It never returns a
+    /// partial byte count. See
+    /// `crates/tensor-wasm-wasi-gpu/src/streaming.rs::StreamingContext::emit_chunk`.
     emit-chunk: func(bytes: list<u8>) -> s32;
 
     /// Flush any buffered chunks. Implicit on guest return; explicit

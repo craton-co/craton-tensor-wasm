@@ -27,7 +27,14 @@
     { "name": "e2e/invoke_not_found/post",   "median_ns": 28100, "tolerance_pct": 50,
       "// note": "Seeded from bench-results/tail-latency.json p50 (unified-memory backend, 2026 baseline)." },
     { "name": "e2e/create_function/post",    "median_ns": null,  "tolerance_pct": 50, "regression_check": false,
-      "// TODO": "no tail-latency entry exists for create_function; run `cargo bench --bench e2e_inference -- create_function` on a quiet host and fill in." }
+      "// TODO": "no tail-latency entry exists for create_function; run `cargo bench --bench e2e_inference -- create_function` on a quiet host and fill in." },
+
+    { "name": "call_export/noargs/call_export_with_args_empty", "median_ns": null, "tolerance_pct": 50, "regression_check": false,
+      "// TODO": "fill from `cargo bench --bench call_export_args -- call_export/noargs` on a quiet host.",
+      "// note": "Batch 6 typed-args path (benches/call_export_args.rs). Ungated stub: spawn+terminate dominates the envelope so absolute CV is high; the cross-group delta vs call_export/args/two_i32 is the signal. Flip regression_check on once a quiet-host median lands." },
+    { "name": "call_export/args/two_i32",    "median_ns": null,  "tolerance_pct": 50, "regression_check": false,
+      "// TODO": "fill from `cargo bench --bench call_export_args -- call_export/args/two_i32` on a quiet host.",
+      "// note": "Batch 6 typed-args marshalling cost (WasmArg -> Val and back). Ungated stub until a quiet-host median lands." }
   ],
   "policy": {
     "regress_pct_threshold": 10,

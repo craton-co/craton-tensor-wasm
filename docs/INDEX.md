@@ -168,6 +168,7 @@ need more than ~8 co-located tenants on one GPU.
 | [AUTO-OFFLOAD.md](AUTO-OFFLOAD.md) | — | User-facing reference for which Wasm patterns the auto-offload JIT recognises and how to enable it (also listed under Architecture). |
 | [CUDA-KERNELS.md](CUDA-KERNELS.md) | W4.5 | Practical guide for developers writing CUDA kernels that load and dispatch under TensorWasm's `wasi:cuda` surface, covering both explicit and auto-offload paths. |
 | [PLIRON-PIPELINE.md](PLIRON-PIPELINE.md) | — | Four-wave implementation plan for the Pliron-based auto-offload pipeline (Wasm to PTX via the interim `LoweredOp` IR and cuda-oxide), companion to RFC 0001. |
+| [CUDA-OXIDE-CUTOVER.md](CUDA-OXIDE-CUTOVER.md) | — | Eight-step cutover runbook for the day cuda-oxide v0.2 ships: dependency bump through default-backend flip, gated on four pre-conditions per RFC 0001 Option C. |
 
 ## Operations
 
@@ -208,6 +209,7 @@ end to end before a real CVE arrives. Reports go to
 | [TESTING.md](TESTING.md) | B2.9 | Testing conventions across the workspace: unit/integration/CUDA/fuzz layers, the `#[ignore]` policy for hardware-gated tests, and the CI matrix that runs them. |
 | [FUZZING.md](FUZZING.md) | B2.9 | The `fuzz/` directory layout, per-target corpora, the nightly + weekly cron schedule, and the v0.5 24-hour gate that determines when a target counts as "covered". |
 | [runbooks/cve-disclosure-dry-run.md](runbooks/cve-disclosure-dry-run.md) | W5.5 | Manual procedure for rehearsing the CVE disclosure pipeline end-to-end on a test repository before a real CVE arrives. |
+| [SECURITY-AUDIT-RFP.md](SECURITY-AUDIT-RFP.md) | — | Procurement-grade RFP a sponsor can send to an external security firm (Trail of Bits / NCC Group / Cure53 / Doyensec) to commission the v0.5 PATH-TO-V1 external pen-test, with bracketed placeholders to fill in. |
 
 ## Governance and supply chain
 
@@ -233,6 +235,7 @@ mechanism that produces every other change that touches them.
 | [PATH-TO-V1.md](PATH-TO-V1.md) | — | The proposed five-milestone roadmap from the current v0.1.0 preview to a v1.0 production release, with explicit anti-goals and open decisions. |
 | [../rfcs/README.md](../rfcs/README.md) | W1.7 | Lightweight RFC process: one contributor writes a doc, opens a PR, gives reviewers a week, and a maintainer decides. |
 | [../rfcs/TEMPLATE.md](../rfcs/TEMPLATE.md) | W1.7 | The required starting point for a new RFC; copy to `rfcs/0000-short-kebab-slug.md` and fill in the sections in order. |
+| [DESIGN-PARTNER-PROGRAM.md](DESIGN-PARTNER-PROGRAM.md) | — | Outreach and program kit for recruiting v0.5 design partners (PATH-TO-V1 Open Decision #6): sponsor deliverables, partner asks, and a copy-pasteable application template. |
 
 ## Snapshots
 

@@ -23,6 +23,15 @@ use wasmtime::{
 /// Default epoch tick. Matches the plan's 10 ms cadence.
 const DEFAULT_EPOCH_TICK: Duration = Duration::from_millis(10);
 
+/// Approximate host-memory cost of a single wasm table entry on wasmtime
+/// (a tagged pointer plus a type-index slot). Kept in lockstep with the
+/// same constant in
+/// [`TensorWasmResourceLimiter::table_growing`](crate::executor::TensorWasmResourceLimiter)
+/// so the pooling allocator's `table_elements` ceiling is derived from the
+/// same per-instance budget the limiter enforces on the `UnifiedBuffer`
+/// path (MED finding — the two backends must agree on the table budget).
+pub(crate) const TABLE_ENTRY_BYTES: u64 = 16;
+
 /// Selects the linear-memory backing strategy for the engine.
 ///
 /// The two modes are mutually exclusive at the Wasmtime level:
@@ -104,6 +113,35 @@ pub struct EngineConfig {
     /// [`std::thread::available_parallelism`] (floored at 1) at executor
     /// construction time.
     pub max_concurrent_compiles: Option<usize>,
+}
+
+impl EngineConfig {
+    /// The effective per-instance linear-memory cap, in bytes, reconciling
+    /// the engine-wide [`Self::max_memory_bytes`] ceiling with the pooling
+    /// allocator's own per-slot byte size when
+    /// [`MemoryBackend::PoolingMpk`] is selected (MED finding).
+    ///
+    /// On the [`MemoryBackend::UnifiedBuffer`] path this is simply
+    /// `max_memory_bytes`. On the pooling path the physical slot size
+    /// (`memory_bytes`) is an independent hard ceiling the allocator
+    /// enforces at instantiation; a module larger than that slot would fail
+    /// to instantiate regardless of `max_memory_bytes`. Taking the minimum
+    /// of the two means the executor's pre-instantiation module check
+    /// ([`check_module_memory_within_cap`](crate::executor)) rejects an
+    /// oversized module with the typed
+    /// [`ExecError::ModuleMemoryTooLarge`](crate::executor::ExecError::ModuleMemoryTooLarge)
+    /// *before* the pooling allocator can surface an opaque
+    /// `ExecError::Wasmtime`, and the per-store
+    /// [`TensorWasmResourceLimiter`](crate::executor::TensorWasmResourceLimiter)
+    /// caps `memory.grow` against the same reconciled value.
+    pub fn effective_memory_cap(&self) -> usize {
+        match self.backend {
+            MemoryBackend::UnifiedBuffer => self.max_memory_bytes,
+            MemoryBackend::PoolingMpk { memory_bytes, .. } => {
+                self.max_memory_bytes.min(memory_bytes)
+            }
+        }
+    }
 }
 
 impl Default for EngineConfig {
@@ -201,9 +239,38 @@ impl TensorWasmEngine {
                 // Pooling owns the memory backing — do NOT install a host
                 // memory creator, and leave Wasmtime's default guard sizes
                 // in place (the pooling allocator depends on them).
+                //
+                // Reconcile the pooling per-slot byte size with the engine's
+                // per-instance cap (MED finding). Two independent dials —
+                // `max_memory_bytes` (the `ResourceLimiter` ceiling and the
+                // module pre-instantiation check) and the pooling
+                // `memory_bytes` (the allocator's physical slot size) — were
+                // not reconciled: a module that passed the
+                // `max_memory_bytes` check could still exceed the pooling
+                // slot and fail instantiation with an opaque allocator error.
+                // The effective per-instance memory cap is the *minimum* of
+                // the two, and the pooling slot is sized to that value so the
+                // allocator never has to refuse a module the cap check
+                // already admitted. `effective_memory_cap()` computes the
+                // same minimum that `check_module_memory_within_cap` validates
+                // against in the executor.
+                let effective = cfg.max_memory_bytes.min(memory_bytes);
                 let mut pooling = PoolingAllocationConfig::default();
                 pooling.total_memories(max_memories);
-                pooling.max_memory_size(memory_bytes);
+                pooling.max_memory_size(effective);
+                // Derive the table limits from the same reconciled
+                // per-instance budget the executor's `ResourceLimiter` uses
+                // (`effective / TABLE_ENTRY_BYTES`, matching
+                // `TensorWasmResourceLimiter::table_growing`), so a module
+                // admitted by the limiter is not then refused by the pooling
+                // allocator's own table ceiling. One table slot per memory
+                // slot. The pooling allocator caps `table_elements` at a
+                // `u32`, so saturate on the cast.
+                pooling.total_tables(max_memories);
+                let table_elems = (effective as u64 / TABLE_ENTRY_BYTES)
+                    .try_into()
+                    .unwrap_or(u32::MAX);
+                pooling.table_elements(table_elems);
                 pooling.memory_protection_keys(MpkEnabled::Auto);
                 wt_cfg.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
             }
@@ -337,6 +404,41 @@ mod tests {
         assert_eq!(c.epoch_tick, Duration::from_millis(10));
         assert!(c.component_model);
         assert!(matches!(c.backend, MemoryBackend::UnifiedBuffer));
+    }
+
+    #[test]
+    fn effective_memory_cap_unified_is_max_memory_bytes() {
+        let cfg = EngineConfig {
+            max_memory_bytes: 128 * 1024 * 1024,
+            backend: MemoryBackend::UnifiedBuffer,
+            ..EngineConfig::default()
+        };
+        assert_eq!(cfg.effective_memory_cap(), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn effective_memory_cap_pooling_takes_minimum() {
+        // Pooling slot smaller than the engine cap → slot wins.
+        let cfg = EngineConfig {
+            max_memory_bytes: 256 * 1024 * 1024,
+            backend: MemoryBackend::PoolingMpk {
+                max_memories: 8,
+                memory_bytes: 64 * 1024 * 1024,
+            },
+            ..EngineConfig::default()
+        };
+        assert_eq!(cfg.effective_memory_cap(), 64 * 1024 * 1024);
+
+        // Engine cap smaller than the pooling slot → engine cap wins.
+        let cfg = EngineConfig {
+            max_memory_bytes: 16 * 1024 * 1024,
+            backend: MemoryBackend::PoolingMpk {
+                max_memories: 8,
+                memory_bytes: 64 * 1024 * 1024,
+            },
+            ..EngineConfig::default()
+        };
+        assert_eq!(cfg.effective_memory_cap(), 16 * 1024 * 1024);
     }
 
     #[tokio::test]

@@ -52,13 +52,23 @@ private to that crate.
 | `e2e/healthz/get` | `tensor-wasm-bench` | `benches/e2e_inference.rs` | Full axum router round-trip on GET `/healthz`. | requests/sec |
 | `e2e/create_function/post` | `tensor-wasm-bench` | `benches/e2e_inference.rs` | POST `/functions` latency; fresh router per iter via `iter_batched`. | requests/sec |
 | `e2e/invoke_not_found/post` | `tensor-wasm-bench` | `benches/e2e_inference.rs` | POST `/functions/<unknown>/invoke` error path. | requests/sec |
+| `dispatch/serial/100`, `dispatch/concurrent_cap64/100`, `e2e/healthz/get`, `e2e/invoke_not_found/post` (P50/P95/P99/P99.9/max) | `tensor-wasm-bench` | `benches/tail_latency.rs` | Hand-rolled 10 000-sample tail-latency loop (not Criterion's pipeline). Emits `TAIL_LATENCY` JSON + `bench-results/tail-latency.json`. Diagnostic, not gated. | n/a (latency percentiles) |
+| `DISPATCH_BACKEND busy-poll`, `DISPATCH_BACKEND cuda-async` | `tensor-wasm-bench` | `benches/dispatch_future_backends.rs` | F3/RFC 0001 busy-poll `DispatchFuture` vs `cuda-async` stub. Meaningful only with `--features cuda`; emits JSON + `bench-results/dispatch-future-backends.json`. Diagnostic, not gated. | n/a (latency percentiles) |
+| `metrics_label_validation/try_new/{first,last,miss}` | `tensor-wasm-bench` | `benches/metrics_label_validation.rs` | `HttpRequestLabels::try_new` route lookup against a 100-route allow-list (post `Vec`→`HashSet` migration). Diagnostic, not gated. | iters/sec |
+| `call_export/noargs/call_export_with_args_empty`, `call_export/args/two_i32` | `tensor-wasm-bench` | `benches/call_export_args.rs` | `call_export_with_args` overhead vs the legacy no-args `call_export` shim; spawn+terminate inside the timed loop. | iters/sec |
+| `invoke_stream/{baseline_invoke,sse,chunked}` | `tensor-wasm-bench` | `benches/streaming_invoke.rs` | `/invoke-stream` vs `/invoke` floor. Placeholder emitting skip lines until B7.1 wires the route. | requests/sec |
 | `tenant_registry/lookup/<N>` for N in {1, 16, 256} | `tensor-wasm-tenant` | `benches/context_switch.rs` | `TenantRegistry::get` host-side lookup; CUDA equivalent is `cuCtxPushCurrent`/`cuCtxPopCurrent`. S16 done-when: <5µs. | iters/sec |
 | `tenant_registry/consume_release/256KiB` | `tensor-wasm-tenant` | `benches/context_switch.rs` | `consume_bytes` + `release_bytes` quota round-trip. | iters/sec |
 
-`kernel_dispatch` was added in S9 and `tenant_registry` in S16; the
-remaining four bench files in `tensor-wasm-bench` (`cold_start`,
-`memory_bandwidth`, `jit_compile`, `e2e_inference`) were introduced in
-S19 alongside this document.
+`kernel_dispatch` was added in S9 and `tenant_registry` in S16;
+`cold_start`, `memory_bandwidth`, `jit_compile`, and `e2e_inference` were
+introduced in S19 alongside this document. The four most recent bench
+files — `tail_latency` (W4.6), `dispatch_future_backends` (F3/RFC 0001),
+`metrics_label_validation`, and `call_export_args` (Batch 6), plus the
+`streaming_invoke` (B7.1) placeholder — bring `tensor-wasm-bench` to 10
+bench files. The last five are diagnostic / placeholder benches and are
+not on the CI regression-gate path; see
+[`bench-results/README.md`](../bench-results/README.md).
 
 ### Interpreting Criterion HTML
 

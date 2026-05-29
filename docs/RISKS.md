@@ -25,13 +25,13 @@ Last updated: 2026-05-28 (v0.3.7 — workspace version bump)
 
 ## CUDA `cust` 0.3.x EOL
 
-**Status:** spike landed under `--features cudarc-backend`; full migration pending v0.2 cutover decision. Workspace pins `cust = "0.3"` as the default; `cudarc = "0.13"` is available behind the per-crate `cudarc-backend` feature flag in `tensor-wasm-mem`. Both backends coexist for v0.2 backward compat. Upstream `cust` maintenance is stalled.
+**Status:** spike landed under `--features cudarc-backend`; full migration pending the v0.5 cutover decision per RFC 0001. Workspace pins `cust = "0.3"` as the default; `cudarc = "0.13"` is available behind the per-crate `cudarc-backend` feature flag in `tensor-wasm-mem`. Both backends coexist through v0.4 for backward compat; the default flip is re-scoped to v0.5. Upstream `cust` maintenance is stalled.
 
 **Risk:** no security or compatibility patches on the cust path; CUDA 13+ may break without warning. The cudarc-backend spike confirms the migration is viable (API mapping is ~95% one-to-one — see `docs/CUDARC-SPIKE.md`), but full cutover still needs a runner pass on real hardware and a callsite sweep across `tensor-wasm-mem::unified`, `advise`, `pool`, and `wasm_memory`.
 
 **Mitigations under evaluation:**
-- Cut the default backend over to `cudarc` in v0.2 once the S22 runner validates the spike end-to-end (see `docs/CUDARC-SPIKE.md` for the proposed cutover plan).
-- Maintain an internal fork of `cust` for security backports if the cutover slips to v0.3.
+- Cut the default backend over (to `cudarc` or `cuda-oxide`) at v0.5 once the S22 runner validates the spike end-to-end (see `docs/CUDARC-SPIKE.md` and RFC 0001 for the proposed cutover plan and the contingent-default approach).
+- Maintain an internal fork of `cust` for security backports if the cutover slips past v0.5.
 
 A third option has appeared since W1.2 wrote the spike: NVlabs `cuda-oxide` v0.1.0 alpha (released 2026-05-09) is now under evaluation per [`rfcs/0001-cuda-oxide-integration.md`](../rfcs/0001-cuda-oxide-integration.md), which proposes a three-way live evaluation with a contingent v0.5 default flip.
 

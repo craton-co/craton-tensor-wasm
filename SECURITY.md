@@ -1,14 +1,15 @@
 # Craton TensorWasm — Security Model
 
-_Status: living document. First written for S6 of the implementation plan.
-This is the threat model and isolation strategy summary; the full security
-audit lands in S21 (`docs/SECURITY-AUDIT.md`)._
+_Status: living document, current as of v0.3.7 (released 2026-05-28).
+This is the threat model and isolation strategy summary; the security
+audit findings live in [`docs/SECURITY-AUDIT.md`](docs/SECURITY-AUDIT.md)._
 
 ## Threat model
 
-Craton TensorWasm runs untrusted Wasm modules that issue explicit (and, post-S14, implicit)
-GPU kernel launches. The adversary controls the Wasm bytecode and the kernel
-PTX. We assume the host kernel, CUDA driver, and Wasmtime runtime are trusted.
+Craton TensorWasm runs untrusted Wasm modules that issue explicit (and, via the
+opt-in `auto-offload` feature, implicit) GPU kernel launches. The adversary
+controls the Wasm bytecode and the kernel PTX. We assume the host kernel,
+CUDA driver, and Wasmtime runtime are trusted.
 
 ### Assets to protect
 
@@ -27,10 +28,10 @@ PTX. We assume the host kernel, CUDA driver, and Wasmtime runtime are trusted.
 - Arbitrary Wasm bytecode (validated by Wasmtime).
 - Arbitrary PTX uploaded via `wasi_cuda_load_ptx` (validated by `ptxas`).
 - Crafted kernel launch parameters (grid, block, args).
-- Crafted snapshot files (S15) submitted to `tensor-wasm restore`.
-- Crafted HTTP requests at the API gateway (S17).
+- Crafted snapshot files submitted to `tensor-wasm restore`.
+- Crafted HTTP requests at the API gateway.
 
-### Out of scope (for v0.1.0)
+### Out of scope
 
 - Side-channel attacks via the GPU L2 cache (see "Known gaps" below).
 - Hardware faults injected by the adversary.
@@ -52,8 +53,8 @@ backed by a per-instance `UnifiedBuffer` allocated by `TensorWasmMemoryCreator`
    `UnifiedBuffer` returned by a separate `cudaMallocManaged` call. There
    is no shared backing store between instances, so even a confused-deputy
    bug in the host couldn't cause one tenant's pointer to alias another's.
-3. **Per-tenant CUDA streams and contexts** (`tensor-wasm-exec` streams in S7,
-   `tensor-wasm-tenant` contexts in S16). Kernels submitted by different tenants
+3. **Per-tenant CUDA streams and contexts** (`tensor-wasm-exec` streams,
+   `tensor-wasm-tenant` contexts). Kernels submitted by different tenants
    execute on different streams (and, in `ContextIsolated` mode, different
    contexts), so an in-flight kernel cannot observe or corrupt a sibling
    tenant's launches.
@@ -103,21 +104,24 @@ caller's `UnifiedBuffer` range. Kernel timeouts (`KernelTimeout`, see
 
 ### CPU/IO time
 
-Wasmtime epoch-based interruption (`tensor-wasm-exec`, S7) terminates instances that
-exceed their per-invocation deadline. The HTTP API gateway (S17) enforces
-per-tenant request rate limiting via `tower_governor`.
+Wasmtime epoch-based interruption (`tensor-wasm-exec`) terminates instances that
+exceed their per-invocation deadline. The HTTP API gateway enforces
+per-token (and per-`(token, tenant)`) request rate limiting via a custom
+in-process token-bucket limiter
+(`crates/tensor-wasm-api/src/rate_limit.rs`) — not an external crate.
+The limiter is opt-in: it is disabled unless
+`TENSOR_WASM_API_RATE_LIMIT_QPS` and `_BURST` are configured.
 
 ### Error containment
 
 `TensorWasmError::TenantIsolationViolation` is raised when any of the above checks
 fail. The instance is terminated, its `UnifiedBuffer` freed, and the event is
 emitted as a tracing span (`tensor_wasm_core::telemetry`) plus a metric increment
-(`tensor_wasm_offload_fallback_total` is *not* the right one — S21 adds a dedicated
-`tensor_wasm_isolation_violations_total` counter).
+on the dedicated `tensor_wasm_isolation_violations_total` counter.
 
 ## IsolationLevel taxonomy
 
-The `tensor_wasm_mem::isolation::IsolationLevel` enum (added in this session) makes
+The `tensor_wasm_mem::isolation::IsolationLevel` enum makes
 the operator's choice explicit:
 
 | Level | Streams | Contexts | Use case |
@@ -128,7 +132,7 @@ the operator's choice explicit:
 
 ## Known gaps
 
-These are documented limitations of v0.1.0; mitigations are tracked.
+These are documented limitations as of v0.3.7; mitigations are tracked.
 
 ### GPU L2 cache timing side channel
 
@@ -139,7 +143,7 @@ co-located tenant's workload. We do not currently mitigate this.
 
 **Long-term mitigation:** deploy on NVIDIA Multi-Instance GPU (MIG) where
 hardware partitions the L2; or use Hopper-class MPS isolation extensions.
-See `docs/MPS-SETUP.md` (S16).
+See `docs/MPS-SETUP.md`.
 
 ### Driver instability under adversarial PTX
 
@@ -155,8 +159,12 @@ incident (see `docs/SECURITY-AUDIT.md`).
 
 ### Wasmtime compile-time fuzzing surface
 
-S21 will fuzz the Wasm → Cranelift → host transition with `cargo-fuzz`. v0.1.0
-ships with Wasmtime's upstream fuzz corpus only.
+The Wasm → Cranelift → host transition is exercised by the `cargo-fuzz`
+suite under `fuzz/` (see [`docs/FUZZING.md`](docs/FUZZING.md) and
+[`fuzz/README.md`](fuzz/README.md)), which runs nightly and on a weekly
+long-form cron. The v0.5 exit criterion is sustained 24-hour coverage per
+target; the suite still leans on Wasmtime's upstream fuzz corpus for the
+`fuzz_wasm_compile` target.
 
 ## Supported versions
 

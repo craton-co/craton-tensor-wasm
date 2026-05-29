@@ -1,6 +1,6 @@
 # Craton TensorWasm — Path to v1.0 (proposal)
 
-A proposed, opinionated roadmap from the current **v0.1.0 preview** to a
+A proposed, opinionated roadmap from the current **v0.3.7 release** to a
 **v1.0 production** release. This is a proposal — it commits no one to
 dates and invites pushback on the milestone shape, the exit criteria,
 and the cut-line between "v1.0" and "v2.0". Treat it as the strawman

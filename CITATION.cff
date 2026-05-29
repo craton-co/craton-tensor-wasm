@@ -1,6 +1,6 @@
 cff-version: 1.2.0
-message: "If you use Craton Tensor-WASM in academic or research work, please cite it as below."
-title: "Craton Tensor-WASM"
+message: "If you use Craton TensorWasm in academic or research work, please cite it as below."
+title: "Craton TensorWasm"
 abstract: "A tensor-aware WebAssembly runtime with GPU integration for serverless workloads."
 authors:
   - name: "Craton Software Company"

@@ -23,6 +23,20 @@
 //!   `dispatch/concurrent_cap64/100`, `e2e/healthz/get`, and
 //!   `e2e/invoke_not_found/post`. Output goes to stdout and (when run
 //!   from the workspace root) to `bench-results/tail-latency.json`.
+//! - `benches/dispatch_future_backends.rs` — F3/RFC 0001 comparison of the
+//!   busy-poll `DispatchFuture` path against the `cuda-async` backend
+//!   (the latter a documented stub until v0.4). Meaningful only with
+//!   `--features cuda`; emits `DISPATCH_BACKEND` JSON lines and
+//!   `bench-results/dispatch-future-backends.json`. Diagnostic, not gated.
+//! - `benches/metrics_label_validation.rs` — `HttpRequestLabels::try_new`
+//!   route-lookup cost against a 100-route allow-list (first/last/miss).
+//!   Pins the `Vec` → `HashSet` migration. Diagnostic, not gated.
+//! - `benches/call_export_args.rs` — `call_export_with_args` overhead vs
+//!   the legacy no-args `call_export` shim (`call_export/noargs/*` and
+//!   `call_export/args/two_i32`).
+//! - `benches/streaming_invoke.rs` — `/invoke-stream` vs `/invoke` floor
+//!   (`invoke_stream/baseline_invoke`, `/sse`, `/chunked`). Placeholder
+//!   that emits skip lines until B7.1 wires the route.
 //!
 //! See [`docs/PERFORMANCE.md`](../../../docs/PERFORMANCE.md) for the
 //! published bench inventory, reference numbers, and the regression-gate

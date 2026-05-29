@@ -138,6 +138,58 @@ fn no_cap_allows_unbounded() {
 }
 
 #[test]
+fn consume_to_u64_max_minus_one_then_overflow_rejected() {
+    // GPU sibling of `quota_overflow_saturating::consume_u64_max_then_one_more_byte`.
+    //
+    // The CPU overflow test jumps straight to `u64::MAX`; here we instead
+    // walk the GPU counter up to exactly `u64::MAX - 1` and then ask for
+    // `2` more, so the rejection is unambiguously the `checked_add`
+    // overflow guard (`(u64::MAX - 1) + 2` wraps), NOT a cap comparison.
+    // We run with no cap (`None`) precisely so the only thing that can
+    // refuse the add is the overflow guard.
+    let ctx = TenantContext::builder(TenantId(5)).build();
+    assert_eq!(ctx.gpu_memory_bytes_cap(), None, "test wants the no-cap path");
+
+    // Reserve everything but one byte. With no cap this is permitted; the
+    // counter records real utilisation for dashboards.
+    ctx.consume_gpu_bytes(u64::MAX - 1)
+        .expect("reserving u64::MAX - 1 under no-cap must succeed");
+    assert_eq!(ctx.gpu_bytes_in_use(), u64::MAX - 1);
+
+    // `+2` would push the counter to `u64::MAX + 1`, which `checked_add`
+    // detects as overflow and refuses with `GpuMemoryExhausted`. The
+    // reported `limit` is `u64::MAX` (the sentinel for "no cap") and
+    // `current` is the pre-rejection value.
+    let err = ctx
+        .consume_gpu_bytes(2)
+        .expect_err("(u64::MAX - 1) + 2 overflows and must be refused");
+    match err {
+        TensorWasmError::GpuMemoryExhausted {
+            requested,
+            limit,
+            current,
+        } => {
+            assert_eq!(requested, 2, "wrong requested in error: {err:?}");
+            assert_eq!(limit, u64::MAX, "no-cap overflow reports u64::MAX limit: {err:?}");
+            assert_eq!(current, u64::MAX - 1, "current must be pre-rejection: {err:?}");
+        }
+        other => panic!("expected GpuMemoryExhausted from checked_add overflow, got {other:?}"),
+    }
+
+    // The rejected add must not move (or wrap) the counter.
+    assert_eq!(
+        ctx.gpu_bytes_in_use(),
+        u64::MAX - 1,
+        "rejected overflow add must leave the GPU counter untouched (no wrap)",
+    );
+
+    // A `+1` is still legitimate: it lands exactly on `u64::MAX`.
+    ctx.consume_gpu_bytes(1)
+        .expect("the final byte up to exactly u64::MAX must still be reservable");
+    assert_eq!(ctx.gpu_bytes_in_use(), u64::MAX);
+}
+
+#[test]
 fn concurrent_consume_release_no_drift() {
     // 32-thread stress test for the CAS-loop atomic discipline.
     //

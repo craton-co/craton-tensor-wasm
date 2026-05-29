@@ -33,6 +33,7 @@ use uuid::Uuid;
 use tensor_wasm_api::{
     build_router_with_config, AppState, AuthConfig, FunctionRecord, TenantConfig,
 };
+use tensor_wasm_core::types::TenantId;
 
 /// WAT exporting `_start` and calling `wasi:tensor/host.emit-chunk`
 /// once with the payload "hello".
@@ -74,6 +75,10 @@ fn router_with_model() -> (axum::Router, Uuid) {
             name: "hello-emitter".to_string(),
             wasm_bytes: Arc::from(wasm),
             created_unix_ms: 0,
+            // OpenAI requests without a tenant header resolve to TenantId(0)
+            // (see openai.rs); match it so the record is owned by the
+            // default tenant the request runs under.
+            tenant_id: TenantId(0),
         },
     );
     let mut map = HashMap::new();

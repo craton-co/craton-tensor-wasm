@@ -12,7 +12,7 @@ The S22 runner runs **CUDA Toolkit 12.4** on **driver 550.54.15** under **Ubuntu
 4. [Verification commands](#verification-commands)
 5. [Feature-flag combinations](#feature-flag-combinations)
 6. [Using the cuda-oxide-backend feature](#using-the-cuda-oxide-backend-feature)
-7. [Using the cuda-oxide-host-backend feature](#using-the-cuda-oxide-host-backend-feature)
+7. [Using the experimental-cuda-oxide-host-backend feature](#using-the-experimental-cuda-oxide-host-backend-feature)
 8. [SM-level compatibility matrix](#sm-level-compatibility-matrix)
 9. [MPS quick-start](#mps-quick-start)
 10. [Troubleshooting](#troubleshooting)
@@ -383,13 +383,25 @@ runner once the v0.4 parity work lands.
 
 ---
 
-## Using the cuda-oxide-host-backend feature
+## Using the experimental-cuda-oxide-host-backend feature
 
-`cuda-oxide-host-backend` (added in W4.1, 2026-05-27) is the
-**strict-superset** sibling of `cuda-oxide-backend`. Enabling it pulls
+`experimental-cuda-oxide-host-backend` (added in W4.1, 2026-05-27; renamed
+from `cuda-oxide-host-backend` to carry the `experimental-` prefix) is the
+**strict-superset** sibling of `cuda-oxide-backend`.
+
+> **Experimental — not yet buildable.** This feature is intentionally
+> non-building: the `cuda_oxide_backend` module opens with a
+> `compile_error!`, so enabling
+> `--features experimental-cuda-oxide-host-backend` will fail to compile
+> today. The `compile_error!` is lifted only once the S22 self-hosted
+> runner has actually compiled and validated the host port. The commands
+> below document the intended invocation for when the port lands; they do
+> not build on the current tree.
+
+Enabling it pulls
 in the four cuda-oxide host-side crates as git-pinned dependencies (pin
 SHA `4a56e4220aab8ce5d085a411e7f806cebb647d14`, matching the v0.1.0 tag)
-and switches `tensor_wasm_mem::cuda_oxide_backend::CudaOxideUnifiedBuffer`
+and is intended to switch `tensor_wasm_mem::cuda_oxide_backend::CudaOxideUnifiedBuffer`
 from the `NOT_YET_WIRED` sentinel-error scaffold to a real
 `cuMemAllocManaged`-backed allocation. The transitive crate set:
 
@@ -462,23 +474,27 @@ setx CUDA_TOOLKIT_PATH "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4
 
 From the repository root:
 
+> The commands below are the *intended* invocation once the host port
+> lands and the `compile_error!` guard is removed. On the current tree
+> they fail to compile by design (see the experimental note above).
+
 ```bash
 # Compile-only check (what CI's cuda-host runner runs)
-cargo check -p tensor-wasm-mem --features cuda-oxide-host-backend
+cargo check -p tensor-wasm-mem --features experimental-cuda-oxide-host-backend
 
 # Full build
-cargo build -p tensor-wasm-mem --features cuda-oxide-host-backend
+cargo build -p tensor-wasm-mem --features experimental-cuda-oxide-host-backend
 
 # Hardware-gated tests (requires a CUDA-capable GPU)
-cargo test -p tensor-wasm-mem --features cuda-oxide-host-backend \
+cargo test -p tensor-wasm-mem --features experimental-cuda-oxide-host-backend \
     --test cuda_oxide_smoke -- --ignored
 ```
 
-The `--features tensor-wasm-mem/cuda-oxide-host-backend` form works
+The `--features tensor-wasm-mem/experimental-cuda-oxide-host-backend` form works
 identically from the workspace root:
 
 ```bash
-cargo build --workspace --features tensor-wasm-mem/cuda-oxide-host-backend
+cargo build --workspace --features tensor-wasm-mem/experimental-cuda-oxide-host-backend
 ```
 
 ### Failure modes
@@ -492,10 +508,14 @@ cargo build --workspace --features tensor-wasm-mem/cuda-oxide-host-backend
 
 ### What CI runs
 
-The `cuda-oxide-host-backend-check` job in `.github/workflows/ci.yml`
-runs `cargo check -p tensor-wasm-mem --features cuda-oxide-host-backend`
-on a runner image that pre-installs CUDA Toolkit 12.4 + LLVM 18. The
-existing CUDA-stub runners are untouched. Hardware-gated tests (the
+The `experimental-cuda-oxide-host-backend-check` job in
+`.github/workflows/ci.yml` runs
+`cargo check -p tensor-wasm-mem --features experimental-cuda-oxide-host-backend`
+on a runner image that pre-installs CUDA Toolkit 12.4 + LLVM 18. Because
+the feature is currently guarded by a `compile_error!`, that job is
+expected to fail-by-design and is kept non-required / allowed-to-fail
+until the S22 host port lifts the guard. The existing CUDA-stub runners
+are untouched. Hardware-gated tests (the
 `#[ignore = "requires CUDA hardware"]` set in
 `tests/cuda_oxide_smoke.rs`) run on the S22 self-hosted runner only.
 

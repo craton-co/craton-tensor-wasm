@@ -189,6 +189,33 @@ pub trait ArtifactStore: Send + Sync {
     /// deliberately distinct from an empty result so GC/audit callers
     /// can tell "store is empty" apart from "could not read the store".
     fn list(&self) -> Result<Vec<ContentHash>, ArtifactError>;
+    /// Cheap existence probe for `hash`: returns `true` if an entry is
+    /// present, `false` otherwise. This is deliberately a stat-only
+    /// check — it does NOT decode, decompress, or HMAC-verify the
+    /// record, so it is dramatically cheaper than [`Self::get`] and
+    /// suitable for the GC/audit roadmap's "is this content already
+    /// resident?" question.
+    ///
+    /// Because no integrity work happens, a `true` result means only
+    /// that a file (disk) or map entry (in-memory) exists under the
+    /// content-addressed key; a subsequent [`Self::get`] can still fail
+    /// with an integrity variant if that record was tampered with.
+    ///
+    /// Returns [`ArtifactError::Io`] only on an underlying probe fault
+    /// that is neither "present" nor "absent" (e.g. a `metadata` call
+    /// failing for a reason other than not-found).
+    fn contains(&self, hash: &ContentHash) -> Result<bool, ArtifactError>;
+    /// Remove the entry stored under `hash`. Returns `true` if a record
+    /// was removed, `false` if nothing was stored under `hash` (a
+    /// no-op delete is not an error — it mirrors `HashMap::remove`'s
+    /// "was it there?" boolean and the POSIX `unlink`-of-missing
+    /// convention GC callers expect).
+    ///
+    /// For [`DiskArtifactStore`] this unlinks the `{hash}.{key_fp}.bin`
+    /// file under this store's key; for [`InMemoryArtifactStore`] it
+    /// drops the map entry. Returns [`ArtifactError::Io`] on an
+    /// underlying delete fault other than not-found.
+    fn remove(&self, hash: &ContentHash) -> Result<bool, ArtifactError>;
 }
 
 // =====================================================================
@@ -844,6 +871,48 @@ impl ArtifactStore for DiskArtifactStore {
         }
         Ok(out)
     }
+
+    fn contains(&self, hash: &ContentHash) -> Result<bool, ArtifactError> {
+        // Stat-only existence probe: no open, no decode, no HMAC. A
+        // not-found error from `metadata` means "absent"; any other
+        // fault (permissions, I/O) is a genuine probe failure and
+        // surfaces as `Io` rather than masquerading as "absent".
+        let path = self.path_for(hash);
+        match std::fs::metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => {
+                warn!(
+                    target: "tensor_wasm_artifacts",
+                    file = %path.display(),
+                    error = %e,
+                    "contains metadata probe failed"
+                );
+                Err(ArtifactError::Io)
+            }
+        }
+    }
+
+    fn remove(&self, hash: &ContentHash) -> Result<bool, ArtifactError> {
+        // Unlink the per-key blob. A not-found error is the "nothing to
+        // remove" path and returns `false`, not an error — this matches
+        // `HashMap::remove`'s boolean and lets idempotent GC retries
+        // stay quiet. Any other delete fault is a real `Io`.
+        let path = self.path_for(hash);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => {
+                warn!(
+                    target: "tensor_wasm_artifacts",
+                    file = %path.display(),
+                    error = %e,
+                    "remove unlink failed"
+                );
+                Err(ArtifactError::Io)
+            }
+        }
+    }
 }
 
 fn hex_of(bytes: &[u8; 32]) -> String {
@@ -1144,6 +1213,17 @@ impl ArtifactStore for InMemoryArtifactStore {
         // treat both stores uniformly.
         Ok(self.entries.lock().keys().copied().collect())
     }
+    fn contains(&self, hash: &ContentHash) -> Result<bool, ArtifactError> {
+        // `contains_key` is the cheap probe — no clone of the payload,
+        // matching the disk store's stat-only contract. Infallible for
+        // an in-memory map; wrapped in `Ok` for trait uniformity.
+        Ok(self.entries.lock().contains_key(hash))
+    }
+    fn remove(&self, hash: &ContentHash) -> Result<bool, ArtifactError> {
+        // `HashMap::remove` returns the old value; map it to the
+        // trait's "was something removed?" boolean.
+        Ok(self.entries.lock().remove(hash).is_some())
+    }
 }
 
 #[cfg(test)]
@@ -1164,6 +1244,16 @@ mod tests {
         let hash = store.put(b"payload").unwrap();
         assert_eq!(store.get(&hash).unwrap(), b"payload");
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn in_memory_contains_and_remove() {
+        let store = InMemoryArtifactStore::new([9u8; 32]);
+        let hash = store.put(b"x").unwrap();
+        assert!(store.contains(&hash).unwrap());
+        assert!(store.remove(&hash).unwrap(), "first remove deletes");
+        assert!(!store.contains(&hash).unwrap());
+        assert!(!store.remove(&hash).unwrap(), "second remove is a no-op");
     }
 
     #[test]

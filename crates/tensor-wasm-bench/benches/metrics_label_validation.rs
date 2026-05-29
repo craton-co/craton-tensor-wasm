@@ -37,7 +37,7 @@
 
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use tensor_wasm_core::metrics::{HttpRequestLabels, RouteAllowlist};
 
 /// Build a stable 100-route allow-list. `Box::leak` is fine here: the
@@ -80,12 +80,18 @@ fn bench_try_new(c: &mut Criterion) {
         // once to recover the `&str` the validator wants.
         group.bench_with_input(BenchmarkId::from_parameter(label), &route, |b, route| {
             b.iter(|| {
-                // The `Result` is intentionally swallowed: the bench
-                // measures the cost of *attempting* validation, not the
-                // cost of unwrapping the result. The `miss` case
-                // legitimately returns `Err(UnknownRoute)`.
-                let _ =
-                    HttpRequestLabels::try_new_with_allowlist(*route, "GET", 200, Some(&allowlist));
+                // The `Result` is intentionally swallowed, but it (and the
+                // loop-invariant inputs) are wrapped in `black_box` so LLVM
+                // can't hoist or elide the call — the constant args would
+                // otherwise let it prove the result unused. Matches every
+                // other bench in the crate.
+                let out = HttpRequestLabels::try_new_with_allowlist(
+                    black_box(*route),
+                    black_box("GET"),
+                    black_box(200),
+                    Some(&allowlist),
+                );
+                black_box(out.is_ok());
             });
         });
     }

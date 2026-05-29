@@ -130,7 +130,7 @@ fn bench_cache_hit_vs_miss(c: &mut Criterion) {
                 let entry =
                     CachedKernel::new(bp.fingerprint(), Arc::new(ptx), CompiledHandle::default());
                 cache.put(key, entry);
-                criterion::black_box(cache.get(&key));
+                criterion::black_box(cache.get(criterion::black_box(&key)));
             },
             BatchSize::SmallInput,
         );
@@ -146,7 +146,7 @@ fn bench_cache_hit_vs_miss(c: &mut Criterion) {
     warm_cache.put(key, warm_entry);
     group.bench_function("warm_hit", |b| {
         b.iter(|| {
-            criterion::black_box(warm_cache.get(&key));
+            criterion::black_box(warm_cache.get(criterion::black_box(&key)));
         });
     });
 

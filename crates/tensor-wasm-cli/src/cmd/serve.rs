@@ -304,19 +304,53 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolves when the process should shut down cleanly. Currently just Ctrl-C;
-/// once we add SIGTERM handling for systemd/kubernetes drains this is the
-/// place to extend.
+/// Resolves when the process should shut down cleanly. On unix we drain on
+/// either Ctrl-C (SIGINT) or SIGTERM so containerized `tensor-wasm serve`
+/// shuts down gracefully on `docker stop` / kubernetes pod termination. On
+/// non-unix targets only Ctrl-C is available.
 async fn shutdown_signal() {
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        tracing::error!(
-            target: "tensor_wasm_cli::serve",
-            error = %e,
-            "failed to install Ctrl-C handler; serve loop will run until killed",
-        );
-        // Park forever so the caller's `with_graceful_shutdown` never fires
-        // a spurious shutdown on a handler-install error.
-        std::future::pending::<()>().await;
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(
+                target: "tensor_wasm_cli::serve",
+                error = %e,
+                "failed to install Ctrl-C handler; serve loop will run until killed",
+            );
+            // Park forever so the caller's `with_graceful_shutdown` never
+            // fires a spurious shutdown on a handler-install error.
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sig) => {
+                    sig.recv().await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "tensor_wasm_cli::serve",
+                        error = %e,
+                        "failed to install SIGTERM handler; relying on Ctrl-C only",
+                    );
+                    // Park forever so a handler-install error doesn't trip a
+                    // spurious shutdown via this arm.
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = terminate => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
     }
 }
 
@@ -339,27 +373,27 @@ mod tests {
         // TENSOR_WASM_ALLOW_PLAINTEXT_PUBLIC from the env via clap's
         // `env = ...` plumbing. Strip it so a developer's shell config
         // can't silently flip the default to `true` under this test.
-        // SAFETY: tests in this binary are not run in parallel with code
-        // that mutates this variable.
-        std::env::remove_var("TENSOR_WASM_ALLOW_PLAINTEXT_PUBLIC");
-        let p = Probe::try_parse_from(["serve"]).expect("defaults parse");
-        assert_eq!(p.args.addr.to_string(), "127.0.0.1:8080");
-        assert!(p.args.tokens.is_empty());
-        assert_eq!(p.args.tenant_header_policy, TenantHeaderPolicy::Optional);
-        assert!(p.args.cors_origins.is_empty());
-        assert_eq!(p.args.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
-        assert!(
-            !p.args.allow_plaintext_public,
-            "--allow-plaintext-public must default to false (safety opt-in)"
-        );
-        assert!(!p.args.check_only);
+        temp_env::with_var("TENSOR_WASM_ALLOW_PLAINTEXT_PUBLIC", None::<&str>, || {
+            let p = Probe::try_parse_from(["serve"]).expect("defaults parse");
+            assert_eq!(p.args.addr.to_string(), "127.0.0.1:8080");
+            assert!(p.args.tokens.is_empty());
+            assert_eq!(p.args.tenant_header_policy, TenantHeaderPolicy::Optional);
+            assert!(p.args.cors_origins.is_empty());
+            assert_eq!(p.args.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
+            assert!(
+                !p.args.allow_plaintext_public,
+                "--allow-plaintext-public must default to false (safety opt-in)"
+            );
+            assert!(!p.args.check_only);
+        });
     }
 
     #[test]
     fn parses_allow_plaintext_public_flag() {
-        std::env::remove_var("TENSOR_WASM_ALLOW_PLAINTEXT_PUBLIC");
-        let p = Probe::try_parse_from(["serve", "--allow-plaintext-public"]).expect("parses");
-        assert!(p.args.allow_plaintext_public);
+        temp_env::with_var("TENSOR_WASM_ALLOW_PLAINTEXT_PUBLIC", None::<&str>, || {
+            let p = Probe::try_parse_from(["serve", "--allow-plaintext-public"]).expect("parses");
+            assert!(p.args.allow_plaintext_public);
+        });
     }
 
     #[test]

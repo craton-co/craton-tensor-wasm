@@ -346,7 +346,13 @@ impl WasiCudaContext {
     pub fn last_lowered_args(&self) -> Vec<LoweredArgSnapshot> {
         self.last_lowered_args
             .lock()
-            .expect("last_lowered_args poisoned")
+            // Recover from a poisoned lock rather than panicking: this is a
+            // PUBLIC observability accessor, so a panic here would be
+            // embedder-reachable. Mirrors every other lock site in this
+            // module (`.unwrap_or_else(|e| e.into_inner())`). The snapshot
+            // is read-only diagnostics — a partially-updated `Vec` left by a
+            // panicking writer is at worst stale, never unsound.
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(LoweredArgSnapshot::from)
             .collect()
@@ -1301,6 +1307,37 @@ mod tests {
         let ctx = WasiCudaContext::new(InstanceId(42));
         ctx.record_error("oh no");
         assert_eq!(ctx.last_error().as_deref(), Some("oh no"));
+    }
+
+    /// A lock poisoned by a panicking writer in another thread must NOT
+    /// make the public `last_lowered_args()` accessor panic. `last_lowered_args`
+    /// recovers via `.unwrap_or_else(|e| e.into_inner())`, so a poisoned
+    /// `Mutex` yields the (possibly stale) inner `Vec` rather than an
+    /// embedder-reachable panic. Regression guard for the MED finding that
+    /// flagged the old `.expect("last_lowered_args poisoned")`.
+    #[test]
+    fn poisoned_lock_does_not_panic_last_lowered_args() {
+        use std::sync::Arc;
+
+        let ctx = Arc::new(WasiCudaContext::new(InstanceId(7)));
+
+        // Poison the `last_lowered_args` mutex: take the lock in a child
+        // thread and panic while holding it. `std::sync::Mutex` marks the
+        // lock poisoned when the guard is dropped during unwinding.
+        let poisoner = {
+            let ctx = Arc::clone(&ctx);
+            std::thread::spawn(move || {
+                let _guard = ctx.last_lowered_args.lock().unwrap();
+                panic!("poison the lock on purpose");
+            })
+        };
+        // The child thread is expected to panic; swallow it.
+        assert!(poisoner.join().is_err());
+        assert!(ctx.last_lowered_args.is_poisoned());
+
+        // Public accessor must recover, not panic.
+        let snapshot = ctx.last_lowered_args();
+        assert!(snapshot.is_empty());
     }
 
     #[test]

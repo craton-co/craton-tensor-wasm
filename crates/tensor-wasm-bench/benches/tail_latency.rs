@@ -97,7 +97,6 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use base64::Engine;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use http_body_util::BodyExt;
 use tensor_wasm_api::{build_router, AppState};

@@ -39,6 +39,17 @@ use tensor_wasm_wasi_gpu::streaming::{add_streaming_to_linker, StreamingContext}
 /// at [`u64::MAX`] if a caller supplies a pathologically long deadline. The
 /// `tick` parameter is the engine's `epoch_tick` cadence; a zero-or-less tick
 /// is treated as 1 ms to avoid division-by-zero on a malformed config.
+///
+/// # Granularity
+///
+/// Both the deadline and the tick are measured in **whole milliseconds**
+/// (`Duration::as_millis`). Sub-millisecond resolution is therefore clamped:
+/// a deadline of `Duration::from_micros(500)` and one of
+/// `Duration::from_micros(1)` both round up to a single tick. This is
+/// intentional — the epoch interrupt itself only fires on the background
+/// ticker's cadence (10 ms by default), so sub-ms precision in the deadline
+/// would be illusory anyway. Callers needing finer-grained interruption must
+/// shorten [`crate::engine::EngineConfig::epoch_tick`], not the deadline.
 fn duration_to_epoch_ticks(d: Duration, tick: Duration) -> u64 {
     let d_ms = d.as_millis();
     let t_ms = tick.as_millis().max(1);
@@ -403,7 +414,28 @@ fn val_to_json(v: &Val) -> serde_json::Value {
         // Unsupported value types fall through as JSON null rather than
         // erroring — keeps the response shape predictable for callers that
         // only ever return numeric scalars (the common case for B5.6).
-        _ => serde_json::Value::Null,
+        // The fallthrough is observable: a guest returning a `v128` or a
+        // reference type silently became `null` before, masking a genuine
+        // signature mismatch. Emit a debug event so operators can see when
+        // a non-numeric return is being lossily projected.
+        other => {
+            // `Val::ty()` needs a store handle we don't thread here, so
+            // describe the variant directly — enough for an operator to
+            // tell a `v128` apart from a reference type.
+            let kind = match other {
+                Val::V128(_) => "v128",
+                Val::FuncRef(_) => "funcref",
+                Val::ExternRef(_) => "externref",
+                Val::AnyRef(_) => "anyref",
+                _ => "unknown",
+            };
+            debug!(
+                target: "tensor_wasm_exec::executor",
+                val_kind = kind,
+                "non-numeric wasm return value mapped to JSON null (v128 / reference types are not representable)",
+            );
+            serde_json::Value::Null
+        }
     }
 }
 
@@ -470,8 +502,10 @@ impl ResourceLimiter for TensorWasmResourceLimiter {
         // store. That's loose (allows ~engine_max bytes for each) but it
         // bounds the worst case from u32::MAX entries down to engine_max/16
         // entries — the qualitative DoS vector closes.
-        const TABLE_ENTRY_BYTES: u64 = 16;
-        let bytes_needed = u64::from(desired).saturating_mul(TABLE_ENTRY_BYTES);
+        // Shared with the pooling allocator's `table_elements` derivation in
+        // `engine.rs` (MED finding) so both backends budget tables against
+        // the same per-instance byte ceiling.
+        let bytes_needed = u64::from(desired).saturating_mul(crate::engine::TABLE_ENTRY_BYTES);
         if bytes_needed > self.engine_max as u64 {
             return Ok(false);
         }
@@ -669,6 +703,45 @@ fn check_module_memory_within_cap(module: &Module, cap_bytes: usize) -> Result<(
     Ok(())
 }
 
+/// Best-effort refinement of a pooling-allocator instantiation error into a
+/// typed [`ExecError::ModuleMemoryTooLarge`] (MED finding).
+///
+/// The pooling allocator surfaces a memory-slot sizing failure as an opaque
+/// [`wasmtime::Error`]; its message chain contains the allocator's
+/// memory-size signature (wasmtime phrases these as "memory ... exceeds the
+/// limit" / "memory minimum size of N pages exceeds ..."). When we recognise
+/// that signature we re-tag the error as `ModuleMemoryTooLarge` so callers
+/// see a stable `MemoryExhausted` on the conversion boundary instead of a
+/// generic compile error. Anything we do not recognise is returned verbatim
+/// as [`ExecError::Wasmtime`] — we only ever *refine*, never swallow.
+fn classify_instantiation_error(err: wasmtime::Error, cap_bytes: usize) -> ExecError {
+    let chain = format!("{err:#}").to_ascii_lowercase();
+    // Conservative match: require both a "memory" mention and an
+    // exceeds/limit phrasing so unrelated traps/link errors are not
+    // misclassified. The pooling allocator's memory-size refusals all
+    // contain one of these limit phrasings.
+    // These phrasings track wasmtime 25's pooling memory_pool errors:
+    //   * "memory index N has a minimum byte size of M which exceeds the
+    //      limit of L bytes" (per-slot size refusal)
+    //   * "maximum memory size of 0x… bytes exceeds the configured maximum
+    //      size" (pool construction / sizing refusal)
+    let is_memory_size_failure = chain.contains("memory")
+        && (chain.contains("exceeds the limit") || chain.contains("exceeds the configured"));
+    if is_memory_size_failure {
+        ExecError::ModuleMemoryTooLarge {
+            // We do not know the exact requested figure here (the allocator
+            // does not expose it structurally), so report the cap as both
+            // bounds — the typed variant's value is the classification, and
+            // the full opaque chain is already logged server-side on the
+            // conversion boundary.
+            requested_bytes: cap_bytes as u64,
+            limit_bytes: cap_bytes as u64,
+        }
+    } else {
+        ExecError::Wasmtime(err)
+    }
+}
+
 impl TensorWasmExecutor {
     /// Construct an executor over the given shared engine.
     pub fn new(engine: Arc<TensorWasmEngine>) -> Self {
@@ -754,7 +827,21 @@ impl TensorWasmExecutor {
         &self.engine
     }
 
-    /// Number of currently live instances.
+    /// Number of instances currently present in the **registry** — i.e.
+    /// those that have been spawned and `register_pooled_instance`'d but
+    /// not yet `terminate`'d. This is the size of the `instances` `DashMap`.
+    ///
+    /// Contrast with [`Self::instances_len`], which reports the
+    /// **admission** count (the atomic counter that
+    /// [`crate::engine::EngineConfig::max_instances`] is enforced against).
+    /// The two can briefly diverge: `instances_len` is bumped *before*
+    /// compile/instantiate in `spawn_instance` (with rollback on failure)
+    /// and a pool can hold an admitted-but-unregistered instance in a warm
+    /// channel, so `instances_len() >= live_count()` always holds, with
+    /// equality once all in-flight spawns have either registered or rolled
+    /// back. Use `live_count()` when you mean "how many handles can
+    /// `call_export` resolve right now"; use `instances_len()` when you mean
+    /// "how close are we to the admission cap".
     pub fn live_count(&self) -> usize {
         self.instances.len()
     }
@@ -774,10 +861,17 @@ impl TensorWasmExecutor {
         self.module_cache.lock().len()
     }
 
-    /// Current number of live instances, sampled atomically. Mirrors the
-    /// counter the admission check in `spawn_instance` consults to decide
-    /// whether a new instance fits under
+    /// Current **admission** count, sampled atomically. This is the counter
+    /// the admission check in `spawn_instance` consults to decide whether a
+    /// new instance fits under
     /// [`crate::engine::EngineConfig::max_instances`].
+    ///
+    /// This is NOT the registry size — see [`Self::live_count`] for the
+    /// distinction. This counter includes instances that have been admitted
+    /// but are not yet (or are no longer) in the registry: an in-flight
+    /// `spawn_instance` between the admission bump and the registry insert,
+    /// and pool-held warm instances that were detached from the registry but
+    /// still occupy a slot. `instances_len() >= live_count()` always holds.
     pub fn instances_len(&self) -> usize {
         self.instance_count.load(Ordering::Acquire)
     }
@@ -1006,7 +1100,14 @@ impl TensorWasmExecutor {
         cfg: &SpawnConfig,
         module: &Module,
     ) -> Result<TensorWasmInstance, ExecError> {
-        let max_memory_bytes = self.engine.config().max_memory_bytes;
+        // Reconcile the engine-wide cap with the pooling allocator's slot
+        // size (MED finding): on the pooling backend a module larger than
+        // the physical slot would fail to instantiate with an opaque
+        // allocator error, so we cap the limiter AND the pre-instantiation
+        // module check at `min(max_memory_bytes, pooling memory_bytes)`.
+        // `effective_memory_cap()` is `max_memory_bytes` on the
+        // UnifiedBuffer path, preserving prior behaviour there.
+        let max_memory_bytes = self.engine.config().effective_memory_cap();
         let mut state =
             InstanceState::new(cfg.tenant_id, InstanceId(0)).with_memory_limit(max_memory_bytes);
         if let Some(ref s) = cfg.streaming {
@@ -1095,10 +1196,25 @@ impl TensorWasmExecutor {
             add_jit_dispatch_to_linker(&mut linker, cache.clone())
                 .map_err(ExecError::Wasmtime)?;
         }
-        let instance = linker
-            .instantiate_async(&mut store, module)
-            .await
-            .map_err(ExecError::Wasmtime)?;
+        let instance = match linker.instantiate_async(&mut store, module).await {
+            Ok(inst) => inst,
+            Err(err) => {
+                // MED finding: the pre-instantiation `check_module_memory_within_cap`
+                // already rejects modules whose *declared* memory exceeds the
+                // reconciled cap with a typed `ModuleMemoryTooLarge`. The
+                // pooling allocator can still refuse instantiation for a
+                // memory-sizing reason the static check cannot see (e.g. the
+                // slot byte-size ceiling), surfacing it as an opaque
+                // wasmtime error. Where the error chain carries the
+                // allocator's memory-size signature, re-classify it as the
+                // typed `ModuleMemoryTooLarge` so callers get a stable
+                // `MemoryExhausted` rather than an opaque compile error.
+                // This is best-effort string inspection — it only *refines*
+                // the error; anything unrecognised still flows through as
+                // `ExecError::Wasmtime` unchanged.
+                return Err(classify_instantiation_error(err, max_memory_bytes));
+            }
+        };
         store.set_epoch_deadline(epoch_deadline_ticks);
         Ok(TensorWasmInstance::new(store, instance))
     }
@@ -1764,6 +1880,37 @@ mod tests {
             .unwrap();
         // Both spawns hit the same wasm bytes — the cache should hold one entry.
         assert_eq!(exec.cached_module_count(), 1);
+    }
+
+    #[test]
+    fn classify_instantiation_error_refines_memory_size_failure() {
+        // A wasmtime error whose chain carries the pooling allocator's
+        // memory-size signature must be re-tagged as ModuleMemoryTooLarge
+        // (MED finding) so callers see a typed MemoryExhausted.
+        let err = wasmtime::Error::msg("memory index 0 has a minimum that exceeds the limit");
+        let classified = classify_instantiation_error(err, 64 * 1024 * 1024);
+        match classified {
+            ExecError::ModuleMemoryTooLarge {
+                requested_bytes,
+                limit_bytes,
+            } => {
+                assert_eq!(limit_bytes, 64 * 1024 * 1024);
+                assert_eq!(requested_bytes, 64 * 1024 * 1024);
+            }
+            other => panic!("expected ModuleMemoryTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_instantiation_error_passes_through_unrelated() {
+        // An unrelated error (e.g. an import-link failure) must NOT be
+        // misclassified — it flows through verbatim as ExecError::Wasmtime.
+        let err = wasmtime::Error::msg("unknown import: `env::foo` has not been defined");
+        let classified = classify_instantiation_error(err, 64 * 1024 * 1024);
+        assert!(
+            matches!(classified, ExecError::Wasmtime(_)),
+            "unrelated errors must not be re-tagged, got {classified:?}",
+        );
     }
 
     #[test]

@@ -16,11 +16,12 @@ through `libfuzzer-sys` against the corresponding subsystem.
 | `fuzz_pool_allocate` | `tensor-wasm-mem` `pool::UnifiedMemoryPool::allocate` | bump-pointer pool never panics on arbitrary `(size, align)` — every failure mode (zero size, bad align, exhaustion, overflow) surfaces as `Err(UnifiedError)` |
 | `lowering_driver` | `tensor-wasm-jit` `lowering_driver::lower_function` | Cranelift → `LoweredFunction` driver never panics; every failure surfaces as `Err(LoweringError::{UnsupportedOpcode,UnsupportedType,UndefinedValue,MalformedTerminator,Rejected,BadBlockReference})` |
 
-The wave landed alongside the existing `fuzz_snapshot_restore` target —
-together the four exercise the four largest host-trust-boundary parsers
-in the runtime: snapshot restore, kernel-args argv lowering, JIT rewrite,
-and the unified-memory bump allocator. Each one's invariant is "no
-panic on arbitrary input; documented errors only."
+The ten targets above exercise the host-trust-boundary parsers and
+emitters across the runtime: Wasm compilation, PTX emission, snapshot
+restore, the wasi-cuda ABI, the token-scope and audit-JSON surfaces,
+kernel-args argv lowering, JIT rewrite, the unified-memory bump
+allocator, and the Cranelift lowering driver. Each one's invariant is
+"no panic on arbitrary input; documented errors only."
 
 ## Running locally
 

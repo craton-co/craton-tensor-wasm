@@ -19,6 +19,8 @@ zstd(
         instance_id:               InstanceId(u128),
         created_unix_ms:           u64,
         total_uncompressed_bytes:  u64,
+        sequence_no:               u64,            // monotonic counter; 0 = unset (v0.3.x default)
+        nonce:                     Option<[u8;16]>, // bincode: 1-byte tag (0=None, 1=Some) then 16 bytes when Some
       },
       crc32:        u32,        // IEEE polynomial; covers wasm_memory ++
                                 //   gpu_memory ++ registers in that order
@@ -42,7 +44,7 @@ violates one of them; `TensorWasmError::Serialization` is returned in every case
 
 | Constant | Value | Enforced where |
 |----------|-------|----------------|
-| `MAX_INPUT_BYTES` | `64 * 1024 * 1024 * 64` (~4 GiB) | Before zstd is invoked, against the raw compressed slice. |
+| `MAX_INPUT_BYTES` | `1024 * 1024 * 1024` (1 GiB) | Before zstd is invoked, against the raw compressed slice. |
 | `MAX_DECOMPRESSED_BYTES` | `256 * 1024 * 1024` (256 MiB) | Streaming zstd cap (`Read::take`). Overridable per reader via `SnapshotReader::with_max_decompressed`. |
 | `MAX_WASM_MEMORY_BYTES` | `1024 * 1024 * 1024` (1 GiB) | Capture (writer) and restore (reader) checks against `wasm_memory.len()`. |
 | `MAX_GPU_MEMORY_BYTES` | `4 * 1024 * 1024 * 1024` (4 GiB) | Capture and restore checks against `gpu_memory.len()`. |
@@ -191,8 +193,8 @@ HMAC-SHA256 was chosen because:
   workspace (see `tensor-wasm-api`) for constant-time comparisons, so
   pulling in `subtle` here matches existing precedent.
 - The 32-byte output is the same size as a SHA-256 digest, so storage and
-  network overhead are 33 bytes per snapshot regardless of compressed
-  size.
+  network overhead are 37 bytes per snapshot (4-byte magic + 1-byte kind +
+  32-byte signature) regardless of compressed size.
 - Symmetric authentication is sufficient for the threat model — operators
   control both the writer and the reader. An asymmetric signature (e.g.
   Ed25519) would let third parties verify snapshots, which is a non-goal
@@ -338,10 +340,12 @@ twasm-artifact01(16) || version(4)=1 || blake3(payload)(32)
 
 The inner `Snapshot::version` field is `SNAPSHOT_VERSION_V2 = 2` (the
 outer envelope already supplies authentication, so the v3 trailer would
-be redundant). The reader still accepts an inner `version` of `2` or
-`3` for forward compatibility — a future writer might route signed
-inner payloads through the same outer envelope without bumping the
-wire format.
+be redundant). The reader accepts an inner `version` of `2` **only** on
+this path (M1): no v3 inner trailer is written or verified inside the
+artifact envelope, so a v3 discriminant would assert a signed-inner
+format the reader cannot actually check. Until a signed-inner-v4 format
+exists with its own inner-trailer verification, an inner `version` of
+`3` is rejected here rather than waved through.
 
 ### Behaviour differences from the inline envelope
 

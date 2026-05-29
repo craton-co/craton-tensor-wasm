@@ -336,7 +336,9 @@ async fn fetch_healthz(client: &reqwest::Client, ctx: &HttpContext, base: &str) 
     match req.send().await {
         Ok(resp) => {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            // T17: bound the in-memory body so a malicious server can't OOM
+            // the CLI by streaming gigabytes of `/healthz` text.
+            let body = super::bounded_text(resp).await.unwrap_or_default();
             if status.is_success() {
                 Health::Ok { body }
             } else {
@@ -356,7 +358,11 @@ async fn fetch_metrics(client: &reqwest::Client, ctx: &HttpContext, base: &str) 
     let req = ctx.apply(client.get(&url));
     let resp = req.send().await.with_context(|| format!("GET {url}"))?;
     let status = resp.status();
-    let text = resp.text().await.with_context(|| format!("read {url}"))?;
+    // T17: bound the in-memory body so a malicious server can't OOM the CLI
+    // by streaming gigabytes of `/metrics` exposition.
+    let text = super::bounded_text(resp)
+        .await
+        .with_context(|| format!("read {url}"))?;
     if !status.is_success() {
         anyhow::bail!("{url} returned HTTP {}", status.as_u16());
     }

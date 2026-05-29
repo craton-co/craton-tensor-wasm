@@ -56,13 +56,26 @@ use tensor_wasm_core::types::TenantId;
 /// that needs to be surfaced. Incremented at most once per failed
 /// build; never decremented.
 ///
-/// Read via [`isolation_downgrade_count`]. Not wired into the
-/// `prometheus-client` registry in `tensor-wasm-core` yet — the metric
-/// is intentionally cheap (a single `AtomicU64`) and lives at the call
-/// site to avoid an upstream-crate API change on the alert path. The
-/// follow-up will surface this as `tensor_wasm_isolation_downgrade_total`
-/// alongside the other counters in
-/// [`tensor_wasm_core::metrics::TensorWasmMetrics`].
+/// Read via [`isolation_downgrade_count`]. Not yet exported through the
+/// `prometheus-client` registry in `tensor-wasm-core`: as of this crate
+/// version [`tensor_wasm_core::metrics::TensorWasmMetrics`] exposes no
+/// counter whose semantics match a per-process isolation-downgrade tally
+/// (the existing `Counter<u64>` accessors — `kernel_dispatches_total`,
+/// `offload_fallback_total`, etc. — all carry unrelated meaning, and
+/// reusing one would corrupt those series), and that crate is owned by a
+/// separate component that this crate must not edit. The metric is
+/// therefore intentionally cheap (a single `AtomicU64`) and lives at the
+/// call site, surfaced via [`isolation_downgrade_count`] so the alert
+/// pipeline can scrape it out-of-band today.
+///
+/// TODO(core): wire registry export once `tensor-wasm-core` grows a
+/// dedicated counter. The minimal core-crate API required is a
+/// `Counter<u64>` field on `TensorWasmMetrics` registered as
+/// `tensor_wasm_isolation_downgrade_total` with a public accessor
+/// `TensorWasmMetrics::isolation_downgrade_total(&self) -> &Counter<u64>`.
+/// When that lands, the `build()` downgrade path below should call
+/// `metrics.isolation_downgrade_total().inc()` whenever `self.metrics`
+/// is `Some`, in addition to bumping this static.
 #[cfg(not(feature = "loom"))]
 static ISOLATION_DOWNGRADE_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -1004,6 +1017,13 @@ impl TenantContextBuilder {
                 // `error!` so the alert pipeline picks it up. The
                 // per-failure-cause logs inside `build_cuda_context`
                 // record the underlying CUDA error code.
+                //
+                // TODO(core): when `TensorWasmMetrics` grows
+                // `isolation_downgrade_total()` (see `ISOLATION_DOWNGRADE_COUNT`
+                // docs), also do `if let Some(m) = &self.metrics {
+                // m.isolation_downgrade_total().inc(); }` here so the
+                // downgrade is observable through the registry, not just
+                // the process-local static.
                 ISOLATION_DOWNGRADE_COUNT.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     target: "tensor_wasm_tenant::context",
@@ -1449,10 +1469,14 @@ mod tests {
         // test will observe the counter is non-zero — the test then
         // documents (rather than enforces) the downgrade contract.
         let count = isolation_downgrade_count();
-        // Always-true sanity check on the public getter shape; the
-        // value-zero check is conditional on the no-cuda compile flag
-        // to keep the test green on CI matrices that do enable `cuda`.
-        let _ = count;
+        // The getter must be a pure read: calling it twice in a row
+        // returns the same value (no side effect, no implicit reset).
+        // This holds on every build matrix regardless of `cuda`.
+        assert_eq!(
+            count,
+            isolation_downgrade_count(),
+            "isolation_downgrade_count() must be a side-effect-free read",
+        );
         #[cfg(not(feature = "cuda"))]
         {
             assert_eq!(

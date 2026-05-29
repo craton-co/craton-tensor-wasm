@@ -72,7 +72,8 @@ fn bench_noargs(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let id = exec.spawn_instance(spawn_cfg.clone(), &wasm).await.unwrap();
-                let _ = exec.call_export_with_args(id, "noop", black_box(&[])).await;
+                let out = exec.call_export_with_args(id, "noop", black_box(&[])).await;
+                black_box(out.is_ok());
                 let _ = exec.terminate(id).await;
             });
         });
@@ -92,9 +93,10 @@ fn bench_with_args(c: &mut Criterion) {
             rt.block_on(async {
                 let id = exec.spawn_instance(spawn_cfg.clone(), &wasm).await.unwrap();
                 let args = vec![WasmArg::I32(1), WasmArg::I32(2)];
-                let _ = exec
+                let out = exec
                     .call_export_with_args(id, "add", black_box(&args))
                     .await;
+                black_box(out.is_ok());
                 let _ = exec.terminate(id).await;
             });
         });

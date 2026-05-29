@@ -301,6 +301,21 @@ impl SnapshotReader {
         // mismatch) is reported as an error rather than silently
         // re-classified — those signal a tampered or wrong-key v4
         // blob and shouldn't be confused with a legacy-format input.
+        //
+        // H2 invariant — `require_signature` is honoured on the v4 path
+        // *without* an explicit gate here. A v4 envelope is only ever
+        // returned `Some(..)` by `try_restore_artifact_envelope` after the
+        // artifact crate's `decode_envelope_from_bytes_with_cap` has verified
+        // the envelope's HMAC-SHA256 trailer (it requires `self.hmac_key` to
+        // be present and returns `Err` on any HMAC mismatch). An
+        // HMAC-authenticated v4 envelope is therefore "signed" in the sense
+        // `require_signature` cares about, so it legitimately satisfies the
+        // gate. Conversely no v4 blob can reach this early return *without*
+        // HMAC verification having run, so the early return cannot be used to
+        // bypass the strict `require_signature` check below: a wrong-key or
+        // tampered v4 blob returns `Err` here (not `Ok(None)`), and a blob
+        // that is not v4 at all returns `Ok(None)` and falls through to the
+        // v3/v2 gate. The `?` propagates the `Err` case.
         #[cfg(all(feature = "artifact-backing", feature = "signed-snapshots"))]
         {
             if let Some(snapshot) = self.try_restore_artifact_envelope(bytes)? {
@@ -857,16 +872,21 @@ impl SnapshotReader {
             ));
         }
 
-        // The artifact-backed write path emits the v2 inner discriminant
-        // (the outer envelope already supplies authentication). Accept v2
-        // and v3 here for forward compatibility — a future writer might
-        // route signed inner payloads through the same envelope without
-        // bumping the wire format.
-        if snapshot.version != SNAPSHOT_VERSION_V2 && snapshot.version != SNAPSHOT_VERSION_V3 {
+        // M1: the artifact-backed write path emits *only* the v2 inner
+        // discriminant — the outer envelope already supplies authentication
+        // (HMAC + content hash) and the inner payload carries no v3 signature
+        // trailer. Accept inner v2 ONLY here. Inner v3 is deliberately
+        // rejected rather than accepted "for forward compatibility": no v3
+        // trailer is written or verified on this path, so a v3 discriminant
+        // would wave through an unverifiable signed-inner claim. The
+        // conservative choice (v2 only) holds until a signed-inner-v4 format
+        // exists with its own inner-trailer verification.
+        if snapshot.version != SNAPSHOT_VERSION_V2 {
             return Err(TensorWasmError::Serialization(
                 format!(
-                    "snapshot version mismatch: expected {} or {}, got {}",
-                    SNAPSHOT_VERSION_V2, SNAPSHOT_VERSION_V3, snapshot.version,
+                    "snapshot artifact-store inner version mismatch: expected {} (inner v3 is not \
+                     accepted on the artifact path — no inner trailer is verified there), got {}",
+                    SNAPSHOT_VERSION_V2, snapshot.version,
                 )
                 .into(),
             ));
@@ -963,6 +983,18 @@ impl SnapshotReader {
     /// verifies the legacy v3 trailer. Without a key configured, a
     /// v4 envelope is rejected the same way a v3 trailer is (the
     /// outer envelope requires HMAC by construction).
+    ///
+    /// H1: the reader's [`SnapshotReader::with_max_decompressed`] cap is
+    /// honoured on this v4 path — it is threaded into the artifact crate's
+    /// `decode_envelope_from_bytes_with_cap` as the zstd zip-bomb ceiling,
+    /// so the per-reader cap applies on **both** the v4 (default) and the
+    /// legacy v3/v2 paths rather than the v4 path silently using the
+    /// artifact crate's hardcoded 1 GiB default.
+    ///
+    /// M1: only an inner `Snapshot::version` of `SNAPSHOT_VERSION_V2` is
+    /// accepted here. Inner v3 is rejected — no inner v3 trailer is written
+    /// or verified inside the envelope, so accepting it would assert an
+    /// unverifiable signed-inner format.
     #[cfg(all(feature = "artifact-backing", feature = "signed-snapshots"))]
     fn try_restore_artifact_envelope(&self, bytes: &[u8]) -> Result<Option<Snapshot>> {
         use tensor_wasm_artifacts::{ArtifactError, ARTIFACT_MAGIC};
@@ -987,22 +1019,34 @@ impl SnapshotReader {
         // the call site below — no explicit `&**key` dance needed, and
         // the underlying 32 bytes are never copied out of the
         // zeroizing wrapper.
-        let payload =
-            tensor_wasm_artifacts::decode_envelope_from_bytes(bytes, key).map_err(|e| match e {
-                // `BadMagic` should be impossible here — we already
-                // checked the leading 16 bytes — but treat it as a
-                // hard failure rather than a fall-through. Otherwise
-                // a writer that produced a malformed envelope (e.g.
-                // truncated below the minimum length) could escape
-                // through the legacy reader and surface a confusing
-                // "zstd init" error.
-                ArtifactError::BadMagic => TensorWasmError::Serialization(
-                    "snapshot artifact envelope: minimum-length / magic check failed".into(),
-                ),
-                other => TensorWasmError::Serialization(
-                    format!("snapshot artifact envelope: {other}").into(),
-                ),
-            })?;
+        //
+        // H1: pass `self.max_decompressed` through the cap-parameterised
+        // variant so the reader's `with_max_decompressed` knob bounds the
+        // zip-bomb ceiling on the v4 (default) path exactly as it does on the
+        // legacy v3/v2 path. `decode_envelope_from_bytes` (the wrapper) would
+        // instead hardcode the artifact crate's 1 GiB `MAX_DECOMPRESSED_LEN`,
+        // silently overriding a reader configured for a tighter (or looser)
+        // budget.
+        let payload = tensor_wasm_artifacts::decode_envelope_from_bytes_with_cap(
+            bytes,
+            key,
+            self.max_decompressed,
+        )
+        .map_err(|e| match e {
+            // `BadMagic` should be impossible here — we already
+            // checked the leading 16 bytes — but treat it as a
+            // hard failure rather than a fall-through. Otherwise
+            // a writer that produced a malformed envelope (e.g.
+            // truncated below the minimum length) could escape
+            // through the legacy reader and surface a confusing
+            // "zstd init" error.
+            ArtifactError::BadMagic => TensorWasmError::Serialization(
+                "snapshot artifact envelope: minimum-length / magic check failed".into(),
+            ),
+            other => TensorWasmError::Serialization(
+                format!("snapshot artifact envelope: {other}").into(),
+            ),
+        })?;
 
         // Decode the bincode payload using the same static allocator
         // ceiling the legacy path uses. The envelope's HMAC has already
@@ -1024,16 +1068,24 @@ impl SnapshotReader {
                 .into(),
             ));
         }
-        // The artifact-backed write path emits the v2 inner discriminant
-        // (the outer envelope already supplies authentication). Accept
-        // v2 and v3 for forward compatibility — a future writer might
-        // route signed inner payloads through the same envelope without
-        // bumping the wire format.
-        if snapshot.version != SNAPSHOT_VERSION_V2 && snapshot.version != SNAPSHOT_VERSION_V3 {
+        // M1: the artifact-backed write path emits *only* the v2 inner
+        // discriminant — the outer v4 envelope already supplies
+        // authentication (HMAC + content hash), so the inner payload carries
+        // no v3 signature trailer. Accept inner v2 ONLY here. We deliberately
+        // do *not* accept inner v3 "for forward compatibility": there is no
+        // v3 trailer to verify on this path (it was never written), so
+        // accepting a v3 discriminant would wave through a value whose
+        // claimed signed-inner format is unverifiable. Until a signed-inner-v4
+        // format exists with its own inner-trailer verification, the
+        // conservative choice is to reject inner v3 outright. The envelope's
+        // HMAC has already authenticated these bytes, so this is a
+        // format-shape assertion, not an additional integrity gate.
+        if snapshot.version != SNAPSHOT_VERSION_V2 {
             return Err(TensorWasmError::Serialization(
                 format!(
-                    "snapshot version mismatch: expected {} or {}, got {}",
-                    SNAPSHOT_VERSION_V2, SNAPSHOT_VERSION_V3, snapshot.version,
+                    "snapshot artifact envelope inner version mismatch: expected {} (inner v3 \
+                     is not accepted on the v4 path — no inner trailer is verified there), got {}",
+                    SNAPSHOT_VERSION_V2, snapshot.version,
                 )
                 .into(),
             ));
@@ -1125,6 +1177,14 @@ pub struct RestoredOnGpu {
 /// Restore `bytes` and stage the `gpu_memory` payload onto the GPU at
 /// `device_index` via `cuMemPrefetchAsync` on a fresh non-blocking stream.
 ///
+/// **M2:** this convenience wrapper restores through a *default*
+/// [`SnapshotReader::new`], so it applies the default decompressed-size cap
+/// and accepts unsigned v2 blobs. Callers that need to apply hardening —
+/// [`SnapshotReader::with_max_decompressed`], [`SnapshotReader::require_signature`],
+/// [`SnapshotReader::with_hmac_sha256_key`], [`SnapshotReader::with_max_age`] —
+/// must use [`restore_to_gpu_with`] and pass their own configured reader.
+/// This wrapper is retained for backward compatibility and delegates to it.
+///
 /// On success the returned [`RestoredOnGpu`] owns a populated
 /// `UnifiedBuffer<u8>` whose pages have been requested to migrate to the
 /// target device. The stream is synchronised before return so the buffer
@@ -1137,10 +1197,36 @@ pub struct RestoredOnGpu {
 #[cfg_attr(docsrs, doc(cfg(feature = "cuda")))]
 #[instrument(skip(bytes), fields(input_len = bytes.len(), device_index = device_index))]
 pub fn restore_to_gpu(bytes: &[u8], device_index: u32) -> Result<RestoredOnGpu> {
+    restore_to_gpu_with(&SnapshotReader::new(), bytes, device_index)
+}
+
+/// Restore `bytes` through the caller-supplied `reader` and stage the
+/// `gpu_memory` payload onto the GPU at `device_index` via
+/// `cuMemPrefetchAsync` on a fresh non-blocking stream.
+///
+/// **M2:** this is the hardening-aware counterpart to [`restore_to_gpu`].
+/// Because the `reader` is supplied by the caller, every reader knob —
+/// [`SnapshotReader::with_max_decompressed`], [`SnapshotReader::require_signature`],
+/// [`SnapshotReader::with_hmac_sha256_key`], [`SnapshotReader::with_max_age`] —
+/// is honoured on the GPU restore path exactly as it is on the plain
+/// [`SnapshotReader::restore`] path. The GPU-staging behaviour is otherwise
+/// identical to [`restore_to_gpu`].
+///
+/// Requires the `cuda` feature; on no-CUDA builds this symbol does not
+/// exist, and callers should fall back to [`SnapshotReader::restore`]
+/// followed by a manual host-to-device copy.
+#[cfg(feature = "cuda")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cuda")))]
+#[instrument(skip(reader, bytes), fields(input_len = bytes.len(), device_index = device_index))]
+pub fn restore_to_gpu_with(
+    reader: &SnapshotReader,
+    bytes: &[u8],
+    device_index: u32,
+) -> Result<RestoredOnGpu> {
     use cust::memory::UnifiedBuffer;
     use cust::stream::{Stream, StreamFlags};
 
-    let snapshot = SnapshotReader::new().restore(bytes)?;
+    let snapshot = reader.restore(bytes)?;
 
     // UnifiedBuffer::new requires a non-zero capacity to actually allocate;
     // a zero-length snapshot is allowed — we just produce an empty buffer.

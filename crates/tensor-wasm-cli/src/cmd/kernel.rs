@@ -4,11 +4,11 @@
 //! `tensor-wasm kernel` — publish, list, and verify entries in the signed
 //! kernel registry (roadmap feature #3).
 //!
-//! ## v0.3.8 status: server-side endpoints LANDED
+//! ## v0.3.7 status: server-side endpoints LANDED
 //!
 //! The B6.4 milestone wired the `/kernels` HTTP routes into the
 //! `tensor-wasm-api` gateway (gated behind the `kernel-registry-api`
-//! Cargo feature). This CLI replaces the previous v0.3.7 scaffold that
+//! Cargo feature). This CLI replaces the previous v0.3.6 scaffold that
 //! exited with [`FEATURE_NOT_EXPOSED`] (3); the actions now actually
 //! talk to the server:
 //!

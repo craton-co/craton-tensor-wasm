@@ -79,9 +79,17 @@ ELEVATED_SAMPLES=500
 
 run_one() {
     local name="$1"
+    # dispatch_future_backends is only meaningful with --features cuda: the
+    # default build skips both backends (see bench-results/README.md). Pass
+    # the feature so the busy-poll path actually exercises the DispatchFuture
+    # loop rather than emitting two skip lines.
+    local extra_args=()
+    if [ "$name" = "dispatch_future_backends" ]; then
+        extra_args=(--features cuda)
+    fi
     echo "[quiet] -- bench: $name (samples=$ELEVATED_SAMPLES)"
     drop_cache
-    cargo bench -p tensor-wasm-bench --bench "$name" -- \
+    cargo bench -p tensor-wasm-bench --bench "$name" "${extra_args[@]}" -- \
         --sample-size "$ELEVATED_SAMPLES" \
         --save-baseline "quiet-$STAMP" \
         2>&1 | tee "$OUT_DIR/${name}.log"
@@ -95,6 +103,9 @@ BENCHES=(
     memory_bandwidth
     tail_latency
     dispatch_future_backends
+    metrics_label_validation
+    call_export_args
+    streaming_invoke
 )
 
 if [ -n "$BENCH_FILTER" ]; then

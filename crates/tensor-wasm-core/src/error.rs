@@ -42,13 +42,39 @@ use crate::types::TenantId;
 /// Returns a short, stable name for an [`std::io::ErrorKind`] suitable for
 /// the sanitised `Display` of [`TensorWasmError::Io`].
 ///
-/// Uses `Debug` formatting to surface the variant identifier
-/// (`"NotFound"`, `"PermissionDenied"`, ...) rather than the prose
-/// `Display` form (`"entity not found"`, ...) — the variant name is what
-/// dashboards, alert rules, and operators grep for. The set of returned
-/// strings is closed and tracks the upstream `std::io::ErrorKind` enum.
-fn io_kind_name(err: &io::Error) -> String {
-    format!("{:?}", err.kind())
+/// Surfaces the variant identifier (`"NotFound"`, `"PermissionDenied"`,
+/// ...) rather than the prose `Display` form (`"entity not found"`, ...) —
+/// the variant name is what dashboards, alert rules, and operators grep
+/// for. Returns a `&'static str` so the (very hot) error `Display` path
+/// does not allocate; an explicit `match` replaces the prior
+/// `format!("{:?}", ...)`. `std::io::ErrorKind` is `#[non_exhaustive]`, so
+/// kinds not enumerated here (and any future additions) fall back to the
+/// static `"Other"`.
+fn io_kind_name(err: &io::Error) -> &'static str {
+    match err.kind() {
+        io::ErrorKind::NotFound => "NotFound",
+        io::ErrorKind::PermissionDenied => "PermissionDenied",
+        io::ErrorKind::ConnectionRefused => "ConnectionRefused",
+        io::ErrorKind::ConnectionReset => "ConnectionReset",
+        io::ErrorKind::ConnectionAborted => "ConnectionAborted",
+        io::ErrorKind::NotConnected => "NotConnected",
+        io::ErrorKind::AddrInUse => "AddrInUse",
+        io::ErrorKind::AddrNotAvailable => "AddrNotAvailable",
+        io::ErrorKind::BrokenPipe => "BrokenPipe",
+        io::ErrorKind::AlreadyExists => "AlreadyExists",
+        io::ErrorKind::WouldBlock => "WouldBlock",
+        io::ErrorKind::InvalidInput => "InvalidInput",
+        io::ErrorKind::InvalidData => "InvalidData",
+        io::ErrorKind::TimedOut => "TimedOut",
+        io::ErrorKind::WriteZero => "WriteZero",
+        io::ErrorKind::Interrupted => "Interrupted",
+        io::ErrorKind::Unsupported => "Unsupported",
+        io::ErrorKind::UnexpectedEof => "UnexpectedEof",
+        io::ErrorKind::OutOfMemory => "OutOfMemory",
+        // `io::ErrorKind` is `#[non_exhaustive]`; map the unenumerated
+        // remainder (including future additions) to a stable static label.
+        _ => "Other",
+    }
 }
 
 /// Returns `true` if an [`std::io::ErrorKind`] is plausibly transient and
@@ -257,6 +283,15 @@ impl TensorWasmError {
     /// recompiling identical bytes will fail identically, and an isolation
     /// breach is a hard policy decision rather than a transient condition.
     ///
+    /// `GpuMemoryExhausted` is likewise *not* retryable: it signals the
+    /// per-tenant GPU memory cap (`TenantContext::gpu_memory_bytes_cap`)
+    /// was hit — a fixed policy ceiling, not a transient resource
+    /// shortage. Retrying the same allocation against the same cap fails
+    /// identically, so it maps to a hard `4xx`-class rejection rather than
+    /// `503`. `MemoryExhausted` (the host/CPU quota) stays retryable: that
+    /// quota gates against transient host-RAM pressure that can recover as
+    /// other instances release memory.
+    ///
     /// `Io(_)` is classified by inspecting [`std::io::Error::kind`]: transient
     /// kinds (`WouldBlock`, `TimedOut`, `Interrupted`, `WriteZero`, the
     /// connection-reset family) flag as retryable, while hard-miss kinds
@@ -267,8 +302,7 @@ impl TensorWasmError {
     pub fn is_retryable(&self) -> bool {
         match self {
             TensorWasmError::KernelTimeout { .. }
-            | TensorWasmError::MemoryExhausted { .. }
-            | TensorWasmError::GpuMemoryExhausted { .. } => true,
+            | TensorWasmError::MemoryExhausted { .. } => true,
             TensorWasmError::Io(err) => is_retryable_io_kind(err.kind()),
             _ => false,
         }
@@ -479,6 +513,62 @@ mod tests {
         .is_retryable());
         assert!(!TensorWasmError::WasmTrap("x".into()).is_retryable());
         assert!(!TensorWasmError::CudaError("x".into()).is_retryable());
+    }
+
+    #[test]
+    fn gpu_memory_exhausted_is_not_retryable() {
+        // The per-tenant GPU memory cap is a fixed policy ceiling, not a
+        // transient shortage: retrying the same allocation against the same
+        // cap fails identically, so it must map to a hard 4xx-class
+        // rejection rather than a retryable `503`. Contrast with
+        // `MemoryExhausted` (the host/CPU quota), which stays retryable
+        // because host RAM pressure can recover as peers release memory.
+        let gpu = TensorWasmError::GpuMemoryExhausted {
+            requested: 1024,
+            limit: 512,
+            current: 256,
+        };
+        assert!(
+            !gpu.is_retryable(),
+            "GpuMemoryExhausted must NOT be flagged as retryable",
+        );
+        // Sibling CPU-quota variant remains retryable.
+        assert!(TensorWasmError::MemoryExhausted {
+            requested: 1024,
+            limit: 512,
+        }
+        .is_retryable());
+    }
+
+    #[test]
+    fn io_kind_name_maps_common_kinds() {
+        // `io_kind_name` returns a zero-alloc `&'static str` for the common
+        // kinds; spot-check a few of the mappings and the non-exhaustive
+        // fallback. The strings are what dashboards/alert rules grep for, so
+        // they must stay stable.
+        assert_eq!(
+            io_kind_name(&io::Error::from(io::ErrorKind::NotFound)),
+            "NotFound"
+        );
+        assert_eq!(
+            io_kind_name(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            "PermissionDenied"
+        );
+        assert_eq!(
+            io_kind_name(&io::Error::from(io::ErrorKind::WouldBlock)),
+            "WouldBlock"
+        );
+        assert_eq!(
+            io_kind_name(&io::Error::from(io::ErrorKind::TimedOut)),
+            "TimedOut"
+        );
+        assert_eq!(
+            io_kind_name(&io::Error::from(io::ErrorKind::AlreadyExists)),
+            "AlreadyExists"
+        );
+        // `io::Error::other` produces `ErrorKind::Other`, which is not
+        // enumerated explicitly and must hit the static fallback.
+        assert_eq!(io_kind_name(&io::Error::other("x")), "Other");
     }
 
     #[test]

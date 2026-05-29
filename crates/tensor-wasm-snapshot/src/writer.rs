@@ -58,6 +58,14 @@ pub const SNAPSHOT_VERSION: u32 = crate::format::SNAPSHOT_VERSION_V2;
 /// mostly-incompressible memory payloads typical of GPU workloads.
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
+/// Lowest zstd compression level [`SnapshotWriter::with_level`] will accept;
+/// values below this are clamped up to it.
+pub const MIN_ZSTD_LEVEL: i32 = 1;
+
+/// Highest zstd compression level [`SnapshotWriter::with_level`] will accept;
+/// values above this are clamped down to it. Matches zstd's `ZSTD_maxCLevel()`.
+pub const MAX_ZSTD_LEVEL: i32 = 22;
+
 /// Hard upper bounds on the payload sizes accepted by capture and restore.
 ///
 /// These constants gate every memory blob carried by a snapshot. They are
@@ -395,11 +403,31 @@ impl SnapshotWriter {
 
     /// Construct a writer with an explicit zstd compression level and no HMAC key.
     ///
-    /// Valid range is `1..=22`; out-of-range values are clamped by the zstd
-    /// library at compression time.
-    pub const fn with_level(zstd_level: i32) -> Self {
+    /// Valid range is [`MIN_ZSTD_LEVEL`]`..=`[`MAX_ZSTD_LEVEL`] (`1..=22`).
+    /// Out-of-range values are clamped into that range at construction (with a
+    /// `debug` log recording the requested and applied level) rather than
+    /// being passed verbatim to the zstd library: this keeps the stored
+    /// `zstd_level` field truthful so callers and diagnostics never observe a
+    /// level the encoder would silently reject. The builder is infallible to
+    /// match the rest of the `SnapshotWriter` builder surface, so a typo'd
+    /// level degrades to the nearest valid level instead of erroring.
+    ///
+    /// No longer `const fn` (the clamp emits a `debug` log); all existing
+    /// call-sites are runtime contexts.
+    #[must_use]
+    pub fn with_level(zstd_level: i32) -> Self {
+        let clamped = zstd_level.clamp(MIN_ZSTD_LEVEL, MAX_ZSTD_LEVEL);
+        if clamped != zstd_level {
+            debug!(
+                requested = zstd_level,
+                applied = clamped,
+                min = MIN_ZSTD_LEVEL,
+                max = MAX_ZSTD_LEVEL,
+                "zstd level out of range; clamped to valid range",
+            );
+        }
         Self {
-            zstd_level,
+            zstd_level: clamped,
             #[cfg(feature = "signed-snapshots")]
             hmac_key: None,
             use_legacy_envelope: false,

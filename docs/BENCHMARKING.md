@@ -356,7 +356,7 @@ trips the gate before it ships:
 Both groups spawn + terminate the instance inside the timed loop so the
 absolute numbers are anchored to the same envelope as the `/invoke` HTTP
 path; the cross-group delta is the args-path overhead in isolation. The
-two `baseline.json` entries land with `regression_check: false` and zero
+two `baseline.json` entries land with `regression_check: false` and null
 medians as stubs — the first quiet-host capture (`run-quiet-bench.sh`)
 must populate real medians before the gate is flipped on.
 
@@ -380,12 +380,14 @@ baseline so v0.4's actual chunk-emitter has a regression target:
 - **`invoke_stream/chunked`** — `/invoke-stream` with the default
   `Accept`. Measures the chunked-transfer-encoding fallback floor.
 
-The bench file currently ships as a `todo!()`-bodied placeholder because
-the `/invoke-stream` route is not yet on `build_router` in this worktree;
-running it surfaces a clear "B7.1: route not yet wired" panic rather than
-emitting misleading numbers against the legacy `/invoke` path. The
-`baseline.json` stubs carry `regression_check: false` until B7.1 merges
-and the placeholders are replaced with real router-driven sample loops
+The bench file currently ships as a skip-only placeholder because the
+`/invoke-stream` route is not yet on `build_router` in this worktree.
+Each group emits a single `STREAMING_INVOKE {"status":"skipped"}` line
+and returns without measuring (mirroring the `dispatch_future_backends`
+skip pattern), so `cargo bench --bench streaming_invoke` runs to
+completion as a build/run smoke test rather than panicking or emitting
+misleading numbers against the legacy `/invoke` path. The placeholders
+are replaced with real router-driven sample loops once B7.1 merges
 (pattern after `tail_latency.rs::measure_invoke_not_found`).
 
 ```sh

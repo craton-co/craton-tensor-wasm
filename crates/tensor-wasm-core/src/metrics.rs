@@ -281,6 +281,12 @@ mod once_cell_table {
         /// returned reference is good for the lifetime of the
         /// process.
         pub(crate) fn get(&self, code: u16) -> Option<&'static str> {
+            // Range-check *before* `get_or_init` so an out-of-range first
+            // lookup (e.g. code 0 or 999) returns `None` without triggering
+            // the one-time 500-entry table build.
+            if !(100..=599).contains(&code) {
+                return None;
+            }
             let table = self.0.get_or_init(|| {
                 (100..=599)
                     .map(|n: u16| {
@@ -293,11 +299,7 @@ mod once_cell_table {
                     })
                     .collect()
             });
-            if (100..=599).contains(&code) {
-                Some(table[(code - 100) as usize])
-            } else {
-                None
-            }
+            Some(table[(code - 100) as usize])
         }
     }
 }

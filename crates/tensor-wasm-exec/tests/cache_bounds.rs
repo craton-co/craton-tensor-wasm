@@ -102,6 +102,55 @@ async fn module_cache_evicts_lru_at_cap() {
 }
 
 #[tokio::test]
+async fn module_cache_stays_bounded_when_filled_past_cap() {
+    // Companion to `module_cache_evicts_lru_at_cap`: drive a larger number
+    // of distinct modules (well past the cap) through the executor and
+    // assert the cache never grows beyond `max_module_cache_entries`. Uses
+    // `cached_module_count()` (the alias surfaced for operators) to confirm
+    // the S-5 bound holds under sustained unique-module pressure — the
+    // exact DoS shape the LRU cap defends against (a tenant submitting
+    // unique wasm bytes in a loop to pin compiled modules).
+    const CAP: usize = 4;
+    const DISTINCT_MODULES: u32 = 32;
+
+    let cfg = EngineConfig {
+        max_module_cache_entries: CAP,
+        ..EngineConfig::default()
+    };
+    let engine = Arc::new(TensorWasmEngine::with_config(cfg).expect("engine"));
+    let exec = TensorWasmExecutor::new(engine);
+
+    for tag in 0..DISTINCT_MODULES {
+        let wasm = distinct_trivial_wasm(tag);
+        let id = exec
+            .spawn_instance(SpawnConfig::for_tenant(TenantId(1)), &wasm)
+            .await
+            .expect("spawn distinct module");
+        // Terminate immediately so the live-instance cap never bounds this
+        // test — the assertion is purely about module-cache occupancy.
+        exec.terminate(id).await.expect("terminate");
+
+        // After every spawn the cache must be at or below the cap; it can
+        // never exceed it regardless of how many distinct modules we feed.
+        assert!(
+            exec.cached_module_count() <= CAP,
+            "cache exceeded cap {CAP} after {} distinct modules: count={}",
+            tag + 1,
+            exec.cached_module_count(),
+        );
+    }
+
+    // After filling well past the cap the cache must sit exactly at the cap
+    // (we touched far more distinct modules than CAP, so eviction must have
+    // fired and the cache must be saturated).
+    assert_eq!(
+        exec.cached_module_count(),
+        CAP,
+        "cache should be saturated at its cap after sustained unique-module pressure",
+    );
+}
+
+#[tokio::test]
 async fn instances_capacity_exhausted_returns_typed_error() {
     // Cap at 2 live instances — the third spawn must fail with the
     // typed `CapacityExhausted` error, not a generic wasmtime error.
