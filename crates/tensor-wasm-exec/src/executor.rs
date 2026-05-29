@@ -946,6 +946,17 @@ fn check_raw_module_memory_within_cap(wasm: &[u8], cap_bytes: usize) -> Result<(
 /// as [`ExecError::Wasmtime`] — we only ever *refine*, never swallow.
 fn classify_instantiation_error(err: wasmtime::Error, cap_bytes: usize) -> ExecError {
     let chain = format!("{err:#}").to_ascii_lowercase();
+    // LOW finding (fragile error classification): this is *substring* matching
+    // on English error text because wasmtime does not expose a structured
+    // error type for a pooling-allocator memory-slot sizing refusal. It is
+    // therefore WASMTIME-VERSION-COUPLED — a wasmtime upgrade can silently
+    // reword these phrasings and quietly stop the refinement. That degradation
+    // is SAFE BY CONSTRUCTION: this function only ever *refines* a recognised
+    // error into the typed `ModuleMemoryTooLarge`; every unrecognised error
+    // falls through to the `else` branch below and is returned verbatim as
+    // `ExecError::Wasmtime(err)` — the original error is never swallowed or
+    // dropped, only (best-effort) re-tagged. When bumping wasmtime, re-verify
+    // the phrasings below against the pooling `memory_pool` error messages.
     // Conservative match: require both a "memory" mention and an
     // exceeds/limit phrasing so unrelated traps/link errors are not
     // misclassified. The pooling allocator's memory-size refusals all
@@ -1618,25 +1629,45 @@ impl TensorWasmExecutor {
         if let Some(m) = &self.metrics {
             m.active_instances().dec();
         }
-        // Unwrap the Arc<Mutex<_>>: the registry held the only outstanding
-        // strong reference (per-instance Mutexes are not cloned out of
-        // the DashMap value slot). If a concurrent call held the lock the
-        // `try_unwrap` would fail and we'd be holding a still-live
-        // `Arc<Mutex<TensorWasmInstance>>`; since we removed under
-        // `DashMap::remove` and the registry never hands out Arc clones,
-        // no other strong reference can exist.
+        // Unwrap the Arc<Mutex<_>>: we need the sole strong reference to move
+        // the instance out into the warm channel.
+        //
+        // LOW finding (detach try_unwrap race): the previous comment claimed
+        // "the registry never hands out Arc clones" — that is NOT true.
+        // `call_export_with_args` clones the value handle
+        // (`.value().clone()`) and holds it across its `call_async` await, so
+        // a `detach` racing an in-flight call on the SAME id observes an
+        // outstanding strong reference and `try_unwrap` fails. The
+        // `DashMap::remove` above prevents NEW clones (the entry is gone), but
+        // an already-cloned handle from a call that started before the remove
+        // can still be live. This is rare (the pool detaches idle instances)
+        // but reachable, so the failure branch below must be correct, not
+        // merely "should not happen".
         match Arc::try_unwrap(handle) {
             Ok(mutex) => Some(mutex.into_inner()),
             Err(_arc) => {
-                // Should not happen: the registry held the only strong
-                // reference. If it does (e.g. a future refactor leaks
-                // an Arc), the safe behaviour is to drop our reference
-                // and skip the pool path — the slot leak is preferable
-                // to a use-after-detach.
+                // A concurrent `call_export_with_args` still holds a clone of
+                // this handle. We drop our reference and skip the pool path —
+                // returning `None` is the safe behaviour (no use-after-detach;
+                // the racing call finishes and drops the last Arc, freeing the
+                // instance). But we already removed the entry from the
+                // registry, so the engine-wide admission slot it occupied
+                // would otherwise leak permanently (no `terminate` /
+                // `release_instance_slot` will ever run for this id). Release
+                // the engine-wide slot here so a racing detach does not erode
+                // the `max_instances` budget. We do NOT touch the per-tenant
+                // count: that decrement requires the tenant id, which lives
+                // behind the still-locked instance we cannot read without
+                // racing the in-flight call; the per-tenant leak (only when a
+                // per-tenant cap is configured) is the lesser, bounded evil
+                // versus blocking on the contended lock here. The happy path
+                // above intentionally leaves the slot charged (the pool owns it).
+                self.instance_count.fetch_sub(1, Ordering::AcqRel);
                 warn!(
                     target: "tensor_wasm_exec::executor",
                     %id,
-                    "detach_pooled_instance: outstanding Arc reference; instance leaked",
+                    "detach_pooled_instance: outstanding Arc reference (racing in-flight call); \
+                     instance not pooled, engine-wide slot released",
                 );
                 None
             }
@@ -2161,11 +2192,38 @@ impl TensorWasmExecutor {
         export: &str,
         args: &[WasmArg],
     ) -> Result<serde_json::Value, ExecError> {
+        // exec H2: capture the per-tenant rollback handle BEFORE the wrapped
+        // call so the guard's `Drop` (which cannot await) can mirror the
+        // per-tenant decrement that the async `terminate` path performs by
+        // reading the tenant off the instance. Only populated when a
+        // per-tenant cap is configured — otherwise `tenant_counts` is never
+        // charged and we leave it `None` so the guard skips the per-tenant
+        // decrement entirely (matching `terminate`, which also skips the
+        // per-instance lock in that case). We read the owning tenant off the
+        // already-registered instance here (we *can* await at construction
+        // time); the cancellation race the guard defends against only opens
+        // once we enter the `call_export_with_args` await below.
+        let tenant_rollback = if self.engine.config().max_instances_per_tenant.is_some() {
+            // Read the owning tenant off the already-registered instance under
+            // its per-instance lock (uncontended on the common path). If the
+            // id is unknown the call below will return `NotFound` and there is
+            // nothing to roll back, so a `None` here is harmless.
+            match self.instances.get(&id).map(|h| h.value().clone()) {
+                Some(handle) => {
+                    let tenant = handle.lock().await.tenant_id();
+                    Some((Arc::clone(&self.tenant_counts), tenant))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let guard = AutoTerminateGuard {
             instances: Arc::clone(&self.instances),
             instance_count: Arc::clone(&self.instance_count),
             metrics: self.metrics.clone(),
             id,
+            tenant_rollback,
             // Re-arm on construction; only the success/error path below
             // is allowed to disarm.
             armed: true,
@@ -2197,6 +2255,16 @@ struct AutoTerminateGuard {
     instance_count: Arc<AtomicUsize>,
     metrics: Option<TensorWasmMetrics>,
     id: InstanceId,
+    /// Per-tenant rollback handle (exec H2). `Some((tenant_counts, tenant))`
+    /// only when a per-tenant fairness cap is configured — in that case the
+    /// async `terminate` path decrements the per-tenant count too, so a
+    /// cancelled-future drop MUST mirror it or the tenant leaks a slot
+    /// permanently (lockout once the cap is reached). The owning `TenantId`
+    /// is captured up front (before the wrapped call) because `Drop` cannot
+    /// await to read it off the instance the way `terminate` does. `None`
+    /// when the cap is disabled — `tenant_counts` is never populated then and
+    /// the guard skips the per-tenant decrement entirely.
+    tenant_rollback: Option<(Arc<DashMap<TenantId, usize>>, TenantId)>,
     armed: bool,
 }
 
@@ -2210,6 +2278,17 @@ impl Drop for AutoTerminateGuard {
         // is a faithful sync mirror.
         if self.instances.remove(&self.id).is_some() {
             self.instance_count.fetch_sub(1, Ordering::AcqRel);
+            // exec H2: mirror the per-tenant decrement the async `terminate`
+            // path performs. Without this a cancelled/dropped invoke future
+            // released the engine-wide slot but leaked the per-tenant slot,
+            // so a tenant that accumulated cancelled invokes would hit its
+            // `max_instances_per_tenant` cap with zero live instances and be
+            // locked out permanently. Same saturating / prune-on-zero
+            // semantics as `terminate` (both go through
+            // `decrement_tenant_count`).
+            if let Some((tenant_counts, tenant)) = &self.tenant_rollback {
+                decrement_tenant_count(tenant_counts, *tenant);
+            }
             if let Some(m) = &self.metrics {
                 m.instance_terminations_total().inc();
                 m.active_instances().dec();

@@ -23,6 +23,19 @@ use wasmtime::{
 /// Default epoch tick. Matches the plan's 10 ms cadence.
 const DEFAULT_EPOCH_TICK: Duration = Duration::from_millis(10);
 
+/// Explicit ceiling on the wasm operand/value stack a single call may use,
+/// in bytes (LOW/hardening finding). Wasmtime applies a default stack ceiling
+/// today, but pinning it here makes the resource contract independent of any
+/// future wasmtime default change. 1 MiB is generous for the deeply-nested
+/// recursion / large-frame guests we expect while still bounding host stack
+/// consumption per fiber. Kept STRICTLY BELOW the async fiber stack reserved
+/// by wasmtime: under `async_support` wasmtime requires
+/// `max_wasm_stack <= async_stack_size`, and the async stack also has to hold
+/// the host frames of any async host import. We do not override
+/// `async_stack_size`, so it stays at wasmtime's default (2 MiB), leaving
+/// ample headroom (2 MiB >= 1 MiB) for host frames on top of the guest stack.
+const MAX_WASM_STACK_BYTES: usize = 1_048_576;
+
 /// Approximate host-memory cost of a single wasm table entry on wasmtime
 /// (a tagged pointer plus a type-index slot). Kept in lockstep with the
 /// same constant in
@@ -253,6 +266,19 @@ impl TensorWasmEngine {
         wt_cfg.consume_fuel(false);
         wt_cfg.wasm_component_model(cfg.component_model);
         wt_cfg.strategy(cfg.strategy);
+
+        // ─── Wasm stack ceiling (LOW/hardening pin) ─────────────────────────
+        //
+        // Pin the per-call wasm stack limit EXPLICITLY rather than relying on
+        // wasmtime's built-in default, so a future wasmtime bump that widens
+        // (or narrows) that default cannot silently change our resource
+        // contract — the same reasoning that motivates the proposal pins
+        // below. 1 MiB bounds host stack growth per fiber while comfortably
+        // accommodating deeply-nested guests. Under `async_support` wasmtime
+        // requires this to be <= `async_stack_size` (default 2 MiB, which we
+        // do not override), with the difference reserved for host frames on
+        // the fiber; 1 MiB leaves 1 MiB of headroom, so the invariant holds.
+        wt_cfg.max_wasm_stack(MAX_WASM_STACK_BYTES);
 
         // ─── Wasm proposal deny-list (security pin) ─────────────────────────
         //

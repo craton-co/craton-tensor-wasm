@@ -82,6 +82,38 @@ pub const MAX_FUNCTION_NAME_BYTES: usize = 256;
 /// [`parse_invoke_args`].
 pub const MAX_INVOKE_ARGS: usize = 256;
 
+/// SECURITY (async-invoke resource amplification, MEDIUM): ceiling on the
+/// number of concurrently-*outstanding* async invocation jobs.
+///
+/// The 30s request timeout and the invoke `ConcurrencyLimitLayer` only bound
+/// the HTTP *request* future. On the `invoke-async` / `invoke-stream` paths
+/// the real work runs in a detached `tokio::spawn` that outlives the request:
+/// the 202/stream response returns immediately, freeing the request
+/// concurrency slot, while the spawned task keeps running. Without an
+/// independent bound a caller can fire requests far faster than jobs complete
+/// and drive an unbounded number of live executor instances + tasks.
+///
+/// We gate new spawns on the existing `jobs_active` gauge (the same counter
+/// the [`JobsActiveGuard`] maintains): before spawning we check the gauge
+/// against this ceiling and reject with `503 capacity_exhausted` when it is
+/// already saturated. 256 mirrors the engine-wide live-instance default so
+/// the two limits are in the same order of magnitude; an operator who raises
+/// the executor cap should raise this in lockstep.
+pub const MAX_OUTSTANDING_ASYNC_JOBS: usize = 256;
+
+/// SECURITY (unbounded `jobs` registry, MEDIUM): hard cap on the number of
+/// [`JobRecord`]s retained in the in-memory `jobs` map.
+///
+/// Completed / failed jobs were never evicted, so a caller could anchor
+/// arbitrarily many records (each carrying a `result` `serde_json::Value`) by
+/// dispatching async invocations and never polling. When an insert would push
+/// the map past this cap, [`evict_jobs_if_over_cap`] drops terminal
+/// (`Completed` / `Failed`) records oldest-first by `created_unix_ms`,
+/// falling back to the oldest records of any status only if no terminal
+/// record can be found. 4096 keeps the steady-state footprint bounded while
+/// leaving generous head-room for legitimate poll-after-dispatch workflows.
+pub const MAX_JOB_RECORDS: usize = 4096;
+
 // ---------------------------------------------------------------------------
 // State records
 // ---------------------------------------------------------------------------
@@ -481,6 +513,62 @@ fn now_unix_ms() -> u64 {
             );
             0
         }
+    }
+}
+
+/// SECURITY (unbounded `jobs` registry, MEDIUM): bound the `jobs` map by
+/// evicting old records once it exceeds [`MAX_JOB_RECORDS`].
+///
+/// Called immediately after a new [`JobRecord`] is inserted. Eviction policy:
+///
+/// 1. Prefer dropping **terminal** records (`Completed` / `Failed`) — a
+///    polled-or-abandoned result is the safe thing to forget; a `Pending`
+///    job is still in flight and being mutated by its spawned task.
+/// 2. Among terminal records, evict **oldest first** by `created_unix_ms`.
+/// 3. Only if there are not enough terminal records to get back under the cap
+///    do we fall back to evicting the oldest records regardless of status
+///    (a pathological all-`Pending` flood) — better to forget an in-flight
+///    job's eventual result slot than to let the map grow without bound.
+///
+/// Concurrency: `DashMap` does not expose a transactional "snapshot + remove"
+/// so under concurrent inserts the map may briefly sit a few records above
+/// the cap between an insert and this pass; that is acceptable — the cap is a
+/// memory-pressure bound, not a hard invariant. We compute the eviction set
+/// from a borrowed scan (which only read-locks the iterated shards) and then
+/// `remove` outside any held shard guard so we never deadlock on a shard we
+/// are already iterating.
+fn evict_jobs_if_over_cap(jobs: &DashMap<Uuid, JobRecord>) {
+    // Fast path: the common case is well under the cap, so avoid the
+    // allocation + scan entirely.
+    let len = jobs.len();
+    if len <= MAX_JOB_RECORDS {
+        return;
+    }
+    let overflow = len - MAX_JOB_RECORDS;
+
+    // Collect `(created_unix_ms, id, is_terminal)` for every record. The scan
+    // read-locks each shard transiently; we copy only the small key/sort
+    // fields out, never the heavy `result` payload.
+    let mut entries: Vec<(u64, Uuid, bool)> = jobs
+        .iter()
+        .map(|e| {
+            let rec = e.value();
+            let terminal =
+                matches!(rec.status, JobStatus::Completed | JobStatus::Failed);
+            (rec.created_unix_ms, *e.key(), terminal)
+        })
+        .collect();
+
+    // Terminal records first (so they sort to the front of the eviction
+    // candidate list), then oldest-first within each group.
+    entries.sort_unstable_by(|a, b| {
+        // `a.2`/`b.2` is `is_terminal`; we want terminal (true) before
+        // non-terminal (false), hence reverse-compare the bool.
+        b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0))
+    });
+
+    for (_, id, _) in entries.into_iter().take(overflow) {
+        jobs.remove(&id);
     }
 }
 
@@ -1528,6 +1616,46 @@ pub async fn invoke_function_async(
         ));
     }
 
+    // SECURITY (async-invoke resource amplification, MEDIUM): bound the
+    // number of concurrently-outstanding async jobs BEFORE we spawn the
+    // detached task. The HTTP request timeout / invoke concurrency layer only
+    // bound the request future, which returns at 202 — they do not bound the
+    // detached executor work. We gate on the live `jobs_active` gauge against
+    // [`MAX_OUTSTANDING_ASYNC_JOBS`] and reject with the existing
+    // `503 capacity_exhausted` shape (well-formed request, retry once load
+    // drops) when the ceiling is already reached.
+    //
+    // Acquiring the [`JobsActiveGuard`] is what makes this an admission gate:
+    // the guard's `inc()` happens here, before the spawn, and the matching
+    // `dec()` runs on the spawned task's terminal transition (or via `Drop`
+    // on panic), so an accepted job holds its slot for its entire lifetime.
+    // We check-then-acquire; under a concurrent burst the gauge may briefly
+    // overshoot the ceiling by the number of racing handlers, which is a
+    // benign soft bound on a memory-pressure limit.
+    if state.metrics.jobs_active().get() as usize >= MAX_OUTSTANDING_ASYNC_JOBS {
+        tracing::warn!(
+            target: "tensor_wasm_api::routes",
+            active = state.metrics.jobs_active().get(),
+            limit = MAX_OUTSTANDING_ASYNC_JOBS,
+            "rejected invoke-async: outstanding async-job ceiling reached",
+        );
+        return Err(ApiError::service_unavailable(
+            "capacity_exhausted",
+            "outstanding async-job capacity exhausted; retry later",
+        ));
+    }
+    // Account the new pending job in the gauge via a Drop-implementing
+    // guard. The matching `.dec()` happens either through `guard.release()`
+    // at the end of the spawned task (happy path) or through `Drop` if the
+    // task unwinds first (panic safety net). v0.3.x emits a single series;
+    // the v0.4 follow-up to break out per tenant lands as a Family swap in
+    // `tensor-wasm-core/src/metrics.rs` and a label tuple here.
+    //
+    // Acquired BEFORE the spawn (and before the JobRecord insert) so the
+    // gauge — which the admission gate above reads — reflects this job for
+    // the whole window between acceptance and terminal resolution.
+    let jobs_active_guard = JobsActiveGuard::new(Arc::clone(&state.metrics));
+
     let job_id = Uuid::new_v4();
     tracing::Span::current().record("job_id", tracing::field::display(job_id));
     state.jobs.insert(
@@ -1541,13 +1669,9 @@ pub async fn invoke_function_async(
             created_unix_ms: now_unix_ms(),
         },
     );
-    // Account the new pending job in the gauge via a Drop-implementing
-    // guard. The matching `.dec()` happens either through `guard.release()`
-    // at the end of the spawned task (happy path) or through `Drop` if the
-    // task unwinds first (panic safety net). v0.3.x emits a single series;
-    // the v0.4 follow-up to break out per tenant lands as a Family swap in
-    // `tensor-wasm-core/src/metrics.rs` and a label tuple here.
-    let jobs_active_guard = JobsActiveGuard::new(Arc::clone(&state.metrics));
+    // SECURITY (unbounded `jobs` registry, MEDIUM): cap + evict old records
+    // so a flood of never-polled jobs cannot pin unbounded memory.
+    evict_jobs_if_over_cap(&state.jobs);
 
     // Spawn the real invocation. The executor is cheap to clone (it's an
     // `Arc` internally) and the jobs map is `Arc<DashMap>`.

@@ -210,6 +210,27 @@ pub struct UnifiedBuffer {
     // unreachable from outside the `unified` module.
     #[allow(dead_code)]
     backing: Backing,
+    /// Audit H4: whether the bytes at `ptr` are dereferenceable from the
+    /// host CPU. `true` for managed/unified allocations (cust
+    /// `cuMemAllocManaged`, cudarc `cuMemAllocManaged`) and the host
+    /// `Box<[u8]>` fallback — all of which are page-migratable / plain
+    /// host memory and so safe to view as a `&[u8]`. `false` for the T39
+    /// `new_in_tenant_pool` path, whose `cuMemAllocFromPoolAsync` memory
+    /// is DEVICE-ONLY (see the "Bytes layout" doc on
+    /// [`Self::new_in_tenant_pool`]); calling `from_raw_parts` over it
+    /// would be host-side UB. `as_slice` / `as_mut_slice` consult this
+    /// flag and panic rather than fabricating a host slice over device
+    /// memory. Every constructor MUST set this correctly.
+    host_addressable: bool,
+    /// Audit (LOW, Drop-time zeroization): whether the backing is plain
+    /// host memory (`Box<[u8]>`) whose bytes can be safely overwritten
+    /// from the CPU in `Drop`. Only the no-CUDA `Box<[u8]>` fallback sets
+    /// this `true`; the CUDA device paths leave it `false` because
+    /// zeroizing them needs a live CUDA context (not available in a bare
+    /// `Drop`). Distinct from `host_addressable`: a future host-pinned
+    /// CUDA allocation could be host-addressable yet still need a context
+    /// to free, so the two concerns are tracked separately.
+    host_zeroize_on_drop: bool,
     /// Tenant context for GPU memory accounting. When `Some`, the
     /// buffer's `Drop` impl calls
     /// [`TenantContext::release_gpu_bytes`] for `size` bytes. Set only
@@ -282,6 +303,13 @@ mod backing {
     /// gating documented at the module head: `unified-memory` OR
     /// `cudarc-backend` ⇒ `true`; only the default `Box<[u8]>` path ⇒ `false`.
     pub(super) const IS_UVM_BACKED: bool = true;
+
+    /// Audit (LOW, Drop-time zeroization): `false` here — the cust managed
+    /// allocation is freed by cust's typed `Drop`, which needs a live CUDA
+    /// context, so [`super::UnifiedBuffer::drop`] must NOT attempt a
+    /// host-side memset over it. Only the no-CUDA `Box<[u8]>` build sets
+    /// this `true`.
+    pub(super) const IS_HOST_BACKED: bool = false;
 
     /// Owning storage for a [`super::UnifiedBuffer`] under the
     /// `unified-memory` feature.

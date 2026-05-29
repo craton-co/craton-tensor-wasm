@@ -297,19 +297,23 @@ impl TokenBucket {
 /// `From<TenantId>` or public constructor, so a workload running inside
 /// tenant A cannot fabricate one for tenant B.
 ///
-/// # Registry binding (`strict-cap-binding` feature)
+/// # Registry binding (H1 — always enforced)
 ///
-/// Under the `strict-cap-binding` feature, every capability also carries
-/// an `Arc<()>` token that points to its minting registry's allocation.
-/// Comparison is by `Arc::ptr_eq`, so a capability minted by registry A
-/// is rejected when presented against a context registered in registry
-/// B, even if both contexts happen to share the same numeric `TenantId`.
-/// Without this gate, capabilities from independent registries are
-/// interchangeable — see the audit note on `RegistryAdminCapability` for
-/// the threat model. The feature is off by default in the 0.3 line so
-/// existing call sites that mix caps across registries (notably test
-/// harnesses) continue to compile and behave identically; v0.4 will flip
-/// it on.
+/// Every capability carries an `Arc<()>` token that points to its
+/// minting registry's allocation. Comparison is by `Arc::ptr_eq`, so a
+/// capability minted by registry A is rejected when presented against a
+/// context registered in registry B, even if both contexts happen to
+/// share the same numeric `TenantId`. Without this binding, capabilities
+/// from independent registries are interchangeable, which the H1 audit
+/// finding flagged as a cross-registry capability-confusion vector — see
+/// the note on `RegistryAdminCapability` for the threat model.
+///
+/// H1 fix: this binding is now UNCONDITIONAL and no longer behind the
+/// `strict-cap-binding` feature gate. A release build with the feature
+/// disabled still binds caps to their minting registry and still fails
+/// closed on cross-registry / forged-admin caps. The `strict-cap-binding`
+/// feature remains defined only to keep the typed `*_strict` admin APIs
+/// and the `cap_binding_strict` integration test compiling.
 #[derive(Debug, Clone)]
 pub struct TenantCapability {
     tenant_id: TenantId,
@@ -317,27 +321,11 @@ pub struct TenantCapability {
     /// struct-literal construction outside `tensor-wasm-tenant`.
     _seal: (),
     /// Pointer-identity stamp of the registry that minted this capability.
-    /// Only present under the `strict-cap-binding` feature; the field
-    /// disappears entirely (no memory cost, no API surface) when the
-    /// feature is off.
-    #[cfg(feature = "strict-cap-binding")]
+    /// H1: always present so registry binding is enforced unconditionally.
     pub(crate) registry_token: std::sync::Arc<()>,
 }
 
 impl TenantCapability {
-    /// Mint a capability bound to `tenant_id`.
-    ///
-    /// `pub(crate)` so only the registry can call it; the
-    /// `TenantCapability` cannot be created from outside this crate at all.
-    /// The non-strict-binding signature is unchanged.
-    #[cfg(not(feature = "strict-cap-binding"))]
-    pub(crate) fn mint(tenant_id: TenantId) -> Self {
-        Self {
-            tenant_id,
-            _seal: (),
-        }
-    }
-
     /// Mint a capability bound to `tenant_id` AND to the minting registry,
     /// identified by `registry_token` (an `Arc::clone` of the registry's
     /// per-instance token allocation). Comparison at `check_capability`
@@ -345,7 +333,10 @@ impl TenantCapability {
     /// `Arc::new(())` at the same address would still be distinct
     /// allocations and `ptr_eq` would return `false` for caps from one
     /// against contexts of the other.
-    #[cfg(feature = "strict-cap-binding")]
+    ///
+    /// H1: the registry-bound signature is now unconditional — there is no
+    /// longer a token-less `mint` variant, so a cap can never be minted
+    /// without provenance regardless of the `strict-cap-binding` feature.
     pub(crate) fn mint(tenant_id: TenantId, registry_token: std::sync::Arc<()>) -> Self {
         Self {
             tenant_id,
@@ -469,17 +460,19 @@ pub struct TenantContext {
     metrics_labels: TenantLabels,
     /// Pointer-identity stamp of the registry this context was registered
     /// in, used by [`Self::check_capability`] to reject caps minted by a
-    /// *different* registry under the `strict-cap-binding` feature.
+    /// *different* registry.
     ///
     /// `None` until the context is moved into
     /// [`crate::TenantRegistry::register_with_capability`], which sets
     /// the token before wrapping the context in an `Arc`. A `None` here
     /// at `check_capability` time means the context was never registered
     /// (or was constructed for a test that bypasses the registry); the
-    /// strict-binding check then **fails closed** (rejects the cap),
+    /// registry-binding check then **fails closed** (rejects the cap),
     /// since an unregistered context has no provenance to vouch for any
     /// capability — see [`Self::check_capability`].
-    #[cfg(feature = "strict-cap-binding")]
+    ///
+    /// H1: always present so registry binding is enforced unconditionally,
+    /// not just under the `strict-cap-binding` feature.
     pub(crate) registry_token: Option<std::sync::Arc<()>>,
 }
 

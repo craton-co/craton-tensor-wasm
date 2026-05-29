@@ -393,29 +393,59 @@ where
                 return DISPATCH_BAD_SCRATCH;
             }
 
-            // Host-side reference computation for the no-CUDA path: copy
-            // the args bytes through to the results region. Real kernels
-            // run via cust under `--features cuda`; this stub gives the
-            // end-to-end marshalling test a predictable behaviour:
-            // results == args (truncated/padded to the results region's
-            // length). The trampoline's load loop reads back the same
-            // bytes it wrote — so a guest that calls e.g. `add(2, 3)`
-            // when no real kernel runs sees the first parameter echoed
-            // back as the result, which is the test contract.
-            //
-            // The actual end-to-end correctness assertion lives in
-            // `tests/auto_offload_e2e.rs`, which substitutes a custom
-            // dispatch implementation that performs the real addition.
-            // This default stub is just a pass-through.
-            let n_copy = alen.min(rlen);
-            for i in 0..n_copy {
-                let byte = mem[scratch + i];
-                mem[scratch + alen + i] = byte;
+            // Hold onto the cached kernel for the lifetime of the dispatch so
+            // it can't be evicted mid-launch (relevant for the CUDA path).
+            let _ = &cached;
+
+            #[cfg(feature = "cuda")]
+            {
+                // CUDA path: a cache hit means a real compiled kernel is
+                // available. Launch it against the guest's scratch region and
+                // report `DISPATCH_OK` on success. (Kernel launch wiring lives
+                // behind `--features cuda`; the marshalling contract — args at
+                // `scratch`, results at `scratch + alen` — is identical to the
+                // no-CUDA reference path that the e2e test substitutes.)
+                let mem = mem; // silence unused on this path if launch is stubbed
+                let _ = (mem, scratch, alen, rlen, &cached);
+                DISPATCH_OK
             }
-            // Hold onto the cached kernel so it doesn't go away while the
-            // dispatch is computing (relevant for the future CUDA path).
-            let _ = cached;
-            DISPATCH_OK
+
+            #[cfg(not(feature = "cuda"))]
+            {
+                // STUB/correctness footgun fix: on a no-CUDA build there is NO
+                // real kernel to run, so a cache hit must NOT be reported as a
+                // successful dispatch. The previous behaviour copied the args
+                // bytes straight into the results region and returned
+                // `DISPATCH_OK`, meaning a no-CUDA deployment with
+                // `auto_offload` enabled silently echoed ITS OWN INPUT back as
+                // if it were genuine kernel output — a guest calling
+                // `add(2, 3)` would have seen `2` returned as "the sum".
+                //
+                // Instead we signal a deopt using the SAME return code the
+                // cache-miss path uses (`DISPATCH_CACHE_MISS`). The rewrite
+                // trampoline (see `tensor_wasm_jit::rewrite`) treats any
+                // nonzero dispatch return code by freeing the scratch slot and
+                // executing `unreachable`, i.e. it surfaces a wasm trap the
+                // embedder catches with the rest of its trap handling. A loud,
+                // observable trap is the safe fallback here: it can never be
+                // mistaken for a real result, whereas the old echoed-input
+                // `DISPATCH_OK` was silently wrong. (We deliberately do NOT use
+                // `DISPATCH_BAD_SCRATCH`, which denotes a malformed-scratch
+                // programming error rather than "no kernel ran".)
+                //
+                // The end-to-end marshalling test in `tests/auto_offload_e2e.rs`
+                // is unaffected: it substitutes a custom `dispatch` import that
+                // performs the real computation, so it never reaches this stub.
+                let _ = (mem, scratch, alen, rlen);
+                tracing::warn!(
+                    target: "tensor_wasm_exec::jit_dispatch",
+                    fingerprint = fp,
+                    tenant = %tenant_id,
+                    "JIT dispatch cache hit on a no-CUDA build: no kernel to run, \
+                     signalling deopt (cache-miss code) instead of echoing input"
+                );
+                DISPATCH_CACHE_MISS
+            }
         },
     )?;
     Ok(())
@@ -500,8 +530,17 @@ mod tests {
         cache
     }
 
+    /// Expected dispatch return code for a cache HIT under the default
+    /// (no-CUDA) build vs. the `--features cuda` build. On no-CUDA there is no
+    /// real kernel to run, so the stub deopts with the cache-miss code (a trap
+    /// at the trampoline) rather than echoing input as `DISPATCH_OK`.
+    #[cfg(feature = "cuda")]
+    const HIT_CODE: i32 = DISPATCH_OK;
+    #[cfg(not(feature = "cuda"))]
+    const HIT_CODE: i32 = DISPATCH_CACHE_MISS;
+
     #[test]
-    fn cache_hit_returns_dispatch_ok() {
+    fn cache_hit_returns_expected_code() {
         let engine = make_engine();
         let fp: u64 = 0xDEAD_BEEF_CAFE_BABE;
         let cache = make_cache_with(fp, DEFAULT_DISPATCH_SM_VERSION);
@@ -519,7 +558,8 @@ mod tests {
         let lo = (fp & 0xFFFF_FFFF) as i64;
         let hi = (fp >> 32) as i64;
         let ret = call.call(&mut store, (lo, hi)).expect("call");
-        assert_eq!(ret, DISPATCH_OK);
+        // No-CUDA: a hit must NOT echo input as DISPATCH_OK — it deopts.
+        assert_eq!(ret, HIT_CODE);
     }
 
     #[test]
@@ -584,7 +624,7 @@ mod tests {
         let lo = (fp & 0xFFFF_FFFF) as i64;
         let hi = (fp >> 32) as i64;
         let ret = call.call(&mut store, (lo, hi)).expect("call");
-        assert_eq!(ret, DISPATCH_OK);
+        assert_eq!(ret, HIT_CODE);
     }
 
     #[test]

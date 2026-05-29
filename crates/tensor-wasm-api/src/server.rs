@@ -8,8 +8,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::Router;
+use axum::{Json, Router};
+use serde_json::json;
+use subtle::ConstantTimeEq;
 use tower::ServiceBuilder;
 
 use crate::audit::{audit_log_middleware, AuditConfig, TrustedProxies};

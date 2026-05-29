@@ -29,7 +29,10 @@ use crate::writer::{
 #[cfg(feature = "signed-snapshots")]
 use crate::format::{SignatureKind, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN};
 #[cfg(feature = "signed-snapshots")]
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+// `verify_strict` is an *inherent* method on `VerifyingKey`, so the
+// `Verifier` trait is no longer imported — pulling it in would now be an
+// unused import and trip `-D warnings`.
+use ed25519_dalek::{Signature, VerifyingKey};
 #[cfg(feature = "artifact-backing")]
 use tensor_wasm_artifacts::ArtifactStore;
 #[cfg(feature = "signed-snapshots")]
@@ -1025,7 +1028,17 @@ impl SnapshotReader {
                 message.extend_from_slice(&bytes[..prefix_len]);
                 message.extend_from_slice(&V3_TRAILER_MAGIC);
                 message.push(kind_byte);
-                verifying_key.verify(&message, &sig).map_err(|_| {
+                // SECURITY (Ed25519 signature malleability): use
+                // `verify_strict` rather than the permissive `verify`. The
+                // plain `Verifier::verify` accepts non-canonical encodings
+                // (signatures with a large `S` scalar, or `R` points in a
+                // small torsion subgroup), so for one signed message an
+                // attacker can derive a *second*, distinct-but-still-valid
+                // signature without the private key. `verify_strict`
+                // (a method on `VerifyingKey`) rejects those non-canonical
+                // forms, giving each (key, message) pair a single accepted
+                // signature and closing the malleability window.
+                verifying_key.verify_strict(&message, &sig).map_err(|_| {
                     TensorWasmError::Serialization("snapshot Ed25519 signature mismatch".into())
                 })?;
             }
