@@ -197,6 +197,27 @@ PR is reasonable; it is intentionally not on the CI regression-gate path
 because tail metrics on shared CI runners are too noisy to gate on
 without hand-tuning thresholds per metric.
 
+### Absolute-ceiling gate (catastrophic-blowup catch)
+
+The delta-based regression gate above ignores P99.9 for the noise reason
+just stated. To still catch a *qualitative* blowup — a deadlock-ish stall,
+a pathological retry loop, an O(n²) regression that drags the tail into the
+milliseconds — `bench.yml` has a **separate** "Tail-latency absolute-ceiling
+gate" step that fails only if any metric's `p99_9_ns` in this file exceeds a
+single fixed ceiling. It is explicitly **not** a regression-delta check: a
+2× tail drift sails through; it fires only on a blowup far outside normal
+run-to-run jitter.
+
+The ceiling lives in the workflow as the `TAIL_P99_9_CEILING_NS` env var
+(currently **10 ms / `10000000` ns**). The worst `p99_9` on the committed
+noisy-dev-host baseline above is ~0.25 ms (`dispatch/concurrent_cap64/100`),
+so the ceiling sits ~40× higher — generous on purpose, so a busy GitHub
+runner cannot trip it. To tune: bump it (and note it here) when a
+legitimately slower path lands; lower it only with a quiet-host capture in
+hand (see [`docs/BENCHMARKING.md`](../docs/BENCHMARKING.md)). Metrics with a
+null/absent `p99_9_ns` (e.g. an unwired backend placeholder) are skipped by
+the gate.
+
 ## Dispatch-future backend comparison
 
 The `dispatch_future_backends` bench answers

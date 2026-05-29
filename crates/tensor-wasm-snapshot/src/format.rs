@@ -39,6 +39,27 @@ pub const SIGNATURE_KIND_HMAC_SHA256: u8 = 1;
 /// Length in bytes of an HMAC-SHA256 signature (the digest size of SHA-256).
 pub const HMAC_SHA256_SIG_LEN: usize = 32;
 
+/// Trailer discriminant for an Ed25519 asymmetric signature.
+///
+/// Stored as a single `u8` immediately after the [`V3_TRAILER_MAGIC`] in a
+/// v3 blob, exactly where [`SIGNATURE_KIND_HMAC_SHA256`] would sit for the
+/// symmetric path. Followed by the 64-byte Ed25519 signature (see
+/// [`ED25519_SIG_LEN`]). Distinct from the HMAC discriminant so a verifier
+/// can tell the two apart by the kind byte alone, and so an attacker cannot
+/// swap an HMAC trailer for an Ed25519 one (or vice-versa) without
+/// invalidating the signature — the kind byte is mixed into both signature
+/// inputs (see `FORMAT.md` § "v3 wire format").
+///
+/// Ed25519 is an *asymmetric* scheme: the writer signs with a private key
+/// (`ed25519_dalek::SigningKey`) and any number of verifiers hold only the
+/// corresponding public key (`ed25519_dalek::VerifyingKey`). This is the
+/// distinguishing advantage over HMAC, where every verifier must hold the
+/// same symmetric secret that can also forge signatures.
+pub const SIGNATURE_KIND_ED25519: u8 = 2;
+
+/// Length in bytes of an Ed25519 signature (RFC 8032: `R` ‖ `s`, 32 + 32).
+pub const ED25519_SIG_LEN: usize = 64;
+
 /// 4-byte magic prefix that begins every v3 trailer.
 ///
 /// Chosen as ASCII `b"S3T1"` ("Snapshot 3 Trailer v1"): four printable
@@ -73,13 +94,15 @@ pub const V3_TRAILER_MAGIC: [u8; 4] = *b"S3T1";
 /// rather than hard-coding `4` at every call site.
 pub const V3_TRAILER_MAGIC_LEN: usize = V3_TRAILER_MAGIC.len();
 
-/// Total length in bytes of a v3 trailer
-/// (`[magic: 4][signature_kind: u8][signature]`).
+/// Total length in bytes of an **HMAC-SHA256** v3 trailer
+/// (`[magic: 4][signature_kind: u8][signature: 32]`).
 ///
-/// Today this is always `4 + 1 + 32 = 37` because the only defined
-/// [`SignatureKind`] is HMAC-SHA256. The reader uses this constant to
-/// split the v2-shaped prefix from the trailer before verifying the
-/// signature.
+/// This is `4 + 1 + 32 = 37`. The reader uses this constant to split the
+/// v2-shaped prefix from the trailer before verifying an HMAC signature.
+/// The asymmetric Ed25519 trailer has its own length
+/// ([`ED25519_TRAILER_LEN`]) because its signature is 64 bytes rather than
+/// 32; [`SignatureKind::trailer_len`] returns the right value for either
+/// kind so the reader's offset arithmetic stays kind-agnostic.
 ///
 /// **Wire-format note (T8):** prior to the magic-prefix change this
 /// constant was `1 + 32 = 33` and the trailer began with the
@@ -89,6 +112,16 @@ pub const V3_TRAILER_MAGIC_LEN: usize = V3_TRAILER_MAGIC.len();
 /// magic prefix is itself the discriminator and the inner bincode
 /// payload is byte-identical to the pre-T8 v3 shape.
 pub const SIGNATURE_TRAILER_LEN: usize = V3_TRAILER_MAGIC_LEN + 1 + HMAC_SHA256_SIG_LEN;
+
+/// Total length in bytes of an **Ed25519** v3 trailer
+/// (`[magic: 4][signature_kind: u8][signature: 64]`).
+///
+/// This is `4 + 1 + 64 = 69`. The trailer header (magic + kind byte) is
+/// identical in shape to the HMAC trailer; only the signature length
+/// differs, so the reader detects the trailer by the same
+/// [`V3_TRAILER_MAGIC`] and then reads the kind byte to learn which length
+/// applies. See [`SignatureKind::trailer_len`].
+pub const ED25519_TRAILER_LEN: usize = V3_TRAILER_MAGIC_LEN + 1 + ED25519_SIG_LEN;
 
 /// Enumeration of the signature algorithms understood by the reader.
 ///
@@ -102,7 +135,23 @@ pub enum SignatureKind {
     /// HMAC-SHA256 over the v2-shaped prefix (zstd frame bytes, inclusive
     /// of magic, version, payload, and CRC32 — i.e. everything between the
     /// start of input and the trailer). 32-byte signature.
+    ///
+    /// Symmetric: every verifier must hold the same secret key, which can
+    /// also forge signatures. Use [`Self::Ed25519`] when verifiers should
+    /// not be trusted with signing capability.
     HmacSha256 = SIGNATURE_KIND_HMAC_SHA256,
+
+    /// Ed25519 asymmetric signature over the same byte range as
+    /// [`Self::HmacSha256`] (the v2-shaped prefix ‖ trailer magic ‖ kind
+    /// byte). 64-byte signature.
+    ///
+    /// Asymmetric: the writer signs with a private
+    /// `ed25519_dalek::SigningKey` and verifiers hold only the
+    /// `ed25519_dalek::VerifyingKey`. A compromised verifier cannot forge a
+    /// snapshot, which is the property HMAC cannot give. Configured via
+    /// [`crate::writer::SnapshotWriter::with_ed25519_signing_key`] /
+    /// [`crate::reader::SnapshotReader::with_ed25519_verifying_key`].
+    Ed25519 = SIGNATURE_KIND_ED25519,
 }
 
 impl SignatureKind {
@@ -116,6 +165,7 @@ impl SignatureKind {
     pub const fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             SIGNATURE_KIND_HMAC_SHA256 => Some(Self::HmacSha256),
+            SIGNATURE_KIND_ED25519 => Some(Self::Ed25519),
             _ => None,
         }
     }
@@ -125,7 +175,20 @@ impl SignatureKind {
     pub const fn signature_len(self) -> usize {
         match self {
             Self::HmacSha256 => HMAC_SHA256_SIG_LEN,
+            Self::Ed25519 => ED25519_SIG_LEN,
         }
+    }
+
+    /// Total length in bytes of the full v3 trailer for this kind —
+    /// `[magic: 4][kind: 1][signature: signature_len()]`.
+    ///
+    /// Lets the reader compute the prefix/trailer split without hard-coding
+    /// a per-kind constant at each call site: HMAC yields
+    /// [`SIGNATURE_TRAILER_LEN`] (37), Ed25519 yields
+    /// [`ED25519_TRAILER_LEN`] (69).
+    #[must_use]
+    pub const fn trailer_len(self) -> usize {
+        V3_TRAILER_MAGIC_LEN + 1 + self.signature_len()
     }
 }
 
@@ -152,7 +215,30 @@ mod tests {
     fn unknown_signature_kind_is_none() {
         assert_eq!(SignatureKind::from_byte(0), None);
         assert_eq!(SignatureKind::from_byte(0xFF), None);
-        assert_eq!(SignatureKind::from_byte(2), None);
+        // `2` is now Ed25519 — `3` is still unknown.
+        assert_eq!(SignatureKind::from_byte(3), None);
+    }
+
+    #[test]
+    fn ed25519_signature_kind_round_trips() {
+        let k = SignatureKind::Ed25519;
+        assert_eq!(k as u8, SIGNATURE_KIND_ED25519);
+        assert_eq!(SignatureKind::from_byte(k as u8), Some(k));
+        assert_eq!(k.signature_len(), ED25519_SIG_LEN);
+        assert_eq!(k.trailer_len(), ED25519_TRAILER_LEN);
+    }
+
+    #[test]
+    fn signature_kinds_are_distinct() {
+        assert_ne!(SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_KIND_ED25519);
+        assert_ne!(SignatureKind::HmacSha256, SignatureKind::Ed25519);
+    }
+
+    #[test]
+    fn trailer_len_matches_per_kind_constants() {
+        assert_eq!(SignatureKind::HmacSha256.trailer_len(), SIGNATURE_TRAILER_LEN);
+        assert_eq!(SignatureKind::Ed25519.trailer_len(), ED25519_TRAILER_LEN);
+        assert_eq!(ED25519_TRAILER_LEN, 69);
     }
 
     #[test]

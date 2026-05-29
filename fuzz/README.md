@@ -8,6 +8,7 @@ through `libfuzzer-sys` against the corresponding subsystem.
 | `fuzz_wasm_compile` | `wasmtime::Module::from_binary` | host process never crashes on arbitrary bytes |
 | `fuzz_ptx_emit` | `tensor-wasm-jit` `ptx_emit::emit` | emitter never panics on arbitrary blueprints |
 | `fuzz_snapshot_restore` | `tensor-wasm-snapshot` `SnapshotReader::restore` | restore returns `Err`, not panic, on malformed input |
+| `fuzz_snapshot_restore_arbitrary` | `tensor-wasm-snapshot` `SnapshotReader::restore` (v4 artifact-envelope path) | prepends `ARTIFACT_MAGIC` + a synthetic HMAC key so `restore` dispatches onto the v0.4 envelope decode; tampered/arbitrary v4 envelopes are rejected as `Err`, never a panic |
 | `fuzz_wasi_cuda_abi` | `tensor-wasm-wasi-gpu` host functions | host never crashes on arbitrary `(ptr, len)` from Wasm guest |
 | `token_scope_parser` | `tensor-wasm-api` `token_scope::parse_tokens_env` | parser never panics; every accepted bearer is non-empty; scope variant matches `is_all()` |
 | `audit_json_round_trip` | `tensor-wasm-api` `AuditRecord` Serialize | production JSON parses back into the documented wire-format shape (catches Serialize drift even though the type doesn't derive Deserialize) |
@@ -15,11 +16,13 @@ through `libfuzzer-sys` against the corresponding subsystem.
 | `fuzz_rewrite_wasm` | `tensor-wasm-jit` `rewrite::rewrite_wasm` | for any input that `wasmparser::validate` accepts, the rewritten module also validates (rewriter preserves Wasm validity) |
 | `fuzz_pool_allocate` | `tensor-wasm-mem` `pool::UnifiedMemoryPool::allocate` | bump-pointer pool never panics on arbitrary `(size, align)` — every failure mode (zero size, bad align, exhaustion, overflow) surfaces as `Err(UnifiedError)` |
 | `lowering_driver` | `tensor-wasm-jit` `lowering_driver::lower_function` | Cranelift → `LoweredFunction` driver never panics; every failure surfaces as `Err(LoweringError::{UnsupportedOpcode,UnsupportedType,UndefinedValue,MalformedTerminator,Rejected,BadBlockReference})` |
+| `fuzz_artifact_decode_envelope` | `tensor-wasm-artifacts` `decode_envelope_from_bytes` / `_with_cap` | splits a synthetic 32-byte HMAC key off the input; the envelope decoder rejects every malformed shape (bad magic/version, HMAC mismatch, zstd garbage, zip-bomb, hash mismatch) as `Err(ArtifactError)`, never a panic |
 
-The ten targets above exercise the host-trust-boundary parsers and
+The targets above exercise the host-trust-boundary parsers and
 emitters across the runtime: Wasm compilation, PTX emission, snapshot
-restore, the wasi-cuda ABI, the token-scope and audit-JSON surfaces,
-kernel-args argv lowering, JIT rewrite, the unified-memory bump
+restore (legacy v2 and the v0.4 artifact-envelope path), the artifact-store
+envelope decoder, the wasi-cuda ABI, the token-scope and audit-JSON
+surfaces, kernel-args argv lowering, JIT rewrite, the unified-memory bump
 allocator, and the Cranelift lowering driver. Each one's invariant is
 "no panic on arbitrary input; documented errors only."
 
@@ -33,6 +36,8 @@ cd fuzz
 cargo +nightly fuzz run fuzz_wasm_compile -- -max_total_time=300
 cargo +nightly fuzz run fuzz_ptx_emit -- -max_total_time=300
 cargo +nightly fuzz run fuzz_snapshot_restore -- -max_total_time=300
+cargo +nightly fuzz run fuzz_snapshot_restore_arbitrary -- -max_total_time=300
+cargo +nightly fuzz run fuzz_artifact_decode_envelope -- -max_total_time=300
 cargo +nightly fuzz run fuzz_wasi_cuda_abi -- -max_total_time=300
 cargo +nightly fuzz run token_scope_parser -- -max_total_time=300
 cargo +nightly fuzz run audit_json_round_trip -- -max_total_time=300

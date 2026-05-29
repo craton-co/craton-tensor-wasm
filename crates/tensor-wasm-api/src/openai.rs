@@ -546,25 +546,15 @@ async fn run_translated(
         }
     };
 
-    // Honesty: the executor has no input channel for the prompt bytes in
-    // v0.4 (numeric WasmArg only; no stdin / argv / input stream), so a
-    // non-empty prompt is dropped on the floor before the guest runs.
-    // The translator already preserves the prompt + its length on
-    // `TranslatedRequest`; warn once per process so operators are not
-    // misled into thinking the prompt reached the guest. See
-    // `openai_translator.rs` § "Prompt → guest argv".
-    if !translated.prompt.is_empty() {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!(
-                target: "tensor_wasm_api::openai",
-                prompt_len = translated.prompt_len_hint,
-                "OpenAI prompt is not delivered to the guest in v0.4: the executor exposes no \
-                 string/bytes input channel. The guest runs argument-less and must produce its \
-                 output via wasi:tensor/host.emit-chunk. This warning is logged once per process.",
-            );
-        });
-    }
+    // The prompt now reaches the guest via the `wasi:tensor/host`
+    // pull-model input channel: `run_buffered` / `run_streaming` stage
+    // `translated.prompt` bytes on `SpawnConfig::input`, and the guest
+    // copies them into its own linear memory via
+    // `wasi:tensor/host.read-input` (sizing the read from
+    // `input-len()`). A guest that ignores the input channel still runs
+    // argument-less and produces its output via
+    // `wasi:tensor/host.emit-chunk` as before — staging input is
+    // non-breaking for those guests (`input-len()` is simply unread).
 
     if translated.stream {
         run_streaming(
@@ -606,11 +596,16 @@ async fn run_buffered(
     let executor = state.executor.clone();
     let args = translated.args.clone();
     let function_id = translated.function_id;
+    // Stage the assembled prompt so the guest can pull it via
+    // `wasi:tensor/host.read-input`. Empty prompts stage nothing (the
+    // guest sees `input-len() == 0`).
+    let input = translated.prompt.into_bytes();
 
     let exec_handle = tokio::spawn(async move {
         let cfg = SpawnConfig::for_tenant(tenant)
             .with_deadline(OPENAI_INVOKE_DEADLINE)
-            .with_streaming(streaming);
+            .with_streaming(streaming)
+            .with_input(input);
         let instance_id = executor.spawn_instance(cfg, &wasm_bytes).await?;
         executor
             .call_export_with_args_then_terminate(instance_id, "_start", &args)
@@ -704,11 +699,16 @@ async fn run_streaming(
 
     let executor = state.executor.clone();
     let args = translated.args.clone();
+    // Stage the assembled prompt for the guest's `wasi:tensor/host`
+    // pull-model input channel (`read-input`); empty prompts stage
+    // nothing.
+    let input = translated.prompt.into_bytes();
 
     tokio::spawn(async move {
         let cfg = SpawnConfig::for_tenant(tenant)
             .with_deadline(OPENAI_INVOKE_DEADLINE)
-            .with_streaming(streaming);
+            .with_streaming(streaming)
+            .with_input(input);
         let outcome = match executor.spawn_instance(cfg, &wasm_bytes).await {
             Ok(instance_id) => executor
                 .call_export_with_args_then_terminate(instance_id, "_start", &args)

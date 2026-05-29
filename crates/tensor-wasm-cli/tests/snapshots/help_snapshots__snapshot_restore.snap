@@ -22,5 +22,9 @@ Options:
           Path to a 32-byte HMAC-SHA256 key. The file is interpreted as 64 hex characters if it's that length (whitespace trimmed), otherwise as 32 raw bytes. Mismatched length → error. When set, the key is forwarded to the server (hex-encoded, in the `X-TensorWasm-Snapshot-HMAC-Key` header) and the server uses it to verify the archive's signature
       --require-signature
           Refuse to restore an unsigned (v2) snapshot. Sends the `X-TensorWasm-Snapshot-Require-Signature: true` header so the server fails closed on archives produced before signing was enabled
+      --ca-cert <PATH>
+          Trust an additional PEM-encoded private CA root for HTTPS (added alongside the system trust store, not instead of it). Use this for a server fronted by an internal/self-signed CA instead of `--insecure`. The file must be PEM, not DER
+      --insecure
+          SECURITY HAZARD: disable TLS certificate verification for outbound HTTPS, exposing the connection to man-in-the-middle attacks and possible theft of the TENSOR_WASM_TOKEN credential. For local dev against a throwaway cert only; prefer --ca-cert. Warns on every run
   -h, --help
           Print help

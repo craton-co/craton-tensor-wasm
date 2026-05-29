@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Args;
 
-use super::HttpContext;
+use super::{HttpContext, OutputFormat};
 
 /// Default address used when `--addr` is omitted. Matches the dev-server
 /// quickstart in `docs/CLI.md`.
@@ -77,6 +77,13 @@ pub struct ObserveArgs {
     /// Refresh interval, in seconds. Must be at least 1.
     #[arg(long, default_value_t = DEFAULT_INTERVAL_SECS)]
     pub interval: u64,
+
+    /// Output format: `text` (in-place ANSI dashboard, default) or `json`
+    /// (one machine-readable JSON document per tick, newline-delimited, for
+    /// CI scripts and log pipelines). In `json` mode the screen is NOT
+    /// cleared between ticks — each tick is appended as an NDJSON line.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text, display_order = 800)]
+    pub output: OutputFormat,
 }
 
 /// One parsed metric sample. Histogram buckets share the same shape — the `le`
@@ -277,26 +284,42 @@ pub async fn run(args: ObserveArgs, ctx: &HttpContext) -> Result<()> {
             Err(e) => (Metrics::new(), Some(e.to_string())),
         };
         let snap = Snapshot::from_metrics(&metrics, now);
-        let board = render_board(&base, interval, &health, &metrics, &prev, &snap, fetch_err);
-        // T18: the board is composed of server-derived text — `/healthz`
-        // body, route labels from `/metrics`, and fetch-error messages.
-        // A malicious server could embed ANSI escapes that survive
-        // through `parse_metrics` / `render_board` and rewrite the
-        // operator's terminal. Sanitise the rendered board before
-        // emitting; the `CLEAR_AND_HOME` constant we prepend is the
-        // *only* escape sequence the dashboard is allowed to use, and
-        // it is added outside the sanitised payload below.
-        let board = super::sanitise_terminal_output(&board);
-        // cli fix 3: only emit the `\x1B[2J\x1B[H` clear-and-home escape when
-        // stdout is a TTY. Piped / redirected output (CI logs, `tee`, files)
-        // would otherwise capture the raw escape bytes and either render them
-        // as garbage or trip downstream parsers. In non-TTY mode we instead
-        // separate each board with a blank line so the stream stays readable.
         let mut stdout = std::io::stdout();
-        if stdout.is_terminal() {
-            print!("{CLEAR_AND_HOME}{board}");
-        } else {
-            println!("\n{board}");
+        match args.output {
+            OutputFormat::Text => {
+                let board =
+                    render_board(&base, interval, &health, &metrics, &prev, &snap, fetch_err);
+                // T18: the board is composed of server-derived text —
+                // `/healthz` body, route labels from `/metrics`, and
+                // fetch-error messages. A malicious server could embed ANSI
+                // escapes that survive through `parse_metrics` /
+                // `render_board` and rewrite the operator's terminal.
+                // Sanitise the rendered board before emitting; the
+                // `CLEAR_AND_HOME` constant we prepend is the *only* escape
+                // sequence the dashboard is allowed to use, and it is added
+                // outside the sanitised payload below.
+                let board = super::sanitise_terminal_output(&board);
+                // cli fix 3: only emit the `\x1B[2J\x1B[H` clear-and-home
+                // escape when stdout is a TTY. Piped / redirected output (CI
+                // logs, `tee`, files) would otherwise capture the raw escape
+                // bytes and either render them as garbage or trip downstream
+                // parsers. In non-TTY mode we instead separate each board
+                // with a blank line so the stream stays readable.
+                if stdout.is_terminal() {
+                    print!("{CLEAR_AND_HOME}{board}");
+                } else {
+                    println!("\n{board}");
+                }
+            }
+            OutputFormat::Json => {
+                // NDJSON: one self-contained document per tick. No screen
+                // clear — downstream log pipelines / `jq` consume the stream
+                // line-by-line. `to_string` already strips control bytes via
+                // serde's JSON escaping, so no extra sanitisation is needed.
+                let doc =
+                    render_board_json(&base, interval, &health, &metrics, &prev, &snap, &fetch_err);
+                println!("{doc}");
+            }
         }
         // Flush so the terminal repaints before we sleep.
         use std::io::Write;
@@ -521,6 +544,132 @@ fn render_board(
     }
     s.push_str("Ctrl-C to exit.\n");
     s
+}
+
+/// Render the same data [`render_board`] shows as a machine-readable JSON
+/// document — one per tick when `--output json` is set. Pure modulo the
+/// snapshot inputs, mirroring `render_board` so the two views stay in sync.
+///
+/// Shape (stable for CI scripts):
+/// ```json
+/// {
+///   "target": "...", "interval_secs": 2,
+///   "liveness": "ok" | "bad" | "unreachable",
+///   "health_status": "ok" | "200" | "<word>" | null,
+///   "uptime_seconds": 125 | null,
+///   "functions": 3 | null, "jobs_active": 0 | null, "instances": 1 | null,
+///   "gpu_memory_bytes": 1073741824 | null,
+///   "endpoints": [ { "route", "req_per_s": <num|null>, "reset": <bool>,
+///                    "p50_seconds": <num|null>, "p95_seconds": <num|null> } ],
+///   "fetch_error": "..." | null
+/// }
+/// ```
+#[allow(clippy::too_many_arguments)]
+fn render_board_json(
+    addr: &str,
+    interval: Duration,
+    health: &Health,
+    metrics: &Metrics,
+    prev: &Snapshot,
+    cur: &Snapshot,
+    fetch_err: &Option<String>,
+) -> String {
+    let (liveness, health_status): (&str, serde_json::Value) = match health {
+        Health::Ok { body } => {
+            let status = match serde_json::from_str::<serde_json::Value>(body) {
+                Ok(v) => match v.get("status").and_then(|s| s.as_str()) {
+                    Some("ok") => serde_json::Value::String("ok".to_string()),
+                    Some(other) => serde_json::Value::String(other.to_string()),
+                    None => serde_json::Value::String("200".to_string()),
+                },
+                Err(_) => serde_json::Value::String("200".to_string()),
+            };
+            ("ok", status)
+        }
+        Health::Bad { status } => (
+            "bad",
+            serde_json::Value::String(format!("HTTP {status}")),
+        ),
+        Health::Unreachable { error } => (
+            "unreachable",
+            serde_json::Value::String(error.clone()),
+        ),
+    };
+
+    let uptime = match health {
+        Health::Ok { body } => parse_uptime_seconds(body),
+        _ => None,
+    };
+
+    let gpu_memory_bytes: Option<f64> =
+        if let Some(series) = metrics.get("tenant_gpu_memory_bytes") {
+            Some(series.iter().map(|s| s.value).sum())
+        } else {
+            scalar(metrics, "tensor_wasm_gpu_memory_used_bytes")
+        };
+
+    let dt_secs = match (prev.taken_at, cur.taken_at) {
+        (Some(a), Some(b)) => (b - a).as_secs_f64().max(0.0),
+        _ => 0.0,
+    };
+    let mut routes: Vec<String> = cur.http_requests.keys().cloned().collect();
+    routes.sort();
+    let endpoints: Vec<serde_json::Value> = routes
+        .into_iter()
+        .map(|route| {
+            let cur_v = cur.http_requests.get(&route).copied().unwrap_or(0.0);
+            let prev_v = prev.http_requests.get(&route).copied().unwrap_or(0.0);
+            let (req_per_s, reset) = if dt_secs <= 0.0 {
+                (serde_json::Value::Null, false)
+            } else if cur_v < prev_v {
+                (serde_json::Value::Null, true)
+            } else {
+                (json_num((cur_v - prev_v) / dt_secs), false)
+            };
+            let p50 = histogram_quantile(
+                metrics,
+                "tensor_wasm_http_request_duration_seconds",
+                &route,
+                0.5,
+            );
+            let p95 = histogram_quantile(
+                metrics,
+                "tensor_wasm_http_request_duration_seconds",
+                &route,
+                0.95,
+            );
+            serde_json::json!({
+                "route": route,
+                "req_per_s": req_per_s,
+                "reset": reset,
+                "p50_seconds": p50.and_then(serde_json::Number::from_f64).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
+                "p95_seconds": p95.and_then(serde_json::Number::from_f64).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+
+    let doc = serde_json::json!({
+        "target": addr,
+        "interval_secs": interval.as_secs(),
+        "liveness": liveness,
+        "health_status": health_status,
+        "uptime_seconds": uptime,
+        "functions": scalar(metrics, "tensor_wasm_functions_total").map(|v| v as u64),
+        "jobs_active": scalar(metrics, "tensor_wasm_jobs_active").map(|v| v as u64),
+        "instances": scalar(metrics, "tensor_wasm_active_instances").map(|v| v as u64),
+        "gpu_memory_bytes": gpu_memory_bytes.map(|v| v as u64),
+        "endpoints": endpoints,
+        "fetch_error": fetch_err,
+    });
+    doc.to_string()
+}
+
+/// Wrap an `f64` into a JSON value, falling back to `null` for non-finite
+/// values that `serde_json::Number` cannot represent.
+fn json_num(v: f64) -> serde_json::Value {
+    serde_json::Number::from_f64(v)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// Look up a single-sample series (typical gauge or label-less counter) and
@@ -906,6 +1055,55 @@ tensor_wasm_gpu_memory_used_bytes 1073741824
         // exact elapsed used in fmt_rate.
         assert!(board.contains("/invoke"), "got: {board}");
         assert!(board.contains("req/s"), "got: {board}");
+    }
+
+    #[test]
+    fn render_board_json_is_valid_and_carries_fields() {
+        let metrics = parse_metrics(SAMPLE_BODY);
+        let now = Instant::now();
+        let snap = Snapshot::from_metrics(&metrics, now);
+        let doc = render_board_json(
+            "http://localhost:8080",
+            Duration::from_secs(2),
+            &Health::Ok {
+                body: r#"{"status":"ok","uptime_seconds":125}"#.to_string(),
+            },
+            &metrics,
+            &Snapshot::default(),
+            &snap,
+            &None,
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&doc).expect("observe --output json must be valid JSON");
+        assert_eq!(v["target"], "http://localhost:8080");
+        assert_eq!(v["interval_secs"], 2);
+        assert_eq!(v["liveness"], "ok");
+        assert_eq!(v["health_status"], "ok");
+        assert_eq!(v["uptime_seconds"], 125);
+        assert_eq!(v["instances"], 3);
+        assert_eq!(v["gpu_memory_bytes"], 1073741824u64);
+        // Endpoints come from the SAMPLE_BODY http_requests series.
+        assert!(v["endpoints"].is_array());
+        assert!(v["fetch_error"].is_null());
+    }
+
+    #[test]
+    fn render_board_json_reports_unreachable() {
+        let doc = render_board_json(
+            "http://x",
+            Duration::from_secs(2),
+            &Health::Unreachable {
+                error: "connection refused".to_string(),
+            },
+            &Metrics::new(),
+            &Snapshot::default(),
+            &Snapshot::default(),
+            &Some("connection refused".to_string()),
+        );
+        let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(v["liveness"], "unreachable");
+        assert_eq!(v["fetch_error"], "connection refused");
+        assert!(v["functions"].is_null());
     }
 
     #[test]

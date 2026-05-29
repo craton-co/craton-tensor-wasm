@@ -49,14 +49,19 @@
 //!   should set this to the proxy's IP(s); operators not running an
 //!   XFCC-stripping proxy should leave it unset. See
 //!   [`audit::TrustedProxies`].
-//! * **Snapshot HMAC key (forward-looking).** When
+//! * **Snapshot HMAC key.** When
 //!   `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` is set (64-char hex, 32 bytes)
-//!   the future `/snapshot/save` and `/snapshot/restore` routes will
-//!   HMAC-SHA256 sign on save and verify on restore. Set
-//!   `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE=true` to additionally
-//!   reject unsigned v2 blobs. The routes themselves are not yet wired
-//!   (see [`config`] for the schema and `crates/tensor-wasm-cli/src/cmd/snapshot.rs`
-//!   for the matching CLI shim that returns `FEATURE_NOT_EXPOSED` today).
+//!   the `/snapshot/save` route HMAC-SHA256-signs the snapshot blob it
+//!   returns and `/snapshot/restore` verifies the signature (always
+//!   requiring a signature on restore). Set
+//!   `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE=true` for the matching
+//!   strict-restore posture. The routes are wired into the protected
+//!   stack (bearer auth + tenant scope + per-tenant ownership) by
+//!   [`build_router`](server::build_router), which reads the key via
+//!   [`AppConfig::from_env`](config::AppConfig::from_env); when the key is
+//!   unset both routes return `503 snapshot_signing_not_configured`. See
+//!   [`routes::snapshot_save`] / [`routes::snapshot_restore`] and
+//!   [`config`] for the schema.
 //! * **HTTP request metrics.** A tower middleware emits
 //!   `tensor_wasm_http_requests_total`,
 //!   `tensor_wasm_http_request_duration_seconds`, and
@@ -113,7 +118,10 @@ pub use openai_translator::{
 pub use rate_limit::{
     AuthContext, PerTenantRateLimitConfig, RateLimitConfig, RateLimiter, TokenId,
 };
-pub use routes::{ApiError, AppState, FunctionRecord, JobRecord, JobStatus};
+pub use routes::{
+    snapshot_restore, snapshot_save, ApiError, AppState, FunctionRecord, JobRecord, JobStatus,
+    SnapshotRestoreRequest, SnapshotRestoreResponse, SnapshotSaveRequest, SnapshotSaveResponse,
+};
 pub use server::{
     build_router, build_router_with_audit, build_router_with_config, build_router_with_full_config,
     build_router_with_kernel_publish_tokens, build_router_with_trusted_proxies, serve,

@@ -31,6 +31,15 @@ cust = { workspace = true, optional = true }
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 subtle = { version = "2", optional = true }
+# Ed25519 asymmetric snapshot signing (v3 wire format, signature_kind = 2).
+# A publisher signs with a private `SigningKey`; many verifiers hold only the
+# public `VerifyingKey` (HMAC, by contrast, requires sharing the symmetric
+# secret with every verifier). Default features include the `rand_core`
+# integration used to generate signing keys in tests. Gated behind
+# `signed-snapshots` alongside `hmac`/`sha2` so the no-feature build keeps its
+# current dependency surface. dalek performs its own (effectively
+# constant-time) verification internally.
+ed25519-dalek = { version = "2", optional = true }
 # Best-effort scrub of the in-memory HMAC key on drop. Wraps the 32-byte key
 # field in `zeroize::Zeroizing` so swap-backed memory is overwritten when
 # the writer/reader is dropped. Gated behind `signed-snapshots` since
@@ -74,7 +83,7 @@ cuda = ["dep:cust"]
 # When enabled (the default), `SnapshotWriter::with_hmac_sha256_key` and
 # `SnapshotReader::with_hmac_sha256_key` become available; without it the
 # writer/reader continue to handle only the unsigned v2 wire format.
-signed-snapshots = ["dep:hmac", "dep:sha2", "dep:subtle", "dep:zeroize"]
+signed-snapshots = ["dep:hmac", "dep:sha2", "dep:subtle", "dep:zeroize", "dep:ed25519-dalek"]
 # Artifact-store backing for snapshots (T40, now the default in v0.4).
 # When enabled the writer's default `capture` path routes through the
 # unified `tensor-wasm-artifacts` envelope (BLAKE3 content-hash + zstd +

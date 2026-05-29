@@ -39,6 +39,11 @@ zeroize = { workspace = true }
 # In-memory store uses a parking_lot Mutex for its entries map. Matches
 # the JIT cache's choice.
 parking_lot = { workspace = true }
+# `ArtifactMetadata` sidecar: a serde-encoded record stored alongside the
+# blob so `list`-based auditing has creation time / original length / source
+# tier to work with. (Re-added — they were dropped earlier when unused.)
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -29,32 +29,32 @@
 //! (per the OpenAI contract). A YAML config file alternative is deferred
 //! to v0.5.
 //!
-//! ## Prompt → guest argv
+//! ## Prompt → guest input channel (pull model)
 //!
 //! The translator returns a [`TranslatedRequest`] carrying the resolved
 //! function id, the assembled prompt text, the prompt's byte length
 //! (`prompt_len_hint`), and an `args` vector.
 //!
-//! **Executor input-channel constraint (why the prompt cannot reach the
-//! guest yet).** The shared
-//! [`tensor_wasm_exec::executor::TensorWasmExecutor`] accepts input only
-//! as a slice of numeric [`WasmArg`] values (`i32`/`i64`/`f32`/`f64` —
-//! the four core wasm value types; see
-//! [`tensor_wasm_exec::executor::WasmArg`]). There is **no string / bytes
-//! arg variant, no stdin, and no WASI argv**, and the
+//! **How the prompt reaches the guest.** The handler in `openai.rs`
+//! stages the assembled `prompt` bytes on
+//! [`SpawnConfig::input`](tensor_wasm_exec::executor::SpawnConfig::input)
+//! at spawn time. The shared
+//! [`tensor_wasm_exec::executor::TensorWasmExecutor`] installs those
+//! bytes on the per-instance host state and wires the `wasi:tensor/host`
+//! pull-model input channel — `input-len() -> u32` and `read-input(ptr,
+//! len) -> s32` — so the guest copies the prompt into its own linear
+//! memory at the start of the invocation (size the buffer from
+//! `input-len()`, then drain it with `read-input`). This is the input
+//! counterpart to the output-only
 //! [`StreamingContext`](tensor_wasm_wasi_gpu::streaming::StreamingContext)
-//! is output-only (guest → host emit channel). The prompt *bytes*
-//! therefore have no channel into the guest through the current
-//! executor; the host-pre-fills-guest-memory plumbing that would carry
-//! them lives in `tensor-wasm-exec` and is a future revision.
+//! `emit-chunk` channel.
 //!
-//! Given that, the translator does **not** silently pretend the prompt
-//! was delivered. Two things happen instead:
+//! Note this is a *bytes* channel, distinct from the numeric
+//! [`WasmArg`](tensor_wasm_exec::executor::WasmArg) call args:
 //!
 //! * The assembled prompt and its byte length are preserved on
-//!   [`TranslatedRequest`] (`prompt` / `prompt_len_hint`) so the handler
-//!   in `openai.rs` can log / surface them and a follow-up revision can
-//!   thread them once the input channel exists.
+//!   [`TranslatedRequest`] (`prompt` / `prompt_len_hint`); the handler
+//!   moves `prompt` into `SpawnConfig::input` so the guest can pull it.
 //! * [`TranslatedRequest::args`] is left **empty**, deliberately, and
 //!   for a load-bearing reason: the executor's `call_export_with_args`
 //!   uses wasmtime's *dynamic* `Func::call_async` path for any non-empty
@@ -65,16 +65,16 @@
 //!   off-the-shelf guest. The empty-args path takes the typed
 //!   `func.typed::<(), ()>()` fast path that those guests rely on —
 //!   identical to how `routes.rs`'s `/invoke` runs an argument-less body.
-//!   So lowering `prompt_len_hint` into `args` is *not* a safe no-op; it
-//!   is an active regression, and we do not do it.
+//!   The prompt travels through the `wasi:tensor/host` input channel
+//!   instead of the numeric argv, so lowering it into `args` is neither
+//!   needed nor safe.
 //!
-//! The net honest position for v0.4: the prompt does not yet reach the
-//! guest, this is an executor limitation rather than a translator bug,
-//! and the handler emits a one-shot warning
-//! ([`crate::openai`]) when a non-empty prompt is dropped so operators
-//! are not misled. v0.4 guests generate their response via the T34
+//! A guest that does not import `read-input` still runs argument-less and
+//! produces its response via the
 //! `wasi:tensor/host.emit-chunk` host function; the handler drains the
 //! receiver and surfaces the emitted bytes as the completion text.
+//! Staging input is therefore non-breaking for such guests — the
+//! staged bytes simply go unread.
 //!
 //! ## Unsupported sampling knobs
 //!
@@ -203,31 +203,33 @@ pub fn model_map_from_env() -> ModelMap {
 /// fully-assembled prompt text, and the synthetic [`WasmArg`] vector to
 /// pass into `call_export_with_args`.
 ///
-/// **v0.4 args policy:** the `args` vector is empty, deliberately. The
+/// **args policy:** the `args` vector is empty, deliberately. The
 /// standard WASI command export is `_start () -> ()`, and the executor's
 /// `call_export_with_args` switches to wasmtime's dynamic call path for
 /// any non-empty arg slice — which validates param arity against the
 /// export signature exactly and would reject a `()`-arity guest handed
-/// an argument. The prompt bytes also have no input channel into the
-/// guest today (numeric args only; no stdin / argv / input stream). So
-/// the prompt is preserved on `prompt` / `prompt_len_hint` for the
-/// handler to surface, but is **not** lowered into `args`. See the
-/// module-level "Prompt → guest argv" section for the full rationale.
-/// v0.4 guests stream their reply via `wasi:tensor/host.emit-chunk`
-/// (T34) — the host buffers / forwards every emitted chunk.
+/// an argument. The prompt is a *bytes* payload, not a numeric arg, so
+/// it travels through the `wasi:tensor/host` pull-model input channel
+/// (`input-len` / `read-input`) rather than `args`: the handler moves
+/// `prompt` into
+/// [`SpawnConfig::input`](tensor_wasm_exec::executor::SpawnConfig::input)
+/// at spawn time. See the module-level "Prompt → guest input channel"
+/// section for the full rationale. Guests stream their reply via
+/// `wasi:tensor/host.emit-chunk` — the host buffers / forwards every
+/// emitted chunk.
 #[derive(Debug, Clone)]
 pub struct TranslatedRequest {
     /// Resolved function id.
     pub function_id: Uuid,
     /// Fully-assembled prompt text (concatenated messages array for
-    /// `/v1/chat/completions`). Preserved for the handler to log /
-    /// surface; the executor has no channel to deliver it to the guest
-    /// in v0.4.
+    /// `/v1/chat/completions`). The handler stages these bytes on
+    /// [`SpawnConfig::input`](tensor_wasm_exec::executor::SpawnConfig::input)
+    /// so the guest can pull them via `wasi:tensor/host.read-input`.
     pub prompt: String,
     /// Byte length of the assembled prompt, clamped to `i32::MAX`.
-    /// Preserved so the handler can report how much prompt text was
-    /// dropped and a future revision can promote it once the
-    /// host-pre-fills-guest-memory plumbing lands.
+    /// Preserved as an observability hint (e.g. for tracing the staged
+    /// prompt size); the prompt itself is delivered to the guest via the
+    /// `wasi:tensor/host` input channel.
     pub prompt_len_hint: i32,
     /// Args to pass into the executor. Empty in v0.4 so the standard
     /// `_start () -> ()` guest links via the typed fast path; see the

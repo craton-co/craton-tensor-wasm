@@ -19,8 +19,8 @@ zstd(
         instance_id:               InstanceId(u128),
         created_unix_ms:           u64,
         total_uncompressed_bytes:  u64,
-        sequence_no:               u64,            // monotonic counter; 0 = unset (v0.3.x default)
-        nonce:                     Option<[u8;16]>, // bincode: 1-byte tag (0=None, 1=Some) then 16 bytes when Some
+        sequence_no:               u64,            // monotonic counter; 0 = unset. LIVE: written by SnapshotWriter::with_sequence_no, enforced by SnapshotReader::with_min_sequence_no.
+        nonce:                     Option<[u8;16]>, // bincode: 1-byte tag (0=None, 1=Some) then 16 bytes when Some. LIVE: written by SnapshotWriter::with_nonce, enforced by SnapshotReader::with_expected_nonce.
       },
       crc32:        u32,        // IEEE polynomial; covers wasm_memory ++
                                 //   gpu_memory ++ registers in that order
@@ -195,11 +195,13 @@ HMAC-SHA256 was chosen because:
 - The 32-byte output is the same size as a SHA-256 digest, so storage and
   network overhead are 37 bytes per snapshot (4-byte magic + 1-byte kind +
   32-byte signature) regardless of compressed size.
-- Symmetric authentication is sufficient for the threat model — operators
-  control both the writer and the reader. An asymmetric signature (e.g.
-  Ed25519) would let third parties verify snapshots, which is a non-goal
-  for v0.3.x. The `SignatureKind` enum is `#[non_exhaustive]` so a
-  future variant can be added without a wire-format break.
+- Symmetric authentication is sufficient when operators control both the
+  writer and the reader. When verifiers should *not* be trusted with signing
+  capability (many readers, single publisher), the asymmetric Ed25519 trailer
+  (`signature_kind = 2`, see "Ed25519 asymmetric signatures" above) is the
+  better fit: verifiers hold only the public key. The `SignatureKind` enum is
+  `#[non_exhaustive]`, which is what let Ed25519 be added without a
+  wire-format break.
 
 ### Defaults
 
@@ -219,8 +221,92 @@ plan.
 | `V3_TRAILER_MAGIC` | `b"S3T1"` (4 bytes) | `format.rs` |
 | `V3_TRAILER_MAGIC_LEN` | `4` | `format.rs` |
 | `SIGNATURE_KIND_HMAC_SHA256` | `1` | `format.rs` |
+| `SIGNATURE_KIND_ED25519` | `2` | `format.rs` |
 | `HMAC_SHA256_SIG_LEN` | `32` | `format.rs` |
-| `SIGNATURE_TRAILER_LEN` | `37` (= `V3_TRAILER_MAGIC_LEN + 1 + HMAC_SHA256_SIG_LEN`) | `format.rs` |
+| `ED25519_SIG_LEN` | `64` | `format.rs` |
+| `SIGNATURE_TRAILER_LEN` | `37` (HMAC; = `V3_TRAILER_MAGIC_LEN + 1 + HMAC_SHA256_SIG_LEN`) | `format.rs` |
+| `ED25519_TRAILER_LEN` | `69` (= `V3_TRAILER_MAGIC_LEN + 1 + ED25519_SIG_LEN`) | `format.rs` |
+
+## Ed25519 asymmetric signatures (`signature_kind = 2`)
+
+The v3 envelope also supports an **asymmetric** trailer. It reuses the same
+`V3_TRAILER_MAGIC` and inner `version = 3` as the HMAC trailer; only the
+`signature_kind` byte (`2`) and the signature length (64 bytes) differ:
+
+```
++----------------------------------------------------------+
+| zstd(bincode(Snapshot { version = 3, ... }))             |  <- end of zstd frame
++----------------------------------------------------------+
+| trailer_magic:  [u8; 4] = V3_TRAILER_MAGIC = b"S3T1"     |
+| signature_kind: u8      = SIGNATURE_KIND_ED25519 (2)     |
+| signature:      [u8; 64] -- Ed25519 (RFC 8032) signature |
++----------------------------------------------------------+
+```
+
+### Signed message
+
+```
+Ed25519-sign(signing_key, prefix_bytes || V3_TRAILER_MAGIC || [signature_kind = 2])
+```
+
+— byte-identical in *shape* to the HMAC input, so the prefix (the entire
+v2-shaped zstd frame), the trailer magic, and the kind byte are all
+authenticated. Because the kind byte is signed, an attacker cannot rewrite
+it to `1` (HMAC) to attempt a cross-scheme downgrade without invalidating the
+signature; the reader's classifier additionally refuses a trailer whose kind
+byte is inconsistent with the trailer length it was detected at.
+
+### Why asymmetric
+
+HMAC is symmetric: every verifier must hold the same secret, which can also
+**forge** snapshots. Ed25519 lets a single publisher hold the private
+`ed25519_dalek::SigningKey` while arbitrarily many verifiers hold only the
+public `ed25519_dalek::VerifyingKey` — a compromised verifier cannot mint new
+snapshots. Configure via `SnapshotWriter::with_ed25519_signing_key(signing_key)`
+on the write side and `SnapshotReader::with_ed25519_verifying_key(verifying_key)`
+on the read side. If both an Ed25519 key and an HMAC key are configured on a
+writer, the Ed25519 trailer takes precedence (the writer never double-signs).
+
+### Reader detection of variable-length trailers
+
+The trailer detector probes both candidate lengths — 69 (Ed25519) then 37
+(HMAC) — and accepts the first whose 4-byte magic *and* immediately-following
+kind byte are self-consistent with the probed length. This disambiguates the
+two trailer sizes while keeping the ~1/2^32 magic false-positive guarantee.
+An HMAC blob is never emitted through the v0.4 artifact envelope when an
+Ed25519 key is configured; the writer routes Ed25519 captures through the
+inline (legacy) v3 envelope because the artifact envelope authenticates with
+HMAC only.
+
+## Replay protection (LANDED) — `sequence_no` and `nonce`
+
+The `SnapshotMetadata::sequence_no` (`u64`) and `nonce` (`Option<[u8; 16]>`)
+fields are now **live** (previously reserved-but-inert):
+
+- **Writer** — `SnapshotWriter::with_sequence_no(n)` and
+  `SnapshotWriter::with_nonce(bytes)` populate the fields. Defaults remain
+  `0` / `None` (the v0.3.x "unset" semantics) for writers that do not opt in.
+- **Reader** — `SnapshotReader::with_min_sequence_no(floor)` rejects any blob
+  whose `sequence_no < floor`; `SnapshotReader::with_expected_nonce(bytes)`
+  rejects any blob whose `nonce != Some(bytes)` (including a `None` nonce).
+  Both checks are opt-in and run **after** authentication and the structural
+  checks, so for a v3 blob the signature has already certified both fields —
+  an attacker cannot rewrite them to slip past the checks without re-signing.
+
+### Operator pattern: per-key highest-seen sequence_no
+
+Track a persistent `last_seen` sequence number **per signing key**. On
+restore, construct the reader with `with_min_sequence_no(last_seen)` (or
+`last_seen + 1` to forbid replays of the exact last value), and after a
+successful restore update `last_seen = max(last_seen, restored.metadata.sequence_no)`.
+A replayed older capture then carries a `sequence_no` below the floor and is
+rejected — closing the rollback window that timestamp freshness
+(`with_max_age`) alone cannot: an attacker who replays a once-valid capture
+inside the `max_age` window still trips the sequence floor.
+
+Rejections surface as `TensorWasmError::Serialization` with a distinct,
+greppable message per check (`"snapshot sequence_no ... below floor ..."`,
+`"snapshot nonce mismatch ..."`, `"snapshot nonce missing ..."`).
 
 ## Platform
 

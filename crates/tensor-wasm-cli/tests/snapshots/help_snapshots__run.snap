@@ -27,5 +27,11 @@ Options:
           
           Example: `--args '[1.0, 2.0]'`. The current executor only invokes `() -> ()` exports, so the array is parsed and validated but the values are not yet wired into the call site.
 
+      --ca-cert <PATH>
+          Trust an additional PEM-encoded private CA root for HTTPS (added alongside the system trust store, not instead of it). Use this for a server fronted by an internal/self-signed CA instead of `--insecure`. The file must be PEM, not DER
+
+      --insecure
+          SECURITY HAZARD: disable TLS certificate verification for outbound HTTPS, exposing the connection to man-in-the-middle attacks and possible theft of the TENSOR_WASM_TOKEN credential. For local dev against a throwaway cert only; prefer --ca-cert. Warns on every run
+
   -h, --help
           Print help (see a summary with '-h')

@@ -8,6 +8,7 @@
 //! into these modules; tests in `tests/cli_smoke.rs` exercise them through the
 //! built binary.
 
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -25,6 +26,22 @@ pub mod observe;
 pub mod run;
 pub mod serve;
 pub mod snapshot;
+
+/// Output rendering mode for the read-oriented subcommands (`bench`,
+/// `metrics`, `observe`). `Text` is the human-readable default; `Json`
+/// emits a machine-readable `serde_json` document of the same data so the
+/// CLI is scriptable in CI perf gates.
+///
+/// Exposed via `clap`'s `ValueEnum` so each command can take a
+/// `--output {text|json}` flag with consistent spelling and help text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// Human-readable tables / dashboard (the default).
+    #[default]
+    Text,
+    /// Machine-readable JSON document for scripting / CI perf gates.
+    Json,
+}
 
 /// Environment variable read by [`HttpContext::from_env`] to obtain a bearer
 /// token for outbound API requests. See `docs/CLI.md` for the operator guide.
@@ -58,17 +75,48 @@ pub struct HttpContext {
     token: Option<String>,
     /// Tenant id; `0` means "do not attach the header".
     tenant: u64,
+    /// TLS knobs threaded from the global CLI flags (`--ca-cert`,
+    /// `--insecure`). Applied in [`Self::build_client`].
+    tls: TlsOptions,
+}
+
+/// TLS configuration for the outbound HTTP client, threaded from the global
+/// `--ca-cert` / `--insecure` CLI flags into [`HttpContext::build_client`].
+///
+/// rustls is the backend (see the `reqwest` features in `Cargo.toml`); these
+/// knobs adjust the trust anchors and verification policy on top of it.
+///
+/// `#[doc(hidden)]` + `pub` so integration tests can construct it, but it is
+/// NOT stable public API.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct TlsOptions {
+    /// Path to a PEM-encoded private CA root to add to the trust store, if any.
+    pub ca_cert: Option<PathBuf>,
+    /// When `true`, disable TLS certificate verification entirely
+    /// (`danger_accept_invalid_certs`). DANGEROUS — see the flag help text.
+    pub insecure: bool,
 }
 
 impl HttpContext {
     /// Build a context from the supplied `--tenant` value and the process
     /// environment. Missing / empty `TENSOR_WASM_TOKEN` is treated as "no auth".
+    ///
+    /// TLS defaults to the system trust store with verification enabled; use
+    /// [`Self::from_env_with_tls`] to thread the `--ca-cert` / `--insecure`
+    /// flags through.
     pub fn from_env(tenant: u64) -> Self {
+        Self::from_env_with_tls(tenant, TlsOptions::default())
+    }
+
+    /// Build a context from the environment plus explicit TLS options parsed
+    /// from the global CLI flags. This is the constructor `main` uses.
+    pub fn from_env_with_tls(tenant: u64, tls: TlsOptions) -> Self {
         let token = std::env::var(TENSOR_WASM_TOKEN_ENV)
             .ok()
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
-        Self { token, tenant }
+        Self { token, tenant, tls }
     }
 
     /// Test-only constructor that bypasses the process environment so
@@ -80,6 +128,7 @@ impl HttpContext {
         Self {
             token: Some(token.into()),
             tenant,
+            tls: TlsOptions::default(),
         }
     }
 
@@ -88,18 +137,68 @@ impl HttpContext {
     /// "no token configured" branch deterministically.
     #[doc(hidden)]
     pub fn from_env_for_test_with_token_optional(token: Option<String>, tenant: u64) -> Self {
-        Self { token, tenant }
+        Self {
+            token,
+            tenant,
+            tls: TlsOptions::default(),
+        }
+    }
+
+    /// Test-only constructor that lets a test pin the TLS options directly so
+    /// the `--ca-cert` / `--insecure` plumbing can be exercised through the
+    /// lib surface without spawning the binary.
+    #[doc(hidden)]
+    pub fn from_env_for_test_with_tls(tenant: u64, tls: TlsOptions) -> Self {
+        Self {
+            token: None,
+            tenant,
+            tls,
+        }
     }
 
     /// Construct a [`reqwest::Client`] with the supplied request timeout. The
     /// per-request headers (auth, tenant) are applied per-call via
     /// [`Self::apply`] rather than baked into the client so each subcommand
     /// can still override the timeout cheaply.
+    ///
+    /// TLS policy comes from [`TlsOptions`]:
+    ///   * `--ca-cert <PATH>` adds a PEM-encoded private CA root to the trust
+    ///     store via [`reqwest::Certificate::from_pem`] +
+    ///     `add_root_certificate`. The system roots remain trusted alongside it.
+    ///   * `--insecure` disables certificate verification entirely
+    ///     (`danger_accept_invalid_certs`). When set, a LOUD `tracing::warn!`
+    ///     fires on every invocation so an operator cannot leave it on by
+    ///     accident without a trail in their logs.
     pub(crate) fn build_client(&self, timeout: Duration) -> Result<reqwest::Client> {
-        reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .context("building HTTP client")
+        let mut builder = reqwest::Client::builder().timeout(timeout);
+
+        if let Some(path) = &self.tls.ca_cert {
+            let pem = std::fs::read(path)
+                .with_context(|| format!("reading --ca-cert file {}", path.display()))?;
+            let cert = reqwest::Certificate::from_pem(&pem).with_context(|| {
+                format!(
+                    "parsing --ca-cert {} as a PEM-encoded certificate",
+                    path.display()
+                )
+            })?;
+            builder = builder.add_root_certificate(cert);
+        }
+
+        if self.tls.insecure {
+            // Fire on EVERY invocation (not warn-once) — disabling TLS
+            // verification is a standing security hazard and the operator
+            // should see the reminder each time, not just the first run in a
+            // long-lived process.
+            tracing::warn!(
+                "TLS certificate verification is DISABLED (--insecure); the \
+                 connection is vulnerable to man-in-the-middle attacks. Never \
+                 use --insecure against a production endpoint or with a real \
+                 TENSOR_WASM_TOKEN."
+            );
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        builder.build().context("building HTTP client")
     }
 
     /// Attach `Authorization` and `X-TensorWasm-Tenant` headers to a request builder
@@ -612,6 +711,7 @@ mod tests {
         let ctx = HttpContext {
             token: Some("abc".to_string()),
             tenant: 0,
+            tls: TlsOptions::default(),
         };
         // Build an off-stack RequestBuilder so we can inspect headers.
         // Use https:// so this test doesn't trip the plaintext-token warn-once
@@ -628,6 +728,7 @@ mod tests {
         let ctx = HttpContext {
             token: None,
             tenant: 7,
+            tls: TlsOptions::default(),
         };
         let client = reqwest::Client::new();
         let req = ctx.apply(client.get("https://x")).build().unwrap();
@@ -640,6 +741,7 @@ mod tests {
         let ctx = HttpContext {
             token: None,
             tenant: 0,
+            tls: TlsOptions::default(),
         };
         let client = reqwest::Client::new();
         let req = ctx.apply(client.get("https://x")).build().unwrap();
@@ -719,6 +821,75 @@ mod tests {
         // tables and is not one of the three whitespace exceptions, so
         // it must be replaced with `?`.
         assert_eq!(sanitise_terminal_output("a\x7Fb"), "a?b");
+    }
+
+    #[test]
+    fn build_client_succeeds_with_default_tls() {
+        let ctx = HttpContext::from_env_for_test_with_tls(0, TlsOptions::default());
+        assert!(ctx.build_client(Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn build_client_insecure_builds_ok() {
+        // `--insecure` must produce a usable client (verification disabled).
+        // We can't easily observe `danger_accept_invalid_certs` on the built
+        // client, but the build must succeed and not panic. The warn-every-
+        // invocation contract is exercised through the binary in
+        // `tests/cli_smoke.rs`.
+        let ctx = HttpContext::from_env_for_test_with_tls(
+            0,
+            TlsOptions {
+                ca_cert: None,
+                insecure: true,
+            },
+        );
+        assert!(ctx.build_client(Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn build_client_ca_cert_missing_path_errors_cleanly() {
+        // A `--ca-cert` pointing at a non-existent file must surface a clear
+        // error (mentioning the path) rather than panicking or silently
+        // falling back to the system trust store.
+        let ctx = HttpContext::from_env_for_test_with_tls(
+            0,
+            TlsOptions {
+                ca_cert: Some(PathBuf::from("definitely_not_a_ca_cert_42.pem")),
+                insecure: false,
+            },
+        );
+        let err = ctx
+            .build_client(Duration::from_secs(5))
+            .expect_err("missing CA cert path must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--ca-cert"),
+            "error should mention the flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_client_ca_cert_bad_pem_errors_cleanly() {
+        // A file that exists but is not a valid PEM certificate must fail at
+        // `Certificate::from_pem` with a clear, path-tagged error.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("not-a-cert.pem");
+        std::fs::write(&bad, b"this is not a certificate").unwrap();
+        let ctx = HttpContext::from_env_for_test_with_tls(
+            0,
+            TlsOptions {
+                ca_cert: Some(bad),
+                insecure: false,
+            },
+        );
+        let err = ctx
+            .build_client(Duration::from_secs(5))
+            .expect_err("invalid PEM must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("PEM") || msg.contains("--ca-cert"),
+            "error should explain the PEM parse failure: {msg}"
+        );
     }
 
     #[test]

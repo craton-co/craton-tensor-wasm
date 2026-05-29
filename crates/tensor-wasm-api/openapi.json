@@ -44,8 +44,16 @@
       "description": "Operator-facing endpoints (health, metrics)"
     },
     {
+      "name": "kernels",
+      "description": "Kernel registry (roadmap feature #3, B6.4). The routes under this\ntag are only mounted when the gateway binary is built with\n`--features kernel-registry-api`; on the default build they are\nabsent and a request to them 404s at the router. When the feature\nis on but `TENSOR_WASM_API_KERNEL_HMAC_KEY` is unset the handlers\nreturn `503 kernel_registry_not_configured`. See\ncrates/tensor-wasm-api/src/kernels.rs and\ndocs/KERNEL-REGISTRY.md.\n"
+    },
+    {
       "name": "openai-compat",
       "description": "OpenAI-compatible inference gateway (T41, v0.4). The two routes\nunder this tag accept the public OpenAI REST request shapes so\noff-the-shelf SDKs (Python `openai`, Node `openai`, LangChain,\nLlamaIndex, ...) can target the gateway URL without modification.\nThe handlers resolve the request's `model` field against an\nenv-configured `model -> function_uuid` map\n(`TENSOR_WASM_API_OPENAI_MODEL_MAP`) and dispatch through the\nshared executor. See `docs/OPENAI-COMPAT.md` for the wire\ncontract and the operator configuration knob.\n"
+    },
+    {
+      "name": "snapshot",
+      "description": "Snapshot save / restore (M5). `/snapshot/save` captures a deployed\nfunction into an HMAC-SHA256-signed snapshot blob and returns it;\n`/snapshot/restore` verifies the signature and decodes the\nblob's provenance. Both routes consume the operator-configured\n`TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`; when it is unset they return\n`503 snapshot_signing_not_configured`. The routes sit on the\nprotected stack (bearer auth + per-tenant scope + per-tenant\nownership). See crates/tensor-wasm-api/src/routes.rs and\ncrates/tensor-wasm-api/src/config.rs.\n"
     }
   ],
   "paths": {
@@ -636,6 +644,378 @@
           }
         }
       }
+    },
+    "/snapshot/save": {
+      "post": {
+        "tags": [
+          "snapshot"
+        ],
+        "summary": "Capture a deployed function into a signed snapshot blob",
+        "description": "Captures the deployed Wasm module bytes of the named function into\na zstd-compressed, HMAC-SHA256-signed snapshot blob and returns it\nbase64-encoded. The blob round-trips through `POST\n/snapshot/restore`.\n\nAuthorization: protected stack (bearer auth + tenant scope). The\nhandler runs `authorize_tenant` against the bearer token's scope\n(an out-of-scope token gets `403 tenant_scope_denied` before any\nlookup) and then a per-resource owner check against the function's\n`tenant_id` (a wildcard-scoped caller from another tenant cannot\nsnapshot tenant A's function).\n\nSigning uses `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`; when it is unset\nthe route returns `503 snapshot_signing_not_configured` rather than\nemitting an unsigned blob.\n\nNOTE: this captures the function's *deployed module bytes* — the\nworking save/restore-of-bytes layer with end-to-end HMAC signing.\nCapturing a *live running instance's* linear / GPU memory needs an\nexecutor capture hook that does not exist yet; requesting that\ncapability surfaces `501 not_implemented`. See\ncrates/tensor-wasm-api/src/routes.rs.\n",
+        "operationId": "snapshotSave",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SnapshotSaveRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Snapshot captured and signed; blob returned base64.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-Trace-Id": {
+                "$ref": "#/components/headers/XTraceId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotSaveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "503": {
+            "$ref": "#/components/responses/SnapshotSigningUnavailable"
+          }
+        }
+      }
+    },
+    "/snapshot/restore": {
+      "post": {
+        "tags": [
+          "snapshot"
+        ],
+        "summary": "Verify and decode a signed snapshot blob",
+        "description": "Accepts a base64-encoded snapshot blob previously produced by\n`POST /snapshot/save`, verifies its HMAC-SHA256 signature against\n`TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`, and returns the\nHMAC-authenticated provenance (captured tenant, instance id,\nuncompressed size, wire version).\n\nHardening: the reader always requires a signature\n(`require_signature`) so a stripped-trailer downgrade to an\nunsigned v2 blob is refused;\n`TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE` is the operator\nsurface for this posture. A 256 MiB decompression cap bounds\nrestore-time memory pressure.\n\nAuthorization: protected stack (bearer auth + tenant scope). After\nHMAC verification recovers the snapshot's captured tenant, the\nhandler enforces that it equals the caller's resolved tenant — a\ncross-tenant restore is `403 tenant_scope_denied`. A wrong /\nmissing key or a tampered blob is `403 snapshot_signature_invalid`\n(a single opaque rejection, not a decode oracle).\n\nNOTE: this verifies and decodes the snapshot *envelope*.\nReconstituting a *live running instance* from the captured memory\nneeds an executor restore hook that does not exist yet; requesting\nthat capability surfaces `501 not_implemented`.\n",
+        "operationId": "snapshotRestore",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SnapshotRestoreRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Snapshot signature verified; provenance returned.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-Trace-Id": {
+                "$ref": "#/components/headers/XTraceId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotRestoreResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_json` (malformed request body) or `invalid_base64`\n(the `snapshot_b64` field is not valid base64). Carries the\nnative `{error:{kind,message}}` envelope.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "`tenant_scope_denied` (the bearer token is not scoped to the\nrequested tenant, or the snapshot was captured for a different\ntenant) or `snapshot_signature_invalid` (HMAC verification\nfailed, the blob is unsigned, or it is malformed). Carries the\nnative `{error:{kind,message}}` envelope.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "503": {
+            "$ref": "#/components/responses/SnapshotSigningUnavailable"
+          }
+        }
+      }
+    },
+    "/kernels": {
+      "post": {
+        "tags": [
+          "kernels"
+        ],
+        "summary": "Publish a signed kernel manifest + PTX text",
+        "description": "FEATURE-GATED: this route is only mounted when the gateway is\nbuilt with `--features kernel-registry-api`; the default build\ndoes not register it (request 404s at the router). When the\nfeature is on but `TENSOR_WASM_API_KERNEL_HMAC_KEY` is unset the\nhandler returns `503 kernel_registry_not_configured`.\n\nPublishes a signed `KernelManifest` plus its PTX source. The\nregistry re-verifies that `BLAKE3(ptx_text)` matches\n`manifest.digest` and that the manifest's HMAC-SHA256 signature\nverifies under the server's configured key before persisting.\n\nAuthorization is stricter than the other routes: in addition to\n`bearer_auth` + `tenant_scope`, the caller's bearer token must\nappear in the `TENSOR_WASM_API_KERNEL_PUBLISH_TOKENS` allowlist\n(the **kernel-publish** scope). Dev mode (empty\n`TENSOR_WASM_API_TOKENS`) rejects every publish with\n`403 kernel_publish_disabled_in_dev_mode`. See\ncrates/tensor-wasm-api/src/kernels.rs.\n",
+        "operationId": "publishKernel",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublishKernelRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Kernel published; canonical name/version echoed back.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-Trace-Id": {
+                "$ref": "#/components/headers/XTraceId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublishKernelResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`digest_mismatch` (BLAKE3 of `ptx_text` did not match\n`manifest.digest`) or `invalid_request` (other registry\nrejection). Carries the native `{error:{kind,message}}`\nenvelope.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "`kernel_publish_disabled_in_dev_mode` (gateway in dev mode),\n`kernel_publish_scope_required` (token not in\n`TENSOR_WASM_API_KERNEL_PUBLISH_TOKENS`), `bad_signature`\n(HMAC verification failed), or `publisher_not_allowed`\n(manifest publisher not in the registry allowlist).\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`already_registered` — a manifest with the same\n`name@version` is already present.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/KernelRegistryUnavailable"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "kernels"
+        ],
+        "summary": "List registered kernel manifests (PTX omitted)",
+        "description": "FEATURE-GATED: only mounted under `--features\nkernel-registry-api`. Returns `503\nkernel_registry_not_configured` when the feature is on but\n`TENSOR_WASM_API_KERNEL_HMAC_KEY` is unset.\n\nLists manifests in unspecified order; PTX text is omitted (use\n`GET /kernels/{name}/{version}` to fetch source). Any\nauthenticated tenant may list. `limit` is clamped to 1000\nserver-side; the response echoes the effective `offset` /\n`limit`.\n",
+        "operationId": "listKernels",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantHeader"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "description": "Index of the first manifest to return; defaults to 0.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum manifests in the returned page; defaults to 100,\nclamped to 1000 server-side.\n",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of manifests with the effective pagination echoed.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-Trace-Id": {
+                "$ref": "#/components/headers/XTraceId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListKernelsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/KernelRegistryUnavailable"
+          }
+        }
+      }
+    },
+    "/kernels/{name}/{version}": {
+      "get": {
+        "tags": [
+          "kernels"
+        ],
+        "summary": "Resolve a kernel manifest + PTX text",
+        "description": "FEATURE-GATED: only mounted under `--features\nkernel-registry-api`. Returns `503\nkernel_registry_not_configured` when the feature is on but\n`TENSOR_WASM_API_KERNEL_HMAC_KEY` is unset.\n\nResolves a single manifest plus its PTX source by\n`name`/`version`. Any authenticated tenant may resolve. Path\nsegments are accepted verbatim; clients must percent-encode any\nreserved characters in `name` or `version`.\n",
+        "operationId": "resolveKernel",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Kernel name segment.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "description": "Kernel version segment.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/TenantHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Resolved manifest and its PTX text.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-Trace-Id": {
+                "$ref": "#/components/headers/XTraceId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResolveKernelResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/KernelRegistryUnavailable"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -831,6 +1211,60 @@
             }
           }
         }
+      },
+      "KernelRegistryUnavailable": {
+        "description": "Kernel registry routes are mounted but the backing registry is\nnot configured: `TENSOR_WASM_API_KERNEL_HMAC_KEY` is unset, so\nthe handler returns `503 kernel_registry_not_configured`. (The\npublish path can also surface `kernel_registry_storage_error`\nhere on a backend I/O failure.)\n",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/XRequestId"
+          },
+          "X-Trace-Id": {
+            "$ref": "#/components/headers/XTraceId"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiErrorEnvelope"
+            }
+          }
+        }
+      },
+      "NotImplemented": {
+        "description": "`not_implemented` — the requested capability needs executor\nsupport that is not wired yet (full live-instance snapshot /\nrestore of linear + GPU memory). The HMAC envelope layer of the\n`/snapshot/*` routes is fully wired; only the live-instance\nreconstitution returns this. Clients should NOT retry.\n",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/XRequestId"
+          },
+          "X-Trace-Id": {
+            "$ref": "#/components/headers/XTraceId"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiErrorEnvelope"
+            }
+          }
+        }
+      },
+      "SnapshotSigningUnavailable": {
+        "description": "`snapshot_signing_not_configured` — the `/snapshot/*` routes are\nmounted but `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` is unset, so the\ngateway has no key to sign or verify snapshot blobs. The failure\nmode is configuration, not load; a client should NOT retry but\nsurface the error to an operator who can set the key.\n",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/XRequestId"
+          },
+          "X-Trace-Id": {
+            "$ref": "#/components/headers/XTraceId"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiErrorEnvelope"
+            }
+          }
+        }
       }
     },
     "schemas": {
@@ -1009,7 +1443,19 @@
               "rate_limited",
               "invoke_timeout",
               "wasmtime",
-              "internal"
+              "internal",
+              "kernel_registry_not_configured",
+              "kernel_registry_storage_error",
+              "kernel_publish_disabled_in_dev_mode",
+              "kernel_publish_scope_required",
+              "publisher_not_allowed",
+              "bad_signature",
+              "digest_mismatch",
+              "already_registered",
+              "invalid_request",
+              "not_implemented",
+              "snapshot_signing_not_configured",
+              "snapshot_signature_invalid"
             ]
           },
           "message": {
@@ -1032,6 +1478,232 @@
         },
         "required": [
           "error"
+        ],
+        "additionalProperties": false
+      },
+      "SnapshotSaveRequest": {
+        "type": "object",
+        "description": "Body of `POST /snapshot/save`. Mirrors the\n`tensor_wasm_api::routes::SnapshotSaveRequest` Rust struct.\n",
+        "properties": {
+          "function_id": {
+            "$ref": "#/components/schemas/FunctionId"
+          }
+        },
+        "required": [
+          "function_id"
+        ],
+        "additionalProperties": false
+      },
+      "SnapshotSaveResponse": {
+        "type": "object",
+        "description": "Body of a successful `POST /snapshot/save`. Carries the full\nHMAC-SHA256-signed snapshot blob, base64-encoded.\n",
+        "properties": {
+          "function_id": {
+            "$ref": "#/components/schemas/FunctionId"
+          },
+          "snapshot_b64": {
+            "type": "string",
+            "description": "Base64-encoded signed snapshot blob (standard alphabet,\npadded). The exact bytes to hand back to `POST\n/snapshot/restore`; the HMAC trailer is part of these bytes.\n"
+          },
+          "signed": {
+            "type": "boolean",
+            "description": "Whether the blob carries an HMAC signature. Always `true` on\nthis path — the route is only reachable with a key configured.\n"
+          }
+        },
+        "required": [
+          "function_id",
+          "snapshot_b64",
+          "signed"
+        ],
+        "additionalProperties": false
+      },
+      "SnapshotRestoreRequest": {
+        "type": "object",
+        "description": "Body of `POST /snapshot/restore`. Mirrors the\n`tensor_wasm_api::routes::SnapshotRestoreRequest` Rust struct.\n",
+        "properties": {
+          "snapshot_b64": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Base64-encoded signed snapshot blob (standard alphabet,\npadded) previously returned by `POST /snapshot/save`.\n"
+          }
+        },
+        "required": [
+          "snapshot_b64"
+        ],
+        "additionalProperties": false
+      },
+      "SnapshotRestoreResponse": {
+        "type": "object",
+        "description": "Body of a successful `POST /snapshot/restore`. Reports the\nHMAC-authenticated provenance recovered from the snapshot\nmetadata.\n",
+        "properties": {
+          "tenant_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Tenant the snapshot was originally captured for."
+          },
+          "instance_id": {
+            "type": "string",
+            "description": "Instance id stamped into the snapshot metadata at capture\ntime, rendered as the `I#<n>` display form.\n"
+          },
+          "total_uncompressed_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Total uncompressed payload bytes recorded in the metadata."
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Snapshot wire-format version that verified (`3` for the signed\nenvelope this gateway writes).\n"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "instance_id",
+          "total_uncompressed_bytes",
+          "version"
+        ],
+        "additionalProperties": false
+      },
+      "KernelManifest": {
+        "type": "object",
+        "description": "Signed kernel manifest. Mirrors the\n`tensor_wasm_jit::registry::KernelManifest` Rust struct\n(`#[non_exhaustive]`, so additional fields may appear in future\nrevisions). `digest` and `signature` are fixed 32-byte arrays\nserialized by serde as JSON arrays of 32 integers (0-255); the\nHMAC `signature` tag is public by design (it authenticates\nauthorship, the signing key is the secret).\n",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Stable kernel name (e.g. `matmul.f32`)."
+          },
+          "version": {
+            "type": "string",
+            "description": "SemVer-style version (e.g. `1.0.0`)."
+          },
+          "sm_version": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "CUDA compute capability the PTX targets (e.g. 80 for sm_80)."
+          },
+          "digest": {
+            "type": "array",
+            "description": "BLAKE3 hash of the PTX text (32 bytes).",
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "minItems": 32,
+            "maxItems": 32
+          },
+          "signature": {
+            "type": "array",
+            "description": "HMAC-SHA256 tag over the canonical signed bytes (32 bytes).",
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "minItems": 32,
+            "maxItems": 32
+          },
+          "published_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Wall-clock publish timestamp (Unix millis)."
+          },
+          "publisher": {
+            "type": "string",
+            "description": "Publisher identifier (typically a tenant id or signing-key id)."
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "sm_version",
+          "digest",
+          "signature",
+          "published_unix_ms",
+          "publisher"
+        ]
+      },
+      "PublishKernelRequest": {
+        "type": "object",
+        "description": "Body of `POST /kernels`. Mirrors the\n`tensor_wasm_api::kernels::PublishKernelRequest` Rust struct.\n",
+        "properties": {
+          "manifest": {
+            "$ref": "#/components/schemas/KernelManifest"
+          },
+          "ptx_text": {
+            "type": "string",
+            "description": "PTX source. The server computes BLAKE3 over the UTF-8 bytes\nand requires a match with `manifest.digest` before the HMAC\nsignature check.\n"
+          }
+        },
+        "required": [
+          "manifest",
+          "ptx_text"
+        ],
+        "additionalProperties": false
+      },
+      "PublishKernelResponse": {
+        "type": "object",
+        "description": "Body of a successful `201 Created` from `POST /kernels`. Echoes\nthe canonical key so the client can confirm what was stored.\n",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version"
+        ],
+        "additionalProperties": false
+      },
+      "ListKernelsResponse": {
+        "type": "object",
+        "description": "Body of `GET /kernels`. Mirrors\n`tensor_wasm_api::kernels::ListKernelsResponse`. PTX text is\nomitted from listed manifests.\n",
+        "properties": {
+          "manifests": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KernelManifest"
+            }
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Effective offset the handler used (echoes the query param)."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Effective limit the handler used after server-side clamping\n(max 1000).\n"
+          }
+        },
+        "required": [
+          "manifests",
+          "offset",
+          "limit"
+        ],
+        "additionalProperties": false
+      },
+      "ResolveKernelResponse": {
+        "type": "object",
+        "description": "Body of `GET /kernels/{name}/{version}`. Mirrors\n`tensor_wasm_api::kernels::ResolveKernelResponse`.\n",
+        "properties": {
+          "manifest": {
+            "$ref": "#/components/schemas/KernelManifest"
+          },
+          "ptx_text": {
+            "type": "string",
+            "description": "PTX text whose BLAKE3 matches `manifest.digest`."
+          }
+        },
+        "required": [
+          "manifest",
+          "ptx_text"
         ],
         "additionalProperties": false
       },

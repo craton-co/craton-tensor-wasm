@@ -72,10 +72,12 @@
 #![cfg(feature = "cudarc-backend")]
 
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cudarc::driver::sys as cuda_sys;
 use cudarc::driver::CudaDevice;
+use tensor_wasm_core::mem_pool::DriverMemPool;
 
 use crate::cudarc_backend::{device_for, ensure_context_bound};
 use crate::unified::UnifiedError;
@@ -106,7 +108,14 @@ use crate::unified::UnifiedError;
 #[derive(Debug)]
 pub struct TenantMemPool {
     pool: cuda_sys::CUmemoryPool,
-    cap_bytes: u64,
+    /// The *requested* release-threshold cap (in bytes). Interior-mutable
+    /// so [`DriverMemPool::set_release_threshold`] can re-pin the
+    /// threshold post-construction (the tenant driver-cap path) and have
+    /// [`Self::cap_bytes`] / [`DriverMemPool::release_threshold`] report
+    /// the new value. Plain relaxed atomics suffice: this is honest
+    /// reporting, not a synchronisation point — the authoritative cap
+    /// lives in the driver after the `cuMemPoolSetAttribute` call.
+    cap_bytes: AtomicU64,
     device_ordinal: u32,
     /// Held purely to keep the device's primary context alive. Dropped
     /// AFTER `cuMemPoolDestroy` in [`Drop`] thanks to Rust's struct
@@ -217,7 +226,7 @@ impl TenantMemPool {
 
             Ok(Self {
                 pool,
-                cap_bytes,
+                cap_bytes: AtomicU64::new(cap_bytes),
                 device_ordinal,
                 device,
             })
@@ -246,7 +255,7 @@ impl TenantMemPool {
     /// adds a separate `effective_cap_bytes()` query that round-trips
     /// through `cuMemPoolGetAttribute`.
     pub fn cap_bytes(&self) -> u64 {
-        self.cap_bytes
+        self.cap_bytes.load(Ordering::Relaxed)
     }
 
     /// Device ordinal this pool's allocations target.
@@ -336,6 +345,45 @@ impl TenantMemPool {
     }
 }
 
+impl DriverMemPool for TenantMemPool {
+    /// Re-pin the pool's `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` to `bytes`.
+    ///
+    /// This is the cycle-breaking entry point: `tensor-wasm-tenant`
+    /// drives a tenant's GPU cap through here against an
+    /// `Arc<dyn DriverMemPool>` without ever naming this concrete type.
+    /// On success the recorded [`Self::cap_bytes`] is updated so honest
+    /// reporting (and [`Self::release_threshold`]) reflect the new value;
+    /// the driver is the authoritative ceiling. Returns
+    /// [`MemPoolError::SetAttribute`] if `cuMemPoolSetAttribute` returns
+    /// anything other than `CUDA_SUCCESS` — in which case the recorded
+    /// value is left unchanged.
+    fn set_release_threshold(&self, bytes: u64) -> Result<(), MemPoolError> {
+        // mem M4: bind the primary context before the context-sensitive
+        // attribute set, mirroring `TenantMemPool::new`.
+        ensure_context_bound(&self.device)
+            .map_err(|e| MemPoolError::Device(format!("ensure_context_bound: {e:?}")))?;
+        // SAFETY: `pool` is non-null and live (this is a `&self` method,
+        // so `Drop` cannot have run); `bytes` outlives the call as the
+        // attribute payload pointer.
+        let res = unsafe {
+            cuda_sys::lib().cuMemPoolSetAttribute(
+                self.pool,
+                cuda_sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                &bytes as *const u64 as *mut core::ffi::c_void,
+            )
+        };
+        if res != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+            return Err(MemPoolError::SetAttribute(format!("{res:?}")));
+        }
+        self.cap_bytes.store(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn release_threshold(&self) -> Option<u64> {
+        Some(self.cap_bytes.load(Ordering::Relaxed))
+    }
+}
+
 impl Drop for TenantMemPool {
     /// Destroy the underlying pool via `cuMemPoolDestroy`.
     ///
@@ -367,7 +415,7 @@ impl Drop for TenantMemPool {
             tracing::error!(
                 target: "tensor_wasm_mem::cuda_mem_pool",
                 ?res,
-                cap_bytes = self.cap_bytes,
+                cap_bytes = self.cap_bytes.load(Ordering::Relaxed),
                 device_ordinal = self.device_ordinal,
                 "cuMemPoolDestroy failed in TenantMemPool::drop",
             );
@@ -385,34 +433,16 @@ unsafe impl Send for TenantMemPool {}
 unsafe impl Sync for TenantMemPool {}
 
 /// Errors raised by [`TenantMemPool`] operations.
-#[derive(Debug, thiserror::Error)]
-pub enum MemPoolError {
-    /// `cuMemPoolCreate` returned a non-`CUDA_SUCCESS` code. The wrapped
-    /// string is the `Debug`-formatted CUDA result.
-    #[error("cuMemPoolCreate failed: {0}")]
-    Create(String),
-    /// `cuMemPoolSetAttribute` returned a non-`CUDA_SUCCESS` code. The
-    /// half-built pool is destroyed before this error is returned, so
-    /// callers do not need to do anything to clean up.
-    #[error("cuMemPoolSetAttribute failed: {0}")]
-    SetAttribute(String),
-    /// CUDA was not initialised by the time the pool constructor ran.
-    /// In v0.3.8 this is reserved for future use — the cudarc
-    /// `CudaDevice::new` cache in
-    /// [`crate::cudarc_backend`] already primes `cuInit(0)` before any
-    /// pool can be created from inside the same process — but the
-    /// variant is present so callers can match on it without a
-    /// breaking-change minor bump in v0.4.
-    #[error("cuda not initialized")]
-    NotInitialized,
-    /// The T26 per-ordinal device cache could not retain a primary
-    /// context for the requested device ordinal. Wraps the underlying
-    /// [`crate::unified::UnifiedError::Cuda`] description from
-    /// [`crate::cudarc_backend::device_for`]. A non-CUDA host or a
-    /// missing GPU surfaces here, NOT through [`Self::Create`].
-    #[error("device retain failed: {0}")]
-    Device(String),
-}
+///
+/// Re-exported from [`tensor_wasm_core::mem_pool`], which now owns the
+/// type so the backend-agnostic [`DriverMemPool`] trait and this
+/// concrete implementor can share one error without `tensor-wasm-tenant`
+/// depending on `tensor-wasm-mem` (that edge would close the
+/// `mem` <-> `tenant` cycle). The variants are unchanged from when they
+/// lived here; existing `MemPoolError::Create` / `::SetAttribute` /
+/// `::NotInitialized` / `::Device` match arms keep compiling against the
+/// re-export.
+pub use tensor_wasm_core::mem_pool::MemPoolError;
 
 #[cfg(test)]
 mod tests {
@@ -425,6 +455,21 @@ mod tests {
     #[test]
     fn tenant_mem_pool_type_has_nonzero_size() {
         assert!(std::mem::size_of::<TenantMemPool>() > 0);
+    }
+
+    /// `TenantMemPool` implements the backend-agnostic
+    /// [`DriverMemPool`] trait that `tensor-wasm-tenant` drives the
+    /// driver-enforced GPU cap through. A pure type-level check (no
+    /// driver call): if the impl is dropped or its signature drifts from
+    /// the core trait, this stops compiling — the regression guard for
+    /// the cycle-break wiring. The `Arc<dyn DriverMemPool>` coercion
+    /// mirrors exactly how the tenant context stores the pool.
+    #[test]
+    fn tenant_mem_pool_is_a_driver_mem_pool() {
+        fn assert_driver_mem_pool<T: DriverMemPool>() {}
+        assert_driver_mem_pool::<TenantMemPool>();
+        // The object-safe coercion the tenant crate relies on must hold.
+        fn _accepts_dyn(_: Arc<dyn DriverMemPool>) {}
     }
 
     /// `MemPoolError` Display impls produce non-empty messages. Cheap

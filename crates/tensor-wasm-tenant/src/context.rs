@@ -42,7 +42,10 @@ use loom::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(feature = "loom"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use std::sync::Arc;
+
 use tensor_wasm_core::error::TensorWasmError;
+use tensor_wasm_core::mem_pool::{DriverMemPool, MemPoolError};
 use tensor_wasm_core::metrics::{TenantLabels, TensorWasmMetrics};
 use tensor_wasm_core::types::TenantId;
 
@@ -267,6 +270,25 @@ pub struct TenantContext {
     #[allow(dead_code)]
     cuda_mem_pool_quota_bytes: Option<u64>,
 
+    /// Optional driver-level memory pool whose release threshold is pinned
+    /// to this tenant's GPU cap. When present, [`Self::consume_gpu_bytes`]
+    /// pushes the cap through
+    /// [`tensor_wasm_core::mem_pool::DriverMemPool::set_release_threshold`]
+    /// so the CUDA driver itself rejects over-cap allocations — closing
+    /// the bypass that the in-process `gpu_bytes_in_use` counter alone
+    /// cannot (a tenant who obtained a raw CUDA driver handle).
+    ///
+    /// Stored as a trait object (`Arc<dyn DriverMemPool>`), NOT the
+    /// concrete `tensor-wasm-mem::cuda_mem_pool::TenantMemPool`: this
+    /// crate depends only on `tensor-wasm-core`, never on
+    /// `tensor-wasm-mem`. Holding the concrete type would require a
+    /// `tenant -> mem` dependency edge, which would close the
+    /// `mem` <-> `tenant` cycle (mem already depends on tenant). The
+    /// backend-agnostic trait lives in `tensor-wasm-core`, which both
+    /// crates already depend on, so the graph stays acyclic. Set via
+    /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`].
+    driver_mem_pool: Option<Arc<dyn DriverMemPool>>,
+
     // Real `cust::context::Context` under the `cuda` feature; otherwise a
     // unit stub so the rest of the crate compiles on CUDA-less hosts.
     #[cfg(feature = "cuda")]
@@ -421,6 +443,31 @@ impl TenantContext {
             ) {
                 Ok(_) => {
                     self.publish_gpu_memory_gauge(next);
+                    // Driver-enforced cap (T39): when a driver memory pool
+                    // was wired in via
+                    // `with_driver_enforced_gpu_cap` AND a cap is set, pin
+                    // the pool's release threshold to the cap so the CUDA
+                    // driver itself rejects over-cap allocations — the
+                    // bypass-resistant second line of defence on top of
+                    // this in-process counter. We push the *cap* (a fixed
+                    // policy ceiling), not the running total, so the
+                    // driver sees the same ceiling regardless of
+                    // interleaving. A `set_release_threshold` failure is
+                    // logged but does NOT fail the consume: the in-process
+                    // counter already accepted this allocation, and the
+                    // driver pin is belt-and-braces.
+                    if let (Some(pool), Some(cap)) = (&self.driver_mem_pool, limit) {
+                        if let Err(e) = pool.set_release_threshold(cap) {
+                            tracing::warn!(
+                                target: "tensor_wasm_tenant::context",
+                                tenant = %self.tenant_id,
+                                cap,
+                                error = %e,
+                                "driver mem-pool set_release_threshold failed; \
+                                 in-process gpu cap still enforced",
+                            );
+                        }
+                    }
                     return Ok(());
                 }
                 Err(observed) => current = observed,
@@ -650,8 +697,19 @@ impl TenantContext {
         self.cuda_mem_pool_quota_bytes
     }
 
-    // TODO(v0.4): driver-enforced GPU cap requires breaking the mem<->tenant
-    // cycle (hoist TenantMemPool into tensor-wasm-core); tracked separately.
+    /// The driver-level memory pool wired into this tenant for
+    /// driver-enforced GPU-cap enforcement, or `None` when no pool was
+    /// provided at build time (the in-process `gpu_bytes_in_use` counter
+    /// is then the only enforcement).
+    ///
+    /// Returned as the backend-agnostic
+    /// [`tensor_wasm_core::mem_pool::DriverMemPool`] trait object: this
+    /// crate never names the concrete `tensor-wasm-mem` pool type, which
+    /// is what keeps the `mem` <-> `tenant` dependency graph acyclic.
+    /// Set via [`TenantContextBuilder::with_driver_enforced_gpu_cap`].
+    pub fn mem_pool(&self) -> Option<&Arc<dyn DriverMemPool>> {
+        self.driver_mem_pool.as_ref()
+    }
 
     /// Push this tenant's CUDA context onto the calling thread's context
     /// stack, returning a RAII guard that pops it on drop. Returns `None`
@@ -871,6 +929,11 @@ pub struct TenantContextBuilder {
     /// keeps the historical "no cap" behaviour; set via
     /// [`TenantContextBuilder::with_gpu_memory_bytes_cap`].
     gpu_memory_bytes_cap: Option<u64>,
+    /// See [`TenantContext::mem_pool`]. `None` (the default) leaves the
+    /// in-process `gpu_bytes_in_use` counter as the only GPU-cap
+    /// enforcement; set via
+    /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`].
+    driver_mem_pool: Option<Arc<dyn DriverMemPool>>,
     #[cfg(feature = "cuda")]
     cuda_device_index: Option<u32>,
     metrics: Option<TensorWasmMetrics>,
@@ -889,6 +952,7 @@ impl TenantContextBuilder {
             memory_quota_bytes: Self::DEFAULT_QUOTA_BYTES,
             cuda_mem_pool_quota_bytes: None,
             gpu_memory_bytes_cap: None,
+            driver_mem_pool: None,
             #[cfg(feature = "cuda")]
             cuda_device_index: None,
             metrics: None,
@@ -976,8 +1040,32 @@ impl TenantContextBuilder {
         self
     }
 
-    // TODO(v0.4): driver-enforced GPU cap requires breaking the mem<->tenant
-    // cycle (hoist TenantMemPool into tensor-wasm-core); tracked separately.
+    /// Wire a driver-level memory pool into this tenant so the per-tenant
+    /// GPU cap is enforced by the CUDA driver itself, not just the
+    /// in-process [`TenantContext::gpu_bytes_in_use`] counter.
+    ///
+    /// `pool` is any [`tensor_wasm_core::mem_pool::DriverMemPool`] — in
+    /// production, `tensor-wasm-mem`'s
+    /// `cuda_mem_pool::TenantMemPool` (backed by
+    /// `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`);
+    /// in tests, a mock. The parameter is the backend-agnostic trait
+    /// object on purpose: taking the concrete `mem` type would require a
+    /// `tenant -> mem` dependency, re-introducing the `mem` <-> `tenant`
+    /// cycle that this whole abstraction exists to break.
+    ///
+    /// When set, [`TenantContext::consume_gpu_bytes`] pins the pool's
+    /// release threshold to the cap configured by
+    /// [`Self::with_gpu_memory_bytes_cap`] on every accepted allocation,
+    /// so a tenant that obtained a raw CUDA driver handle and bypassed
+    /// the in-process counter still hits a driver-level
+    /// `CUDA_ERROR_OUT_OF_MEMORY` at the cap. Pair this with
+    /// [`Self::with_gpu_memory_bytes_cap`]; without a cap the pool is
+    /// stored but never pinned (there is no ceiling to push). See
+    /// `docs/GPU-QUOTAS.md` for the threat model the driver pin closes.
+    pub fn with_driver_enforced_gpu_cap(mut self, pool: Arc<dyn DriverMemPool>) -> Self {
+        self.driver_mem_pool = Some(pool);
+        self
+    }
 
     /// Set the CUDA device index this tenant's context should be built
     /// against. Only meaningful when the `cuda` feature is enabled and
@@ -1049,6 +1137,7 @@ impl TenantContextBuilder {
             gpu_memory_bytes_cap: self.gpu_memory_bytes_cap,
             gpu_bytes_in_use: AtomicU64::new(0),
             cuda_mem_pool_quota_bytes: self.cuda_mem_pool_quota_bytes,
+            driver_mem_pool: self.driver_mem_pool,
             cu_context,
             metrics: self.metrics,
             metrics_labels,
@@ -1304,6 +1393,117 @@ mod tests {
         );
     }
 
+    /// Mock [`DriverMemPool`] that records every `set_release_threshold`
+    /// call so tests can assert the tenant cap is pushed through with the
+    /// right value. Lives in the test module so it cannot leak into the
+    /// public surface; it is the `tensor-wasm-mem`-free stand-in for
+    /// `cuda_mem_pool::TenantMemPool` (which this crate must not depend
+    /// on).
+    #[derive(Debug, Default)]
+    struct MockDriverMemPool {
+        threshold: AtomicU64,
+        set_calls: AtomicU64,
+        /// When `true`, `set_release_threshold` returns an error to
+        /// exercise the consume path's fail-soft behaviour.
+        fail: bool,
+    }
+
+    impl DriverMemPool for MockDriverMemPool {
+        fn set_release_threshold(&self, bytes: u64) -> Result<(), MemPoolError> {
+            self.set_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(MemPoolError::SetAttribute("mock forced failure".into()));
+            }
+            self.threshold.store(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn release_threshold(&self) -> Option<u64> {
+            Some(self.threshold.load(Ordering::SeqCst))
+        }
+    }
+
+    #[test]
+    fn driver_enforced_gpu_cap_pushes_threshold_on_consume() {
+        let pool = Arc::new(MockDriverMemPool::default());
+        let ctx = TenantContext::builder(TenantId(20))
+            .with_gpu_memory_bytes_cap(4096)
+            .with_driver_enforced_gpu_cap(pool.clone())
+            .build();
+
+        // The accessor returns the wired pool.
+        assert!(ctx.mem_pool().is_some());
+
+        // A successful GPU consume pins the driver threshold to the cap
+        // (NOT the running total).
+        ctx.consume_gpu_bytes(1000).unwrap();
+        assert_eq!(pool.set_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.threshold.load(Ordering::SeqCst), 4096);
+        assert_eq!(pool.release_threshold(), Some(4096));
+
+        // A second consume re-pins to the same cap.
+        ctx.consume_gpu_bytes(500).unwrap();
+        assert_eq!(pool.set_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.threshold.load(Ordering::SeqCst), 4096);
+    }
+
+    #[test]
+    fn driver_enforced_gpu_cap_not_pushed_without_cap() {
+        // No `with_gpu_memory_bytes_cap` → no ceiling to push, so the
+        // pool is stored but `set_release_threshold` is never called.
+        let pool = Arc::new(MockDriverMemPool::default());
+        let ctx = TenantContext::builder(TenantId(21))
+            .with_driver_enforced_gpu_cap(pool.clone())
+            .build();
+        ctx.consume_gpu_bytes(1000).unwrap();
+        assert_eq!(pool.set_calls.load(Ordering::SeqCst), 0);
+        assert!(ctx.mem_pool().is_some());
+    }
+
+    #[test]
+    fn driver_enforced_gpu_cap_over_limit_does_not_push() {
+        // An over-cap consume is rejected by the in-process counter
+        // BEFORE the driver pin runs, so the pool sees no call for the
+        // rejected allocation.
+        let pool = Arc::new(MockDriverMemPool::default());
+        let ctx = TenantContext::builder(TenantId(22))
+            .with_gpu_memory_bytes_cap(1024)
+            .with_driver_enforced_gpu_cap(pool.clone())
+            .build();
+        let err = ctx.consume_gpu_bytes(2048).unwrap_err();
+        assert!(matches!(err, TensorWasmError::GpuMemoryExhausted { .. }));
+        assert_eq!(pool.set_calls.load(Ordering::SeqCst), 0);
+        // The rejected allocation must not move the counter either.
+        assert_eq!(ctx.gpu_bytes_in_use(), 0);
+    }
+
+    #[test]
+    fn driver_enforced_gpu_cap_set_failure_is_fail_soft() {
+        // If the driver pin fails, the in-process consume still succeeds:
+        // the counter already accepted the allocation and the driver pin
+        // is belt-and-braces.
+        let pool = Arc::new(MockDriverMemPool {
+            fail: true,
+            ..Default::default()
+        });
+        let ctx = TenantContext::builder(TenantId(23))
+            .with_gpu_memory_bytes_cap(4096)
+            .with_driver_enforced_gpu_cap(pool.clone())
+            .build();
+        ctx.consume_gpu_bytes(1000).unwrap();
+        assert_eq!(pool.set_calls.load(Ordering::SeqCst), 1);
+        // Threshold never recorded because the mock errored before storing.
+        assert_eq!(pool.threshold.load(Ordering::SeqCst), 0);
+        // The in-process counter still reflects the accepted allocation.
+        assert_eq!(ctx.gpu_bytes_in_use(), 1000);
+    }
+
+    #[test]
+    fn mem_pool_accessor_default_is_none() {
+        let ctx = TenantContext::builder(TenantId(24)).build();
+        assert!(ctx.mem_pool().is_none());
+    }
+
     #[test]
     fn metrics_two_tenants_produce_two_distinct_series() {
         // Mirrors the dashboard's expected shape: two registered tenants
@@ -1378,7 +1578,6 @@ mod tests {
         // must equal the algebraic sum (clamped to zero), regardless of
         // interleaving. The old implementation would drop consumes,
         // producing a final value that drifts below the expected one.
-        use std::sync::Arc;
         use std::thread;
 
         const ITERATIONS: u64 = 10_000;

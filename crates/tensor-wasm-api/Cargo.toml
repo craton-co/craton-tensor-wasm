@@ -20,6 +20,16 @@ anyhow.workspace = true
 axum.workspace = true
 tensor-wasm-core = { workspace = true }
 tensor-wasm-exec = { workspace = true }
+# tensor-wasm-snapshot: consumed by the `/snapshot/save` and
+# `/snapshot/restore` routes (M5). The `signed-snapshots` feature is
+# required so the handlers can call `SnapshotWriter::with_hmac_sha256_key`
+# / `SnapshotReader::with_hmac_sha256_key` to sign and verify blobs with
+# the operator-configured `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`. We pin the
+# legacy v2/v3 inline envelope on the write path (via
+# `SnapshotWriter::with_legacy_envelope`) so the api crate does not pull
+# in the artifact-store machinery; `default-features = false` keeps that
+# dep surface off.
+tensor-wasm-snapshot = { workspace = true, default-features = false, features = ["signed-snapshots"] }
 # tensor-wasm-wasi-gpu: needed by the streaming `/invoke-stream` route to
 # construct a `StreamingContext` whose `mpsc::Sender<Vec<u8>>` is wired
 # into the executor's spawn config (T34). The receiver end stays in the

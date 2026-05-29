@@ -20,6 +20,8 @@ use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::TensorWasmEngine;
 use tensor_wasm_exec::executor::{SpawnConfig, TensorWasmExecutor};
 
+use super::OutputFormat;
+
 /// Arguments to `tensor-wasm bench`.
 #[derive(Debug, Args)]
 pub struct BenchArgs {
@@ -31,6 +33,13 @@ pub struct BenchArgs {
     /// Number of iterations to run. Must be >= 1.
     #[arg(long, default_value_t = 100)]
     pub n: usize,
+    /// Output format: `text` (human-readable table, default) or `json`
+    /// (machine-readable document for CI perf gates).
+    ///
+    /// `display_order` pinned so this sorts after the other local flags and
+    /// before the global TLS flags, keeping the help layout stable.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text, display_order = 800)]
+    pub output: OutputFormat,
 }
 
 /// Entry point for `tensor-wasm bench`.
@@ -61,41 +70,90 @@ pub async fn run(args: BenchArgs) -> Result<()> {
         samples.push(start.elapsed());
     }
 
-    print_table(&args.export, args.n, &mut samples);
+    let summary = BenchSummary::from_samples(&args.export, args.n, &mut samples);
+    match args.output {
+        OutputFormat::Text => print_table(&summary),
+        OutputFormat::Json => println!("{}", summary.to_json()),
+    }
     Ok(())
 }
 
-/// Compute and print the P50/P95/P99/max latency table.
+/// Computed P50/P95/P99/max latency summary for a bench run.
 ///
-/// `samples` is sorted in place. Pure function so unit tests can exercise the
+/// Holds the durations as raw nanoseconds so the JSON renderer can emit
+/// stable integer fields (machine-friendly) while the text renderer formats
+/// them through [`fmt_dur`]. Pure to construct so unit tests can exercise the
 /// math without spinning up an executor.
-pub(crate) fn print_table(export: &str, n: usize, samples: &mut [Duration]) {
-    samples.sort();
-    let p = |q: f64| -> Duration {
-        if samples.is_empty() {
-            return Duration::ZERO;
-        }
-        let len = samples.len();
-        // Nearest-rank percentile: index = ceil(q * len) - 1, clamped to
-        // [0, len-1]. Using `usize` directly avoids the historical `isize`
-        // round-trip that could overflow for very large `len`.
-        let rank = (q * len as f64).ceil() as usize;
-        let idx = rank.saturating_sub(1).min(len - 1);
-        samples[idx]
-    };
-    let max = samples.last().copied().unwrap_or_default();
-    let p50 = p(0.50);
-    let p95 = p(0.95);
-    let p99 = p(0.99);
+#[derive(Debug, Clone)]
+pub(crate) struct BenchSummary {
+    export: String,
+    iterations: usize,
+    p50: Duration,
+    p95: Duration,
+    p99: Duration,
+    max: Duration,
+}
 
-    println!("bench: export=`{}` iterations={}", export, n);
+impl BenchSummary {
+    /// Sort `samples` in place and compute the percentile summary.
+    pub(crate) fn from_samples(export: &str, n: usize, samples: &mut [Duration]) -> Self {
+        samples.sort();
+        let p = |q: f64| -> Duration {
+            if samples.is_empty() {
+                return Duration::ZERO;
+            }
+            let len = samples.len();
+            // Nearest-rank percentile: index = ceil(q * len) - 1, clamped to
+            // [0, len-1]. Using `usize` directly avoids the historical `isize`
+            // round-trip that could overflow for very large `len`.
+            let rank = (q * len as f64).ceil() as usize;
+            let idx = rank.saturating_sub(1).min(len - 1);
+            samples[idx]
+        };
+        Self {
+            export: export.to_string(),
+            iterations: n,
+            p50: p(0.50),
+            p95: p(0.95),
+            p99: p(0.99),
+            max: samples.last().copied().unwrap_or_default(),
+        }
+    }
+
+    /// Render the summary as a machine-readable JSON document. Latencies are
+    /// emitted both as nanosecond integers (`*_ns`, stable for CI thresholds)
+    /// and as the human-readable string (`*_human`) the text table shows.
+    pub(crate) fn to_json(&self) -> String {
+        let doc = serde_json::json!({
+            "export": self.export,
+            "iterations": self.iterations,
+            "latency": {
+                "p50_ns": self.p50.as_nanos() as u64,
+                "p95_ns": self.p95.as_nanos() as u64,
+                "p99_ns": self.p99.as_nanos() as u64,
+                "max_ns": self.max.as_nanos() as u64,
+                "p50_human": fmt_dur(self.p50),
+                "p95_human": fmt_dur(self.p95),
+                "p99_human": fmt_dur(self.p99),
+                "max_human": fmt_dur(self.max),
+            }
+        });
+        // `to_string` (compact) keeps the line greppable / pipeable; callers
+        // who want pretty output can pipe through `jq`.
+        doc.to_string()
+    }
+}
+
+/// Print the P50/P95/P99/max latency table for a computed [`BenchSummary`].
+pub(crate) fn print_table(s: &BenchSummary) {
+    println!("bench: export=`{}` iterations={}", s.export, s.iterations);
     println!("+-----------+--------------+");
     println!("| percentile|       latency|");
     println!("+-----------+--------------+");
-    println!("| P50       | {:>12} |", fmt_dur(p50));
-    println!("| P95       | {:>12} |", fmt_dur(p95));
-    println!("| P99       | {:>12} |", fmt_dur(p99));
-    println!("| max       | {:>12} |", fmt_dur(max));
+    println!("| P50       | {:>12} |", fmt_dur(s.p50));
+    println!("| P95       | {:>12} |", fmt_dur(s.p95));
+    println!("| P99       | {:>12} |", fmt_dur(s.p99));
+    println!("| max       | {:>12} |", fmt_dur(s.max));
     println!("+-----------+--------------+");
 }
 
@@ -122,15 +180,43 @@ mod tests {
     fn percentile_picks_nearest_rank() {
         // Samples 1..=100 ms; P50 = 50ms, P95 = 95ms, P99 = 99ms, max = 100ms.
         let mut samples: Vec<Duration> = (1..=100).map(Duration::from_millis).collect();
-        print_table("noop", samples.len(), &mut samples);
+        let s = BenchSummary::from_samples("noop", samples.len(), &mut samples);
+        print_table(&s);
         assert_eq!(samples.last().copied(), Some(Duration::from_millis(100)));
+        assert_eq!(s.p50, Duration::from_millis(50));
+        assert_eq!(s.p95, Duration::from_millis(95));
+        assert_eq!(s.p99, Duration::from_millis(99));
+        assert_eq!(s.max, Duration::from_millis(100));
     }
 
     #[test]
     fn percentile_handles_single_sample() {
         let mut samples = vec![Duration::from_millis(7)];
         // Should not panic and should not under-/over-flow indexing.
-        print_table("one", 1, &mut samples);
+        let s = BenchSummary::from_samples("one", 1, &mut samples);
+        print_table(&s);
+    }
+
+    #[test]
+    fn json_output_is_valid_and_carries_percentiles() {
+        // The percentile math is already covered above; this pins the JSON
+        // contract CI perf gates will parse. Samples 1..=100 ms so the
+        // expected ns values are deterministic.
+        let mut samples: Vec<Duration> = (1..=100).map(Duration::from_millis).collect();
+        let summary = BenchSummary::from_samples("noop", samples.len(), &mut samples);
+        let json = summary.to_json();
+
+        // Must parse as a JSON object.
+        let v: serde_json::Value = serde_json::from_str(&json).expect("bench --output json valid");
+        assert_eq!(v["export"], "noop");
+        assert_eq!(v["iterations"], 100);
+        // P50 = 50ms = 50_000_000 ns.
+        assert_eq!(v["latency"]["p50_ns"], 50_000_000u64);
+        assert_eq!(v["latency"]["p95_ns"], 95_000_000u64);
+        assert_eq!(v["latency"]["p99_ns"], 99_000_000u64);
+        assert_eq!(v["latency"]["max_ns"], 100_000_000u64);
+        // Human strings present for eyeballing.
+        assert!(v["latency"]["p50_human"].is_string());
     }
 
     #[test]

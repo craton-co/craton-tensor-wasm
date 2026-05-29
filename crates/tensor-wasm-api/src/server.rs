@@ -24,7 +24,7 @@ use crate::middleware::{
 use crate::rate_limit::{rate_limit, RateLimitConfig, RateLimiter};
 use crate::routes::{
     create_function, delete_function, get_job, healthz, invoke_function, invoke_function_async,
-    invoke_function_stream, metrics, AppState,
+    invoke_function_stream, metrics, snapshot_restore, snapshot_save, AppState,
 };
 use crate::trace_propagation::{inject_trace_id_header, install_w3c_propagator};
 
@@ -49,7 +49,52 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let limiter = RateLimiter::new(RateLimitConfig::from_env());
     let audit = AuditConfig::from_env();
     let cors = CorsConfig::from_env();
+    // M5: read the top-level `AppConfig` (snapshot HMAC signing key +
+    // require-signature toggle) from the environment and thread it onto
+    // the shared `AppState` so the `/snapshot/save` and `/snapshot/restore`
+    // handlers consume `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`. This is the
+    // production caller that turns the previously-inert key into a
+    // live knob (closes finding M5). A malformed key is a hard startup
+    // error — we refuse to come up serving snapshot routes under a
+    // misconfigured signing key rather than silently degrade.
+    let state = apply_app_config_from_env(state);
     build_router_with_audit(state, auth, tenant, limiter, audit, cors)
+}
+
+/// Read [`AppConfig::from_env`](crate::config::AppConfig::from_env) and
+/// install it onto `state` so the snapshot routes pick up the operator's
+/// signing key.
+///
+/// On a malformed snapshot key / toggle this logs the parse error and
+/// **panics** — unlike the kernel registry (which degrades to `503`), a
+/// snapshot signing-key misconfiguration must be fatal at startup, because
+/// silently dropping the key would downgrade restore integrity (a wrong
+/// or empty key would let unverified blobs through once the routes are
+/// reachable). The hard-fail mirrors the contract documented on
+/// `AppConfig::from_env`.
+///
+/// `state` arrives behind an `Arc`; we recover the inner value when we are
+/// the sole owner (the normal startup case) and otherwise clone-and-replace
+/// the `app_config` field so the contract holds even if a caller has
+/// already shared the handle.
+fn apply_app_config_from_env(state: Arc<AppState>) -> Arc<AppState> {
+    let cfg = crate::config::AppConfig::from_env().unwrap_or_else(|e| {
+        // Key-free: `ConfigError::Display` never prints the secret bytes.
+        panic!(
+            "invalid snapshot configuration (TENSOR_WASM_API_SNAPSHOT_*): {e}; \
+             refusing to start with a misconfigured snapshot signing key",
+        );
+    });
+    match Arc::try_unwrap(state) {
+        Ok(inner) => Arc::new(inner.with_app_config(cfg)),
+        Err(shared) => {
+            // The handle was already cloned elsewhere; rebuild a fresh
+            // `AppState` carrying the same registries/executor with the
+            // config applied. Cloning `AppState` is cheap — the maps,
+            // metrics, and executor all sit behind their own `Arc`.
+            Arc::new((*shared).clone().with_app_config(cfg))
+        }
+    }
 }
 
 /// Build the router with explicit auth / tenant config and the rate limiter
@@ -449,9 +494,26 @@ fn build_router_full(
         // body. See `docs/STREAMING.md`.
         .route("/functions/:id/invoke-stream", post(invoke_function_stream))
         .layer(concurrency_limit_layer(INVOKE_CONCURRENCY_LIMIT));
+    // M5: `/snapshot/save` and `/snapshot/restore` join the write-class
+    // budget. Both are POSTs that do CPU-bound crypto + (de)compression
+    // work on the blocking pool, comparable in weight to a deploy. They
+    // sit under the same protected stack as the other resource routes
+    // (bearer_auth + tenant_scope + rate_limit + audit applied below on
+    // `protected_router`), so they inherit:
+    //   * bearer auth — an unauthenticated caller gets `401`, not `503`;
+    //   * tenant scope — `X-TensorWasm-Tenant` is resolved and the handler
+    //     runs `authorize_tenant` + a per-resource owner check (save: the
+    //     function's `tenant_id`; restore: the HMAC-authenticated snapshot
+    //     metadata's `tenant_id`) so cross-tenant access is `403
+    //     tenant_scope_denied`;
+    //   * per-token rate limiting and audit logging.
+    // When `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` is unset both handlers
+    // return `503 snapshot_signing_not_configured` (feature-detect shape).
     let write_router = Router::new()
         .route("/functions", post(create_function))
         .route("/functions/:id", delete(delete_function))
+        .route("/snapshot/save", post(snapshot_save))
+        .route("/snapshot/restore", post(snapshot_restore))
         .layer(concurrency_limit_layer(WRITE_CONCURRENCY_LIMIT));
     let read_router = Router::new()
         .route("/jobs/:id", get(get_job))

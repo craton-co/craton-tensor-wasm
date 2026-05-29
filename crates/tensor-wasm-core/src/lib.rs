@@ -5,6 +5,7 @@
 #![deny(missing_docs)]
 
 pub mod error;
+pub mod mem_pool;
 pub mod metrics;
 pub mod telemetry;
 pub mod types;

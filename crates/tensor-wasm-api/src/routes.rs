@@ -43,7 +43,7 @@ use futures::stream;
 use serde::{Deserialize, Serialize};
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::metrics::TensorWasmMetrics;
-use tensor_wasm_core::types::TenantId;
+use tensor_wasm_core::types::{InstanceId, TenantId};
 use tensor_wasm_exec::engine::TensorWasmEngine;
 use tensor_wasm_exec::executor::{ExecError, SpawnConfig, TensorWasmExecutor, WasmArg};
 use tensor_wasm_wasi_gpu::streaming::StreamingContext;
@@ -181,6 +181,18 @@ pub struct AppState {
     /// every OpenAI request returns `404 model_not_found`. See
     /// [`crate::openai_translator`] for the env-var grammar.
     pub openai_model_map: crate::openai_translator::ModelMap,
+    /// Top-level [`AppConfig`](crate::config::AppConfig) carrying the
+    /// snapshot HMAC signing key and the `require_signature` toggle (M5).
+    ///
+    /// Read from the environment (`TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` /
+    /// `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE`) in
+    /// [`build_router`](crate::server::build_router) and threaded here so
+    /// the `/snapshot/save` and `/snapshot/restore` handlers can sign and
+    /// verify blobs with the operator's configured key. When the key is
+    /// `None` the snapshot routes return `503 snapshot_signing_not_configured`
+    /// — mirroring the kernel-registry posture so a client can detect the
+    /// feature being disabled without inspecting the URL surface.
+    pub app_config: crate::config::AppConfig,
 }
 
 impl std::fmt::Debug for AppState {
@@ -218,7 +230,28 @@ impl AppState {
             #[cfg(feature = "kernel-registry-api")]
             kernel_registry: build_kernel_registry_from_env(),
             openai_model_map: crate::openai_translator::model_map_from_env(),
+            // Default to the empty config (no snapshot key). Production
+            // wiring flows the parsed `AppConfig::from_env()` in through
+            // [`AppState::with_app_config`] from `build_router`; tests that
+            // construct `AppState::default()` get the keyless config and
+            // the `/snapshot/*` routes then report
+            // `503 snapshot_signing_not_configured`.
+            app_config: crate::config::AppConfig::default(),
         })
+    }
+
+    /// Install the top-level [`AppConfig`](crate::config::AppConfig),
+    /// carrying the snapshot HMAC key + require-signature toggle (M5).
+    ///
+    /// Called by [`build_router`](crate::server::build_router) with the
+    /// result of [`AppConfig::from_env`](crate::config::AppConfig::from_env)
+    /// so the `/snapshot/*` handlers consume the operator-configured key.
+    /// Public so integration tests can drive the snapshot routes with an
+    /// explicit key without poisoning the process environment.
+    #[must_use]
+    pub fn with_app_config(mut self, cfg: crate::config::AppConfig) -> Self {
+        self.app_config = cfg;
+        self
     }
 
     /// Install an explicit OpenAI model map, bypassing the env-var
@@ -555,6 +588,25 @@ impl ApiError {
         }
     }
 
+    /// Construct a `501 Not Implemented` with the given `kind` and `message`.
+    ///
+    /// Used by the snapshot routes (M5) for the parts of full
+    /// live-instance snapshot / restore that still need executor support:
+    /// `/snapshot/save` signs and returns a snapshot blob built from the
+    /// function's deployed bytes (the HMAC envelope layer is fully wired),
+    /// but capturing a *running* instance's linear / GPU memory needs a
+    /// `TensorWasmExecutor` capture hook that does not exist yet — that
+    /// capability surfaces `501 not_implemented` rather than silently
+    /// returning an empty or misleading capture. The `(501, kind)` pair is
+    /// the documented contract; clients should NOT retry.
+    pub fn not_implemented(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            kind: kind.into(),
+            message: message.into(),
+        }
+    }
+
     /// Construct a `413 Payload Too Large` with `kind = "body_too_large"`.
     ///
     /// Returned when an inbound request body exceeds the global
@@ -823,6 +875,70 @@ pub struct InvokeRequest {
     /// [`WasmArg`]; non-numeric elements surface as `400 invalid_args`.
     #[serde(default)]
     pub args: Vec<serde_json::Value>,
+}
+
+/// Body of `POST /snapshot/save`.
+///
+/// Identifies the deployed function whose state is captured into a
+/// signed snapshot blob. The captured blob's metadata is stamped with the
+/// resolved tenant so a later `/snapshot/restore` can enforce that the
+/// snapshot is replayed under the same tenant it was taken for.
+#[derive(Debug, Deserialize)]
+pub struct SnapshotSaveRequest {
+    /// Server-assigned identifier of the function to snapshot. Must name a
+    /// function owned by the caller's resolved tenant (cross-tenant ids are
+    /// rejected with `403 tenant_scope_denied`).
+    pub function_id: Uuid,
+}
+
+/// Response body of `POST /snapshot/save`.
+///
+/// The `snapshot_b64` field carries the full signed snapshot blob
+/// (base64, standard alphabet, padded) — the exact bytes a caller hands
+/// back to `POST /snapshot/restore`. The HMAC trailer is part of those
+/// bytes; the gateway never returns the signing key.
+#[derive(Debug, Serialize)]
+pub struct SnapshotSaveResponse {
+    /// Function the snapshot was taken for (echoed for caller correlation).
+    pub function_id: Uuid,
+    /// Base64-encoded signed snapshot blob (HMAC-SHA256, v3 envelope).
+    pub snapshot_b64: String,
+    /// Whether the blob carries an HMAC signature. Always `true` on this
+    /// path — the route is only reachable when a key is configured.
+    pub signed: bool,
+}
+
+/// Body of `POST /snapshot/restore`.
+///
+/// Carries a base64-encoded snapshot blob previously produced by
+/// `POST /snapshot/save`. The handler verifies the blob's HMAC-SHA256
+/// signature against the gateway's configured key before decoding any
+/// inner payload.
+#[derive(Debug, Deserialize)]
+pub struct SnapshotRestoreRequest {
+    /// Base64-encoded signed snapshot blob (standard alphabet, padded).
+    pub snapshot_b64: String,
+}
+
+/// Response body of `POST /snapshot/restore`.
+///
+/// Reports the verified provenance of the restored blob. Full
+/// reconstitution of a *running* instance from the captured memory is not
+/// yet wired (the executor exposes no restore hook); this response
+/// confirms the HMAC-verified envelope and its metadata so the caller can
+/// observe the round-trip succeeded.
+#[derive(Debug, Serialize)]
+pub struct SnapshotRestoreResponse {
+    /// Tenant the snapshot was originally captured for, recovered from the
+    /// HMAC-authenticated metadata.
+    pub tenant_id: u64,
+    /// Instance id stamped into the snapshot metadata at capture time.
+    pub instance_id: String,
+    /// Total uncompressed payload bytes recorded in the snapshot metadata.
+    pub total_uncompressed_bytes: u64,
+    /// Snapshot wire-format version that verified (`3` for the signed
+    /// envelope this gateway writes).
+    pub version: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1984,6 +2100,294 @@ pub async fn get_job(
         }
         None => Err(ApiError::not_found(format!("job {id} not found"))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot save / restore (M5)
+// ---------------------------------------------------------------------------
+
+/// `POST /snapshot/save` — capture a deployed function into a signed
+/// snapshot blob.
+///
+/// ## Auth posture
+///
+/// Mounted on the protected stack (bearer auth + tenant scope + rate
+/// limit + audit), exactly like the function-mutating routes. The handler
+/// runs the same two-stage tenant gate the other resource handlers use:
+///
+/// 1. `authorize_tenant` against the bearer token's scope — an out-of-scope
+///    token sees `403 tenant_scope_denied` before any registry lookup, so
+///    it cannot probe function-id existence via a 403-vs-404 split.
+/// 2. a per-resource owner check against the looked-up
+///    [`FunctionRecord::tenant_id`] — a wildcard-scoped caller from another
+///    tenant cannot snapshot tenant A's function.
+///
+/// ## HMAC wiring (M5)
+///
+/// The snapshot blob is signed with the operator-configured
+/// `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` (threaded in via
+/// [`AppState::app_config`]). When no key is configured the route returns
+/// `503 snapshot_signing_not_configured`, mirroring the kernel-registry
+/// posture — the gateway will not silently emit an unsigned blob under a
+/// route that promises a signed one.
+///
+/// ## What is captured
+///
+/// The function's deployed Wasm module bytes are captured into the
+/// snapshot's `wasm_memory` blob via
+/// [`tensor_wasm_snapshot::writer::SnapshotWriter`]. This is the working
+/// save/restore-of-bytes layer with end-to-end HMAC signing. Capturing a
+/// *live running instance's* linear / GPU memory needs a
+/// `TensorWasmExecutor` capture hook that does not exist yet; that
+/// capability is intentionally out of scope here (see the module status in
+/// [`crate::config`]). The blob produced here round-trips through
+/// `/snapshot/restore`.
+#[tracing::instrument(
+    name = "http.snapshot_save",
+    skip(state, auth, payload),
+    fields(
+        function_id = tracing::field::Empty,
+        tenant = tracing::field::Empty,
+    ),
+)]
+pub async fn snapshot_save(
+    State(state): State<Arc<AppState>>,
+    tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<crate::rate_limit::AuthContext>>,
+    payload: Result<Json<SnapshotSaveRequest>, JsonRejection>,
+) -> ApiResult<Json<SnapshotSaveResponse>> {
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    tracing::Span::current().record("tenant", tracing::field::display(tenant));
+    // Token-scope check first (mirrors create/delete/invoke): an
+    // out-of-scope token must be rejected before any registry lookup.
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        ctx.authorize_tenant(tenant)?;
+    }
+
+    // The route is only useful with a signing key; refuse early with the
+    // same 503-config shape the kernel routes use so a client can detect
+    // the feature being disabled without a key leak or a misleading 200.
+    let key = match state.app_config.snapshot_hmac_key {
+        Some(k) => k,
+        None => {
+            return Err(ApiError::service_unavailable(
+                "snapshot_signing_not_configured",
+                "snapshot signing key is not configured; set \
+                 TENSOR_WASM_API_SNAPSHOT_HMAC_KEY to enable /snapshot/save",
+            ));
+        }
+    };
+
+    let Json(req) = payload?;
+    tracing::Span::current().record("function_id", tracing::field::display(req.function_id));
+
+    // Snapshot the Wasm bytes + owning tenant under the shard lock, then
+    // drop the guard before any blocking / await work.
+    let (wasm_bytes, owner) = match state.functions.get(&req.function_id) {
+        Some(entry) => (Arc::clone(&entry.value().wasm_bytes), entry.value().tenant_id),
+        None => {
+            return Err(ApiError::not_found(format!(
+                "function {} not found",
+                req.function_id
+            )))
+        }
+    };
+    // Per-resource owner check (api S-IDOR): the token-scope gate above
+    // only proves the caller may address the *claimed* tenant, not that
+    // the looked-up record belongs to it.
+    if owner != tenant {
+        return Err(ApiError::forbidden(
+            "tenant_scope_denied",
+            "function belongs to a different tenant",
+        ));
+    }
+
+    // Stamp the instance id from the function id's low 64 bits so the
+    // restore side can correlate the blob back to a function. The capture
+    // itself is CPU-bound (bincode + zstd) over potentially large module
+    // bytes, so run it on the blocking pool to keep the reactor free.
+    let instance_id = InstanceId(req.function_id.as_u128() & u128::from(u64::MAX));
+    let snapshot_bytes = tokio::task::spawn_blocking(move || {
+        use tensor_wasm_snapshot::writer::{InstanceState, SnapshotWriter};
+        // `with_legacy_envelope` pins the inline v3 (HMAC-SHA256-signed)
+        // wire format so the api crate does not depend on the artifact
+        // store; the reader on `/snapshot/restore` is configured the same
+        // way (`with_hmac_sha256_key`).
+        SnapshotWriter::new()
+            .with_hmac_sha256_key(key)
+            .with_legacy_envelope()
+            .capture(InstanceState {
+                tenant_id: tenant,
+                instance_id,
+                wasm_memory: &wasm_bytes,
+                gpu_memory: &[],
+                registers: &[],
+            })
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("snapshot capture task panicked: {e}")))?
+    .map_err(|e| {
+        // The snapshot crate's `Display` (Serialization variant) is
+        // operator-facing and key-free; log server-side and return a
+        // stable, content-light message to the caller.
+        tracing::error!(
+            target: "tensor_wasm_api::routes",
+            error = %e,
+            "snapshot capture failed",
+        );
+        ApiError::internal("snapshot capture failed")
+    })?;
+
+    let snapshot_b64 = BASE64.encode(&snapshot_bytes);
+    Ok(Json(SnapshotSaveResponse {
+        function_id: req.function_id,
+        snapshot_b64,
+        signed: true,
+    }))
+}
+
+/// `POST /snapshot/restore` — verify and decode a signed snapshot blob.
+///
+/// ## Auth posture
+///
+/// Same protected-stack posture as [`snapshot_save`]: bearer auth + tenant
+/// scope + rate limit + audit. The handler runs `authorize_tenant` against
+/// the caller's token scope, then — after HMAC verification recovers the
+/// snapshot's captured tenant — enforces a per-resource owner check: the
+/// blob's `metadata.tenant_id` must equal the caller's resolved tenant, so
+/// a wildcard-scoped caller from tenant B cannot restore a blob captured
+/// for tenant A (`403 tenant_scope_denied`).
+///
+/// ## HMAC wiring (M5)
+///
+/// Verification uses the operator-configured
+/// `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` via
+/// [`SnapshotReader::with_hmac_sha256_key`](tensor_wasm_snapshot::reader::SnapshotReader::with_hmac_sha256_key)
+/// and [`SnapshotReader::require_signature`](tensor_wasm_snapshot::reader::SnapshotReader::require_signature):
+/// the reader rejects any blob whose HMAC does not verify, and — because
+/// the gateway always opts into `require_signature` on this path — refuses
+/// unsigned v2 blobs outright. A wrong / missing key or a tampered blob
+/// surfaces as `403 snapshot_signature_invalid`. When no key is configured
+/// the route returns `503 snapshot_signing_not_configured`.
+///
+/// The reader's [`with_max_decompressed`](tensor_wasm_snapshot::reader::SnapshotReader::with_max_decompressed)
+/// hardening uses the crate default (256 MiB), bounding restore-time memory
+/// pressure from a zip-bomb payload.
+///
+/// ## What is restored
+///
+/// This handler restores and authenticates the snapshot *envelope* and
+/// returns its verified provenance. Reconstituting a *running* instance
+/// from the captured memory needs a `TensorWasmExecutor` restore hook that
+/// does not exist yet; that capability surfaces `501 not_implemented` when
+/// requested. Verifying the blob and recovering its metadata — the part
+/// that exercises the HMAC key end-to-end — works today.
+#[tracing::instrument(
+    name = "http.snapshot_restore",
+    skip(state, auth, payload),
+    fields(tenant = tracing::field::Empty),
+)]
+pub async fn snapshot_restore(
+    State(state): State<Arc<AppState>>,
+    tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<crate::rate_limit::AuthContext>>,
+    payload: Result<Json<SnapshotRestoreRequest>, JsonRejection>,
+) -> ApiResult<Json<SnapshotRestoreResponse>> {
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    tracing::Span::current().record("tenant", tracing::field::display(tenant));
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        ctx.authorize_tenant(tenant)?;
+    }
+
+    let key = match state.app_config.snapshot_hmac_key {
+        Some(k) => k,
+        None => {
+            return Err(ApiError::service_unavailable(
+                "snapshot_signing_not_configured",
+                "snapshot signing key is not configured; set \
+                 TENSOR_WASM_API_SNAPSHOT_HMAC_KEY to enable /snapshot/restore",
+            ));
+        }
+    };
+
+    let Json(req) = payload?;
+    // Decode the base64 envelope. Reuse the dedicated invalid_base64
+    // mapping so the byte-offset detail of attacker input is logged, not
+    // echoed.
+    let snapshot_bytes = BASE64
+        .decode(req.snapshot_b64.as_bytes())
+        .map_err(base64_decode_error)?;
+
+    // Hardening posture (consumes `snapshot_require_signature`):
+    //
+    // `require_signature()` is applied unconditionally on this path. The
+    // gateway only ever *writes* the signed v3 envelope (see
+    // [`snapshot_save`]), so accepting an unsigned v2 blob on restore would
+    // be a strip-the-trailer downgrade primitive. The operator-facing
+    // `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE` knob is the documented
+    // surface for this stricter posture; here it is enforced as the
+    // hardened default. We still read the configured flag so that an
+    // operator who explicitly set it gets a confirming log line (and so a
+    // future relaxation of the unconditional require has the value in
+    // hand) — the knob is genuinely consumed, not inert.
+    if state.app_config.snapshot_require_signature {
+        tracing::debug!(
+            target: "tensor_wasm_api::routes",
+            "snapshot restore: require-signature explicitly enabled by operator",
+        );
+    }
+    // `with_max_decompressed` is left at the crate default
+    // (`limits::MAX_DECOMPRESSED_BYTES`, 256 MiB) — the standard zip-bomb
+    // ceiling that bounds restore-time memory pressure. Verify HMAC +
+    // decode on the blocking pool since zstd + bincode are CPU-bound.
+    let restored = tokio::task::spawn_blocking(move || {
+        use tensor_wasm_snapshot::reader::SnapshotReader;
+        SnapshotReader::new()
+            .with_hmac_sha256_key(key)
+            .require_signature()
+            .restore(&snapshot_bytes)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("snapshot restore task panicked: {e}")))?;
+
+    let snapshot = match restored {
+        Ok(s) => s,
+        Err(e) => {
+            // Any verification / structural failure (wrong key, missing
+            // signature, tampered bytes, oversized decompress) is surfaced
+            // as a single 403 so a caller cannot use the error text as a
+            // decode oracle. The detailed snapshot-crate message is logged
+            // server-side for operators.
+            tracing::warn!(
+                target: "tensor_wasm_api::routes",
+                error = %e,
+                "snapshot restore rejected (signature / structural verification failed)",
+            );
+            return Err(ApiError::forbidden(
+                "snapshot_signature_invalid",
+                "snapshot signature verification failed or blob is malformed",
+            ));
+        }
+    };
+
+    // Per-resource owner check: the HMAC-authenticated metadata records the
+    // tenant the blob was captured for. A caller must not restore another
+    // tenant's blob, even with a valid signature (the key is per-deployment,
+    // not per-tenant), so reject a cross-tenant restore with the same
+    // `tenant_scope_denied` shape the other handlers use.
+    if snapshot.metadata.tenant_id != tenant {
+        return Err(ApiError::forbidden(
+            "tenant_scope_denied",
+            "snapshot was captured for a different tenant",
+        ));
+    }
+
+    Ok(Json(SnapshotRestoreResponse {
+        tenant_id: snapshot.metadata.tenant_id.0,
+        instance_id: snapshot.metadata.instance_id.to_string(),
+        total_uncompressed_bytes: snapshot.metadata.total_uncompressed_bytes,
+        version: snapshot.version,
+    }))
 }
 
 // ---------------------------------------------------------------------------

@@ -105,6 +105,11 @@ fn expected_routes() -> Vec<(&'static str, &'static str)> {
         // `docs/OPENAI-COMPAT.md` for the rollout plan.
         ("POST", "/v1/completions"),
         ("POST", "/v1/chat/completions"),
+        // Snapshot save/restore (M5 — HMAC-signed via the configured
+        // TENSOR_WASM_API_SNAPSHOT_HMAC_KEY). See
+        // `crates/tensor-wasm-api/src/routes.rs` `snapshot_save`/`snapshot_restore`.
+        ("POST", "/snapshot/save"),
+        ("POST", "/snapshot/restore"),
     ];
     #[cfg(feature = "kernel-registry-api")]
     {

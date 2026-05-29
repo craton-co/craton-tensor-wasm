@@ -23,9 +23,10 @@ If you only read one section: skip to [Anti-cheating checklist](#anti-cheating-c
 6. [Workload corpus](#workload-corpus)
 7. [Per-competitor recipes](#per-competitor-recipes)
 8. [Bench-ID to competitor-metric map](#bench-id-to-competitor-metric-map)
-9. [Reporting format](#reporting-format)
-10. [Anti-cheating checklist](#anti-cheating-checklist)
-11. [Where TensorWasm wins, where it won't](#where-tensor-wasm-wins-where-it-wont)
+9. [Profiling a regression](#profiling-a-regression)
+10. [Reporting format](#reporting-format)
+11. [Anti-cheating checklist](#anti-cheating-checklist)
+12. [Where TensorWasm wins, where it won't](#where-tensor-wasm-wins-where-it-wont)
 
 ---
 
@@ -620,6 +621,129 @@ unmatched one.
 
 If your comparison covers a TensorWasm metric not in this table, add a row
 to this doc in the same PR that publishes the comparison.
+
+---
+
+## Profiling a regression
+
+When the CI delta-gate (or the absolute-ceiling tail gate — see
+[`bench-results/README.md`](../bench-results/README.md)) fires, the next
+step is to find *where* the time went. The two groups worth drilling into
+first are `e2e/*` (the HTTP gateway + invoke path) and `jit_compile/*` (the
+text-emit + cache path) — they have the deepest call graphs and the most
+historical churn. This section gives two recipes: an external sampling
+profiler (`cargo flamegraph`, no source changes) and an in-process
+profiler (`pprof` wired into Criterion, needs a dev-dep).
+
+### Quick: `cargo flamegraph` (no code changes)
+
+`cargo flamegraph` wraps `perf` (Linux) / `dtrace` (macOS) around the bench
+binary and renders an SVG. It needs no edits to the bench crate — it
+samples the already-built `--release`/bench binary.
+
+```sh
+cargo install flamegraph        # one-time; pulls the `flamegraph` binary
+
+# Profile the whole e2e group. `--bench e2e_inference` selects the target;
+# everything after `--` is forwarded to the Criterion harness, so the usual
+# filter/measurement flags apply.
+cargo flamegraph --bench e2e_inference -- --bench e2e/
+
+# Narrow to a single metric to keep the graph readable:
+cargo flamegraph --bench e2e_inference -- --bench e2e/invoke_not_found
+
+# JIT path. emit_text dominates a cold compile; cache/warm_hit isolates the
+# lookup. Profile them separately — their hot frames are unrelated.
+cargo flamegraph --bench jit_compile -- --bench jit_compile/emit_text
+cargo flamegraph --bench jit_compile -- --bench jit_compile/cache
+```
+
+Output lands at `flamegraph.svg` in the cwd; open it in a browser and
+click-to-zoom into the widest (hottest) frames.
+
+**Pitfalls.**
+
+- On Linux, `perf` needs `kernel.perf_event_paranoid <= 1`
+  (`sudo sysctl -w kernel.perf_event_paranoid=1`) and ideally
+  `kernel.kptr_restrict=0` for kernel-frame symbolization.
+- Build with frame pointers so the stacks are walkable:
+  `RUSTFLAGS="-C force-frame-pointers=yes" cargo flamegraph ...`.
+  Without this the stacks collapse into `[unknown]` on a release build.
+- Criterion's warm-up + measurement loop runs many iterations, which is
+  exactly what you want for a sampling profiler — but trim the metric with
+  a `--bench <filter>` so the SVG isn't dominated by setup frames from the
+  *other* metrics in the group.
+- The numbers are for *attribution*, not publication — a profiled run is
+  slower than a clean one. Never quote a flamegraph run's timings.
+
+### Deep: `pprof` Criterion profiler (in-process, sampled)
+
+For frame-accurate, per-bench profiles that drop straight into
+`target/criterion/<group>/<id>/profile/`, Criterion supports a custom
+`profiler` via `Criterion::with_profiler`. The `pprof` crate provides a
+`criterion::Profiler` impl that emits a flamegraph (and/or a `pprof`
+protobuf consumable by `go tool pprof`) per benchmark.
+
+**This recipe requires a dev-dependency that is intentionally NOT added
+here** — the bench crate's `Cargo.toml` `[dev-dependencies]` is owned by a
+separate concern, and adding a dep would touch a file outside this change's
+scope. Wire it locally when you need it (and drop it again, or land it in a
+dedicated PR):
+
+1. Add the dep to `crates/tensor-wasm-bench/Cargo.toml` under
+   `[dev-dependencies]` (matches the `criterion.workspace = true` style
+   already there):
+
+   ```toml
+   # Sampled in-process profiler with a Criterion integration. The
+   # `flamegraph` feature emits an SVG per bench; `protobuf-codec` emits a
+   # pprof protobuf for `go tool pprof`. Keep this out of the committed
+   # manifest — it's a local profiling aid, not a CI dep.
+   pprof = { version = "0.13", features = ["flamegraph", "criterion", "protobuf-codec"] }
+   ```
+
+2. Hand the profiler to the `Criterion` builder in the bench you're
+   drilling into. The `e2e_inference.rs` and `jit_compile.rs` benches
+   construct their `Criterion` in the `criterion_group!`/`criterion_main!`
+   wiring; swap the default config for one with a profiler attached:
+
+   ```rust
+   use pprof::criterion::{Output, PProfProfiler};
+
+   fn profiled() -> Criterion {
+       // 100 Hz sampling is plenty for a multi-second measurement window
+       // and keeps overhead low. Output::Flamegraph renders the SVG; swap
+       // for Output::Protobuf(None) to get a pprof file instead.
+       Criterion::default()
+           .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
+   }
+
+   criterion_group! {
+       name = benches;
+       config = profiled();
+       targets = bench_healthz, bench_invoke_not_found /* , ... */
+   }
+   ```
+
+3. Run with the `--profile-time` flag so Criterion runs the profiler loop
+   instead of the normal measurement loop:
+
+   ```sh
+   cargo bench --bench e2e_inference -- --profile-time 10 e2e/invoke_not_found
+   cargo bench --bench jit_compile   -- --profile-time 10 jit_compile/emit_text
+   ```
+
+   The flamegraph SVG (or `profile.pb` protobuf) lands under
+   `target/criterion/<group>/<id>/profile/`. For the protobuf form:
+   `go tool pprof -http=:8080 target/criterion/.../profile/profile.pb`.
+
+**When to reach for which.** `cargo flamegraph` is the zero-setup first
+look — run it the moment a gate fires. The `pprof`/Criterion path is for
+when you need the profile keyed to the exact Criterion metric (so the
+flame graph excludes warm-up and other metrics in the group) or want the
+`go tool pprof` interactive call-graph / top-N view to compare against a
+captured baseline profile. Neither path is on CI — both are local
+drill-down tools.
 
 ---
 

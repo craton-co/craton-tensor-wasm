@@ -597,6 +597,107 @@ fn kernel_verify_succeeds_locally_when_manifest_signed_under_key() {
         .stdout(predicate::str::contains("verifies under the supplied key"));
 }
 
+// -- TLS flag + `--output json` smoke tests ----------------------------
+//
+// Cover the new global `--ca-cert` / `--insecure` flags (feature 1) and the
+// `--output json` machine-readable mode (feature 3). The unit tests in
+// `src/cmd/mod.rs` exercise `build_client` directly; these prove the flags
+// parse on the real binary and behave end-to-end.
+
+#[test]
+fn insecure_flag_parses_and_warns() {
+    // `--insecure` must parse as a global flag and, on every invocation,
+    // emit the LOUD TLS-disabled warning to stderr. We pair it with `metrics`
+    // against the dead server so a real `build_client` runs (the warn fires
+    // inside `build_client`). The command fails (no server) but the warning
+    // must be present regardless.
+    let mut cmd = AssertCmd::cargo_bin("tensor-wasm").expect("tensor-wasm binary built");
+    cmd.env_remove("TENSOR_WASM_TOKEN")
+        // Ensure the warn is visible: default filter is `warn`, but a stray
+        // env in the dev shell could mute it. Pin it explicitly.
+        .env("TENSOR_WASM_LOG", "warn");
+    let assertion = cmd
+        .args(["metrics", "--server", DEAD_SERVER, "--insecure"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_lowercase();
+    assert!(
+        stderr.contains("tls certificate verification is disabled")
+            || stderr.contains("--insecure"),
+        "expected a loud TLS-disabled warning, got: {stderr}"
+    );
+}
+
+#[test]
+fn ca_cert_with_bad_path_errors_cleanly() {
+    // A `--ca-cert` pointing at a non-existent file must fail with a clear
+    // error mentioning the flag, not panic. Run against the dead server so
+    // `build_client` (where the CA cert is loaded) executes before any
+    // network I/O.
+    let assertion = tensor_wasm()
+        .args([
+            "metrics",
+            "--server",
+            DEAD_SERVER,
+            "--ca-cert",
+            "definitely_no_such_ca_42.pem",
+        ])
+        .assert()
+        .failure();
+    let out = assertion.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+    .to_lowercase();
+    assert!(!combined.contains("panicked"), "must not panic: {combined}");
+    assert!(
+        combined.contains("ca-cert"),
+        "error should mention --ca-cert: {combined}"
+    );
+}
+
+#[test]
+fn bench_output_json_emits_valid_json() {
+    // `bench --output json` must print a single machine-parseable JSON
+    // document carrying the percentile data, so CI perf gates can `jq` it.
+    let wat = r#"(module (func (export "noop")))"#;
+    let wasm = wat::parse_str(wat).expect("compile WAT fixture");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path().join("m.wasm");
+    std::fs::write(&p, &wasm).expect("write");
+
+    let assertion = tensor_wasm()
+        .args([
+            "bench",
+            p.to_str().unwrap(),
+            "--export",
+            "noop",
+            "--n",
+            "3",
+            "--output",
+            "json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout);
+    // The last non-empty stdout line is the JSON document.
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .expect("bench json output");
+    let v: serde_json::Value =
+        serde_json::from_str(line).expect("bench --output json must be valid JSON");
+    assert_eq!(v["export"], "noop");
+    assert_eq!(v["iterations"], 3);
+    assert!(
+        v["latency"]["p50_ns"].is_u64(),
+        "expected p50_ns integer, got: {v}"
+    );
+}
+
 #[test]
 fn kernel_help_lists_all_subactions() {
     // Help is the design-partner-facing surface — if `publish`, `list`,

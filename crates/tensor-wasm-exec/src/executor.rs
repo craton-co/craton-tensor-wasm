@@ -29,7 +29,9 @@ use crate::instance::{InstanceState, TensorWasmInstance};
 use crate::instance_pool::{InstancePool, ModuleHash};
 use crate::jit_dispatch::add_jit_dispatch_to_linker;
 use tensor_wasm_wasi_gpu::scheduler::add_scheduler_to_linker;
-use tensor_wasm_wasi_gpu::streaming::{add_streaming_to_linker, StreamingContext};
+use tensor_wasm_wasi_gpu::streaming::{
+    add_input_to_linker, add_streaming_to_linker, InputContext, StreamingContext,
+};
 
 /// Convert a wall-clock [`Duration`] into a number of epoch ticks suitable
 /// for [`wasmtime::Store::set_epoch_deadline`].
@@ -295,6 +297,19 @@ pub struct SpawnConfig {
     /// `/invoke` (the synchronous route) takes the `None` path; only
     /// `/invoke-stream` opts in.
     pub streaming: Option<StreamingContext>,
+    /// Bytes staged for the guest to pull via the `wasi:tensor/host`
+    /// pull-model input channel (`input-len` / `read-input`).
+    ///
+    /// Empty by default (the historical behaviour: the guest has no
+    /// input channel). When non-empty,
+    /// [`TensorWasmExecutor::spawn_instance`] installs an
+    /// [`InputContext`](tensor_wasm_wasi_gpu::streaming::InputContext) on
+    /// the per-instance state and registers the `input-len` /
+    /// `read-input` host functions on the spawn linker — so a guest can
+    /// copy these bytes into its own linear memory at the start of the
+    /// invocation. The OpenAI completions shim sets this to the assembled
+    /// prompt bytes.
+    pub input: Vec<u8>,
 }
 
 impl SpawnConfig {
@@ -305,6 +320,7 @@ impl SpawnConfig {
             deadline: None,
             args: Vec::new(),
             streaming: None,
+            input: Vec::new(),
         }
     }
 
@@ -332,6 +348,20 @@ impl SpawnConfig {
     /// concurrently drains into the SSE / chunked response body.
     pub fn with_streaming(mut self, ctx: StreamingContext) -> Self {
         self.streaming = Some(ctx);
+        self
+    }
+
+    /// Stage `input` bytes for the guest to pull via the
+    /// `wasi:tensor/host` input channel (`input-len` / `read-input`). See
+    /// [`SpawnConfig::input`].
+    ///
+    /// Builder method; pairs with [`Self::for_tenant`] /
+    /// [`Self::with_deadline`] / [`Self::with_streaming`]. An empty slice
+    /// is a no-op (the default) — the guest then observes `input-len() ==
+    /// 0`. The OpenAI completions shim passes the assembled prompt bytes
+    /// here so the guest receives the prompt.
+    pub fn with_input(mut self, input: Vec<u8>) -> Self {
+        self.input = input;
         self
     }
 }
@@ -1090,8 +1120,9 @@ impl TensorWasmExecutor {
     /// Internal: shared instantiation logic. Builds the [`Store`], wires the
     /// limiter, arms the start-function epoch deadline, builds a
     /// [`wasmtime::Linker`] with every available host surface registered
-    /// (scheduler always; streaming when [`SpawnConfig::streaming`] is set;
-    /// JIT dispatch when a [`KernelCache`] is configured via
+    /// (scheduler always; the `wasi:tensor/host` input channel — `input-len`
+    /// / `read-input` — always; streaming when [`SpawnConfig::streaming`] is
+    /// set; JIT dispatch when a [`KernelCache`] is configured via
     /// [`Self::with_jit_cache`]), and instantiates against it. Does NOT touch
     /// the registry or the admission counter — callers must pair this with
     /// [`Self::charge_instance_slot`] / [`Self::register_pooled_instance`].
@@ -1112,6 +1143,9 @@ impl TensorWasmExecutor {
             InstanceState::new(cfg.tenant_id, InstanceId(0)).with_memory_limit(max_memory_bytes);
         if let Some(ref s) = cfg.streaming {
             state = state.with_streaming(s.clone());
+        }
+        if !cfg.input.is_empty() {
+            state = state.with_input(InputContext::new(cfg.input.clone()));
         }
         if let Some(d) = cfg.deadline {
             state = state
@@ -1184,6 +1218,16 @@ impl TensorWasmExecutor {
         // a linker never cross-talk.
         add_scheduler_to_linker(&mut linker, |state: &InstanceState| state.scheduler())
             .map_err(ExecError::Wasmtime)?;
+        // Guest-input pull channel (`wasi:tensor/host` `input-len` /
+        // `read-input`): always registered. The per-store `InputContext`
+        // is constructed unconditionally in `InstanceState::new`
+        // (`empty()` default, populated when `cfg.input` is non-empty),
+        // so the surface is always safe to expose — a guest that doesn't
+        // import it pays nothing, and one that does sees `input-len() ==
+        // 0` when no prompt was staged. Mirrors the always-on scheduler
+        // surface above. Registered before streaming so both
+        // `wasi:tensor/host` host-fn families coexist on one linker.
+        add_input_to_linker(&mut linker).map_err(ExecError::Wasmtime)?;
         if cfg.streaming.is_some() {
             add_streaming_to_linker(&mut linker).map_err(ExecError::Wasmtime)?;
         }

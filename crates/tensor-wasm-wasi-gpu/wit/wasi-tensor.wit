@@ -38,6 +38,38 @@ interface host {
     /// Flush any buffered chunks. Implicit on guest return; explicit
     /// flush is useful to mark logical record boundaries.
     flush: func() -> s32;
+
+    /// Number of input bytes the host has staged for this invocation.
+    ///
+    /// This is the pull-model counterpart to `emit-chunk`: the gateway
+    /// (e.g. the OpenAI completions shim) stages the assembled prompt
+    /// bytes on the per-instance host state before the guest runs, and
+    /// the guest learns how many bytes are waiting via this call. Returns
+    /// `0` when no input was staged for this invocation (the default).
+    ///
+    /// The count is fixed for the lifetime of the invocation — the host
+    /// never mutates the staged buffer mid-call — so a guest may size a
+    /// single read buffer from one `input-len` call and then drain it via
+    /// one or more `read-input` calls.
+    input-len: func() -> u32;
+
+    /// Copy up to `len` bytes of the staged input into guest linear
+    /// memory at `ptr`, returning the number of bytes written.
+    ///
+    /// The whole staged buffer is presented as a single contiguous run
+    /// starting at offset 0; a guest reading the full input passes
+    /// `len >= input-len()` and receives every byte in one call. The
+    /// host writes `min(len, input-len())` bytes and returns that count.
+    ///
+    /// Returns a negative error code on failure, drawn from the same ABI
+    /// error space as the wasi-cuda surface (`crate::abi::AbiError`):
+    ///   -2 = the `(ptr, len)` pair is invalid — negative, or the region
+    ///        `[ptr, ptr+len)` falls outside the guest's exported
+    ///        `memory` (bounds-checked with the same `checked_add`
+    ///        pattern as `emit-chunk` / the wasi-cuda `read_bytes` path).
+    /// A return of `0` means "no input staged" (or `len == 0`), never an
+    /// error.
+    read-input: func(ptr: u32, len: u32) -> s32;
 }
 
 world tensor-streaming {

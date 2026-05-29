@@ -21,6 +21,13 @@
 //!
 //! * `--tenant <u64>` — when non-zero, attaches the `X-TensorWasm-Tenant` header to
 //!   every outbound request. Defaults to `0` (header omitted; legacy behavior).
+//! * `--ca-cert <PATH>` — trust an additional PEM-encoded private CA root for
+//!   outbound HTTPS (added alongside the system trust store, not instead of
+//!   it). Use this for internal/self-signed CAs rather than `--insecure`.
+//! * `--insecure` — disable TLS certificate verification entirely. **Security
+//!   note:** this exposes the connection to man-in-the-middle attacks and can
+//!   leak the `TENSOR_WASM_TOKEN` bearer credential; a warning is logged on
+//!   every invocation. Intended only for local dev against a throwaway cert.
 //! * `TENSOR_WASM_TOKEN` — if set, sent as `Authorization: Bearer <token>` on every
 //!   outbound request. See `docs/CLI.md` for the operator guide.
 //! * `TENSOR_WASM_LOG` — `tracing-subscriber` `EnvFilter` directive. Defaults to
@@ -50,7 +57,11 @@ async fn main() {
         .try_init();
 
     let cli = Cli::parse();
-    let ctx = cmd::HttpContext::from_env(cli.tenant);
+    let tls = cmd::TlsOptions {
+        ca_cert: cli.ca_cert.clone(),
+        insecure: cli.insecure,
+    };
+    let ctx = cmd::HttpContext::from_env_with_tls(cli.tenant, tls);
     let result: Result<()> = match cli.command {
         Command::Run(args) => cmd::run::run(args).await,
         Command::Deploy(args) => cmd::deploy::run(args, &ctx).await,

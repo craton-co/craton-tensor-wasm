@@ -25,7 +25,9 @@ use crate::format::{SNAPSHOT_VERSION_V2, SNAPSHOT_VERSION_V3};
 use crate::writer::{check_blob_size, limits, payload_crc32, Snapshot, SNAPSHOT_MAGIC};
 
 #[cfg(feature = "signed-snapshots")]
-use crate::format::{SignatureKind, SIGNATURE_TRAILER_LEN, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN};
+use crate::format::{SignatureKind, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN};
+#[cfg(feature = "signed-snapshots")]
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 #[cfg(feature = "artifact-backing")]
 use tensor_wasm_artifacts::ArtifactStore;
 #[cfg(feature = "signed-snapshots")]
@@ -78,10 +80,28 @@ pub struct SnapshotReader {
     /// allocator's freelist after the reader has gone out of scope.
     #[cfg(feature = "signed-snapshots")]
     hmac_key: Option<Zeroizing<[u8; 32]>>,
+    /// Ed25519 *public* verifying key used to verify v3 blobs whose trailer
+    /// carries `signature_kind = 2`. `None` -> such blobs are rejected.
+    ///
+    /// This is the asymmetric counterpart to [`Self::hmac_key`]: a publisher
+    /// signs with the private key and any number of readers verify with only
+    /// this public key, which cannot forge new snapshots. The key is public
+    /// by nature, so it is not wrapped in `Zeroizing`.
+    #[cfg(feature = "signed-snapshots")]
+    ed25519_verifying_key: Option<VerifyingKey>,
     /// When `true`, v2 (unsigned) inputs are rejected even if otherwise
     /// well-formed. Allows operators to enforce signature-only restores
     /// without compiling a separate binary.
     require_signature: bool,
+    /// Replay defence: when `Some(n)`, [`SnapshotReader::restore`] rejects a
+    /// blob whose `metadata.sequence_no` is `< n`. `None` (the default)
+    /// disables the floor. See [`SnapshotReader::with_min_sequence_no`].
+    min_sequence_no: Option<u64>,
+    /// Replay defence: when `Some(nonce)`, [`SnapshotReader::restore`]
+    /// rejects a blob whose `metadata.nonce` is not exactly `Some(nonce)`.
+    /// `None` (the default) disables the nonce check. See
+    /// [`SnapshotReader::with_expected_nonce`].
+    expected_nonce: Option<[u8; 16]>,
     /// T9 freshness check: when `Some(d)`, a restored snapshot whose
     /// `metadata.created_unix_ms` is older than `now - d` is rejected
     /// with [`TensorWasmError::SnapshotTooOld`]. `None` (the default)
@@ -110,7 +130,14 @@ impl std::fmt::Debug for SnapshotReader {
                 .as_ref()
                 .map(|_| "<REDACTED 32-byte HMAC key>"),
         );
+        #[cfg(feature = "signed-snapshots")]
+        d.field(
+            "ed25519_verifying_key",
+            &self.ed25519_verifying_key.as_ref().map(|_| "<set>"),
+        );
         d.field("require_signature", &self.require_signature);
+        d.field("min_sequence_no", &self.min_sequence_no);
+        d.field("expected_nonce", &self.expected_nonce.as_ref().map(|_| "<set>"));
         d.field("max_age", &self.max_age);
         d.finish()
     }
@@ -128,7 +155,11 @@ impl SnapshotReader {
             max_decompressed: limits::MAX_DECOMPRESSED_BYTES,
             #[cfg(feature = "signed-snapshots")]
             hmac_key: None,
+            #[cfg(feature = "signed-snapshots")]
+            ed25519_verifying_key: None,
             require_signature: false,
+            min_sequence_no: None,
+            expected_nonce: None,
             max_age: None,
         }
     }
@@ -151,6 +182,74 @@ impl SnapshotReader {
         // drops. `Zeroizing::new` is not `const`, so this constructor is no
         // longer `const fn`. All existing call-sites are runtime contexts.
         self.hmac_key = Some(Zeroizing::new(key));
+        self
+    }
+
+    /// Configure Ed25519 *asymmetric* verification with a public key.
+    ///
+    /// Required before the reader can accept a v3 blob whose trailer carries
+    /// `signature_kind = 2`. Without it, such a blob is rejected with a
+    /// `Serialization` error. v2 inputs continue to be accepted unless
+    /// [`SnapshotReader::require_signature`] has also been called, and HMAC
+    /// (`signature_kind = 1`) blobs are still handled by
+    /// [`SnapshotReader::with_hmac_sha256_key`].
+    ///
+    /// This is the verifier half of the asymmetric scheme: pass the public
+    /// key obtained from the publisher's
+    /// `signing_key.verifying_key()`. The reader can verify but never sign,
+    /// so distributing this key to many restorers does not let any of them
+    /// forge a snapshot — the property HMAC cannot provide. Verification is
+    /// performed by `ed25519_dalek`, which checks the signature without
+    /// data-dependent branching on the secret-derived state.
+    #[cfg(feature = "signed-snapshots")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "signed-snapshots")))]
+    #[must_use]
+    pub fn with_ed25519_verifying_key(mut self, key: VerifyingKey) -> Self {
+        self.ed25519_verifying_key = Some(key);
+        self
+    }
+
+    /// Reject any blob whose `metadata.nonce` is not exactly `Some(nonce)`.
+    ///
+    /// Pairs with [`crate::writer::SnapshotWriter::with_nonce`]: the
+    /// restorer pins the snapshot to a single expected challenge value and
+    /// rejects everything else — a blob with no nonce (`None`), a blob with a
+    /// different nonce, or a replayed older capture that carried a stale
+    /// nonce. The check runs after authentication and the structural checks,
+    /// so for a v3 blob the signature has already certified the nonce
+    /// (it lives inside the signed bincode payload) and an attacker cannot
+    /// substitute a matching nonce without re-signing.
+    ///
+    /// Disabled by default (`None`), preserving backward compatibility.
+    #[must_use]
+    pub const fn with_expected_nonce(mut self, nonce: [u8; 16]) -> Self {
+        self.expected_nonce = Some(nonce);
+        self
+    }
+
+    /// Reject any blob whose `metadata.sequence_no` is `< floor`
+    /// (rollback / replay defence).
+    ///
+    /// Pairs with [`crate::writer::SnapshotWriter::with_sequence_no`]. The
+    /// intended operator usage is a **per-signing-key "track highest seen
+    /// sequence_no"** pattern: maintain a persistent `last_seen` value for
+    /// each signing key, construct the reader with
+    /// `with_min_sequence_no(last_seen + 1)` (or `last_seen` if equal values
+    /// should be accepted), and after a successful `restore` update
+    /// `last_seen = max(last_seen, restored.metadata.sequence_no)`. A
+    /// replayed older snapshot then carries a `sequence_no` below the floor
+    /// and is rejected, closing the rollback window that timestamp-based
+    /// freshness ([`SnapshotReader::with_max_age`]) alone cannot — an
+    /// attacker who replays a once-valid capture within the `max_age`
+    /// window still trips the sequence floor.
+    ///
+    /// The check runs after authentication, so for a v3 blob the signature
+    /// has already certified `sequence_no` (it is inside the signed payload)
+    /// and cannot be rewritten without re-signing. Disabled by default
+    /// (`None`).
+    #[must_use]
+    pub const fn with_min_sequence_no(mut self, floor: u64) -> Self {
+        self.min_sequence_no = Some(floor);
         self
     }
 
@@ -323,52 +422,38 @@ impl SnapshotReader {
             }
         }
 
-        // Detect a v3 (signed) blob by peeking at the trailer position.
-        // A v3 envelope is
-        // `[compressed prefix][V3_TRAILER_MAGIC: 4][signature_kind: 1][32-byte sig]`
-        // where the trailer magic starts at `len - SIGNATURE_TRAILER_LEN`.
-        // We deliberately key off the trailer *before* decompression so
-        // HMAC verification can authenticate the prefix bytes before zstd
-        // or bincode see them — the "authenticate then parse" property.
+        // Detect a v3 (signed) blob by peeking at the trailer position,
+        // *before* decompression, so signature verification can authenticate
+        // the prefix bytes before zstd or bincode see them — the
+        // "authenticate then parse" property. Keying off a 4-byte magic
+        // prefix (rather than the pre-T8 single-byte kind sniff) keeps the v2
+        // false-positive rate at ~1/2^32.
         //
-        // **T8:** prior to this commit the detector was a single-byte
-        // sniff at `bytes[len - 33] == SIGNATURE_KIND_HMAC_SHA256` (`1`).
-        // Because that byte sits inside the zstd frame epilogue of a
-        // legitimate v2 blob with ~1/256 probability, a v2 capture could
-        // be misclassified as v3 and then rejected by the HMAC check —
-        // a downgrade-shaped error message and wasted HMAC work, both
-        // observable side channels. Switching to a 4-byte magic prefix
-        // shrinks the false-positive rate to ~1/2^32 (~2.3e-10), well
-        // below per-blob CRC32 collision rates. v2 snapshots whose tail
-        // bytes happen to match `S3T1` exactly are still vanishingly
-        // rare in practice; if one is observed it will be caught by the
-        // HMAC mismatch path (since the writer would not have signed it)
-        // exactly as before.
+        // The trailer is now variable-length: HMAC-SHA256 carries a 37-byte
+        // trailer (`[magic: 4][kind: 1][sig: 32]`), Ed25519 a 69-byte one
+        // (`[magic: 4][kind: 1][sig: 64]`). `detect_v3_trailer` probes both
+        // candidate lengths — for each it checks that the 4-byte magic sits at
+        // `len - trailer_len(kind)` AND the kind byte immediately after the
+        // magic matches that kind — and returns the matched
+        // `(SignatureKind, prefix_len)`. Keying off both the magic and the
+        // self-consistent kind byte keeps the ~1/2^32 false-positive guarantee
+        // and unambiguously selects the right prefix split for the two trailer
+        // sizes.
         #[cfg(feature = "signed-snapshots")]
-        let is_v3 = bytes.len() >= SIGNATURE_TRAILER_LEN && {
-            let trailer_start = bytes.len() - SIGNATURE_TRAILER_LEN;
-            // Magic check: the first 4 bytes of the trailer must equal
-            // V3_TRAILER_MAGIC. We deliberately do NOT also check the
-            // signature-kind byte here — that check lives inside
-            // `verify_v3_trailer`, which already rejects unknown kinds
-            // with a descriptive error and so doubles as the
-            // forward-compatibility hook for future variants.
-            bytes[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN] == V3_TRAILER_MAGIC
-        };
+        let detected = detect_v3_trailer(bytes);
+        #[cfg(feature = "signed-snapshots")]
+        let is_v3 = detected.is_some();
         #[cfg(not(feature = "signed-snapshots"))]
         let is_v3 = false;
 
         // STEP 2.5 — AUTHENTICATE FIRST.
-        // Verify HMAC over the compressed prefix before any decompression or
-        // bincode decode runs. On failure we return immediately so an attacker
-        // cannot use the zstd or bincode decoders as oracles. The trailer
-        // length and HMAC are constants of the v3 envelope (37 bytes total
-        // post-T8: 4-byte magic + 1-byte kind + 32-byte signature), so the
-        // prefix is exactly `bytes[..len - SIGNATURE_TRAILER_LEN]`.
+        // Verify the signature over the compressed prefix before any
+        // decompression or bincode decode runs. On failure we return
+        // immediately so an attacker cannot use the zstd or bincode decoders
+        // as oracles. The prefix is `bytes[..len - kind.trailer_len()]`.
         #[cfg(feature = "signed-snapshots")]
-        let prefix_len = if is_v3 {
-            let p = bytes.len() - SIGNATURE_TRAILER_LEN;
-            self.verify_v3_trailer(bytes, p)?;
+        let prefix_len = if let Some((kind, p)) = detected {
+            self.verify_v3_trailer(bytes, p, kind)?;
             p
         } else {
             bytes.len()
@@ -637,6 +722,11 @@ impl SnapshotReader {
         // reader's clock is authoritative.
         self.check_freshness(snapshot.metadata.created_unix_ms)?;
 
+        // Replay/rollback defence (opt-in via `with_min_sequence_no` /
+        // `with_expected_nonce`). Runs last, on a fully-authenticated and
+        // structurally-valid snapshot.
+        self.check_replay(&snapshot.metadata)?;
+
         debug!(
             decompressed = decompressed.len(),
             wasm = snapshot.wasm_memory.len(),
@@ -689,6 +779,55 @@ impl SnapshotReader {
         Ok(())
     }
 
+    /// Replay/rollback defence: enforce the optional `min_sequence_no` floor
+    /// and `expected_nonce` match against the snapshot's metadata.
+    ///
+    /// Runs *after* authentication, CRC, and the structural checks (so a
+    /// malformed blob is never re-categorised as a replay) and after
+    /// `check_freshness`. For a v3 blob the signature has already certified
+    /// both fields (they live inside the signed bincode payload), so an
+    /// attacker who replays a stale capture cannot rewrite the sequence
+    /// number or nonce to slip past these checks without re-signing.
+    ///
+    /// Both checks are opt-in; a reader built via [`SnapshotReader::new`]
+    /// leaves them disabled and accepts any `sequence_no` / `nonce`,
+    /// preserving backward compatibility.
+    ///
+    /// Rejections are surfaced as [`TensorWasmError::Serialization`] with a
+    /// distinct, greppable message per check (`"snapshot sequence_no ... below
+    /// floor ..."` / `"snapshot nonce mismatch"` / `"snapshot nonce missing"`)
+    /// so dashboards can pin replay-attempt rejections apart from generic
+    /// format errors without a new core-crate error variant.
+    fn check_replay(&self, metadata: &crate::writer::SnapshotMetadata) -> Result<()> {
+        if let Some(floor) = self.min_sequence_no {
+            if metadata.sequence_no < floor {
+                return Err(TensorWasmError::Serialization(
+                    format!(
+                        "snapshot sequence_no {} below floor {} (replay/rollback rejected)",
+                        metadata.sequence_no, floor,
+                    )
+                    .into(),
+                ));
+            }
+        }
+        if let Some(expected) = self.expected_nonce {
+            match metadata.nonce {
+                Some(actual) if actual == expected => {}
+                Some(_) => {
+                    return Err(TensorWasmError::Serialization(
+                        "snapshot nonce mismatch (replay rejected)".into(),
+                    ));
+                }
+                None => {
+                    return Err(TensorWasmError::Serialization(
+                        "snapshot nonce missing but a nonce was required (replay rejected)".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate the trailing `[magic][signature_kind][signature]` bytes of
     /// a v3 blob.
     ///
@@ -704,46 +843,48 @@ impl SnapshotReader {
     /// cannot drive the zstd, bincode, or per-blob validation paths as a
     /// side channel.
     ///
-    /// **T8 wire format:** the trailer is now `[magic: 4][kind: 1][sig: 32]`
-    /// = 37 bytes. The classifier in [`SnapshotReader::restore`] has
-    /// already checked that the magic equals [`V3_TRAILER_MAGIC`] before
-    /// dispatching here; we re-read the magic from the slice (rather than
-    /// trusting the classifier) so this function remains correct under
-    /// future refactors that hoist the check.
+    /// **Wire format:** the trailer is `[magic: 4][kind: 1][sig: N]` where
+    /// `N` is 32 for HMAC-SHA256 (37-byte trailer) or 64 for Ed25519
+    /// (69-byte trailer). The classifier in [`SnapshotReader::restore`] has
+    /// already matched the magic and the self-consistent kind byte before
+    /// dispatching here and passes the decided `kind`; we re-read and
+    /// re-validate the magic and kind from the slice (rather than trusting
+    /// the classifier) so this function remains correct under future
+    /// refactors that hoist the check.
     ///
     /// Errors are deliberately generic: we never include the expected or
     /// observed signature bytes in the error message, since either could
     /// leak information about the secret key under a side-channel attacker.
     /// The constant-time `ct_eq` from `subtle` is used to compare the
     /// recomputed HMAC against the stored bytes so a timing oracle cannot
-    /// recover the signature byte-by-byte.
+    /// recover the signature byte-by-byte; Ed25519 verification is delegated
+    /// to `ed25519_dalek`, which is constant-time with respect to the key.
     #[cfg(feature = "signed-snapshots")]
-    fn verify_v3_trailer(&self, bytes: &[u8], prefix_len: usize) -> Result<()> {
-        let key = self.hmac_key.as_ref().ok_or_else(|| {
-            TensorWasmError::Serialization(
-                "snapshot is signed (v3) but reader has no HMAC key".into(),
-            )
-        })?;
-
-        // The trailer must be exactly `[magic: 4][kind: 1][sig: 32]`.
-        // Anything shorter is a truncation; anything longer is junk after
-        // the signature (which we refuse rather than silently accept).
+    fn verify_v3_trailer(
+        &self,
+        bytes: &[u8],
+        prefix_len: usize,
+        kind: SignatureKind,
+    ) -> Result<()> {
+        // The trailer must be exactly `[magic: 4][kind: 1][sig: N]` for the
+        // detected kind. Anything else is a truncation or junk after the
+        // signature (refused rather than silently accepted).
         let trailer = bytes
             .get(prefix_len..)
             .ok_or_else(|| TensorWasmError::Serialization("snapshot v3 trailer missing".into()))?;
-        if trailer.len() != SIGNATURE_TRAILER_LEN {
+        if trailer.len() != kind.trailer_len() {
             return Err(TensorWasmError::Serialization(
                 format!(
                     "snapshot v3 trailer length mismatch: expected {} bytes, got {}",
-                    SIGNATURE_TRAILER_LEN,
+                    kind.trailer_len(),
                     trailer.len(),
                 )
                 .into(),
             ));
         }
         // Layout: trailer[0..4] = magic, trailer[4] = kind, trailer[5..] = sig.
-        // The classifier already checked the magic, but re-validate here
-        // for defence in depth (a future refactor that hoists detection
+        // The classifier already checked the magic and kind, but re-validate
+        // here for defence in depth (a future refactor that hoists detection
         // upstream must not be able to skip authentication).
         let magic_bytes = &trailer[..V3_TRAILER_MAGIC_LEN];
         if magic_bytes != V3_TRAILER_MAGIC {
@@ -753,13 +894,53 @@ impl SnapshotReader {
         }
         let kind_byte = trailer[V3_TRAILER_MAGIC_LEN];
         let sig_bytes = &trailer[V3_TRAILER_MAGIC_LEN + 1..];
-        let kind = SignatureKind::from_byte(kind_byte).ok_or_else(|| {
+        let parsed_kind = SignatureKind::from_byte(kind_byte).ok_or_else(|| {
             TensorWasmError::Serialization(format!("unknown signature_kind: {kind_byte}").into())
         })?;
+        // The kind byte in the slice must agree with the kind the classifier
+        // selected the trailer length from — otherwise the offset arithmetic
+        // and the signature length would be inconsistent.
+        if parsed_kind != kind {
+            return Err(TensorWasmError::Serialization(
+                "snapshot v3 trailer kind inconsistent with detected length".into(),
+            ));
+        }
         debug_assert_eq!(sig_bytes.len(), kind.signature_len());
 
         match kind {
+            SignatureKind::Ed25519 => {
+                let verifying_key = self.ed25519_verifying_key.as_ref().ok_or_else(|| {
+                    TensorWasmError::Serialization(
+                        "snapshot is Ed25519-signed (v3) but reader has no Ed25519 verifying key"
+                            .into(),
+                    )
+                })?;
+                // Reconstruct the 64-byte signature. `Signature::from_slice`
+                // only fails on a wrong length, which we have already
+                // guaranteed via the trailer-length check above.
+                let sig = Signature::from_slice(sig_bytes).map_err(|_| {
+                    TensorWasmError::Serialization("snapshot Ed25519 signature malformed".into())
+                })?;
+                // Reconstruct the exact signed message:
+                // `prefix || V3_TRAILER_MAGIC || [kind_byte]`. This mirrors
+                // the writer and authenticates the trailer header, so an
+                // attacker cannot rewrite the kind byte (e.g. to claim HMAC)
+                // without invalidating the signature.
+                let mut message =
+                    Vec::with_capacity(prefix_len + V3_TRAILER_MAGIC_LEN + 1);
+                message.extend_from_slice(&bytes[..prefix_len]);
+                message.extend_from_slice(&V3_TRAILER_MAGIC);
+                message.push(kind_byte);
+                verifying_key.verify(&message, &sig).map_err(|_| {
+                    TensorWasmError::Serialization("snapshot Ed25519 signature mismatch".into())
+                })?;
+            }
             SignatureKind::HmacSha256 => {
+                let key = self.hmac_key.as_ref().ok_or_else(|| {
+                    TensorWasmError::Serialization(
+                        "snapshot is signed (v3) but reader has no HMAC key".into(),
+                    )
+                })?;
                 use hmac::{Hmac, Mac};
                 use sha2::Sha256;
                 use subtle::ConstantTimeEq;
@@ -952,6 +1133,7 @@ impl SnapshotReader {
         // `created_unix_ms` cannot have been tampered with after the
         // snapshot was sealed.
         self.check_freshness(snapshot.metadata.created_unix_ms)?;
+        self.check_replay(&snapshot.metadata)?;
 
         debug!(
             wasm = snapshot.wasm_memory.len(),
@@ -1142,6 +1324,7 @@ impl SnapshotReader {
             ));
         }
         self.check_freshness(snapshot.metadata.created_unix_ms)?;
+        self.check_replay(&snapshot.metadata)?;
 
         debug!(
             wasm = snapshot.wasm_memory.len(),
@@ -1152,6 +1335,67 @@ impl SnapshotReader {
         );
         Ok(Some(snapshot))
     }
+}
+
+/// Detect a v3 (signed) trailer at the tail of `bytes` and, if present,
+/// return the `(SignatureKind, prefix_len)` it implies.
+///
+/// The v3 trailer is `[V3_TRAILER_MAGIC: 4][signature_kind: 1][sig: N]`,
+/// where `N` depends on the kind (32 for HMAC-SHA256, 64 for Ed25519). The
+/// detector probes each known kind's trailer length: for candidate `kind`
+/// it checks whether the 4-byte magic sits at `len - kind.trailer_len()`
+/// **and** the byte immediately after the magic equals that kind's
+/// discriminant. Requiring the kind byte to be self-consistent with the
+/// trailer length it was probed at disambiguates the two trailer sizes — a
+/// stray `S3T1` inside an Ed25519 signature's bytes cannot masquerade as an
+/// HMAC trailer because its kind byte would not read as `1` — while
+/// preserving the ~1/2^32 magic false-positive guarantee. Ed25519 (the
+/// longer trailer) is probed first.
+///
+/// As a backward-compatibility fallback, if neither self-consistent probe
+/// matches but the 4-byte magic *is* present at the HMAC offset
+/// (`len - 37`), the blob is still classified as an HMAC-kind trailer so
+/// that a corrupted/unknown kind byte at that position is routed to
+/// [`SnapshotReader::verify_v3_trailer`] and rejected there with the precise
+/// `"unknown signature_kind"` / length-mismatch error rather than being
+/// silently re-classified as v2. The signature is verified later; this
+/// function only classifies.
+///
+/// Returns `None` for any blob that carries no recognised trailer magic at
+/// either candidate offset — the caller treats it as v2 (or rejects it under
+/// `require_signature`).
+#[cfg(feature = "signed-snapshots")]
+fn detect_v3_trailer(bytes: &[u8]) -> Option<(SignatureKind, usize)> {
+    // First pass: a self-consistent magic+kind match at either candidate
+    // trailer length unambiguously selects the kind and the prefix split.
+    for kind in [SignatureKind::Ed25519, SignatureKind::HmacSha256] {
+        let trailer_len = kind.trailer_len();
+        if bytes.len() < trailer_len {
+            continue;
+        }
+        let trailer_start = bytes.len() - trailer_len;
+        let magic_ok =
+            bytes[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN] == V3_TRAILER_MAGIC;
+        let kind_ok = bytes[trailer_start + V3_TRAILER_MAGIC_LEN] == kind as u8;
+        if magic_ok && kind_ok {
+            return Some((kind, trailer_start));
+        }
+    }
+    // Fallback: magic present at the HMAC offset but the kind byte did not
+    // read as a self-consistent discriminant. Classify as HMAC so
+    // `verify_v3_trailer` can surface the precise kind/length error. (The
+    // Ed25519 offset has no analogous fallback: a corrupted kind byte there
+    // with an intact magic is indistinguishable from a coincidental magic
+    // inside payload bytes, so we leave it to the v2 path / version-
+    // consistency check, exactly as a stripped trailer would be handled.)
+    let hmac_trailer_len = SignatureKind::HmacSha256.trailer_len();
+    if bytes.len() >= hmac_trailer_len {
+        let trailer_start = bytes.len() - hmac_trailer_len;
+        if bytes[trailer_start..trailer_start + V3_TRAILER_MAGIC_LEN] == V3_TRAILER_MAGIC {
+            return Some((SignatureKind::HmacSha256, trailer_start));
+        }
+    }
+    None
 }
 
 /// In-memory representation of a snapshot whose `gpu_memory` blob has been
@@ -1268,7 +1512,7 @@ pub fn restore_to_gpu_with(
 mod tests {
     use super::*;
     #[cfg(feature = "signed-snapshots")]
-    use crate::format::{HMAC_SHA256_SIG_LEN, SIGNATURE_KIND_HMAC_SHA256};
+    use crate::format::{HMAC_SHA256_SIG_LEN, SIGNATURE_KIND_HMAC_SHA256, SIGNATURE_TRAILER_LEN};
     use crate::writer::{InstanceState, SnapshotWriter, SNAPSHOT_VERSION};
     use tensor_wasm_core::types::{InstanceId, TenantId};
 
@@ -1734,5 +1978,267 @@ mod tests {
         assert_eq!(restored.gpu_memory, gpu);
         assert_eq!(restored.registers, regs);
         assert_eq!(restored.version, crate::format::SNAPSHOT_VERSION_V3);
+    }
+
+    // ----- Ed25519 asymmetric signatures -----
+
+    /// Ed25519 sign → verify round-trip: a writer signs with the private
+    /// key, a reader holding only the public key restores it.
+    #[cfg(feature = "signed-snapshots")]
+    #[test]
+    fn ed25519_round_trip() {
+        use ed25519_dalek::SigningKey;
+        let signing_key = SigningKey::from_bytes(&[0x21u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let wasm = vec![0xAAu8; 200];
+        let gpu = vec![0xBBu8; 100];
+        let regs = vec![0xCCu8; 8];
+        let bytes = SnapshotWriter::new()
+            .with_ed25519_signing_key(signing_key)
+            .capture(InstanceState {
+                tenant_id: TenantId(7),
+                instance_id: InstanceId(7),
+                wasm_memory: &wasm,
+                gpu_memory: &gpu,
+                registers: &regs,
+            })
+            .expect("capture");
+        let restored = SnapshotReader::new()
+            .with_ed25519_verifying_key(verifying_key)
+            .restore(&bytes)
+            .expect("ed25519 round-trip");
+        assert_eq!(restored.wasm_memory, wasm);
+        assert_eq!(restored.gpu_memory, gpu);
+        assert_eq!(restored.registers, regs);
+    }
+
+    /// A blob signed with key A is rejected by a reader holding key B's
+    /// public key.
+    #[cfg(feature = "signed-snapshots")]
+    #[test]
+    fn ed25519_wrong_key_is_rejected() {
+        use ed25519_dalek::SigningKey;
+        let signing_key_a = SigningKey::from_bytes(&[0x01u8; 32]);
+        let verifying_key_b = SigningKey::from_bytes(&[0x02u8; 32]).verifying_key();
+        let bytes = SnapshotWriter::new()
+            .with_ed25519_signing_key(signing_key_a)
+            .capture(InstanceState {
+                tenant_id: TenantId(4),
+                instance_id: InstanceId(4),
+                wasm_memory: &[42; 16],
+                gpu_memory: &[],
+                registers: &[],
+            })
+            .expect("capture");
+        let err = SnapshotReader::new()
+            .with_ed25519_verifying_key(verifying_key_b)
+            .restore(&bytes)
+            .expect_err("wrong key must be rejected");
+        match err {
+            TensorWasmError::Serialization(m) => {
+                assert!(m.contains("Ed25519"), "unexpected message: {m}");
+            }
+            other => panic!("expected Serialization, got {other:?}"),
+        }
+    }
+
+    /// A reader configured with an Ed25519 key but no HMAC key cannot verify
+    /// an HMAC-signed blob, and vice-versa: the kind byte distinguishes the
+    /// two so a blob signed under one scheme cannot be presented as the other
+    /// (downgrade / cross-scheme rejection).
+    #[cfg(feature = "signed-snapshots")]
+    #[test]
+    fn ed25519_vs_hmac_kind_byte_downgrade_rejected() {
+        use ed25519_dalek::SigningKey;
+        let signing_key = SigningKey::from_bytes(&[0x33u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let hmac_key = [0x44u8; 32];
+
+        // Ed25519 blob presented to an HMAC-only reader → rejected (the
+        // reader has no Ed25519 key for the kind=2 trailer).
+        let ed_bytes = SnapshotWriter::new()
+            .with_ed25519_signing_key(signing_key)
+            .capture(InstanceState {
+                tenant_id: TenantId(5),
+                instance_id: InstanceId(5),
+                wasm_memory: &[1, 2, 3, 4],
+                gpu_memory: &[],
+                registers: &[],
+            })
+            .expect("capture ed25519");
+        let err = SnapshotReader::new()
+            .with_hmac_sha256_key(hmac_key)
+            .restore(&ed_bytes)
+            .expect_err("ed25519 blob must not verify against an HMAC-only reader");
+        assert!(
+            matches!(err, TensorWasmError::Serialization(_)),
+            "expected Serialization",
+        );
+
+        // HMAC blob presented to an Ed25519-only reader → rejected.
+        let hmac_bytes = SnapshotWriter::new()
+            .with_hmac_sha256_key(hmac_key)
+            .with_legacy_envelope()
+            .capture(InstanceState {
+                tenant_id: TenantId(6),
+                instance_id: InstanceId(6),
+                wasm_memory: &[5, 6, 7, 8],
+                gpu_memory: &[],
+                registers: &[],
+            })
+            .expect("capture hmac");
+        let err = SnapshotReader::new()
+            .with_ed25519_verifying_key(verifying_key)
+            .restore(&hmac_bytes)
+            .expect_err("hmac blob must not verify against an ed25519-only reader");
+        match err {
+            TensorWasmError::Serialization(m) => assert!(
+                m.contains("no HMAC key"),
+                "expected the HMAC-key-missing error, got: {m}",
+            ),
+            other => panic!("expected Serialization, got {other:?}"),
+        }
+    }
+
+    /// Flipping the kind byte of an Ed25519 trailer to claim HMAC (=1) must
+    /// be rejected — the asymmetric signature authenticates the kind byte,
+    /// and the trailer-length classifier no longer self-consistently matches.
+    #[cfg(feature = "signed-snapshots")]
+    #[test]
+    fn ed25519_kind_byte_rewrite_to_hmac_rejected() {
+        use ed25519_dalek::SigningKey;
+        let signing_key = SigningKey::from_bytes(&[0x55u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let mut bytes = SnapshotWriter::new()
+            .with_ed25519_signing_key(signing_key)
+            .capture(InstanceState {
+                tenant_id: TenantId(8),
+                instance_id: InstanceId(8),
+                wasm_memory: &[9; 32],
+                gpu_memory: &[],
+                registers: &[],
+            })
+            .expect("capture");
+        // Rewrite the kind byte (at the Ed25519 trailer's magic+4 offset)
+        // from 2 (Ed25519) to 1 (HMAC).
+        let kind_pos = bytes.len() - crate::format::ED25519_TRAILER_LEN + V3_TRAILER_MAGIC_LEN;
+        assert_eq!(bytes[kind_pos], crate::format::SIGNATURE_KIND_ED25519);
+        bytes[kind_pos] = SIGNATURE_KIND_HMAC_SHA256;
+        let err = SnapshotReader::new()
+            .with_ed25519_verifying_key(verifying_key)
+            .with_hmac_sha256_key([0x55u8; 32])
+            .restore(&bytes)
+            .expect_err("kind-byte downgrade must be rejected");
+        assert!(
+            matches!(err, TensorWasmError::Serialization(_)),
+            "expected Serialization",
+        );
+    }
+
+    // ----- Replay protection: nonce -----
+
+    /// Matching nonce is accepted; mismatched / missing nonce is rejected.
+    #[test]
+    fn nonce_match_and_mismatch() {
+        let nonce = [0x7Eu8; 16];
+        let bytes = SnapshotWriter::new()
+            .with_nonce(nonce)
+            .capture(InstanceState {
+                tenant_id: TenantId(1),
+                instance_id: InstanceId(1),
+                wasm_memory: &[1, 2, 3],
+                gpu_memory: &[],
+                registers: &[],
+            })
+            .expect("capture");
+
+        // Match → accepted.
+        SnapshotReader::new()
+            .with_expected_nonce(nonce)
+            .restore(&bytes)
+            .expect("matching nonce must be accepted");
+
+        // Mismatch → rejected.
+        let err = SnapshotReader::new()
+            .with_expected_nonce([0x00u8; 16])
+            .restore(&bytes)
+            .expect_err("mismatched nonce must be rejected");
+        match err {
+            TensorWasmError::Serialization(m) => {
+                assert!(m.contains("nonce mismatch"), "unexpected message: {m}")
+            }
+            other => panic!("expected Serialization, got {other:?}"),
+        }
+    }
+
+    /// A reader requiring a nonce rejects a blob that carries none.
+    #[test]
+    fn nonce_required_but_absent_is_rejected() {
+        let bytes = SnapshotWriter::new()
+            .capture(InstanceState {
+                tenant_id: TenantId(1),
+                instance_id: InstanceId(1),
+                wasm_memory: &[1, 2, 3],
+                gpu_memory: &[],
+                registers: &[],
+            })
+            .expect("capture");
+        let err = SnapshotReader::new()
+            .with_expected_nonce([0x01u8; 16])
+            .restore(&bytes)
+            .expect_err("absent nonce must be rejected when required");
+        match err {
+            TensorWasmError::Serialization(m) => {
+                assert!(m.contains("nonce missing"), "unexpected message: {m}")
+            }
+            other => panic!("expected Serialization, got {other:?}"),
+        }
+    }
+
+    // ----- Replay protection: sequence_no floor -----
+
+    /// A snapshot at or above the floor is accepted; one below is rejected.
+    #[test]
+    fn sequence_no_floor_accept_and_reject() {
+        let make = |seq: u64| {
+            SnapshotWriter::new()
+                .with_sequence_no(seq)
+                .capture(InstanceState {
+                    tenant_id: TenantId(1),
+                    instance_id: InstanceId(1),
+                    wasm_memory: &[1, 2, 3],
+                    gpu_memory: &[],
+                    registers: &[],
+                })
+                .expect("capture")
+        };
+
+        // At the floor → accepted.
+        let at_floor = make(10);
+        SnapshotReader::new()
+            .with_min_sequence_no(10)
+            .restore(&at_floor)
+            .expect("seq == floor must be accepted");
+
+        // Above the floor → accepted.
+        let above = make(11);
+        SnapshotReader::new()
+            .with_min_sequence_no(10)
+            .restore(&above)
+            .expect("seq > floor must be accepted");
+
+        // Below the floor → rejected (rollback/replay).
+        let below = make(9);
+        let err = SnapshotReader::new()
+            .with_min_sequence_no(10)
+            .restore(&below)
+            .expect_err("seq < floor must be rejected");
+        match err {
+            TensorWasmError::Serialization(m) => assert!(
+                m.contains("sequence_no") && m.contains("below floor"),
+                "unexpected message: {m}",
+            ),
+            other => panic!("expected Serialization, got {other:?}"),
+        }
     }
 }

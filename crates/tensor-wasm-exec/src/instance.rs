@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use tensor_wasm_core::types::{InstanceId, TenantId};
 use tensor_wasm_wasi_gpu::scheduler::SchedulerContext;
-use tensor_wasm_wasi_gpu::streaming::{HasStreaming, StreamingContext};
+use tensor_wasm_wasi_gpu::streaming::{HasInput, HasStreaming, InputContext, StreamingContext};
 
 use crate::executor::TensorWasmResourceLimiter;
 use crate::jit_dispatch::{ArenaState, JitArenaProvider};
@@ -94,6 +94,16 @@ pub struct InstanceState {
     /// `POST /functions/{id}/invoke-stream` route — see
     /// `docs/STREAMING.md`.
     pub(crate) streaming: StreamingContext,
+    /// Per-instance guest-input context backing the
+    /// `wasi:tensor/host@0.1.0` `input-len` / `read-input` host functions
+    /// (the pull-model input channel). Constructed via
+    /// [`InputContext::empty`] by default — `input-len` then returns `0`
+    /// and `read-input` copies nothing.
+    ///
+    /// Set by [`crate::executor::SpawnConfig::with_input`] at spawn time.
+    /// The OpenAI completions shim stages the assembled prompt bytes here
+    /// so the guest can pull them via `wasi:tensor/host.read-input`.
+    pub(crate) input: InputContext,
 }
 
 impl InstanceState {
@@ -129,6 +139,10 @@ impl InstanceState {
             // `wasi:tensor/host` and run under the non-streaming
             // `/invoke` route see every `emit-chunk` return `-1`.
             streaming: StreamingContext::disabled(),
+            // No input staged by default; spawns that stage a prompt
+            // install a populated context via `SpawnConfig::with_input`.
+            // Guests calling `wasi:tensor/host.input-len` then see `0`.
+            input: InputContext::empty(),
         }
     }
 
@@ -151,6 +165,26 @@ impl InstanceState {
     /// functions.
     pub fn streaming(&self) -> &StreamingContext {
         &self.streaming
+    }
+
+    /// Install an [`InputContext`] on this state; returns `self` for
+    /// builder-style chaining.
+    ///
+    /// Called from [`crate::executor::TensorWasmExecutor`]'s spawn path
+    /// when [`crate::executor::SpawnConfig::input`] is non-empty so the
+    /// `wasi:tensor/host.read-input` host function reaches the staged
+    /// bytes. Spawns without input retain the default
+    /// [`InputContext::empty`] shape.
+    pub fn with_input(mut self, input: InputContext) -> Self {
+        self.input = input;
+        self
+    }
+
+    /// Borrow the per-instance input context. Used by the
+    /// `wasi:tensor/host` linker registration to plumb the per-instance
+    /// staged bytes into the `input-len` and `read-input` host functions.
+    pub fn input(&self) -> &InputContext {
+        &self.input
     }
 
     /// Set the per-instance linear-memory cap (in bytes). Returns `self`
@@ -276,6 +310,12 @@ impl HasStreaming for InstanceState {
     }
 }
 
+impl HasInput for InstanceState {
+    fn input(&self) -> &InputContext {
+        InstanceState::input(self)
+    }
+}
+
 /// A running Wasm instance.
 pub struct TensorWasmInstance {
     /// Wasmtime store driving execution.
@@ -354,6 +394,23 @@ mod tests {
 
         let s = InstanceState::new(TenantId(0), InstanceId(0));
         assert!(!s.is_past_deadline());
+    }
+
+    #[test]
+    fn input_empty_by_default() {
+        // A freshly-constructed InstanceState stages no guest input, so
+        // `wasi:tensor/host.input-len` returns 0.
+        let s = InstanceState::new(TenantId(0), InstanceId(0));
+        assert!(s.input().is_empty());
+        assert_eq!(s.input().len_u32(), 0);
+    }
+
+    #[test]
+    fn with_input_stages_bytes() {
+        let s = InstanceState::new(TenantId(0), InstanceId(0))
+            .with_input(InputContext::new(b"prompt".to_vec()));
+        assert!(!s.input().is_empty());
+        assert_eq!(s.input().bytes(), b"prompt");
     }
 
     #[test]

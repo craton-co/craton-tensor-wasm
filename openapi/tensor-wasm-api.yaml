@@ -69,6 +69,17 @@ tags:
       (`TENSOR_WASM_API_OPENAI_MODEL_MAP`) and dispatch through the
       shared executor. See `docs/OPENAI-COMPAT.md` for the wire
       contract and the operator configuration knob.
+  - name: snapshot
+    description: |
+      Snapshot save / restore (M5). `/snapshot/save` captures a deployed
+      function into an HMAC-SHA256-signed snapshot blob and returns it;
+      `/snapshot/restore` verifies the signature and decodes the
+      blob's provenance. Both routes consume the operator-configured
+      `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`; when it is unset they return
+      `503 snapshot_signing_not_configured`. The routes sit on the
+      protected stack (bearer auth + per-tenant scope + per-tenant
+      ownership). See crates/tensor-wasm-api/src/routes.rs and
+      crates/tensor-wasm-api/src/config.rs.
 
 paths:
   /healthz:
@@ -511,6 +522,156 @@ paths:
         "429":
           $ref: "#/components/responses/RateLimited"
 
+  /snapshot/save:
+    post:
+      tags: [snapshot]
+      summary: Capture a deployed function into a signed snapshot blob
+      description: |
+        Captures the deployed Wasm module bytes of the named function into
+        a zstd-compressed, HMAC-SHA256-signed snapshot blob and returns it
+        base64-encoded. The blob round-trips through `POST
+        /snapshot/restore`.
+
+        Authorization: protected stack (bearer auth + tenant scope). The
+        handler runs `authorize_tenant` against the bearer token's scope
+        (an out-of-scope token gets `403 tenant_scope_denied` before any
+        lookup) and then a per-resource owner check against the function's
+        `tenant_id` (a wildcard-scoped caller from another tenant cannot
+        snapshot tenant A's function).
+
+        Signing uses `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`; when it is unset
+        the route returns `503 snapshot_signing_not_configured` rather than
+        emitting an unsigned blob.
+
+        NOTE: this captures the function's *deployed module bytes* — the
+        working save/restore-of-bytes layer with end-to-end HMAC signing.
+        Capturing a *live running instance's* linear / GPU memory needs an
+        executor capture hook that does not exist yet; requesting that
+        capability surfaces `501 not_implemented`. See
+        crates/tensor-wasm-api/src/routes.rs.
+      operationId: snapshotSave
+      parameters:
+        - $ref: "#/components/parameters/TenantHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnapshotSaveRequest"
+      responses:
+        "200":
+          description: Snapshot captured and signed; blob returned base64.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotSaveResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/SnapshotSigningUnavailable"
+
+  /snapshot/restore:
+    post:
+      tags: [snapshot]
+      summary: Verify and decode a signed snapshot blob
+      description: |
+        Accepts a base64-encoded snapshot blob previously produced by
+        `POST /snapshot/save`, verifies its HMAC-SHA256 signature against
+        `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`, and returns the
+        HMAC-authenticated provenance (captured tenant, instance id,
+        uncompressed size, wire version).
+
+        Hardening: the reader always requires a signature
+        (`require_signature`) so a stripped-trailer downgrade to an
+        unsigned v2 blob is refused;
+        `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE` is the operator
+        surface for this posture. A 256 MiB decompression cap bounds
+        restore-time memory pressure.
+
+        Authorization: protected stack (bearer auth + tenant scope). After
+        HMAC verification recovers the snapshot's captured tenant, the
+        handler enforces that it equals the caller's resolved tenant — a
+        cross-tenant restore is `403 tenant_scope_denied`. A wrong /
+        missing key or a tampered blob is `403 snapshot_signature_invalid`
+        (a single opaque rejection, not a decode oracle).
+
+        NOTE: this verifies and decodes the snapshot *envelope*.
+        Reconstituting a *live running instance* from the captured memory
+        needs an executor restore hook that does not exist yet; requesting
+        that capability surfaces `501 not_implemented`.
+      operationId: snapshotRestore
+      parameters:
+        - $ref: "#/components/parameters/TenantHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnapshotRestoreRequest"
+      responses:
+        "200":
+          description: Snapshot signature verified; provenance returned.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotRestoreResponse"
+        "400":
+          description: |
+            `invalid_json` (malformed request body) or `invalid_base64`
+            (the `snapshot_b64` field is not valid base64). Carries the
+            native `{error:{kind,message}}` envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            `tenant_scope_denied` (the bearer token is not scoped to the
+            requested tenant, or the snapshot was captured for a different
+            tenant) or `snapshot_signature_invalid` (HMAC verification
+            failed, the blob is unsigned, or it is malformed). Carries the
+            native `{error:{kind,message}}` envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorEnvelope"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/SnapshotSigningUnavailable"
+
   /kernels:
     post:
       tags: [kernels]
@@ -859,6 +1020,38 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ApiErrorEnvelope"
+    NotImplemented:
+      description: |
+        `not_implemented` — the requested capability needs executor
+        support that is not wired yet (full live-instance snapshot /
+        restore of linear + GPU memory). The HMAC envelope layer of the
+        `/snapshot/*` routes is fully wired; only the live-instance
+        reconstitution returns this. Clients should NOT retry.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        X-Trace-Id:
+          $ref: "#/components/headers/XTraceId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorEnvelope"
+    SnapshotSigningUnavailable:
+      description: |
+        `snapshot_signing_not_configured` — the `/snapshot/*` routes are
+        mounted but `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` is unset, so the
+        gateway has no key to sign or verify snapshot blobs. The failure
+        mode is configuration, not load; a client should NOT retry but
+        surface the error to an operator who can set the key.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        X-Trace-Id:
+          $ref: "#/components/headers/XTraceId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorEnvelope"
 
   schemas:
     FunctionId:
@@ -1020,6 +1213,10 @@ components:
             - digest_mismatch
             - already_registered
             - invalid_request
+            # Snapshot save / restore (M5).
+            - not_implemented
+            - snapshot_signing_not_configured
+            - snapshot_signature_invalid
         message:
           type: string
           description: Human-readable description (not part of the contract).
@@ -1031,6 +1228,87 @@ components:
         error:
           $ref: "#/components/schemas/ApiErrorBody"
       required: [error]
+      additionalProperties: false
+
+    # ---- Snapshot save / restore shapes (M5) ------------------------------
+    SnapshotSaveRequest:
+      type: object
+      description: |
+        Body of `POST /snapshot/save`. Mirrors the
+        `tensor_wasm_api::routes::SnapshotSaveRequest` Rust struct.
+      properties:
+        function_id:
+          $ref: "#/components/schemas/FunctionId"
+      required: [function_id]
+      additionalProperties: false
+    SnapshotSaveResponse:
+      type: object
+      description: |
+        Body of a successful `POST /snapshot/save`. Carries the full
+        HMAC-SHA256-signed snapshot blob, base64-encoded.
+      properties:
+        function_id:
+          $ref: "#/components/schemas/FunctionId"
+        snapshot_b64:
+          type: string
+          description: |
+            Base64-encoded signed snapshot blob (standard alphabet,
+            padded). The exact bytes to hand back to `POST
+            /snapshot/restore`; the HMAC trailer is part of these bytes.
+        signed:
+          type: boolean
+          description: |
+            Whether the blob carries an HMAC signature. Always `true` on
+            this path — the route is only reachable with a key configured.
+      required: [function_id, snapshot_b64, signed]
+      additionalProperties: false
+    SnapshotRestoreRequest:
+      type: object
+      description: |
+        Body of `POST /snapshot/restore`. Mirrors the
+        `tensor_wasm_api::routes::SnapshotRestoreRequest` Rust struct.
+      properties:
+        snapshot_b64:
+          type: string
+          minLength: 1
+          description: |
+            Base64-encoded signed snapshot blob (standard alphabet,
+            padded) previously returned by `POST /snapshot/save`.
+      required: [snapshot_b64]
+      additionalProperties: false
+    SnapshotRestoreResponse:
+      type: object
+      description: |
+        Body of a successful `POST /snapshot/restore`. Reports the
+        HMAC-authenticated provenance recovered from the snapshot
+        metadata.
+      properties:
+        tenant_id:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Tenant the snapshot was originally captured for.
+        instance_id:
+          type: string
+          description: |
+            Instance id stamped into the snapshot metadata at capture
+            time, rendered as the `I#<n>` display form.
+        total_uncompressed_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Total uncompressed payload bytes recorded in the metadata.
+        version:
+          type: integer
+          minimum: 0
+          description: |
+            Snapshot wire-format version that verified (`3` for the signed
+            envelope this gateway writes).
+      required:
+        - tenant_id
+        - instance_id
+        - total_uncompressed_bytes
+        - version
       additionalProperties: false
 
     # ---- Kernel registry shapes (B6.4, feature kernel-registry-api) -------

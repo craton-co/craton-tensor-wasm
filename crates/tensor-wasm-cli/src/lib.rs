@@ -38,6 +38,24 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 0)]
     pub tenant: u64,
 
+    /// Trust an additional PEM-encoded private CA root for HTTPS (added
+    /// alongside the system trust store, not instead of it). Use this for a
+    /// server fronted by an internal/self-signed CA instead of `--insecure`.
+    /// The file must be PEM, not DER.
+    ///
+    /// `display_order` is pinned high so this (and `--insecure`) always sort
+    /// at the end of every subcommand's option list, just before `--help`,
+    /// keeping the generated help layout stable as commands gain local flags.
+    #[arg(long, global = true, value_name = "PATH", display_order = 900)]
+    pub ca_cert: Option<PathBuf>,
+
+    /// SECURITY HAZARD: disable TLS certificate verification for outbound
+    /// HTTPS, exposing the connection to man-in-the-middle attacks and
+    /// possible theft of the TENSOR_WASM_TOKEN credential. For local dev
+    /// against a throwaway cert only; prefer --ca-cert. Warns on every run.
+    #[arg(long, global = true, display_order = 901)]
+    pub insecure: bool,
+
     /// Subcommand to execute.
     #[command(subcommand)]
     pub command: Command,

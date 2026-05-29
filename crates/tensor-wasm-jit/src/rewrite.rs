@@ -84,6 +84,22 @@ pub struct RewriteOptions {
     pub host_free_fn: String,
     /// CUDA compute capability the pre-populated kernels are compiled for.
     pub sm_version: u32,
+    /// Owning tenant the rewrite-time cache pre-population is keyed under.
+    ///
+    /// The rewriter pre-populates the [`KernelCache`] with the emitted PTX
+    /// for every offloaded function so the *first* runtime dispatch hits
+    /// straight away instead of missing and re-emitting. That hit only
+    /// lands if the pre-populated entry's [`CacheKey`] tenant matches the
+    /// tenant the runtime dispatch looks up under — cache keys are
+    /// tenant-scoped (see [`CacheKey`] for the cross-tenant confused-deputy
+    /// primitive this enforces). Thread the owning tenant in here so the
+    /// pre-populated entries are reachable at runtime.
+    ///
+    /// Defaults to `TenantId(0)` for backward compatibility: callers that
+    /// do not yet know the owning tenant get the historical behaviour
+    /// (entries land under the `TenantId(0)` placeholder and the runtime
+    /// misses + re-emits on first call).
+    pub tenant_id: TenantId,
     /// Detector configuration used to classify each function body. Use this
     /// to lower thresholds in tests or to tune offload aggressiveness in
     /// production deployments.
@@ -98,6 +114,7 @@ impl Default for RewriteOptions {
             host_alloc_fn: DEFAULT_HOST_ALLOC_FN.into(),
             host_free_fn: DEFAULT_HOST_FREE_FN.into(),
             sm_version: DEFAULT_SM_VERSION,
+            tenant_id: TenantId(0),
             detector: DetectorConfig::default(),
         }
     }
@@ -480,15 +497,16 @@ fn emit_for_slot(pre: &PreFuncInfo, opts: &RewriteOptions, cache: &KernelCache) 
         Ok(blueprint) => match emit(&blueprint) {
             Ok(ptx) => {
                 let fp = blueprint.fingerprint();
-                // Rewrite-time pre-population: the rewriter runs at
-                // module-load with no tenant context yet, so pre-populated
-                // entries land under the placeholder `TenantId(0)`. The
-                // runtime dispatch (which knows the real tenant) will miss
-                // this entry and re-emit on first call — that's the safe
-                // default until the rewriter is plumbed with the owning
-                // tenant. See `CacheKey` docs for the cross-tenant
-                // confused-deputy primitive this prevents.
-                let key = CacheKey::for_tenant(TenantId(0), fp, opts.sm_version);
+                // Rewrite-time pre-population: key the entry under the
+                // owning tenant supplied in `RewriteOptions::tenant_id` so
+                // the first runtime dispatch (which looks up under that same
+                // tenant) actually HITS this pre-populated entry instead of
+                // missing and re-emitting. Defaults to the historical
+                // `TenantId(0)` placeholder when the caller hasn't plumbed a
+                // tenant through. Cache keys are tenant-scoped — see
+                // `CacheKey` docs for the cross-tenant confused-deputy
+                // primitive this enforces.
+                let key = CacheKey::for_tenant(opts.tenant_id, fp, opts.sm_version);
                 cache.put(
                     key,
                     CachedKernel::new(fp, Arc::new(ptx), CompiledHandle::default()),
@@ -1194,6 +1212,51 @@ mod tests {
         assert_eq!(opts.host_alloc_fn, DEFAULT_HOST_ALLOC_FN);
         assert_eq!(opts.host_free_fn, DEFAULT_HOST_FREE_FN);
         assert_eq!(opts.sm_version, DEFAULT_SM_VERSION);
+        // Back-compat default: pre-population lands under the placeholder
+        // tenant unless the caller plumbs the real one through.
+        assert_eq!(opts.tenant_id, TenantId(0));
+    }
+
+    /// Pre-population must key the cache under the tenant configured in
+    /// `RewriteOptions::tenant_id` so the first runtime dispatch (which
+    /// looks up under the owning tenant) hits the pre-populated entry
+    /// instead of missing and re-emitting. Configure a non-zero tenant and
+    /// assert the cache key tenant matches it — and that the historical
+    /// `TenantId(0)` placeholder is now a miss.
+    #[test]
+    fn rewrite_prepop_uses_configured_tenant_id() {
+        let wasm = wat::parse_str(V128_HEAVY_WAT).unwrap();
+        let cache = KernelCache::new();
+        let tenant = TenantId(4242);
+        let opts = RewriteOptions {
+            tenant_id: tenant,
+            detector: DetectorConfig {
+                v128_ratio_threshold: 0.05,
+                min_trip_count: 64,
+            },
+            ..RewriteOptions::default()
+        };
+        let out = rewrite_wasm(&wasm, &opts, &cache).expect("rewrite");
+        assert_eq!(
+            out.offloaded_functions.len(),
+            1,
+            "the v128-heavy module should produce exactly one swap"
+        );
+        let fp = out.offloaded_functions[0].fingerprint;
+
+        // The entry is reachable under the configured tenant…
+        let configured_key = CacheKey::for_tenant(tenant, fp, DEFAULT_SM_VERSION);
+        assert!(
+            cache.get(&configured_key).is_some(),
+            "pre-populated kernel must be keyed under the configured tenant id"
+        );
+        // …and NOT under the old `TenantId(0)` placeholder.
+        let placeholder_key = CacheKey::for_tenant(TenantId(0), fp, DEFAULT_SM_VERSION);
+        assert!(
+            cache.get(&placeholder_key).is_none(),
+            "with a non-zero tenant configured, the placeholder TenantId(0) \
+             key must be a miss — keys are tenant-scoped"
+        );
     }
 
     #[test]

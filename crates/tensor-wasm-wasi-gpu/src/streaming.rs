@@ -50,6 +50,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use wasmtime::{Caller, Linker};
 
+use crate::abi::AbiError;
+
 /// Maximum size, in bytes, of a single `emit-chunk` call. 64 KiB matches
 /// typical HTTP chunk-encoder buffer sizes; guests producing larger
 /// payloads should call `emit-chunk` repeatedly. Enforced by the v0.4
@@ -220,6 +222,12 @@ pub const FN_EMIT_CHUNK: &str = "emit-chunk";
 /// Host-function name for `flush`.
 pub const FN_FLUSH: &str = "flush";
 
+/// Host-function name for `input-len`.
+pub const FN_INPUT_LEN: &str = "input-len";
+
+/// Host-function name for `read-input`.
+pub const FN_READ_INPUT: &str = "read-input";
+
 /// Register the wasi-tensor host functions on a wasmtime `Linker`.
 ///
 /// `T` is the store data type and must implement [`HasStreaming`].
@@ -327,6 +335,149 @@ fn prepare_emit_chunk<T: HasStreaming>(
     Ok((bytes, ctx))
 }
 
+// ---------------------------------------------------------------------------
+// Guest input channel (pull model): `input-len` / `read-input`
+// ---------------------------------------------------------------------------
+
+/// Per-invocation input context. Owns the bytes the host staged for the
+/// guest to pull via the `wasi:tensor/host` `input-len` / `read-input`
+/// host functions.
+///
+/// This is the input counterpart to [`StreamingContext`] (which is
+/// output-only, guest → host). The gateway stages the request payload —
+/// e.g. the OpenAI completions shim stages the assembled prompt bytes —
+/// before the guest runs, and the guest copies them into its own linear
+/// memory.
+///
+/// Cloning is cheap: the bytes live behind an `Arc<[u8]>`, so a clone is
+/// a single refcount bump. An empty context (`InputContext::empty`) is
+/// the default for invocations the gateway did not stage input for —
+/// `len()` is `0` and `read-input` copies nothing.
+#[derive(Debug, Clone, Default)]
+pub struct InputContext {
+    /// Bytes staged for the guest. Empty by default.
+    bytes: Arc<[u8]>,
+}
+
+impl InputContext {
+    /// Construct an empty context. `len()` returns `0`; `read-input`
+    /// copies nothing. This is the default for invocations the gateway
+    /// did not stage any input for.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Construct a context wrapping the given staged input bytes.
+    pub fn new(bytes: impl Into<Arc<[u8]>>) -> Self {
+        Self {
+            bytes: bytes.into(),
+        }
+    }
+
+    /// Borrow the staged input bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Number of staged input bytes. Clamped to `u32::MAX` so the value
+    /// fits the WIT `input-len() -> u32` return type — a staged buffer
+    /// above 4 GiB is implausible (the API body-size cap is far below
+    /// that) but we saturate rather than wrap on the cast.
+    pub fn len_u32(&self) -> u32 {
+        u32::try_from(self.bytes.len()).unwrap_or(u32::MAX)
+    }
+
+    /// `true` when no input bytes are staged.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+/// Trait implemented by store data types that can hand out an
+/// [`InputContext`]. Parallels [`HasStreaming`]; the executor's
+/// `InstanceState` implements it so the `input-len` / `read-input` host
+/// functions reach the per-instance staged buffer.
+pub trait HasInput {
+    /// Borrow the input context.
+    fn input(&self) -> &InputContext;
+}
+
+/// Register the `wasi:tensor/host` guest-input host functions
+/// (`input-len`, `read-input`) on a wasmtime `Linker`.
+///
+/// `T` is the store data type and must implement [`HasInput`]. Mirrors
+/// [`add_streaming_to_linker`]: both register host functions on the same
+/// [`STREAMING_MODULE`] (`wasi:tensor/host`) so a guest importing either
+/// surface links against one host module. They are split into two
+/// registration functions because the input surface needs only
+/// [`HasInput`] while the streaming surface needs [`HasStreaming`]; the
+/// executor's `InstanceState` implements both and calls both.
+///
+/// `read-input` bounds-checks the `(ptr, len)` destination region against
+/// the guest's exported `"memory"` with the same `checked_add` pattern as
+/// [`prepare_emit_chunk`] and the wasi-cuda `read_bytes` path, returning
+/// [`AbiError::InvalidPointer`] (`-2`) on any out-of-bounds / overflow /
+/// missing-memory failure. A successful copy returns the number of bytes
+/// written (`min(len, input-len())`); `0` means "nothing staged" or
+/// `len == 0`, never an error.
+pub fn add_input_to_linker<T: HasInput + Send + 'static>(
+    linker: &mut Linker<T>,
+) -> wasmtime::Result<()> {
+    linker.func_wrap(STREAMING_MODULE, FN_INPUT_LEN, |caller: Caller<'_, T>| -> u32 {
+        caller.data().input().len_u32()
+    })?;
+
+    linker.func_wrap(
+        STREAMING_MODULE,
+        FN_READ_INPUT,
+        |mut caller: Caller<'_, T>, ptr: u32, len: u32| -> i32 {
+            // Clone the staged bytes out of store data before borrowing
+            // memory mutably for the write. The `Arc<[u8]>` clone is a
+            // refcount bump.
+            let input = caller.data().input().clone();
+            let staged = input.bytes();
+            if staged.is_empty() || len == 0 {
+                return 0;
+            }
+            let to_copy = std::cmp::min(staged.len(), len as usize);
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return AbiError::InvalidPointer.code(),
+            };
+            // Bounds-check the destination region against the current
+            // linear-memory size with the same `checked_add` guard the
+            // emit-chunk / read_bytes paths use: without it a guest could
+            // pass `(ptr = u32::MAX - 1, len = 4)` and wrap to a small
+            // `end` that looks in-bounds.
+            let start = ptr as usize;
+            let end = match start.checked_add(to_copy) {
+                Some(e) => e,
+                None => return AbiError::InvalidPointer.code(),
+            };
+            let mem_len = memory.data(&caller).len();
+            if end > mem_len {
+                return AbiError::InvalidPointer.code();
+            }
+            // Copy out of the Arc-backed buffer into an owned Vec so the
+            // subsequent mutable `memory.write` borrow does not alias the
+            // `input` borrow (mirrors `last_error_copy` in `host.rs`).
+            let buf = staged[..to_copy].to_vec();
+            if memory.write(&mut caller, start, &buf).is_err() {
+                return AbiError::InvalidPointer.code();
+            }
+            // `to_copy <= len <= u32::MAX` and `to_copy <= staged.len()`,
+            // and the WIT contract caps a single read at `input-len()`
+            // which is itself clamped to `u32::MAX`, so the `as i32` cast
+            // is non-negative for any realistic buffer. Guard the
+            // (implausible) >2 GiB case so we never hand back a negative
+            // count that a guest would read as an error.
+            i32::try_from(to_copy).unwrap_or(i32::MAX)
+        },
+    )?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +501,26 @@ mod tests {
         let chunk = rx.recv().await.expect("chunk delivered");
         assert_eq!(chunk, vec![0xAA, 0xBB, 0xCC]);
         assert_eq!(ctx.flush(), 0);
+    }
+
+    #[test]
+    fn input_context_empty_by_default() {
+        let ctx = InputContext::empty();
+        assert!(ctx.is_empty());
+        assert_eq!(ctx.len_u32(), 0);
+        assert_eq!(ctx.bytes(), b"");
+        // Default impl agrees with `empty()`.
+        assert!(InputContext::default().is_empty());
+    }
+
+    #[test]
+    fn input_context_carries_staged_bytes() {
+        let ctx = InputContext::new(b"hello prompt".to_vec());
+        assert!(!ctx.is_empty());
+        assert_eq!(ctx.len_u32(), 12);
+        assert_eq!(ctx.bytes(), b"hello prompt");
+        // Cheap clone shares the same backing buffer.
+        let cloned = ctx.clone();
+        assert_eq!(cloned.bytes(), ctx.bytes());
     }
 }

@@ -9,71 +9,69 @@
 //! [`crate::middleware::AuthConfig`], [`crate::middleware::TenantConfig`],
 //! [`crate::rate_limit::RateLimitConfig`], [`crate::audit::AuditConfig`]).
 //! That works fine for knobs that flow into exactly one layer, but breaks
-//! down for cross-cutting concerns whose consumer hasn't been built yet
-//! — e.g. the snapshot HMAC key, which is parsed at server startup but
-//! consumed by the (still-pending) `/snapshot/save` and
-//! `/snapshot/restore` route handlers.
+//! down for cross-cutting concerns whose consumer spans more than one
+//! route — e.g. the snapshot HMAC key, which is parsed at server startup
+//! and consumed by the `/snapshot/save` and `/snapshot/restore` route
+//! handlers.
 //!
-//! This module hosts that small set of orphaned-but-load-bearing knobs as
-//! [`AppConfig`], keeping the env-var schema in one place while the
-//! routes that consume them land in follow-up milestones.
+//! This module hosts that small set of cross-cutting knobs as
+//! [`AppConfig`], keeping the env-var schema in one place.
 //!
 //! ## Env-var schema
 //!
-//! **Both variables below are currently INERT / forward-looking.** They
-//! are parsed and validated at startup *only* by [`AppConfig::from_env`],
-//! which itself is not yet called by any production code path: the
-//! `build_router*` builders in [`crate::server`] never construct an
-//! [`AppConfig`], and no `/snapshot/*` route exists today. Setting them
-//! has NO runtime effect on the running gateway beyond a one-shot startup
-//! log line (and a hard parse error if malformed). The "Meaning" column
-//! describes the *intended* behaviour once the snapshot routes land — see
-//! the Status section.
+//! **Both variables below are LIVE (M5).** They are parsed and validated
+//! at startup by [`AppConfig::from_env`], which
+//! [`crate::server::build_router`] now calls and threads onto the shared
+//! [`crate::routes::AppState`] (via `AppState::with_app_config`). The
+//! `/snapshot/save` and `/snapshot/restore` routes consume the resulting
+//! [`AppConfig`] to sign and verify snapshot blobs.
 //!
-//! | Variable                                       | Format         | Default | Meaning (FORWARD-LOOKING — not yet consumed by any route)                                                          |
+//! | Variable                                       | Format         | Default | Meaning                                                                                                            |
 //! |------------------------------------------------|----------------|---------|--------------------------------------------------------------------------------------------------------------------|
-//! | `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`            | hex (64 chars) | unset   | *When the routes ship:* snapshot save HMAC-SHA256-signs and restore verifies. Malformed values are a hard parse error today. |
-//! | `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE`   | `true`/`false` | `false` | *When the routes ship:* restore refuses unsigned (v2) snapshots even if a key is configured.                       |
+//! | `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`            | hex (64 chars) | unset   | `/snapshot/save` HMAC-SHA256-signs the returned blob and `/snapshot/restore` verifies it. Unset ⇒ both routes return `503 snapshot_signing_not_configured`. Malformed values are a hard startup error. |
+//! | `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE`   | `true`/`false` | `false` | Strict-restore posture: refuse unsigned (v2) snapshots. `/snapshot/restore` enforces signature verification unconditionally as its hardened default; this knob is the operator surface for that posture. |
 //!
 //! ## Status
 //!
-//! The `/snapshot/save` and `/snapshot/restore` HTTP routes are not yet
-//! wired into [`crate::server::build_router`] (see
-//! `crates/tensor-wasm-cli/src/cmd/snapshot.rs` for the CLI shim that
-//! returns `FEATURE_NOT_EXPOSED` today), and [`AppConfig::from_env`] has
-//! no production caller, so the key is a *dead knob* at runtime right
-//! now. The parsing/validation is retained deliberately: landing the env
-//! knob ahead of the routes lets operators bake the secret into their
-//! deployment manifests now, so when the routes ship in v0.4 they pick
-//! the key up automatically with no config-management churn. Do not
-//! mistake the presence of this module for a wired feature — until a
-//! `/snapshot/*` route calls `AppConfig::from_env`, setting either
-//! variable does nothing beyond startup validation.
+//! The `/snapshot/save` and `/snapshot/restore` HTTP routes are wired into
+//! [`crate::server::build_router`], which reads
+//! [`AppConfig::from_env`] at startup and installs it on the
+//! [`crate::routes::AppState`]. The key is therefore a **live knob** at
+//! runtime (closes finding M5): with it set, save returns a signed blob
+//! and restore verifies the HMAC; with it unset, both routes report
+//! `503 snapshot_signing_not_configured`. A malformed key / toggle is a
+//! hard startup failure (`build_router` panics) — the gateway refuses to
+//! come up serving snapshot routes under a misconfigured signing key
+//! rather than silently downgrading restore integrity.
 
 use std::fmt;
 
-/// Environment variable carrying the hex-encoded HMAC-SHA256 key
-/// *intended* for signing and verifying snapshot blobs.
+/// Environment variable carrying the hex-encoded HMAC-SHA256 key used for
+/// signing and verifying snapshot blobs.
 ///
-/// **INERT today.** No route consumes this value: the snapshot routes do
-/// not exist yet and [`AppConfig::from_env`] (the only reader) has no
-/// production caller. Setting it has no runtime effect beyond startup
-/// validation. See the module-level docs for the forward-looking
-/// rationale on why the knob is parsed ahead of the routes.
+/// **LIVE (M5).** Consumed by the `/snapshot/save` and `/snapshot/restore`
+/// routes: [`AppConfig::from_env`] is read by
+/// [`crate::server::build_router`] and threaded onto the
+/// [`crate::routes::AppState`]. With the key set, save returns an
+/// HMAC-SHA256-signed blob and restore verifies the signature; with it
+/// unset both routes return `503 snapshot_signing_not_configured`.
 ///
 /// 64 lowercase or uppercase hex characters (32 bytes). Any other length
 /// or non-hex character is a hard parse error from
-/// [`AppConfig::from_env`].
+/// [`AppConfig::from_env`] (and a startup panic from `build_router`).
 pub const ENV_SNAPSHOT_HMAC_KEY: &str = "TENSOR_WASM_API_SNAPSHOT_HMAC_KEY";
 
-/// Environment variable that, *once the snapshot routes land*, will make
-/// snapshot restore refuse v2 (unsigned) snapshots when set to `true`
-/// (case-insensitive). Defaults to `false` for backwards compatibility
-/// with existing v2 archives.
+/// Environment variable selecting the strict-restore posture: when set to
+/// `true` (case-insensitive) snapshot restore refuses v2 (unsigned)
+/// snapshots. Defaults to `false`.
 ///
-/// **INERT today** — like [`ENV_SNAPSHOT_HMAC_KEY`], parsed but not
-/// consumed by any route. Setting it has no runtime effect beyond startup
-/// validation and a one-shot warning when it is `true` with no key set.
+/// **LIVE (M5).** Carried on the [`crate::routes::AppState`] alongside
+/// [`ENV_SNAPSHOT_HMAC_KEY`]. The `/snapshot/restore` route enforces
+/// signature verification unconditionally as its hardened default (the
+/// gateway only ever writes signed blobs), so this knob is the documented
+/// operator surface for that posture; an operator who sets it gets a
+/// confirming log line on restore. A one-shot startup warning still fires
+/// when it is `true` with no key set.
 pub const ENV_SNAPSHOT_REQUIRE_SIGNATURE: &str = "TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE";
 
 /// Byte length of the HMAC-SHA256 key. Fixed by the algorithm.
@@ -188,9 +186,9 @@ impl AppConfig {
                 target: "tensor_wasm_api::config",
                 env_key = ENV_SNAPSHOT_HMAC_KEY,
                 env_require = ENV_SNAPSHOT_REQUIRE_SIGNATURE,
-                "{} is true but {} is unset; restore will reject every blob \
-                 once the snapshot routes land — this is almost certainly a \
-                 misconfiguration",
+                "{} is true but {} is unset; the /snapshot/* routes will \
+                 return 503 snapshot_signing_not_configured — this is almost \
+                 certainly a misconfiguration",
                 ENV_SNAPSHOT_REQUIRE_SIGNATURE,
                 ENV_SNAPSHOT_HMAC_KEY,
             );

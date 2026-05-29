@@ -20,6 +20,11 @@ tensor-wasm-api = { path = "../crates/tensor-wasm-api" }
 tensor-wasm-jit = { path = "../crates/tensor-wasm-jit", features = ["cuda-oxide-backend"] }
 tensor-wasm-mem = { path = "../crates/tensor-wasm-mem" }
 tensor-wasm-snapshot = { path = "../crates/tensor-wasm-snapshot" }
+# The artifact-envelope decode fuzzer (`fuzz_artifact_decode_envelope`) drives
+# `decode_envelope_from_bytes` directly; the snapshot crate also re-enters this
+# code via its default `artifact-backing` feature (used by
+# `fuzz_snapshot_restore_arbitrary`'s v4 path).
+tensor-wasm-artifacts = { path = "../crates/tensor-wasm-artifacts" }
 tensor-wasm-wasi-gpu = { path = "../crates/tensor-wasm-wasi-gpu" }
 # Used by `lowering_driver` to hand-build small Cranelift `Function`s.
 # Pinned to the same version as the workspace (see top-level Cargo.toml).
@@ -51,6 +56,18 @@ bench = false
 [[bin]]
 name = "fuzz_snapshot_restore"
 path = "fuzz_targets/fuzz_snapshot_restore.rs"
+test = false
+doc = false
+bench = false
+
+# v4 artifact-envelope reader fuzz — prepends `ARTIFACT_MAGIC` and a synthetic
+# 32-byte HMAC key so `SnapshotReader::restore` dispatches onto the v0.4
+# artifact-store envelope decode path rather than the legacy v3/v2 readers.
+# Complements `fuzz_snapshot_restore` (v2). See
+# `fuzz_targets/fuzz_snapshot_restore_arbitrary.rs`.
+[[bin]]
+name = "fuzz_snapshot_restore_arbitrary"
+path = "fuzz_targets/fuzz_snapshot_restore_arbitrary.rs"
 test = false
 doc = false
 bench = false
@@ -109,6 +126,17 @@ bench = false
 [[bin]]
 name = "fuzz_wasi_cuda_abi"
 path = "fuzz_targets/fuzz_wasi_cuda_abi.rs"
+test = false
+doc = false
+bench = false
+
+# Artifact-store envelope decode fuzz — splits a synthetic 32-byte HMAC key off
+# the input and feeds the rest to `decode_envelope_from_bytes` /
+# `decode_envelope_from_bytes_with_cap`. See
+# `fuzz_targets/fuzz_artifact_decode_envelope.rs`.
+[[bin]]
+name = "fuzz_artifact_decode_envelope"
+path = "fuzz_targets/fuzz_artifact_decode_envelope.rs"
 test = false
 doc = false
 bench = false

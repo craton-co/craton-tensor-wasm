@@ -168,6 +168,29 @@ pub const DEFAULT_CAPACITY: usize = 256;
 pub struct KernelCacheConfig {
     /// Soft maximum L1 entry count. Clamped to `>= 1` inside the cache.
     pub capacity: usize,
+    /// Optional soft maximum on the *total* bytes of cached PTX text held
+    /// in L1, summed across every live entry (each entry contributes
+    /// `cached.ptx.text.len()`). When `Some(cap)`, [`KernelCache::put`]
+    /// evicts LRU entries — using the same eviction queue the count cap
+    /// drives — until the running byte total fits under `cap`, *after*
+    /// admitting the new entry. The count cap ([`Self::capacity`]) still
+    /// applies independently; whichever cap binds first wins.
+    ///
+    /// Why this exists: the count cap alone is a DoS vector. A 256-slot
+    /// cache fed adversarial multi-MB PTX blueprints (a deliberately
+    /// unrolled kernel can emit 10 MB of PTX) reaches ~2.5 GB of resident
+    /// L1 — see the memory-ceiling note on [`DEFAULT_CAPACITY`]. The byte
+    /// cap bounds the worst case regardless of per-entry size.
+    ///
+    /// A single entry larger than `cap` is still admitted (the cache never
+    /// refuses an insert outright — it would otherwise wedge the dispatch
+    /// path) but it will evict every other entry first; the byte total may
+    /// transiently exceed `cap` by at most one such oversized entry.
+    ///
+    /// Default `None` (preserves the historical count-only behaviour). Set
+    /// via [`Self::with_max_total_bytes`]. Track the live total via
+    /// [`KernelCache::total_bytes`].
+    pub max_total_bytes: Option<u64>,
     /// When `true` (the default), [`KernelCache::get`] recomputes a
     /// BLAKE3 over the cached `ptx.text` on every L1 hit and compares
     /// the result against the entry's stored `integrity_hash` (jit S-3
@@ -199,6 +222,7 @@ impl Default for KernelCacheConfig {
     fn default() -> Self {
         Self {
             capacity: DEFAULT_CAPACITY,
+            max_total_bytes: None,
             verify_on_get: true,
             #[cfg(feature = "kernel-registry")]
             registry: None,
@@ -212,6 +236,18 @@ impl KernelCacheConfig {
     #[must_use]
     pub fn with_capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity;
+        self
+    }
+
+    /// Set the soft total-bytes cap on resident L1 PTX. `None` (the
+    /// default) preserves the historical count-only behaviour; `Some(cap)`
+    /// makes [`KernelCache::put`] evict LRU entries until the running PTX
+    /// byte total fits under `cap`. See the field-level docs on
+    /// [`Self::max_total_bytes`] for the DoS-mitigation rationale and the
+    /// single-oversized-entry caveat.
+    #[must_use]
+    pub fn with_max_total_bytes(mut self, max_total_bytes: u64) -> Self {
+        self.max_total_bytes = Some(max_total_bytes);
         self
     }
 
@@ -247,6 +283,7 @@ impl std::fmt::Debug for KernelCacheConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("KernelCacheConfig");
         d.field("capacity", &self.capacity);
+        d.field("max_total_bytes", &self.max_total_bytes);
         d.field("verify_on_get", &self.verify_on_get);
         #[cfg(feature = "kernel-registry")]
         d.field(
@@ -365,6 +402,23 @@ pub struct KernelCache {
     /// [`DiskCacheConfig`] for the threat model that motivates the design
     /// (jit S-3).
     disk: Option<Arc<DiskCache>>,
+    /// Running sum of the PTX-text bytes of every entry currently resident
+    /// in `storage` (each entry contributes `cached.ptx.text.len()`).
+    /// Maintained incrementally on `put` (add the inserted entry, subtract
+    /// every eviction) so the byte cap in
+    /// [`KernelCacheConfig::max_total_bytes`] can be enforced without
+    /// re-summing the whole map. Exposed via [`Self::total_bytes`] for the
+    /// Prometheus gauge `tensor_wasm_jit_cache_bytes`. `Arc`-shared so
+    /// cache clones agree on the total.
+    ///
+    /// Accuracy note: this is a best-effort accounting that tracks the
+    /// entries this cache instance inserted and evicted. The `verify_on_get`
+    /// failure path and L2 disk-hit promotion also keep it in step. Under
+    /// pathological concurrent races on the same key it may drift by a
+    /// bounded amount, but it is never used as a correctness gate — only to
+    /// drive best-effort byte-based eviction — so a transient skew at most
+    /// delays an eviction by one `put`.
+    total_bytes: Arc<AtomicU64>,
     /// Cumulative count of `get` calls that skipped the BLAKE3 recompute
     /// because [`KernelCacheConfig::verify_on_get`] was `false`.
     /// Exposed via [`Self::verify_skipped_total`] so operators can wire
@@ -422,6 +476,7 @@ impl KernelCache {
             lru: Arc::new(Mutex::new(LruCache::new(nz))),
             config,
             disk: None,
+            total_bytes: Arc::new(AtomicU64::new(0)),
             verify_skipped_total: Arc::new(AtomicU64::new(0)),
             cache_hits_total: Arc::new(AtomicU64::new(0)),
             cache_misses_total: Arc::new(AtomicU64::new(0)),
@@ -478,8 +533,33 @@ impl KernelCache {
         self
     }
 
+    /// Byte cost a single entry contributes to [`Self::total_bytes`]: the
+    /// length of its PTX text. The 32-byte integrity hash, fingerprint, and
+    /// LRU bookkeeping are fixed-size per entry and already bounded by the
+    /// count cap, so the byte cap deliberately accounts only the variable-
+    /// size payload that the DoS note on [`DEFAULT_CAPACITY`] flags.
+    fn entry_bytes(kernel: &CachedKernel) -> u64 {
+        kernel.ptx.text.len() as u64
+    }
+
+    /// Remove a key from storage *and* decrement the byte total by the
+    /// removed entry's payload size. Centralised so every eviction site
+    /// keeps [`Self::total_bytes`] in step with `storage`. Returns the
+    /// removed entry (if any) for callers that want it.
+    fn evict_key(&self, key: &CacheKey) -> Option<Arc<CachedKernel>> {
+        if let Some((_, removed)) = self.storage.remove(key) {
+            self.total_bytes
+                .fetch_sub(Self::entry_bytes(&removed), Ordering::Relaxed);
+            Some(removed)
+        } else {
+            None
+        }
+    }
+
     /// Insert (or replace) a kernel. If the insert pushes the cache over
-    /// capacity, evicts the LRU entry from storage and the policy queue.
+    /// the count cap (or, when configured, the byte cap), evicts LRU
+    /// entries from storage and the policy queue until both caps are
+    /// satisfied.
     ///
     /// jit S-3: the kernel's `integrity_hash` is recomputed and compared
     /// against the stored hash; a mismatch is treated as a programmer
@@ -511,8 +591,17 @@ impl KernelCache {
             }
         }
         // T20 perf: storage holds `Arc<CachedKernel>` so cache hits return a
-        // refcount bump rather than a wrapper-clone.
-        self.storage.insert(key, Arc::new(kernel));
+        // refcount bump rather than a wrapper-clone. Account the new entry's
+        // bytes; if `insert` replaced an existing entry under the same key,
+        // subtract the displaced entry's bytes so the running total reflects
+        // a replace rather than an add.
+        let new_bytes = Self::entry_bytes(&kernel);
+        let replaced = self.storage.insert(key, Arc::new(kernel));
+        self.total_bytes.fetch_add(new_bytes, Ordering::Relaxed);
+        if let Some(old) = replaced {
+            self.total_bytes
+                .fetch_sub(Self::entry_bytes(&old), Ordering::Relaxed);
+        }
         // `LruCache::push` returns `Some((evicted_key, ()))` when sizing the
         // LRU triggers eviction of an older entry. We use this as the
         // authoritative signal for storage eviction so the two stay in sync.
@@ -523,8 +612,9 @@ impl KernelCache {
             if evicted_key != key {
                 // Don't remove if `push` returned the just-inserted key
                 // (which happens when the cache already held it — push acts
-                // as a replace and returns the old `(K, V)`).
-                self.storage.remove(&evicted_key);
+                // as a replace and returns the old `(K, V)`). `evict_key`
+                // keeps `total_bytes` in step with the storage removal.
+                self.evict_key(&evicted_key);
             }
         }
         // Safety net for the rare burst case where two concurrent `put`s
@@ -542,7 +632,7 @@ impl KernelCache {
             while self.storage.len() > self.config.capacity {
                 match lru.pop_lru() {
                     Some((evict_key, ())) => {
-                        self.storage.remove(&evict_key);
+                        self.evict_key(&evict_key);
                     }
                     None => {
                         tracing::error!(
@@ -552,6 +642,29 @@ impl KernelCache {
                             "cache storage exceeds capacity but eviction queue is empty"
                         );
                         break;
+                    }
+                }
+            }
+        }
+        // Byte-cap eviction (DoS mitigation — see
+        // `KernelCacheConfig::max_total_bytes`). Reuse the SAME LRU policy
+        // queue that drives the count cap: pop least-recently-used keys and
+        // evict them until the running PTX-byte total fits under `cap`. We
+        // never evict the just-inserted key down to an empty cache — the
+        // loop stops once at most one entry (the most-recently-used, i.e.
+        // typically the entry we just inserted) remains, so a single entry
+        // larger than `cap` is still served rather than wedging dispatch.
+        if let Some(cap) = self.config.max_total_bytes {
+            if self.total_bytes.load(Ordering::Relaxed) > cap {
+                let mut lru = self.lru.lock();
+                while self.total_bytes.load(Ordering::Relaxed) > cap
+                    && self.storage.len() > 1
+                {
+                    match lru.pop_lru() {
+                        Some((evict_key, ())) => {
+                            self.evict_key(&evict_key);
+                        }
+                        None => break,
                     }
                 }
             }
@@ -609,7 +722,7 @@ impl KernelCache {
                         "L1 cache entry failed integrity verification on get; \
                          evicting and refusing to return it"
                     );
-                    self.storage.remove(key);
+                    self.evict_key(key);
                     self.integrity_reject_total.fetch_add(1, Ordering::Relaxed);
                     self.cache_misses_total.fetch_add(1, Ordering::Relaxed);
                     return None;
@@ -630,7 +743,7 @@ impl KernelCache {
                          likely a struct-literal CachedKernel built without \
                          CachedKernel::new — evicting and refusing to return it"
                     );
-                    self.storage.remove(key);
+                    self.evict_key(key);
                     self.integrity_reject_total.fetch_add(1, Ordering::Relaxed);
                     self.cache_misses_total.fetch_add(1, Ordering::Relaxed);
                     return None;
@@ -651,8 +764,21 @@ impl KernelCache {
                     // wrap once here and clone the Arc for the return value
                     // so the caller and the cache share the allocation.
                     let arc = Arc::new(kernel);
-                    self.storage.insert(*key, Arc::clone(&arc));
-                    let _ = self.lru.lock().push(*key, ());
+                    let promoted_bytes = Self::entry_bytes(&arc);
+                    let replaced = self.storage.insert(*key, Arc::clone(&arc));
+                    self.total_bytes.fetch_add(promoted_bytes, Ordering::Relaxed);
+                    if let Some(old) = replaced {
+                        self.total_bytes
+                            .fetch_sub(Self::entry_bytes(&old), Ordering::Relaxed);
+                    }
+                    // Drive count-cap eviction via the policy queue exactly as
+                    // `put` does, keeping `total_bytes` in step through
+                    // `evict_key`.
+                    if let Some((evicted_key, ())) = self.lru.lock().push(*key, ()) {
+                        if evicted_key != *key {
+                            self.evict_key(&evicted_key);
+                        }
+                    }
                     self.cache_hits_total.fetch_add(1, Ordering::Relaxed);
                     return Some(arc);
                 }
@@ -752,6 +878,94 @@ impl KernelCache {
         self.config.capacity
     }
 
+    /// Running sum of resident PTX-text bytes across all L1 entries (each
+    /// entry contributes `cached.ptx.text.len()`). This is the quantity the
+    /// optional [`KernelCacheConfig::max_total_bytes`] cap bounds. Surface
+    /// on the Prometheus gauge `tensor_wasm_jit_cache_bytes` so operators
+    /// can watch the L1 footprint against the configured byte cap. Always
+    /// present (returns `0` for an empty cache, and tracks the live total
+    /// whether or not a byte cap is configured).
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The configured byte cap, if any (mirror of
+    /// [`KernelCacheConfig::max_total_bytes`]). `None` means count-only
+    /// eviction. Useful for diagnostic endpoints that surface both the
+    /// live [`Self::total_bytes`] and the ceiling it is measured against.
+    pub fn max_total_bytes(&self) -> Option<u64> {
+        self.config.max_total_bytes
+    }
+
+    /// Fingerprint of the *active* on-disk HMAC key — the partition prefix
+    /// every file this cache writes lands under — or `None` if no L2 disk
+    /// cache is configured.
+    ///
+    /// Pass this into the `retain` set of [`Self::gc_disk`] to keep the
+    /// live generation (though `gc_disk` retains it unconditionally as a
+    /// safety net).
+    pub fn active_disk_key_fingerprint(&self) -> Option<KeyFingerprint> {
+        self.disk.as_ref().map(|d| d.active_key_fingerprint())
+    }
+
+    /// Enumerate the distinct HMAC-key fingerprints present in the on-disk
+    /// L2 cache directory (one per key generation that has written at least
+    /// one file). Returns an empty `Vec` when no disk cache is configured or
+    /// the directory does not yet exist.
+    ///
+    /// Use this to discover stale generations before a [`Self::gc_disk`]
+    /// sweep — anything in this list that is not the active fingerprint and
+    /// not a key you still want to honour is a rotation leftover.
+    pub fn disk_key_fingerprints(&self) -> std::io::Result<Vec<KeyFingerprint>> {
+        match &self.disk {
+            Some(d) => d.key_fingerprints_on_disk(),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Garbage-collect the on-disk L2 cache after an HMAC-key rotation:
+    /// remove every persisted entry whose key fingerprint is NOT in
+    /// `retain`, returning the number of files removed. A no-op returning
+    /// `Ok(0)` when no disk cache is configured.
+    ///
+    /// The *active* key's fingerprint is always retained — even if the
+    /// caller omits it from `retain` — so a sweep can never delete the live
+    /// generation's entries. Only stale-fingerprint files are removed, and
+    /// only files matching the cache's own naming scheme are considered
+    /// (unrelated files in the directory are left untouched).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # fn load_hmac_key_from_secret_store() -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    /// #     Ok([0u8; 32])
+    /// # }
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use std::path::PathBuf;
+    /// use tensor_wasm_jit::cache::{KernelCache, DiskCacheConfig};
+    ///
+    /// // After rotating to a fresh HMAC key, stand up a cache under it…
+    /// let cache = KernelCache::new().with_disk_persistence(DiskCacheConfig {
+    ///     dir: PathBuf::from("/var/cache/tensor-wasm/kernels"),
+    ///     hmac_key: load_hmac_key_from_secret_store()?,
+    /// });
+    ///
+    /// // …then sweep every previous generation's files. Retaining only the
+    /// // active key (which `gc_disk` keeps regardless) drops all the rest.
+    /// let active = cache.active_disk_key_fingerprint().into_iter().collect::<Vec<_>>();
+    /// let removed = cache.gc_disk(&active)?;
+    /// println!("swept {removed} stale-fingerprint cache files");
+    /// # let _ = removed;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn gc_disk(&self, retain: &[KeyFingerprint]) -> std::io::Result<usize> {
+        match &self.disk {
+            Some(d) => d.gc(retain),
+            None => Ok(0),
+        }
+    }
+
     /// Borrow the construction-time [`KernelCacheConfig`]. Useful for
     /// tests and diagnostic endpoints that want to surface whether
     /// `verify_on_get` is on for this cache instance.
@@ -825,7 +1039,13 @@ impl KernelCache {
     #[cfg(feature = "__unstable-test-internals")]
     pub fn __test_only_insert_unchecked(&self, key: CacheKey, kernel: CachedKernel) {
         // T20 perf: storage holds `Arc<CachedKernel>`; wrap on insert.
-        self.storage.insert(key, Arc::new(kernel));
+        let bytes = Self::entry_bytes(&kernel);
+        let replaced = self.storage.insert(key, Arc::new(kernel));
+        self.total_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(old) = replaced {
+            self.total_bytes
+                .fetch_sub(Self::entry_bytes(&old), Ordering::Relaxed);
+        }
         let _ = self.lru.lock().push(key, ());
     }
 }
@@ -901,6 +1121,55 @@ impl Drop for DiskCacheConfig {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.hmac_key.zeroize();
+    }
+}
+
+/// 16-hex-char fingerprint of an HMAC key, as it appears in on-disk
+/// filenames.
+///
+/// The disk layout partitions every file by the first 8 bytes of
+/// `blake3::hash(hmac_key)` rendered as 16 lowercase hex chars — the
+/// sidecar prefix in `{fp}-{cache_key}.ptxbin` and the middle segment in
+/// the artifact store's `{content_hash}.{fp}.bin` blobs both use the same
+/// fingerprint. Rotating the HMAC key changes the fingerprint, so a
+/// rotation leaves the previous generation's files behind under their old
+/// fingerprint, trivially sweepable by [`KernelCache::gc_disk`].
+///
+/// This is *not* secret: it is `blake3(key)` truncated, already publicly
+/// observable to anyone with directory-list access (it is in the
+/// filename). It is a partitioning tag, not a confidentiality boundary —
+/// the HMAC trailer on each blob is what actually gates load.
+///
+/// Obtain the fingerprint of the currently-active key via
+/// [`KernelCache::active_disk_key_fingerprint`], and the set present on
+/// disk via [`KernelCache::disk_key_fingerprints`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct KeyFingerprint(pub String);
+
+impl KeyFingerprint {
+    /// The 16-hex-char fingerprint of `key` — the same value the disk
+    /// layout stamps into filenames. Equivalent to the artifact store's
+    /// own `key_fingerprint_hex`; kept in lock-step so a `KernelCache` and
+    /// its underlying [`DiskArtifactStore`] always agree on the partition.
+    #[must_use]
+    pub fn of_key(key: &[u8; 32]) -> Self {
+        let h = blake3::hash(&key[..]);
+        let mut buf = [0u8; 16];
+        hex::encode_to_slice(&h.as_bytes()[..8], &mut buf).expect("16 byte buf for 8 byte input");
+        // `buf` is ASCII hex by construction, so the UTF-8 check never fails.
+        Self(std::str::from_utf8(&buf).expect("hex is utf8").to_string())
+    }
+
+    /// Borrow the underlying hex string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for KeyFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -1361,6 +1630,110 @@ impl DiskCache {
             CompiledHandle::default(),
         )))
     }
+
+    /// Fingerprint of this cache's *own* (currently-active) HMAC key — the
+    /// partition prefix every file this cache writes lands under.
+    fn active_key_fingerprint(&self) -> KeyFingerprint {
+        KeyFingerprint::of_key(&self.hmac_key)
+    }
+
+    /// Parse the key-fingerprint segment out of a cache file name.
+    ///
+    /// Two on-disk shapes carry the fingerprint:
+    ///   * sidecars `{fp}-{cache_key}.ptxbin` — fingerprint is the segment
+    ///     before the first `-`.
+    ///   * artifact blobs `{content_hash}.{fp}.bin` — fingerprint is the
+    ///     second-to-last `.`-delimited segment.
+    ///
+    /// Returns `None` for any name that does not match one of these shapes
+    /// (so unrelated files in the directory are never touched by `gc`).
+    fn fingerprint_of_filename(name: &str) -> Option<KeyFingerprint> {
+        if let Some(rest) = name.strip_suffix(".ptxbin") {
+            // `{fp}-{cache_key}` — split on the first '-'.
+            let fp = rest.split('-').next()?;
+            if fp.is_empty() || fp.len() != 16 {
+                return None;
+            }
+            return Some(KeyFingerprint(fp.to_string()));
+        }
+        if let Some(rest) = name.strip_suffix(".bin") {
+            // `{content_hash}.{fp}` — fingerprint is the trailing segment.
+            let fp = rest.rsplit('.').next()?;
+            if fp.len() != 16 {
+                return None;
+            }
+            return Some(KeyFingerprint(fp.to_string()));
+        }
+        None
+    }
+
+    /// Enumerate the distinct HMAC-key fingerprints with at least one file
+    /// (sidecar or artifact blob) present in the cache directory. A missing
+    /// directory yields an empty set (a fresh cache has nothing to sweep).
+    fn key_fingerprints_on_disk(&self) -> std::io::Result<Vec<KeyFingerprint>> {
+        let mut seen = std::collections::BTreeSet::new();
+        let rd = match std::fs::read_dir(&self.dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        for entry in rd {
+            let entry = entry?;
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(fp) = Self::fingerprint_of_filename(name) {
+                    seen.insert(fp);
+                }
+            }
+        }
+        Ok(seen.into_iter().collect())
+    }
+
+    /// Garbage-collect stale-fingerprint files: remove every sidecar /
+    /// artifact-blob whose key fingerprint is NOT in `retain`, returning
+    /// the count of files removed.
+    ///
+    /// The active key's fingerprint is unconditionally retained even if a
+    /// caller forgets to list it — this is the safety guarantee in the
+    /// public-API docs: `gc` only sweeps *stale* generations, never the
+    /// live one. Files that do not match a known cache-file shape (anything
+    /// `fingerprint_of_filename` rejects) are left untouched.
+    fn gc(&self, retain: &[KeyFingerprint]) -> std::io::Result<usize> {
+        let active = self.active_key_fingerprint();
+        let rd = match std::fs::read_dir(&self.dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(0);
+            }
+            Err(e) => return Err(e),
+        };
+        let mut removed = 0usize;
+        for entry in rd {
+            let entry = entry?;
+            let name_os = entry.file_name();
+            let name = match name_os.to_str() {
+                Some(n) => n,
+                None => continue,
+            };
+            let fp = match Self::fingerprint_of_filename(name) {
+                Some(fp) => fp,
+                None => continue, // not one of ours — leave it alone
+            };
+            // Never sweep the active key's files; never sweep a retained one.
+            if fp == active || retain.contains(&fp) {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Raced with another sweeper / writer; treat as already gone.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
+    }
 }
 
 impl Default for KernelCache {
@@ -1396,6 +1769,107 @@ mod tests {
         let key = CacheKey::for_tenant(TenantId(7), 1, 80);
         cache.put(key, dummy_kernel(1));
         assert_eq!(cache.get(&key).unwrap().fingerprint, 1);
+    }
+
+    /// Build a kernel whose PTX text is exactly `bytes` long so byte-cap
+    /// tests can reason about `total_bytes` precisely.
+    fn sized_kernel(fp: u64, bytes: usize) -> CachedKernel {
+        CachedKernel::new(
+            fp,
+            Arc::new(EmittedPtx {
+                text: "x".repeat(bytes),
+                launch_geometry: (1, 1),
+            }),
+            CompiledHandle::default(),
+        )
+    }
+
+    /// Byte-cap eviction: with a generous count cap but a tight byte cap,
+    /// inserting oversized blueprints must keep the resident byte total
+    /// bounded by evicting LRU entries, and the eviction order must be LRU.
+    #[test]
+    fn byte_cap_evicts_lru_and_bounds_total_bytes() {
+        // Count cap of 100 (won't bind) but a 250-byte total cap. Each
+        // entry is 100 bytes, so at most 2 entries fit (200 <= 250; a 3rd
+        // would push to 300 > 250).
+        let cache = KernelCache::with_config(
+            KernelCacheConfig::default()
+                .with_capacity(100)
+                .with_max_total_bytes(250),
+        );
+        let k1 = CacheKey::for_tenant(TenantId(0), 1, 80);
+        let k2 = CacheKey::for_tenant(TenantId(0), 2, 80);
+        let k3 = CacheKey::for_tenant(TenantId(0), 3, 80);
+
+        cache.put(k1, sized_kernel(1, 100));
+        cache.put(k2, sized_kernel(2, 100));
+        assert_eq!(cache.total_bytes(), 200, "two 100-byte entries fit");
+        assert_eq!(cache.len(), 2);
+
+        // Inserting the third 100-byte entry overflows the byte cap (300 >
+        // 250). The LRU entry (k1) must be evicted, bringing the total back
+        // to 200 and keeping k2 + k3.
+        cache.put(k3, sized_kernel(3, 100));
+        assert!(
+            cache.total_bytes() <= 250,
+            "byte total must stay bounded by the cap, got {}",
+            cache.total_bytes()
+        );
+        assert_eq!(cache.total_bytes(), 200);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&k1).is_none(), "k1 is the LRU and must be evicted");
+        assert!(cache.get(&k2).is_some(), "k2 must survive");
+        assert!(cache.get(&k3).is_some(), "k3 was just inserted");
+    }
+
+    /// A single entry larger than the byte cap is still admitted (the cache
+    /// never wedges dispatch by refusing an insert) but it evicts every
+    /// other entry, so the byte total settles at just that one oversized
+    /// entry.
+    #[test]
+    fn byte_cap_admits_single_oversized_entry() {
+        let cache = KernelCache::with_config(
+            KernelCacheConfig::default()
+                .with_capacity(100)
+                .with_max_total_bytes(50),
+        );
+        let small = CacheKey::for_tenant(TenantId(0), 1, 80);
+        let big = CacheKey::for_tenant(TenantId(0), 2, 80);
+        cache.put(small, sized_kernel(1, 40));
+        cache.put(big, sized_kernel(2, 1000));
+        // The oversized entry is served; the small one was evicted to make
+        // room. Total transiently exceeds the cap by exactly that one entry.
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.total_bytes(), 1000);
+        assert!(cache.get(&big).is_some(), "oversized entry must still serve");
+        assert!(cache.get(&small).is_none(), "smaller LRU entry evicted");
+    }
+
+    /// `total_bytes` must track replacement (same key re-inserted with a
+    /// different-sized payload) as a delta, not an add.
+    #[test]
+    fn total_bytes_tracks_replacement() {
+        let cache = KernelCache::new();
+        let key = CacheKey::for_tenant(TenantId(0), 1, 80);
+        cache.put(key, sized_kernel(1, 100));
+        assert_eq!(cache.total_bytes(), 100);
+        // Replace the same key with a larger payload — net delta is +50.
+        cache.put(key, sized_kernel(1, 150));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.total_bytes(), 150);
+    }
+
+    /// Default config keeps the byte cap disabled (count-only behaviour),
+    /// while `total_bytes` still tracks the live total.
+    #[test]
+    fn byte_cap_default_is_none() {
+        let cache = KernelCache::new();
+        assert_eq!(cache.max_total_bytes(), None);
+        cache.put(
+            CacheKey::for_tenant(TenantId(0), 1, 80),
+            sized_kernel(1, 512),
+        );
+        assert_eq!(cache.total_bytes(), 512);
     }
 
     #[test]

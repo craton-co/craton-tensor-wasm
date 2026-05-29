@@ -30,7 +30,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 use zeroize::Zeroizing;
@@ -107,6 +109,16 @@ pub enum ArtifactError {
     HashMismatch { expected: String, actual: String },
     #[error("zstd decompression failed: {0}")]
     Decompression(String),
+    /// (De)serialisation of an [`ArtifactMetadata`] sidecar failed. Carries
+    /// the serde error rendered to a string so the variant stays
+    /// `PartialEq`-compatible with the rest of [`ArtifactError`] (which
+    /// deliberately avoids embedding non-`Eq` inner error types). Only
+    /// reachable through the metadata-aware paths
+    /// ([`DiskArtifactStore::put_with_metadata`] /
+    /// [`DiskArtifactStore::metadata`]); the plain `put`/`get` round-trip
+    /// never touches a sidecar.
+    #[error("artifact metadata codec error: {0}")]
+    Metadata(String),
     /// Either the payload handed to `put` exceeded [`MAX_PAYLOAD_LEN`],
     /// or the body handed to `get` decompressed to more than
     /// [`MAX_DECOMPRESSED_LEN`] bytes. Carries the offending size and
@@ -180,6 +192,39 @@ pub trait ArtifactStore: Send + Sync {
     /// returned when a record was present but the format checks rejected
     /// it.
     fn get(&self, hash: &ContentHash) -> Result<Vec<u8>, ArtifactError>;
+    /// Stream the verified-then-decoded body of `hash` into `out`,
+    /// returning the number of bytes written. This completes the
+    /// streaming story [`Self::put`] already has on the write side: where
+    /// [`Self::get`] returns an owned `Vec<u8>` (up to ~1 GiB resident),
+    /// `get_to` lets a caller pipe a large artifact straight into a file,
+    /// socket, or hashing sink without first materialising the whole
+    /// decoded payload as a return value.
+    ///
+    /// ## Integrity ordering
+    ///
+    /// The HMAC covers the *entire* compressed blob, so it cannot be
+    /// verified until the last body byte has been seen. To preserve the
+    /// crate-wide invariant — **no unverified bytes are ever exposed to a
+    /// caller** — implementations MUST authenticate the blob *before*
+    /// any decoded byte reaches `out`. [`DiskArtifactStore`] does this
+    /// with a two-pass scheme (pass 1: stream the compressed body through
+    /// the HMAC to verify; pass 2: re-open and stream-decode directly to
+    /// `out`), so peak heap stays bounded by the I/O buffers regardless
+    /// of payload size and `out` only ever sees authenticated bytes. The
+    /// error variants match [`Self::get`].
+    ///
+    /// The default implementation delegates to [`Self::get`] and copies
+    /// the resulting buffer into `out`; it is correct (the `Vec` `get`
+    /// returns is already verified) but not memory-bounded. Backends that
+    /// can stream override it.
+    fn get_to(&self, hash: &ContentHash, out: &mut dyn Write) -> Result<u64, ArtifactError> {
+        let bytes = self.get(hash)?;
+        out.write_all(&bytes).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "get_to default writer write failed");
+            ArtifactError::Io
+        })?;
+        Ok(bytes.len() as u64)
+    }
     /// Enumerate the content hashes currently stored. Order is
     /// implementation-defined; callers that need a deterministic order
     /// must sort the result themselves.
@@ -216,6 +261,141 @@ pub trait ArtifactStore: Send + Sync {
     /// drops the map entry. Returns [`ArtifactError::Io`] on an
     /// underlying delete fault other than not-found.
     fn remove(&self, hash: &ContentHash) -> Result<bool, ArtifactError>;
+}
+
+// =====================================================================
+// Key provider — pluggable signing key + accepted-for-read key set
+// =====================================================================
+
+/// Supplies the signing material a [`DiskArtifactStore`] uses, abstracting
+/// over key rotation.
+///
+/// A store always *writes* under a single active key (so a fresh `put`
+/// lands under one fingerprint and round-trips cleanly), but during a
+/// rotation it must still be able to *read* blobs that were written under
+/// an older, now-retired key. A `KeyProvider` therefore exposes two
+/// things:
+///
+/// * [`Self::active_key`] — the one key new `put`s sign with, and the key
+///   `list` reports the store's "own" namespace under; and
+/// * [`Self::read_keys`] — every key a `get` / `list` is allowed to try,
+///   newest first. The active key MUST appear in this set.
+///
+/// On a `get`, the store tries each read key's namespaced file in turn
+/// (keys partition the on-disk namespace by fingerprint, so at most one
+/// can match a given content hash). On a `list`, the store unions the
+/// hashes visible under every read key, so an audit sees blobs across the
+/// rotation boundary.
+///
+/// Implementations MUST be `Send + Sync` (the store is shared behind an
+/// `Arc`). Keys are returned by value (`[u8; 32]`) rather than borrowed so
+/// a provider backing onto a rotating KMS can mint them on demand.
+pub trait KeyProvider: Send + Sync {
+    /// The key new `put`s sign with. MUST be one of [`Self::read_keys`].
+    fn active_key(&self) -> [u8; 32];
+    /// Every key a read (`get` / `list`) may try, conventionally newest
+    /// first so the common "just-written under the active key" case hits
+    /// on the first probe. The active key MUST be present.
+    fn read_keys(&self) -> Vec<[u8; 32]>;
+}
+
+/// The default single-key provider: writes and reads under exactly one
+/// key. This is what [`DiskArtifactStore::new`] wraps the caller's
+/// `[u8; 32]` in, so the historical single-key constructor keeps its exact
+/// behaviour (one active key, that same key the only accepted read key).
+///
+/// The key is held in a [`Zeroizing`] so it is scrubbed on drop, matching
+/// the store's own `hmac_key` handling.
+pub struct SingleKeyProvider {
+    key: Zeroizing<[u8; 32]>,
+}
+
+impl SingleKeyProvider {
+    /// Wrap a single key as a provider.
+    pub fn new(key: [u8; 32]) -> Self {
+        Self {
+            key: Zeroizing::new(key),
+        }
+    }
+}
+
+impl KeyProvider for SingleKeyProvider {
+    fn active_key(&self) -> [u8; 32] {
+        *self.key
+    }
+    fn read_keys(&self) -> Vec<[u8; 32]> {
+        vec![*self.key]
+    }
+}
+
+/// A rotation-aware key provider: one active (write) key plus an ordered
+/// list of additional keys accepted for reads only.
+///
+/// During a rotation an operator constructs this with the new key as
+/// `active` and the previous key(s) in `also_accept`; new `put`s sign
+/// under `active`, while `get` / `list` continue to see blobs written
+/// under the retired keys until they are migrated or GC'd. The active key
+/// is automatically included in [`KeyProvider::read_keys`] (first), so the
+/// caller passes only the *extra* accepted keys.
+pub struct RotatingKeyProvider {
+    active: Zeroizing<[u8; 32]>,
+    also_accept: Vec<Zeroizing<[u8; 32]>>,
+}
+
+impl RotatingKeyProvider {
+    /// Build a provider whose write/active key is `active` and which also
+    /// accepts every key in `also_accept` for reads. Duplicates of the
+    /// active key in `also_accept` are harmless (the store dedups by
+    /// fingerprint when listing).
+    pub fn new(active: [u8; 32], also_accept: impl IntoIterator<Item = [u8; 32]>) -> Self {
+        Self {
+            active: Zeroizing::new(active),
+            also_accept: also_accept.into_iter().map(Zeroizing::new).collect(),
+        }
+    }
+}
+
+impl KeyProvider for RotatingKeyProvider {
+    fn active_key(&self) -> [u8; 32] {
+        *self.active
+    }
+    fn read_keys(&self) -> Vec<[u8; 32]> {
+        // Active key first (the hot path: reading something just written),
+        // then the retired keys in the order supplied.
+        let mut keys = Vec::with_capacity(1 + self.also_accept.len());
+        keys.push(*self.active);
+        keys.extend(self.also_accept.iter().map(|k| **k));
+        keys
+    }
+}
+
+// =====================================================================
+// Artifact metadata sidecar
+// =====================================================================
+
+/// Optional per-artifact metadata, stored as a serde-encoded sidecar next
+/// to the blob.
+///
+/// The blob itself is opaque content-addressed bytes; nothing in the
+/// envelope records *when* or *from where* it was produced. For
+/// `list`-based auditing and GC (roadmap feature #9) that provenance is
+/// useful, so [`DiskArtifactStore::put_with_metadata`] writes one of these
+/// alongside the blob and [`DiskArtifactStore::metadata`] reads it back.
+///
+/// Metadata is strictly optional: a plain [`ArtifactStore::put`] writes no
+/// sidecar, and [`DiskArtifactStore::metadata`] returns
+/// [`ArtifactError::NotFound`] for a blob that has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactMetadata {
+    /// Wall-clock creation time in Unix milliseconds, as recorded by the
+    /// writer at `put_with_metadata` time.
+    pub created_unix_ms: u64,
+    /// Length in bytes of the *uncompressed* payload. Lets an auditor size
+    /// the store's logical footprint without decoding every blob.
+    pub original_len: u64,
+    /// Free-form origin tag (e.g. `"jit-l2"`, `"snapshot"`, `"import"`) so
+    /// GC policy can treat artifacts from different producers differently.
+    pub source_tier: String,
 }
 
 // =====================================================================
@@ -347,32 +527,70 @@ impl<R: Read> Read for MacReader<'_, R> {
 /// Verification uses constant-time comparison.
 pub struct DiskArtifactStore {
     dir: PathBuf,
+    /// Active signing key — the key new `put`s sign with and the key the
+    /// `contains` / `remove` probes resolve against. Cached out of the
+    /// provider once at construction so the hot write/probe paths don't
+    /// re-enter the provider (a rotating provider may mint keys on
+    /// demand). Held in a `Zeroizing` so it's scrubbed on drop.
     hmac_key: Zeroizing<[u8; 32]>,
-    /// `blake3(hmac_key)[..8]` rendered as 16 ascii-hex chars, computed
-    /// once in [`Self::new`]. Used as the per-key filename segment by
-    /// `path_for`, `get`, `put`, and `list`; caching it here avoids
+    /// `blake3(active_key)[..8]` rendered as 16 ascii-hex chars, computed
+    /// once at construction. Used as the per-key filename segment by
+    /// `path_for`, `put`, `contains`, and `remove`; caching it here avoids
     /// re-hashing the key on every store operation.
     key_fp_hex: String,
+    /// Pluggable source of signing keys. For a single-key store this is a
+    /// [`SingleKeyProvider`]; for a rotating store it yields the active
+    /// key plus the retired keys still accepted for reads. `get` and
+    /// `list` consult [`KeyProvider::read_keys`] so they span a rotation.
+    key_provider: Arc<dyn KeyProvider>,
 }
 
 impl DiskArtifactStore {
     /// Construct a disk store rooted at `dir`, signing with `hmac_key`.
     /// The directory is created lazily on the first `put`.
+    ///
+    /// This wraps `hmac_key` in a [`SingleKeyProvider`] internally, so the
+    /// store writes and reads under exactly that one key — identical to
+    /// the historical single-key behaviour. Use
+    /// [`Self::with_key_provider`] for rotation support.
     pub fn new(dir: PathBuf, hmac_key: [u8; 32]) -> Self {
-        let key_fp_hex = key_fingerprint_hex(&hmac_key);
+        Self::with_key_provider(dir, Arc::new(SingleKeyProvider::new(hmac_key)))
+    }
+
+    /// Construct a disk store rooted at `dir` whose signing keys come from
+    /// `key_provider`.
+    ///
+    /// New `put`s sign under [`KeyProvider::active_key`]; `get` and `list`
+    /// try every key in [`KeyProvider::read_keys`], so a store built with
+    /// a [`RotatingKeyProvider`] can read blobs written under a retired
+    /// key after rotation. The directory is created lazily on the first
+    /// `put`.
+    pub fn with_key_provider(dir: PathBuf, key_provider: Arc<dyn KeyProvider>) -> Self {
+        let active = key_provider.active_key();
+        let key_fp_hex = key_fingerprint_hex(&active);
         Self {
             dir,
-            hmac_key: Zeroizing::new(hmac_key),
+            hmac_key: Zeroizing::new(active),
             key_fp_hex,
+            key_provider,
         }
     }
 
-    /// Compute the on-disk path for `hash` under this store's key.
+    /// Compute the on-disk path for `hash` under this store's *active*
+    /// key. Counterpart helper [`Self::path_for_key`] resolves under an
+    /// arbitrary accepted read key.
     ///
     /// Filename format: `{content_hash_hex}.{key_fp_hex}.bin`. The key
     /// fingerprint segment partitions the namespace per HMAC key so
     /// two stores in the same dir under different keys never collide.
     fn path_for(&self, hash: &ContentHash) -> PathBuf {
+        self.path_for_key(hash, &self.key_fp_hex)
+    }
+
+    /// Compute the on-disk path for `hash` under the key whose fingerprint
+    /// is `key_fp_hex`. Used by the rotation-aware `get` to probe each
+    /// accepted read key's namespace in turn.
+    fn path_for_key(&self, hash: &ContentHash, key_fp_hex: &str) -> PathBuf {
         let hash_hex = hash.to_string();
         // The rendered hash MUST be exactly 64 lowercase ascii-hex chars
         // before it becomes a path component — `ContentHash`'s `Display`
@@ -387,8 +605,363 @@ impl DiskArtifactStore {
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
             "ContentHash rendered to an unexpected filename segment: {hash_hex:?}"
         );
+        self.dir.join(format!("{hash_hex}.{key_fp_hex}.bin"))
+    }
+
+    /// On-disk path for the metadata sidecar of `hash` under the active
+    /// key. Sits next to the blob with a `.meta.json` extension in place
+    /// of `.bin`, so it shares the blob's content-addressed + key-
+    /// partitioned naming and is filtered out of `list` (which only
+    /// matches `.bin`).
+    fn meta_path_for(&self, hash: &ContentHash) -> PathBuf {
+        let hash_hex = hash.to_string();
         let key_hex = &self.key_fp_hex;
-        self.dir.join(format!("{hash_hex}.{key_hex}.bin"))
+        self.dir.join(format!("{hash_hex}.{key_hex}.meta.json"))
+    }
+
+    /// Insert `payload` (exactly like [`ArtifactStore::put`]) and write an
+    /// [`ArtifactMetadata`] sidecar next to the blob under the active key.
+    ///
+    /// The blob and the sidecar are independent files: the blob is the
+    /// content-addressed envelope, the sidecar is a `.meta.json` serde
+    /// document. A later [`Self::metadata`] reads the sidecar back. Plain
+    /// `put` continues to write no sidecar, so metadata stays optional.
+    ///
+    /// `metadata.original_len` is recorded as supplied by the caller (it
+    /// is provenance, not a re-derived fact); pass `payload.len()` for the
+    /// common "this is the blob I just stored" case.
+    pub fn put_with_metadata(
+        &self,
+        payload: &[u8],
+        metadata: &ArtifactMetadata,
+    ) -> Result<ContentHash, ArtifactError> {
+        // Store the blob first; if that fails we never write an orphan
+        // sidecar. (A crash between the two writes can leave a blob with
+        // no sidecar — that's the benign direction: `metadata` simply
+        // reports `NotFound` and the blob still round-trips via `get`.)
+        let hash = self.put(payload)?;
+
+        let encoded = serde_json::to_vec(metadata).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "metadata serialize failed");
+            ArtifactError::Metadata(e.to_string())
+        })?;
+
+        // Atomic publish of the sidecar via temp-then-rename, mirroring
+        // the blob's own publish so a torn write never leaves a partial
+        // sidecar a concurrent reader trips over.
+        let meta_path = self.meta_path_for(&hash);
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "metadata tempfile create failed");
+            ArtifactError::Io
+        })?;
+        tmp.write_all(&encoded).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "metadata write failed");
+            ArtifactError::Io
+        })?;
+        tmp.persist(&meta_path).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "metadata persist failed");
+            ArtifactError::Io
+        })?;
+        Ok(hash)
+    }
+
+    /// Read the [`ArtifactMetadata`] sidecar for `hash` under the active
+    /// key.
+    ///
+    /// Returns [`ArtifactError::NotFound`] if no sidecar exists (either
+    /// because the blob was written via plain `put`, or because it lives
+    /// under a different key). A malformed sidecar surfaces as
+    /// [`ArtifactError::Metadata`].
+    pub fn metadata(&self, hash: &ContentHash) -> Result<ArtifactMetadata, ArtifactError> {
+        let meta_path = self.meta_path_for(hash);
+        let bytes = match std::fs::read(&meta_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ArtifactError::NotFound(hash.to_string()));
+            }
+            Err(e) => {
+                warn!(
+                    target: "tensor_wasm_artifacts",
+                    file = %meta_path.display(),
+                    error = %e,
+                    "metadata read failed"
+                );
+                return Err(ArtifactError::Io);
+            }
+        };
+        serde_json::from_slice(&bytes).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "metadata deserialize failed");
+            ArtifactError::Metadata(e.to_string())
+        })
+    }
+
+    /// Pass 1 of the streaming `get_to`: verify the HMAC of the blob at
+    /// `path` under `key` *without* exposing any decoded bytes. Streams
+    /// the compressed body through the running MAC and compares the
+    /// trailing tag in constant time. On success returns the validated
+    /// header's content hash and the byte range of the zstd body, so pass
+    /// 2 can re-open and decode without re-reading the header.
+    ///
+    /// Returns the same integrity error surface as [`ArtifactStore::get`].
+    fn verify_blob(
+        &self,
+        path: &std::path::Path,
+        key: &[u8; 32],
+    ) -> Result<VerifiedBlob, ArtifactError> {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ArtifactError::NotFound(path.display().to_string()));
+            }
+            Err(e) => {
+                warn!(target: "tensor_wasm_artifacts", file = %path.display(), error = %e, "open failed");
+                return Err(ArtifactError::Io);
+            }
+        };
+        let file_len = file
+            .metadata()
+            .map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", file = %path.display(), error = %e, "metadata failed");
+                ArtifactError::Io
+            })?
+            .len();
+        let min_len = (ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN) as u64;
+        if file_len < min_len {
+            return Err(ArtifactError::BadMagic);
+        }
+        let prefix_end = file_len - ARTIFACT_HMAC_LEN as u64;
+        let body_len = prefix_end - ARTIFACT_HEADER_LEN as u64;
+
+        let mut reader = BufReader::with_capacity(STREAM_BUF_LEN, file);
+        let mut mac = new_mac(key);
+
+        let mut header = [0u8; ARTIFACT_HEADER_LEN];
+        reader.read_exact(&mut header).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", file = %path.display(), error = %e, "header read failed");
+            ArtifactError::Io
+        })?;
+        if header[..16] != ARTIFACT_MAGIC {
+            return Err(ArtifactError::BadMagic);
+        }
+        let version = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+        if version != ARTIFACT_VERSION {
+            return Err(ArtifactError::BadVersion(version));
+        }
+        let mut hash_on_disk = [0u8; 32];
+        hash_on_disk.copy_from_slice(&header[20..52]);
+        {
+            use hmac::Mac;
+            mac.update(&header);
+        }
+
+        // Stream the whole compressed body through the MAC, discarding the
+        // bytes. We do NOT decode here: the goal of pass 1 is solely to
+        // authenticate, so no decoded byte exists yet to leak.
+        {
+            let mut body_take = Read::take(&mut reader, body_len);
+            let mut scratch = [0u8; STREAM_BUF_LEN];
+            loop {
+                let n = body_take.read(&mut scratch).map_err(|e| {
+                    warn!(target: "tensor_wasm_artifacts", file = %path.display(), error = %e, "body read failed");
+                    ArtifactError::Io
+                })?;
+                if n == 0 {
+                    break;
+                }
+                use hmac::Mac;
+                mac.update(&scratch[..n]);
+            }
+        }
+
+        let mut tag_bytes = [0u8; ARTIFACT_HMAC_LEN];
+        reader.read_exact(&mut tag_bytes).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", file = %path.display(), error = %e, "tag read failed");
+            ArtifactError::Io
+        })?;
+        let expected = finalize_into_tag(mac);
+        use subtle::ConstantTimeEq;
+        if !bool::from(expected.as_slice().ct_eq(&tag_bytes[..])) {
+            warn!(target: "tensor_wasm_artifacts", file = %path.display(), "HMAC mismatch (get_to verify pass)");
+            return Err(ArtifactError::BadHmac);
+        }
+        Ok(VerifiedBlob {
+            hash_on_disk,
+            body_len,
+        })
+    }
+
+    /// Pass 2 of the streaming `get_to`: stream-decode the already-verified
+    /// blob at `path` directly into `out`, enforcing the decompressed-size
+    /// cap and recomputing the content hash as defence-in-depth. Only
+    /// called after [`Self::verify_blob`] has authenticated the same file,
+    /// so every byte written to `out` is authenticated.
+    fn decode_to_writer(
+        &self,
+        path: &std::path::Path,
+        verified: &VerifiedBlob,
+        requested: &ContentHash,
+        out: &mut dyn Write,
+    ) -> Result<u64, ArtifactError> {
+        let file = File::open(path).map_err(|e| {
+            // The file verified moments ago; a NotFound here means a
+            // concurrent unlink raced us. Treat any open failure as Io.
+            warn!(target: "tensor_wasm_artifacts", file = %path.display(), error = %e, "reopen failed (decode pass)");
+            ArtifactError::Io
+        })?;
+        let mut reader = BufReader::with_capacity(STREAM_BUF_LEN, file);
+        // Skip the header — already validated in pass 1.
+        let mut header = [0u8; ARTIFACT_HEADER_LEN];
+        reader.read_exact(&mut header).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "header reread failed (decode pass)");
+            ArtifactError::Io
+        })?;
+
+        let cap = MAX_DECOMPRESSED_LEN;
+        let probe_limit = u64::try_from(cap)
+            .ok()
+            .and_then(|c| c.checked_add(1))
+            .unwrap_or(u64::MAX);
+
+        // Decode the body straight into a hashing+counting+capping sink
+        // that forwards to `out`. Because the blob is already
+        // authenticated, streaming decoded bytes to the caller honours
+        // the "no unverified bytes exposed" invariant.
+        let body_take = Read::take(&mut reader, verified.body_len);
+        let decoder = zstd::stream::read::Decoder::new(body_take).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed (decode pass)");
+            ArtifactError::Decompression(e.to_string())
+        })?;
+        let mut sink = HashingWriter::new(out);
+        let copied = std::io::copy(&mut Read::take(decoder, probe_limit), &mut sink);
+        // A `copy` error is one of two things: the downstream writer
+        // refused a byte (the `HashingWriter` records this in
+        // `downstream_failed`, regardless of the io error kind), or the
+        // zstd decoder faulted on the body. Check the downstream flag
+        // first so a writer fault is reported as `Io`, not `Decompression`.
+        let written = match copied {
+            Ok(n) => n,
+            Err(e) => {
+                if sink.downstream_failed {
+                    warn!(target: "tensor_wasm_artifacts", error = %e, "get_to writer write failed");
+                    return Err(ArtifactError::Io);
+                }
+                warn!(target: "tensor_wasm_artifacts", error = %e, "zstd decode failed (decode pass)");
+                return Err(ArtifactError::Decompression(e.to_string()));
+            }
+        };
+        if written > cap as u64 {
+            warn!(
+                target: "tensor_wasm_artifacts",
+                file = %path.display(),
+                actual = written,
+                limit = cap,
+                "rejecting oversized decompressed payload (possible zstd bomb)"
+            );
+            return Err(ArtifactError::TooLarge {
+                actual: written as usize,
+                limit: cap,
+            });
+        }
+        // Defence-in-depth: the streamed bytes must hash to both the
+        // header value and the requested key.
+        let recomputed: [u8; 32] = sink.hasher.finalize().into();
+        if recomputed != verified.hash_on_disk {
+            return Err(ArtifactError::HashMismatch {
+                expected: hex_of(&verified.hash_on_disk),
+                actual: hex_of(&recomputed),
+            });
+        }
+        if recomputed != *requested.as_bytes() {
+            return Err(ArtifactError::HashMismatch {
+                expected: requested.to_string(),
+                actual: hex_of(&recomputed),
+            });
+        }
+        Ok(written)
+    }
+
+    /// Resolve which accepted read key holds `hash`, if any. Probes each
+    /// key from [`KeyProvider::read_keys`] (active first) with a stat-only
+    /// existence check and returns the `(path, key)` of the first match —
+    /// keys partition the namespace by fingerprint, so there is at most
+    /// one. Returns `Ok(None)` on a genuine miss across all keys, and
+    /// [`ArtifactError::Io`] on a probe fault that is neither present nor
+    /// absent.
+    fn resolve_read_key(
+        &self,
+        hash: &ContentHash,
+    ) -> Result<Option<(PathBuf, [u8; 32])>, ArtifactError> {
+        for key in self.key_provider.read_keys() {
+            let fp = key_fingerprint_hex(&key);
+            let path = self.path_for_key(hash, &fp);
+            match std::fs::metadata(&path) {
+                Ok(_) => return Ok(Some((path, key))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    warn!(
+                        target: "tensor_wasm_artifacts",
+                        file = %path.display(),
+                        error = %e,
+                        "resolve_read_key metadata probe failed"
+                    );
+                    return Err(ArtifactError::Io);
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Result of [`DiskArtifactStore::verify_blob`]: the authenticated header
+/// hash and the zstd body length, handed to the decode pass.
+struct VerifiedBlob {
+    hash_on_disk: [u8; 32],
+    body_len: u64,
+}
+
+/// `Write` adapter that tees bytes into a BLAKE3 hasher (for the
+/// defence-in-depth content-hash recheck), counts them, and forwards to a
+/// downstream writer. Used by the streaming `get_to` decode pass so the
+/// decoded bytes are hashed *as they stream to the caller* — no second
+/// buffer.
+///
+/// A downstream write failure is recorded in `downstream_failed` and
+/// surfaced as an `io::ErrorKind::Other` so the caller can map it to
+/// [`ArtifactError::Io`] (and distinguish it from a zstd decode fault,
+/// which `std::io::copy` reports with the same kind).
+struct HashingWriter<'a> {
+    inner: &'a mut dyn Write,
+    hasher: blake3::Hasher,
+    downstream_failed: bool,
+}
+
+impl<'a> HashingWriter<'a> {
+    fn new(inner: &'a mut dyn Write) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+            downstream_failed: false,
+        }
+    }
+}
+
+impl Write for HashingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Forward first; only hash the bytes the downstream accepted so
+        // the recomputed hash matches exactly what reached the caller.
+        match self.inner.write(buf) {
+            Ok(n) => {
+                self.hasher.update(&buf[..n]);
+                Ok(n)
+            }
+            Err(e) => {
+                self.downstream_failed = true;
+                Err(e)
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -525,7 +1098,14 @@ impl ArtifactStore for DiskArtifactStore {
     }
 
     fn get(&self, hash: &ContentHash) -> Result<Vec<u8>, ArtifactError> {
-        let path = self.path_for(hash);
+        // Rotation-aware key resolution: keys partition the on-disk
+        // namespace by fingerprint, so at most one accepted read key has a
+        // file for this content hash. Probe each (active first) and use
+        // whichever one's file exists. If none exist it's a genuine miss.
+        let (path, key) = match self.resolve_read_key(hash)? {
+            Some(found) => found,
+            None => return Err(ArtifactError::NotFound(hash.to_string())),
+        };
 
         // T22 streaming read: open the file behind a 64 KiB BufReader
         // and stream the prefix (header + zstd body) through a
@@ -586,7 +1166,7 @@ impl ArtifactStore for DiskArtifactStore {
         let body_len = prefix_end - ARTIFACT_HEADER_LEN as u64;
 
         let mut reader = BufReader::with_capacity(STREAM_BUF_LEN, file);
-        let mut mac = new_mac(&self.hmac_key);
+        let mut mac = new_mac(&key);
 
         // ---- Read and validate the fixed header. ----
         let mut header = [0u8; ARTIFACT_HEADER_LEN];
@@ -799,77 +1379,50 @@ impl ArtifactStore for DiskArtifactStore {
         Ok(payload)
     }
 
-    fn list(&self) -> Result<Vec<ContentHash>, ArtifactError> {
-        let suffix = format!(".{}.bin", self.key_fp_hex);
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(e) => e,
-            // A missing store directory legitimately means "empty" (the
-            // dir is created lazily on the first `put`). Any other
-            // failure — permissions, I/O — is propagated so GC/audit
-            // callers don't mistake a read fault for an empty store.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => {
-                warn!(
-                    target: "tensor_wasm_artifacts",
-                    dir = %self.dir.display(),
-                    error = %e,
-                    "read_dir failed"
-                );
-                return Err(ArtifactError::Io);
-            }
+    fn get_to(&self, hash: &ContentHash, out: &mut dyn Write) -> Result<u64, ArtifactError> {
+        // Two-pass streaming: the HMAC covers the whole compressed blob,
+        // so we must authenticate before exposing any decoded byte. Pass 1
+        // (`verify_blob`) streams the compressed body through the MAC and
+        // checks the tag WITHOUT decoding — no decoded byte exists to
+        // leak. Only once that passes does pass 2 (`decode_to_writer`)
+        // re-open the file and stream-decode straight into `out`.
+        //
+        // Tradeoff: this reads the compressed body off disk twice (it is
+        // re-opened, not buffered in RAM). That keeps peak heap bounded by
+        // the I/O buffers regardless of payload size — the alternative
+        // (buffer the whole decoded payload, verify, then write) would
+        // hold up to MAX_DECOMPRESSED_LEN resident, which is exactly what
+        // `get` already does and what the streaming path exists to avoid.
+        let (path, key) = match self.resolve_read_key(hash)? {
+            Some(found) => found,
+            None => return Err(ArtifactError::NotFound(hash.to_string())),
         };
-        let mut out = Vec::new();
-        for entry in entries {
-            // A per-entry error (e.g. the directory was racing with a
-            // concurrent unlink, or an underlying I/O fault) is a real
-            // enumeration failure, not a skippable filename mismatch —
-            // propagate it rather than silently shortening the listing.
-            let entry = entry.map_err(|e| {
-                warn!(
-                    target: "tensor_wasm_artifacts",
-                    dir = %self.dir.display(),
-                    error = %e,
-                    "read_dir entry failed"
-                );
-                ArtifactError::Io
-            })?;
-            let name = match entry.file_name().into_string() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            // Filenames look like `{64 hex chars}.{16 hex chars}.bin`.
-            // Match the suffix so we ignore files written by stores
-            // under a different key.
-            if !name.ends_with(&suffix) {
-                continue;
-            }
-            let hash_hex = &name[..name.len() - suffix.len()];
-            if hash_hex.len() != 64 {
-                continue;
-            }
-            let mut bytes = [0u8; 32];
-            let mut ok = true;
-            for (i, chunk) in hash_hex.as_bytes().chunks(2).enumerate() {
-                let s = match std::str::from_utf8(chunk) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
-                };
-                match u8::from_str_radix(s, 16) {
-                    Ok(b) => bytes[i] = b,
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if ok {
-                out.push(ContentHash::from_bytes(bytes));
-            }
+        let verified = self.verify_blob(&path, &key)?;
+        self.decode_to_writer(&path, &verified, hash, out)
+    }
+
+    fn list(&self) -> Result<Vec<ContentHash>, ArtifactError> {
+        // Rotation-aware enumeration: union the hashes visible under every
+        // accepted read-key fingerprint so an audit spans the rotation
+        // boundary. Dedup because a content hash may be present under more
+        // than one key (e.g. re-put after rotation). Probe each key's
+        // `.bin` suffix in turn.
+        let mut seen: std::collections::HashSet<ContentHash> = std::collections::HashSet::new();
+        let mut fps: Vec<String> = self
+            .key_provider
+            .read_keys()
+            .iter()
+            .map(key_fingerprint_hex)
+            .collect();
+        // The single-key common case has exactly one fingerprint; dedup the
+        // fingerprint list so a provider that repeats the active key in
+        // `read_keys` doesn't scan the directory twice.
+        fps.sort();
+        fps.dedup();
+        for fp in fps {
+            self.list_one_key(&fp, &mut seen)?;
         }
-        Ok(out)
+        Ok(seen.into_iter().collect())
     }
 
     fn contains(&self, hash: &ContentHash) -> Result<bool, ArtifactError> {
@@ -899,9 +1452,9 @@ impl ArtifactStore for DiskArtifactStore {
         // `HashMap::remove`'s boolean and lets idempotent GC retries
         // stay quiet. Any other delete fault is a real `Io`.
         let path = self.path_for(hash);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        let removed = match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
                 warn!(
                     target: "tensor_wasm_artifacts",
@@ -909,9 +1462,105 @@ impl ArtifactStore for DiskArtifactStore {
                     error = %e,
                     "remove unlink failed"
                 );
-                Err(ArtifactError::Io)
+                return Err(ArtifactError::Io);
+            }
+        };
+        // Best-effort: drop the metadata sidecar too so it never outlives
+        // the blob it describes. A missing sidecar is the common case
+        // (plain `put` writes none); any other unlink fault is logged but
+        // does not flip the blob-removal result, since the blob — the
+        // authoritative entry — is already gone.
+        let meta_path = self.meta_path_for(hash);
+        if let Err(e) = std::fs::remove_file(&meta_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    target: "tensor_wasm_artifacts",
+                    file = %meta_path.display(),
+                    error = %e,
+                    "remove sidecar unlink failed (blob already removed)"
+                );
             }
         }
+        Ok(removed)
+    }
+}
+
+impl DiskArtifactStore {
+    /// Enumerate the content hashes stored under the single key fingerprint
+    /// `fp`, inserting each into `seen`. Shared by [`ArtifactStore::list`]'s
+    /// per-key loop. A missing store directory is treated as empty (the dir
+    /// is created lazily on the first `put`); any other `read_dir` fault is
+    /// propagated as [`ArtifactError::Io`].
+    fn list_one_key(
+        &self,
+        fp: &str,
+        seen: &mut std::collections::HashSet<ContentHash>,
+    ) -> Result<(), ArtifactError> {
+        let suffix = format!(".{fp}.bin");
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                warn!(
+                    target: "tensor_wasm_artifacts",
+                    dir = %self.dir.display(),
+                    error = %e,
+                    "read_dir failed"
+                );
+                return Err(ArtifactError::Io);
+            }
+        };
+        for entry in entries {
+            // A per-entry error (e.g. the directory was racing with a
+            // concurrent unlink, or an underlying I/O fault) is a real
+            // enumeration failure, not a skippable filename mismatch —
+            // propagate it rather than silently shortening the listing.
+            let entry = entry.map_err(|e| {
+                warn!(
+                    target: "tensor_wasm_artifacts",
+                    dir = %self.dir.display(),
+                    error = %e,
+                    "read_dir entry failed"
+                );
+                ArtifactError::Io
+            })?;
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            // Filenames look like `{64 hex chars}.{16 hex chars}.bin`.
+            // Match the suffix so we ignore files written under a
+            // different key (and the `.meta.json` sidecars).
+            if !name.ends_with(&suffix) {
+                continue;
+            }
+            let hash_hex = &name[..name.len() - suffix.len()];
+            if hash_hex.len() != 64 {
+                continue;
+            }
+            let mut bytes = [0u8; 32];
+            let mut ok = true;
+            for (i, chunk) in hash_hex.as_bytes().chunks(2).enumerate() {
+                let s = match std::str::from_utf8(chunk) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                };
+                match u8::from_str_radix(s, 16) {
+                    Ok(b) => bytes[i] = b,
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                seen.insert(ContentHash::from_bytes(bytes));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1207,6 +1856,22 @@ impl ArtifactStore for InMemoryArtifactStore {
             .cloned()
             .ok_or_else(|| ArtifactError::NotFound(hash.to_string()))
     }
+    fn get_to(&self, hash: &ContentHash, out: &mut dyn Write) -> Result<u64, ArtifactError> {
+        // The in-memory map already holds the plaintext payload (integrity
+        // is guaranteed by the map itself — no envelope to verify), so
+        // streaming is a single write of the stored bytes while the lock
+        // is held. We write under the lock to avoid cloning the payload
+        // first; the bytes are authentic by construction.
+        let guard = self.entries.lock();
+        let bytes = guard
+            .get(hash)
+            .ok_or_else(|| ArtifactError::NotFound(hash.to_string()))?;
+        out.write_all(bytes).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "in-memory get_to writer write failed");
+            ArtifactError::Io
+        })?;
+        Ok(bytes.len() as u64)
+    }
     fn list(&self) -> Result<Vec<ContentHash>, ArtifactError> {
         // An in-memory map cannot fail to enumerate, so this is
         // infallible — but the signature matches the trait so callers
@@ -1254,6 +1919,43 @@ mod tests {
         assert!(store.remove(&hash).unwrap(), "first remove deletes");
         assert!(!store.contains(&hash).unwrap());
         assert!(!store.remove(&hash).unwrap(), "second remove is a no-op");
+    }
+
+    #[test]
+    fn in_memory_get_to_streams_payload() {
+        let store = InMemoryArtifactStore::new([5u8; 32]);
+        let hash = store.put(b"streamed").unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let n = store.get_to(&hash, &mut out).unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(out, b"streamed");
+    }
+
+    #[test]
+    fn single_key_provider_active_is_only_read_key() {
+        let p = SingleKeyProvider::new([3u8; 32]);
+        assert_eq!(p.active_key(), [3u8; 32]);
+        assert_eq!(p.read_keys(), vec![[3u8; 32]]);
+    }
+
+    #[test]
+    fn rotating_provider_active_first_then_accepted() {
+        let p = RotatingKeyProvider::new([1u8; 32], [[2u8; 32], [3u8; 32]]);
+        assert_eq!(p.active_key(), [1u8; 32]);
+        // Active key leads, then the accepted-for-read keys in order.
+        assert_eq!(p.read_keys(), vec![[1u8; 32], [2u8; 32], [3u8; 32]]);
+    }
+
+    #[test]
+    fn metadata_serde_round_trips() {
+        let m = ArtifactMetadata {
+            created_unix_ms: 123,
+            original_len: 456,
+            source_tier: "test".to_string(),
+        };
+        let json = serde_json::to_vec(&m).unwrap();
+        let back: ArtifactMetadata = serde_json::from_slice(&json).unwrap();
+        assert_eq!(m, back);
     }
 
     #[test]

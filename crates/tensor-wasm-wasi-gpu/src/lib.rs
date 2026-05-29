@@ -30,6 +30,7 @@ pub mod scheduler;
 pub mod streaming;
 
 pub use streaming::{
-    add_streaming_to_linker, HasStreaming, StreamingContext, FN_EMIT_CHUNK, FN_FLUSH,
-    MAX_CHUNK_BYTES, MAX_TOTAL_STREAM_BYTES, STREAMING_MODULE,
+    add_input_to_linker, add_streaming_to_linker, HasInput, HasStreaming, InputContext,
+    StreamingContext, FN_EMIT_CHUNK, FN_FLUSH, FN_INPUT_LEN, FN_READ_INPUT, MAX_CHUNK_BYTES,
+    MAX_TOTAL_STREAM_BYTES, STREAMING_MODULE,
 };
