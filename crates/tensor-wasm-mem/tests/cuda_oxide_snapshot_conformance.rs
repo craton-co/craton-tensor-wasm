@@ -4,35 +4,28 @@
 //! W4.2 cross-backend snapshot conformance: cuda-oxide half.
 //!
 //! Compiled only when the dep-less `cuda-oxide-backend` scaffold feature
-//! is on, and split internally so the hardware-touching path is
-//! additionally gated on the strict-superset `cuda-oxide-host-backend`
-//! feature (which pulls in the W4.1 `cuda-host` / `cuda-core` git deps —
-//! the LIBCLANG + CUDA Toolkit prerequisites are documented in
-//! `docs/CUDA-SETUP.md`).
+//! is on.
 //!
 //! Mirrors [`cust_snapshot_conformance.rs`][cust] and
 //! [`cudarc_snapshot_conformance.rs`][cudarc] so the diff between the
 //! three backends is body-only.
 //!
-//! Three test bands:
+//! Two test bands:
 //!
-//! 1. **Host-only, scaffold OR host-backend.** A pure-`Vec<u8>`
-//!    round-trip proving the snapshot wire format stays byte-stable
-//!    when the cuda-oxide module is compiled into the test binary.
+//! 1. A pure-`Vec<u8>` round-trip proving the snapshot wire format stays
+//!    byte-stable when the cuda-oxide module is compiled into the test
+//!    binary.
 //!
-//! 2. **Host-only, scaffold-only.** Witness that
-//!    `CudaOxideUnifiedBuffer::allocate` returns the documented
-//!    `NOT_YET_WIRED` sentinel — and that the snapshot path therefore
-//!    is unreachable through this backend until the host-backend feature
-//!    lands. Skipped under the host-backend build because that build
-//!    either succeeds or returns a real driver error, never the
-//!    sentinel string.
+//! 2. Witness that `CudaOxideUnifiedBuffer::allocate` returns the
+//!    documented `NOT_YET_WIRED` sentinel — and that the snapshot path
+//!    therefore is unreachable through this backend until the host port
+//!    lands.
 //!
-//! 3. **Hardware-gated, host-backend only.** Allocate three real
-//!    cuMemAllocManaged regions via the W4.1 host-backend impl,
-//!    populate them, and run the same round-trip. Marked `#[ignore =
-//!    "requires CUDA hardware"]`. The S22 runner unignores via `cargo
-//!    test --features cuda-oxide-host-backend -- --ignored`.
+//! NOTE: the hardware-gated band that exercised the real
+//! `cuMemAllocManaged` host backend (formerly gated on the
+//! `experimental-cuda-oxide-host-backend` feature) was removed for
+//! crates.io publishability — it relied on git-pinned cuda-oxide crates.
+//! Restore it with the host port (RFC 0001 / docs/CUDA-OXIDE-CUTOVER.md).
 //!
 //! [cust]: ./cust_snapshot_conformance.rs
 //! [cudarc]: ./cudarc_snapshot_conformance.rs
@@ -40,10 +33,6 @@
 #![cfg(feature = "cuda-oxide-backend")]
 
 use tensor_wasm_mem::cuda_oxide_backend::CudaOxideUnifiedBuffer;
-// `UnifiedError` is only referenced by the scaffold-only negative-witness
-// test below; under `cuda-oxide-host-backend` the import would be unused
-// and would warn under `-D warnings`.
-#[cfg(not(feature = "experimental-cuda-oxide-host-backend"))]
 use tensor_wasm_mem::unified::UnifiedError;
 
 mod common;
@@ -80,11 +69,6 @@ fn cuda_oxide_feature_does_not_perturb_snapshot_wire_format() {
 /// fake host pointer that the snapshot writer would then happily
 /// serialise — a v0.5 cust-successor compat hazard called out in RFC
 /// 0001).
-///
-/// Skipped under `cuda-oxide-host-backend` because that build *does*
-/// have a working `allocate` (which either succeeds or returns a real
-/// driver error — never the sentinel).
-#[cfg(not(feature = "experimental-cuda-oxide-host-backend"))]
 #[test]
 fn cuda_oxide_scaffold_allocate_blocks_snapshot_producer_path() {
     let err = CudaOxideUnifiedBuffer::allocate(CONFORMANCE_WASM_LEN)
@@ -104,35 +88,9 @@ fn cuda_oxide_scaffold_allocate_blocks_snapshot_producer_path() {
     }
 }
 
-/// Hardware-gated end-to-end: allocate three real `cuMemAllocManaged`
-/// regions via the W4.1 cuda-oxide host backend, populate them via
-/// `CudaOxideUnifiedBuffer::as_mut_slice`, and round-trip through
-/// `SnapshotWriter::capture` → `SnapshotReader::restore`. The
-/// decisive assertion is the cross-backend conformance guarantee: a
-/// snapshot blob produced from cuda-oxide-allocated bytes is
-/// bit-identical (in the restored-payload sense) to one produced from
-/// cust- or cudarc-allocated bytes carrying the same logical content.
-///
-/// Compiled only under `cuda-oxide-host-backend` (the strict-superset
-/// W4.1 feature). Marked `#[ignore]` per the repo convention; runs on
-/// the S22 CUDA runner via `cargo test --features
-/// cuda-oxide-host-backend -- --ignored`.
-#[cfg(feature = "experimental-cuda-oxide-host-backend")]
-#[test]
-#[ignore = "requires CUDA hardware"]
-fn cuda_oxide_host_backend_snapshot_round_trip_on_device() {
-    let mut wasm_buf = CudaOxideUnifiedBuffer::allocate(CONFORMANCE_WASM_LEN)
-        .expect("alloc wasm-memory cuda-oxide buffer");
-    let mut gpu_buf = CudaOxideUnifiedBuffer::allocate(CONFORMANCE_GPU_LEN)
-        .expect("alloc gpu-memory cuda-oxide buffer");
-    let mut regs_buf = CudaOxideUnifiedBuffer::allocate(CONFORMANCE_REGISTERS_LEN)
-        .expect("alloc registers cuda-oxide buffer");
-
-    populate_payloads_into(
-        wasm_buf.as_mut_slice(),
-        gpu_buf.as_mut_slice(),
-        regs_buf.as_mut_slice(),
-    );
-
-    snapshot_round_trip_with_source(wasm_buf.as_slice(), gpu_buf.as_slice(), regs_buf.as_slice());
-}
+// NOTE: the hardware-gated end-to-end test that allocated three real
+// `cuMemAllocManaged` regions via the cuda-oxide host backend was removed
+// together with the `experimental-cuda-oxide-host-backend` feature and the
+// git-pinned cuda-oxide crates it depended on, which blocked crates.io
+// publishing. Restore it with the host port (RFC 0001 /
+// docs/CUDA-OXIDE-CUTOVER.md).

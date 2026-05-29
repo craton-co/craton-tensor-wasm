@@ -159,6 +159,16 @@ pub struct InstancePool {
     /// wait-free reads on the hot acquire path: `try_recv` is a single
     /// atomic operation against the per-entry channel.
     pools: Arc<DashMap<PoolKey, Arc<PoolEntry>>>,
+    /// Per-key single-flight guard for the first-build pre-spawn loop.
+    /// Concurrent first-`acquire`s for the same `(tenant, module_hash)`
+    /// share one [`tokio::sync::OnceCell`]: exactly one runs the
+    /// (`await`-heavy) pre-spawn loop while the losers park on
+    /// `get_or_try_init` and observe the winner's [`PoolEntry`] instead
+    /// of redundantly Cranelift-compiling/instantiating their own
+    /// (thundering-herd fix). The shard write-guard on this map is only
+    /// held long enough to clone the `Arc<OnceCell>` — never across the
+    /// `await` inside the initializer — so it cannot deadlock the build.
+    inflight: Arc<DashMap<PoolKey, Arc<tokio::sync::OnceCell<Arc<PoolEntry>>>>>,
     /// Total warm-and-in-channel count across all entries. Counts UP on
     /// pre-spawn / release-enqueue and DOWN on acquire-from-channel /
     /// reset-failure-drop. Operators observe this via
@@ -187,6 +197,7 @@ impl InstancePool {
         Self {
             cfg,
             pools: Arc::new(DashMap::new()),
+            inflight: Arc::new(DashMap::new()),
             warm_total: Arc::new(AtomicUsize::new(0)),
             draws_total: Arc::new(AtomicUsize::new(0)),
             hit_count: Arc::new(AtomicUsize::new(0)),
@@ -434,8 +445,62 @@ impl InstancePool {
             return Ok(entry.value().clone());
         }
 
-        // First observation for this tuple — pre-warm.
+        // First observation for this tuple — pre-warm under a per-key
+        // single-flight guard. Two concurrent first-`acquire`s both miss
+        // the `pools.get` fast path above; without this guard they would
+        // each run the full pre-spawn loop (Cranelift-compiling and
+        // instantiating `warm_n` instances apiece) and the loser would
+        // then have to drain + refund its wasted work. Instead we share
+        // one `OnceCell` per key so only the winner runs the build; the
+        // losers park on `get_or_try_init` and observe the winner's
+        // `PoolEntry`.
         //
+        // The shard write-guard on `inflight` is dropped immediately
+        // after we clone the `Arc<OnceCell>` (the `entry`/`or_insert`
+        // call below borrows the shard only for that statement), so it is
+        // never held across the `await` inside the initializer — no
+        // shard-guard-across-await deadlock.
+        let cell = self
+            .inflight
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .value()
+            .clone();
+
+        // `get_or_try_init` runs the initializer on exactly one task per
+        // `OnceCell`; concurrent callers await its completion and clone
+        // the resulting `Arc<PoolEntry>`. On initializer error every
+        // waiter observes the same `Err` and no `PoolEntry` is cached, so
+        // a later `acquire` retries the build cleanly.
+        let entry = cell
+            .get_or_try_init(|| self.build_entry(executor, wasm, cfg, key.clone()))
+            .await?
+            .clone();
+
+        // The entry now lives in `pools` (the fast path will find it) and
+        // in the cell. Drop the single-flight cell so `inflight` does not
+        // grow unbounded; a straggler that already cloned this `Arc` is
+        // unaffected, and a fresh caller hits the `pools` fast path.
+        self.inflight.remove(&key);
+
+        Ok(entry)
+    }
+
+    /// Build and register the per-tuple [`PoolEntry`]: allocate the
+    /// bounded channel, run the pre-spawn loop, and insert into `pools`.
+    /// Invoked at most once per key via the `inflight` `OnceCell`, so the
+    /// slot/`warm_total` accounting here is driven by a single builder —
+    /// there is no lost-race refund to perform. The previous
+    /// double-build defence (drain-local-channel + refund slots on a lost
+    /// `DashEntry` race) is therefore gone: a second builder can no
+    /// longer exist for the same key.
+    async fn build_entry(
+        &self,
+        executor: &TensorWasmExecutor,
+        wasm: &[u8],
+        cfg: &SpawnConfig,
+        key: PoolKey,
+    ) -> Result<Arc<PoolEntry>, ExecError> {
         // We use `build_pooled_instance` for the first instance so the
         // compiled module + hash are returned, then
         // `rebuild_pooled_from_module` for the rest (no need to
@@ -456,10 +521,11 @@ impl InstancePool {
             }
             if i == 0 {
                 let (inst, module, _) = executor.build_pooled_instance(cfg, wasm).await?;
+                // Single builder per key + a channel sized at `cap >=
+                // warm_n` means `try_send` cannot fail here for capacity
+                // reasons; treat any error defensively by releasing the
+                // slot we charged so admission control stays balanced.
                 if sender.try_send(inst).is_err() {
-                    // Channel filled by a concurrent pre-warm? Drop
-                    // and release the slot — defence against the
-                    // (theoretical) double-build race.
                     executor.release_instance_slot(cfg.tenant_id);
                 } else {
                     self.warm_total.fetch_add(1, Ordering::Relaxed);
@@ -507,30 +573,12 @@ impl InstancePool {
             module,
             capacity: cap,
         });
-        // Race: another thread may have built the entry while we were
-        // pre-warming. If we lose the race the freshly-built entry's
-        // channel still holds the instances we just spawned — drain it
-        // and release the corresponding executor slots before dropping
-        // our local copy, otherwise admission control leaks counts.
-        use dashmap::mapref::entry::Entry as DashEntry;
-        let stored = match self.pools.entry(key) {
-            DashEntry::Vacant(v) => {
-                v.insert(entry.clone());
-                entry
-            }
-            DashEntry::Occupied(o) => {
-                // We lost the race. Drain our local channel and refund
-                // the slots we charged in the pre-spawn loop above.
-                let local = entry;
-                while let Ok(inst) = local.receiver.try_recv() {
-                    drop(inst);
-                    executor.release_instance_slot(cfg.tenant_id);
-                    self.warm_total.fetch_sub(1, Ordering::Relaxed);
-                }
-                o.get().clone()
-            }
-        };
-        Ok(stored)
+        // Single-flight: this is the only builder for `key`, so the
+        // insert is uncontended. Use `entry()` purely to insert; a
+        // pre-existing value would be a logic error (the `OnceCell`
+        // already serialises us), so overwrite-by-insert is fine.
+        self.pools.insert(key, entry.clone());
+        Ok(entry)
     }
 
     /// Number of currently warm (in-channel) instances across all tuples.

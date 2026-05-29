@@ -33,32 +33,16 @@ tracing.workspace = true
 wasmtime.workspace = true
 cust = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
-# cuda-oxide host-runtime crates — pulled in ONLY under the opt-in
-# `experimental-cuda-oxide-host-backend` feature (NOT under
-# `cuda-oxide-backend`, which is the dep-less scaffold). NOTE: that feature
-# is intentionally non-building (its module opens with a `compile_error!`)
-# because the host FFI surface is inferred and unverified. Building these
-# crates requires:
-#
-#   * a CUDA Toolkit (`CUDA_TOOLKIT_PATH` env var pointing at the install
-#     root; defaults to `/usr/local/cuda` on Linux), and
-#   * a working `libclang` reachable through `LIBCLANG_PATH` (cuda-bindings
-#     runs bindgen against `<cuda.h>` in its build script).
-#
-# The default Windows / Linux contributor box without these is unable to
-# compile the cuda-bindings crate, which is why the host-backend deps live
-# behind a separate strict-superset feature flag rather than the base
-# `cuda-oxide-backend` scaffold. The pattern mirrors W3.3's
-# `pliron-llvm-backend` on `tensor-wasm-jit`. See `docs/CUDA-SETUP.md`
-# section "Using the cuda-oxide-host-backend feature" for the toolchain
-# install matrix. RFC 0001 (rfcs/0001-cuda-oxide-integration.md) tracks
-# the full adoption rationale and the nightly-2026-04-03 toolchain pin
-# aligning the workspace with cuda-oxide's own rust-toolchain.toml.
-cuda-host = { workspace = true, optional = true }
-cuda-core = { workspace = true, optional = true }
-cuda-async = { workspace = true, optional = true }
-cuda-device = { workspace = true, optional = true }
-cuda-macros = { workspace = true, optional = true }
+# NOTE: the five cuda-oxide host/device crates (`cuda-host`, `cuda-core`,
+# `cuda-async`, `cuda-device`, `cuda-macros`) used to be declared here as
+# `{ workspace = true, optional = true }` behind the
+# `experimental-cuda-oxide-host-backend` feature. They were git-pinned in
+# the workspace manifest, which crates.io refuses to publish (a `git`
+# dependency — even optional/feature-gated — is rejected). Both the deps
+# and that never-building feature have been removed so this crate (and its
+# downstream consumers) can be published. The dep-less `cuda-oxide-backend`
+# scaffold feature below is retained. Re-add these crates once cuda-oxide
+# ships to crates.io — see RFC 0001 / docs/CUDA-OXIDE-CUTOVER.md.
 
 [dev-dependencies]
 wat.workspace = true
@@ -67,8 +51,8 @@ tempfile.workspace = true
 tracing-subscriber.workspace = true
 # W4.2 — cross-backend snapshot conformance tests pull in the snapshot
 # crate to drive the capture/restore round-trip against bytes produced by
-# each CUDA backing (`unified-memory` / cust, `cudarc-backend`,
-# `experimental-cuda-oxide-host-backend`). The snapshot crate itself is intentionally
+# each CUDA backing (`unified-memory` / cust, `cudarc-backend`). The
+# snapshot crate itself is intentionally
 # backend-agnostic (bytes-in, bytes-out); these tests are the regression
 # guard documented in RFC 0001 "Test plan" that the W1.3 cross-version
 # compat suite runs cleanly under each backend feature.
@@ -129,64 +113,22 @@ gpu-mem-pool = ["cudarc-backend"]
 # rfcs/0001-cuda-oxide-integration.md). It is intentionally **dep-less**:
 # enabling it exposes the `crate::cuda_oxide_backend` module (with the
 # scaffold `CudaOxideUnifiedBuffer` returning the documented
-# `NOT_YET_WIRED` sentinel) but does NOT pull `cuda-host`, `cuda-core`,
-# `cuda-device`, or `cuda-macros` into the resolved dependency graph.
-# That keeps `cargo check --features cuda-oxide-backend` building cleanly
-# on contributor boxes that lack a CUDA Toolkit and `libclang`. The real
-# host-runtime port — `cuMemAllocManaged` and friends — lives behind the
-# strict-superset `experimental-cuda-oxide-host-backend` feature below.
+# `NOT_YET_WIRED` sentinel) but does NOT pull any cuda-oxide crate into the
+# resolved dependency graph. That keeps `cargo check --features
+# cuda-oxide-backend` building cleanly on contributor boxes that lack a
+# CUDA Toolkit and `libclang`, and — because it adds no `git` dependency —
+# keeps this crate publishable to crates.io.
 #
-# v0.3.1 ships the FEATURE FLAG and an empty module only; the unified-
-# memory port lands at v0.4 per RFC 0001 "Rollout — v0.4 (parity)" and is
-# wired through the `experimental-cuda-oxide-host-backend` superset feature so the
-# scaffold itself stays dep-less. The feature is intentionally mutually
-# compatible with `unified-memory` and `cudarc-backend`; enabling all
-# three at once is valid (and is what CI will exercise once the parity
-# port lands).
+# This feature ships the FEATURE FLAG and the scaffold module only. The
+# real host-runtime port (`cuMemAllocManaged` and friends) previously lived
+# behind a strict-superset `experimental-cuda-oxide-host-backend` feature
+# that pulled in the git-pinned cuda-oxide host/device crates and never
+# compiled (its module opened with a `compile_error!`). That feature and
+# those git deps were REMOVED for crates.io publishability; re-add the port
+# once cuda-oxide ships to crates.io (RFC 0001 / docs/CUDA-OXIDE-CUTOVER.md).
+# The feature is intentionally mutually compatible with `unified-memory`
+# and `cudarc-backend`; enabling all three at once is valid.
 cuda-oxide-backend = []
-# `experimental-cuda-oxide-host-backend` is a STRICT SUPERSET of
-# `cuda-oxide-backend` (W3.3 pliron-llvm-backend → pliron-backend pattern).
-# It pulls in the four cuda-oxide host-side crates intended for the v0.4
-# parity port:
-#
-#   * `cuda-host`  — kernel launch helpers, LtoIR loader
-#   * `cuda-core`  — RAII context / stream / module / memory wrappers and
-#                    the raw `cuda_bindings` re-export used here for
-#                    `cuMemAllocManaged`, `cuMemPrefetchAsync`,
-#                    `cuMemAdvise`, `cuMemFree_v2`
-#   * `cuda-device`— device-side primitives (DisjointSlice, kernel attr).
-#                    Pulled in here so a single feature flag toggles the
-#                    complete cuda-oxide surface; not directly imported
-#                    from `cuda_oxide_backend.rs` today.
-#   * `cuda-macros`— `#[kernel]` / `cuda_launch!` proc-macros; same
-#                    rationale as cuda-device — toggled together so v0.4
-#                    callers do not need to layer features.
-#
-# !!! EXPERIMENTAL / DOES NOT BUILD !!!
-# The `cuda_oxide_backend::host_backend` module this feature gates is ~350
-# LOC of `unsafe` FFI written against an INFERRED, never-compiled cuda-oxide
-# host API (every `// W4.1: API surface inferred ... verify` comment). It
-# has NEVER been compiled against the real `cuda-bindings`-generated
-# symbols. Enabling this feature is deliberately wired to FAIL the build:
-# the `host_backend` module opens with a `compile_error!` so an operator
-# who flips the flag gets a clear message instead of unverified unsafe
-# code. The `experimental-` prefix exists to make that non-buildable status
-# obvious on the command line. Do NOT enable until a LIBCLANG-equipped CI
-# runner has actually compiled the port and the `compile_error!` is lifted.
-#
-# When it does graduate it will additionally require the contributor host to
-# provide BOTH a CUDA Toolkit (so `<cuda.h>` is reachable) AND `libclang`
-# via `LIBCLANG_PATH` (so the `cuda-bindings` build script can run bindgen).
-# See `docs/CUDA-SETUP.md` section "Using the cuda-oxide-host-backend
-# feature" for the install matrix and the `LIBCLANG_PATH` /
-# `CUDA_TOOLKIT_PATH` env vars.
-experimental-cuda-oxide-host-backend = [
-    "cuda-oxide-backend",
-    "dep:cuda-host",
-    "dep:cuda-core",
-    "dep:cuda-device",
-    "dep:cuda-macros",
-]
 
 [package.metadata.docs.rs]
 all-features = false

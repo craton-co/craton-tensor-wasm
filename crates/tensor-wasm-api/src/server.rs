@@ -662,10 +662,11 @@ fn build_router_full(
     // and `MetricsAuth::from_env` emits a one-shot startup `warn!` that
     // the scrape target is unauthenticated. The `MetricsAuth` extension
     // is inserted on this sub-router only, so `/healthz` and every other
-    // route are oblivious to it. NOTE: enabling the token does diverge
-    // from the published `security: []` contract — the OpenAPI spec and
-    // operator docs should grow an optional `bearerAuth` note for
-    // `/metrics` (deferred: those files are outside this change's scope).
+    // route are oblivious to it. The published spec documents `/metrics`
+    // as `security: []` (open by default, matching the unset-env posture)
+    // and its `description` notes that setting
+    // `TENSOR_WASM_API_METRICS_TOKEN` opts the endpoint into a bearer gate;
+    // see `openapi/tensor-wasm-api.yaml` and `crates/tensor-wasm-api/openapi.json`.
     let metrics_router = Router::new()
         .route("/metrics", get(metrics))
         .layer(axum::middleware::from_fn(metrics_auth_gate))

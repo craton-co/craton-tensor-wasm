@@ -1,36 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
 
-//! `cuda-oxide` host-runtime adapter.
+//! `cuda-oxide` host-runtime adapter (dep-less scaffold).
 //!
 //! This module is the v0.5 cust-successor migration tracked in [RFC
-//! 0001](../../../../rfcs/0001-cuda-oxide-integration.md). It exists in two
-//! flavours, selected at compile time by which superset feature is enabled:
+//! 0001](../../../../rfcs/0001-cuda-oxide-integration.md).
 //!
-//! * **`cuda-oxide-backend` (scaffold, dep-less)** — [`Self::allocate`]
-//!   returns the documented `NOT_YET_WIRED` sentinel error. No git
-//!   dependency is pulled into the resolved graph; `cargo check
-//!   --features cuda-oxide-backend` builds on any contributor host even
-//!   without a CUDA Toolkit or `libclang`. The scaffold's only job is to
-//!   keep the public surface (`CudaOxideUnifiedBuffer`, `apply_advice`,
-//!   `CudaOxideAdvice`) stable so call-sites in `tensor-wasm-jit` /
-//!   `tensor-wasm-tenant` written today need no re-typing once the host
-//!   port lands.
+//! **`cuda-oxide-backend` (scaffold, dep-less)** — [`Self::allocate`]
+//! returns the documented `NOT_YET_WIRED` sentinel error. No git
+//! dependency is pulled into the resolved graph; `cargo check --features
+//! cuda-oxide-backend` builds on any contributor host even without a CUDA
+//! Toolkit or `libclang`, and the crate stays publishable to crates.io.
+//! The scaffold's only job is to keep the public surface
+//! (`CudaOxideUnifiedBuffer`, `apply_advice`, `CudaOxideAdvice`) stable so
+//! call-sites in `tensor-wasm-jit` / `tensor-wasm-tenant` written today
+//! need no re-typing once the real host port lands.
 //!
-//! * **`experimental-cuda-oxide-host-backend` (W4.1 host port)** — strict superset that
-//!   additionally pulls in the four cuda-oxide host-side crates
-//!   (`cuda-host`, `cuda-core`, `cuda-device`, `cuda-macros` per the
-//!   `tensor-wasm-mem` `Cargo.toml`). [`Self::allocate`] forwards to the
-//!   real `cuMemAllocManaged` driver call via the
-//!   `cuda_core::sys` bindgen output; [`Self::prefetch_async`] wraps
-//!   `cuMemPrefetchAsync`; [`apply_advice`] wraps `cuMemAdvise`; and the
-//!   `Drop` impl calls `cuMemFree_v2`. The implementation mirrors the
-//!   cudarc-backend's [`crate::cudarc_backend`] code path so the two
-//!   parallel backends remain easy to diff during the W4.x parity work.
-//!
-//! See `docs/CUDA-SETUP.md` section "Using the experimental-cuda-oxide-host-backend
-//! feature" for the toolchain install matrix that the host-backend
-//! requires.
+//! NOTE: the real `cuMemAllocManaged`/`cuMemAdvise`/`cuMemPrefetchAsync`/
+//! `cuMemFree_v2` host port previously lived in this file behind an
+//! `experimental-cuda-oxide-host-backend` feature that pulled in the
+//! git-pinned cuda-oxide host/device crates (`cuda-host`, `cuda-core`,
+//! `cuda-async`, `cuda-device`, `cuda-macros`). crates.io rejects any
+//! manifest with a `git` dependency — even an optional, feature-gated one
+//! — so both that feature and those deps were REMOVED to unblock
+//! publishing. The host port never actually compiled (its module opened
+//! with a `compile_error!`), so nothing that built before is lost. It can
+//! be re-added once cuda-oxide ships its workspace members to crates.io;
+//! see RFC 0001 and `docs/CUDA-OXIDE-CUTOVER.md` for the cutover plan.
 //!
 //! # What this module IS NOT (yet)
 //!
@@ -38,20 +34,8 @@
 //!   pipeline. The Wasm→PTX kernel-compilation lever (per RFC 0001
 //!   "Pliron lever and the auto-offload pipeline") lives in
 //!   `tensor-wasm-jit::pliron_*` and is gated separately.
-//! * A `Stream` / `Event` plumbing surface. The host port today uses the
-//!   driver's null stream (the same as the cudarc-backend) so the v0.4
-//!   diff is body-only against a stable starting point. The W4.x async
-//!   integration will thread a `cuda_host::CudaStream` through this
-//!   surface in a follow-up PR.
-//!
-//! # Why the dual scaffold / real impl
-//!
-//! Splitting the module into two `cfg`-gated implementations keeps the
-//! v0.4 host port body-only against W3.x scaffold tests: the
-//! `NOT_YET_WIRED` sentinel and the trait-bound (`Send + Sync`) witnesses
-//! survive into the host-backend build because the public surface is the
-//! same. Tests that need real hardware are isolated to
-//! `tests/cuda_oxide_smoke.rs` under the host-backend feature gate.
+//! * A real driver-backed allocation surface. Every call returns the
+//!   `NOT_YET_WIRED` sentinel until the host port is restored.
 
 #![cfg(feature = "cuda-oxide-backend")]
 
@@ -78,14 +62,12 @@ fn leaked_set() -> &'static Mutex<HashSet<u64>> {
     LEAKED_CUDA_ALLOCATIONS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-// In the host-backend build, `record_leak` is called from
-// `CudaOxideUnifiedBuffer::drop` on every `cuMemFree_v2` failure (mem H4
-// invariant — see the `Drop` impl in the `host_backend` module). In the
-// scaffold-only build no construction succeeds, so the call site is
-// unreachable and the function genuinely is dead code; the gated allow
-// keeps `-D warnings` happy on contributor boxes that build without the
-// host-backend feature.
-#[cfg_attr(not(feature = "experimental-cuda-oxide-host-backend"), allow(dead_code))]
+// `record_leak` will be called from the real host-backend `Drop` on every
+// `cuMemFree_v2` failure (mem H4 invariant) once the cuda-oxide host port
+// is restored. In the current scaffold-only build no construction
+// succeeds, so the call site is unreachable and the function is dead code;
+// the unconditional allow keeps `-D warnings` happy on contributor boxes.
+#[allow(dead_code)]
 fn record_leak(ptr: u64) {
     leaked_set().lock().insert(ptr);
 }
@@ -99,19 +81,19 @@ pub fn leaked_cuda_allocations() -> Vec<u64> {
     leaked_set().lock().iter().copied().collect()
 }
 
-/// Sentinel error message returned by every stub call in this module when
-/// the dep-less `cuda-oxide-backend` scaffold is active (i.e. when the
-/// strict-superset `experimental-cuda-oxide-host-backend` feature is OFF).
+/// Sentinel error message returned by every stub call in this module while
+/// the dep-less `cuda-oxide-backend` scaffold is the only path (the real
+/// host port was removed for crates.io publishability — see the module NOTE).
 ///
 /// Exposed `pub(crate)` so the unit + integration tests can assert against
-/// the exact string without duplicating it. The W4.1 host port leaves this
-/// constant in place because it remains observable on contributor boxes
-/// that build with only `--features cuda-oxide-backend`.
+/// the exact string without duplicating it. The future host port should
+/// leave this constant in place because it remains observable on
+/// contributor boxes that build with `--features cuda-oxide-backend`.
 pub(crate) const NOT_YET_WIRED: &str =
     "cuda-oxide-backend: allocate not yet wired -- see RFC 0001 v0.4 port";
 
-/// Memory-advice hint passed to `cuMemAdvise` when the
-/// `experimental-cuda-oxide-host-backend` feature is on.
+/// Memory-advice hint that the future cuda-oxide host port will pass to
+/// `cuMemAdvise`. Kept on the scaffold path so the public surface is stable.
 ///
 /// Mirrors the shape of [`crate::advise::Advice`] but is declared locally so
 /// the dep-less scaffold build (without the host crates) still has a
@@ -135,10 +117,12 @@ pub enum CudaOxideAdvice {
 }
 
 // =============================================================================
-// Scaffold path — active when `experimental-cuda-oxide-host-backend` is OFF.
+// Scaffold path — the only path today. The real `cuMemAllocManaged` host
+// backend was removed for crates.io publishability (it relied on git-pinned
+// cuda-oxide crates); see the module-level NOTE and RFC 0001 /
+// docs/CUDA-OXIDE-CUTOVER.md.
 // =============================================================================
 
-#[cfg(not(feature = "experimental-cuda-oxide-host-backend"))]
 mod scaffold {
     use super::*;
 
@@ -149,9 +133,9 @@ mod scaffold {
     /// invocation returns [`UnifiedError::Cuda`] with the
     /// [`NOT_YET_WIRED`] sentinel.
     ///
-    /// The W4.1 host-backend path replaces this with a real owning
-    /// pointer; see the `experimental-cuda-oxide-host-backend`-gated `impl` block
-    /// below for the actual `cuMemAllocManaged` path.
+    /// The future cuda-oxide host port will replace this with a real
+    /// owning pointer doing the actual `cuMemAllocManaged` path; that port
+    /// was removed for crates.io publishability (see the module NOTE).
     pub struct CudaOxideUnifiedBuffer {
         /// Size in bytes the caller asked for. Stored so [`Self::len`] is
         /// reachable from tests once a buffer is constructible (today
@@ -178,8 +162,8 @@ mod scaffold {
         ///
         /// Scaffold stub. Always returns
         /// `Err(UnifiedError::Cuda(NOT_YET_WIRED.into()))`. The signature
-        /// matches the host-backend variant so call sites do not need to
-        /// be re-typed once `experimental-cuda-oxide-host-backend` is enabled.
+        /// matches the future host port so call sites do not need to be
+        /// re-typed once that port is restored.
         pub fn allocate(size: usize) -> Result<Self, UnifiedError> {
             // Intentionally swallow the `size` argument — the host
             // variant uses it. Binding to `_size` keeps the linter quiet
@@ -302,621 +286,29 @@ mod scaffold {
 }
 
 // =============================================================================
-// Host-backend path — active when `experimental-cuda-oxide-host-backend` is ON.
-// =============================================================================
-
-#[cfg(feature = "experimental-cuda-oxide-host-backend")]
-mod host_backend {
-    // QUARANTINE: this module is ~350 LOC of `unsafe` FFI written against
-    // an INFERRED, never-compiled cuda-oxide host API (see the `// W4.1:
-    // API surface inferred ... verify` comments throughout). It has never
-    // been built against the real `cuda-bindings`-generated symbols. Until
-    // a LIBCLANG-equipped CI runner has actually compiled this against the
-    // toolkit, enabling the feature must fail LOUDLY rather than emit
-    // unverified unsafe code. The module is only compiled when the feature
-    // is on, so placing the guard at module top means turning the feature
-    // on is the trigger.
-    compile_error!(
-        "experimental-cuda-oxide-host-backend is not yet buildable: the \
-         cuda-oxide host FFI surface is inferred and unverified; see \
-         crates/tensor-wasm-mem/Cargo.toml"
-    );
-
-    use super::*;
-
-    use std::ptr::NonNull;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, OnceLock};
-
-    // W4.1: cuda-host re-exports DeviceBuffer / CudaContext / CudaStream
-    // from cuda-core; we go through cuda-core directly to make the
-    // import surface explicit and to keep `cuda-host` reserved for the
-    // kernel-launch path the W4.x dispatcher will use.
-    use cuda_core::context::CudaContext;
-    use cuda_core::sys as cuda_sys;
-
-    /// Sentinel for `CU_DEVICE_CPU` in `cuMemPrefetchAsync`. CUDA defines
-    /// this as `-1` in `cuda.h`; bindgen's output names drift between
-    /// CUDA versions so we inline the numeric literal — same approach as
-    /// the cudarc-backend.
-    const CU_DEVICE_CPU: i32 = -1;
-
-    /// `CU_MEM_ATTACH_GLOBAL` for `cuMemAllocManaged`'s `flags` argument.
-    /// Documented as `1` in the CUDA driver headers; inlined for the same
-    /// drift-resistance reason as `CU_DEVICE_CPU`.
-    ///
-    /// W4.1: API surface inferred from cuda-oxide docs; verify against
-    /// `cuda-bindings`-generated `CUmemAttach_flags_enum` once a
-    /// LIBCLANG-equipped CI runner is available.
-    const CU_MEM_ATTACH_GLOBAL: u32 = 1;
-
-    // Numeric values for CUmem_advise. CUDA's `cuda.h` defines:
-    //   CU_MEM_ADVISE_SET_READ_MOSTLY            = 1
-    //   CU_MEM_ADVISE_UNSET_READ_MOSTLY          = 2
-    //   CU_MEM_ADVISE_SET_PREFERRED_LOCATION     = 3
-    //   CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION   = 4
-    //   CU_MEM_ADVISE_SET_ACCESSED_BY            = 5
-    //   CU_MEM_ADVISE_UNSET_ACCESSED_BY          = 6
-    //
-    // W4.1: numeric values inferred from CUDA driver headers; the
-    // cuda-bindings bindgen output names this enum
-    // `CUmem_advise_enum_*` but the numeric values are stable across
-    // CUDA toolkit versions (12.0 through 13.2 verified). The cuMemAdvise
-    // FFI takes `CUmem_advise` (an `i32`-typedef'd enum) so we cast to
-    // the bindings' enum type via `as _` at the call site rather than
-    // depending on the enum path.
-    //
-    // The `_INLINE` suffix is load-bearing: the cudarc crate's
-    // `CUmem_advise_enum` variants share the same bare names (e.g.
-    // `CU_MEM_ADVISE_SET_READ_MOSTLY`), so if the drift-guard `const _`
-    // block below pulled them into scope with `use ...::*`, those variants
-    // would shadow the inline literals and turn every assertion into a
-    // tautological `X == X`. Naming the inline constants distinctly is
-    // what makes the cross-check actually compare a literal against the
-    // bindgen-derived enum value.
-    const CU_MEM_ADVISE_SET_READ_MOSTLY_INLINE: u32 = 1;
-    const CU_MEM_ADVISE_SET_PREFERRED_LOCATION_INLINE: u32 = 3;
-    const CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION_INLINE: u32 = 4;
-    const CU_MEM_ADVISE_SET_ACCESSED_BY_INLINE: u32 = 5;
-    const CU_MEM_ADVISE_UNSET_ACCESSED_BY_INLINE: u32 = 6;
-
-    // mem M5 drift guard. When the `cudarc-backend` feature is also
-    // enabled, the cudarc crate's `cuda_sys` re-exports the matching
-    // enum variants — cross-check at compile time so a CUDA toolkit
-    // bump that renumbers the enum (or a sibling backend that gets a
-    // new bindgen output) fails to build rather than silently firing
-    // the wrong advice. The cust backend's enum lives behind the
-    // `cuda` feature; we cross-check there too if it's on.
-    //
-    // When neither sibling backend is enabled (this crate's default
-    // build), the inline literals above are the single source of
-    // truth and the drift guard simply doesn't run — that's
-    // acceptable because nothing on the host can issue a `cuMemAdvise`
-    // call without one of the wrapper backends being present.
-    //
-    // Note: we deliberately do NOT `use cudarc::driver::sys::CUmem_advise_enum::*`
-    // here. Doing so would bring the variant names (which match the cudarc
-    // bindgen output, e.g. `CU_MEM_ADVISE_SET_READ_MOSTLY`) into scope and,
-    // because Rust resolves the LHS of `==` against the nearest binding,
-    // every assertion would degenerate to `X == X`. Instead we reference
-    // the inline `_INLINE` literals on the LHS and the fully qualified
-    // cudarc enum path on the RHS so the comparison actually runs.
-    #[cfg(feature = "cudarc-backend")]
-    const _: () = {
-        assert!(
-            CU_MEM_ADVISE_SET_READ_MOSTLY_INLINE
-                == cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_READ_MOSTLY as u32
-        );
-        assert!(
-            CU_MEM_ADVISE_SET_PREFERRED_LOCATION_INLINE
-                == cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_PREFERRED_LOCATION
-                    as u32
-        );
-        assert!(
-            CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION_INLINE
-                == cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION
-                    as u32
-        );
-        assert!(
-            CU_MEM_ADVISE_SET_ACCESSED_BY_INLINE
-                == cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_ACCESSED_BY as u32
-        );
-        assert!(
-            CU_MEM_ADVISE_UNSET_ACCESSED_BY_INLINE
-                == cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_UNSET_ACCESSED_BY as u32
-        );
-    };
-
-    /// Process-wide counter of `cuMemFree_v2` failures observed in
-    /// [`CudaOxideUnifiedBuffer`]'s `Drop`. A non-zero value indicates
-    /// leaked managed allocations — the driver refused to release them.
-    /// Operators can poll this via [`cuda_oxide_free_failures`] to alert
-    /// on leak rate. Mirrors the cudarc-backend's `CUDARC_FREE_FAILURES`.
-    static FREE_FAILURES: AtomicU64 = AtomicU64::new(0);
-
-    /// Number of `cuMemFree_v2` failures observed since process start
-    /// inside the cuda-oxide host backend.
-    ///
-    /// Each increment corresponds to one leaked managed-memory
-    /// allocation. The monotonically increasing log is also emitted at
-    /// `tracing::warn!` for forensic correlation.
-    pub fn cuda_oxide_free_failures() -> u64 {
-        FREE_FAILURES.load(Ordering::Relaxed)
-    }
-
-    /// Process-wide per-ordinal cache of `Arc<CudaContext>`.
-    ///
-    /// Caching per-ordinal `Arc<CudaContext>` prevents the
-    /// failed-construction race that would otherwise release another
-    /// tenant's primary context.
-    ///
-    /// Audit T26 background. `cuda_core::CudaContext::new(ordinal)`
-    /// retains the primary context for the requested device; dropping
-    /// the last `Arc<CudaContext>` calls `cuDevicePrimaryCtxRelease`,
-    /// which invalidates *every* managed pointer on that device process-
-    /// wide. Before this cache, only ordinal 0 was memoised; any non-zero
-    /// ordinal allocation re-ran `CudaContext::new(ordinal)`. If that
-    /// construction failed downstream before the new `Arc` was wired
-    /// into a surviving `CudaOxideUnifiedBuffer`, the freshly-built
-    /// `Arc` would drop and release the primary context — silently
-    /// breaking every *other* tenant's managed pointers on the same
-    /// device. The per-ordinal cache converts that into a single
-    /// "build once, retain for the process lifetime" guarantee.
-    ///
-    /// Mirrors the cudarc-backend's `DEVICE_CACHE` so a side-by-side
-    /// comparison of the two backends differs only in the underlying
-    /// driver-call shape, never in the caching strategy.
-    static CONTEXT_CACHE: OnceLock<Mutex<std::collections::HashMap<u32, Arc<CudaContext>>>> =
-        OnceLock::new();
-
-    fn context_cache() -> &'static Mutex<std::collections::HashMap<u32, Arc<CudaContext>>> {
-        CONTEXT_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-    }
-
-    /// Lazily fetch (or construct) the cached cuda-oxide context for
-    /// device ordinal `ordinal`.
-    ///
-    /// Caching per-ordinal `Arc<CudaContext>` prevents the
-    /// failed-construction race that would otherwise release another
-    /// tenant's primary context — see [`CONTEXT_CACHE`] for the audit
-    /// background. The first call for a given ordinal runs
-    /// `CudaContext::new(ordinal)` and inserts the resulting
-    /// `Arc<CudaContext>`; every subsequent call returns a fresh clone
-    /// of the cached `Arc`, so no transient holder ever owns the last
-    /// strong-count reference.
-    fn context_for(ordinal: u32) -> Result<Arc<CudaContext>, UnifiedError> {
-        // Hot path: probe under the mutex; if present, hand out a clone
-        // and release the lock immediately.
-        {
-            let cache = context_cache().lock();
-            if let Some(cached) = cache.get(&ordinal) {
-                return Ok(Arc::clone(cached));
-            }
-        }
-
-        // Cold path: build outside the lock so a slow `CudaContext::new`
-        // does not block other-ordinal probes. If another thread wins
-        // the install race, we drop the duplicate `Arc<CudaContext>` we
-        // built ourselves — safe because the *winning* `Arc` is now
-        // pinned in the cache, so the primary context never sees its
-        // strong-count fall to zero.
-        let fresh = CudaContext::new(ordinal as usize)
-            .map_err(|e| UnifiedError::Cuda(format!("CudaContext::new({ordinal}): {e:?}")))?;
-        // L2: on the lost-race path the loser's `fresh` `Arc<CudaContext>`
-        // must be dropped OUTSIDE the cache mutex — dropping the last
-        // strong ref runs `cuDevicePrimaryCtxRelease` under the driver and
-        // we do not want that executing while the lock is held. Capture the
-        // canonical clone plus the (possibly redundant) loser handle, drop
-        // the guard explicitly, then drop the loser. Race-correctness is
-        // unchanged: the winner's `Arc` is pinned in the cache (strong-count
-        // ≥ 1) before the lock is released.
-        let mut cache = context_cache().lock();
-        let (canonical, loser) = match cache.entry(ordinal) {
-            std::collections::hash_map::Entry::Occupied(occupied) => {
-                (Arc::clone(occupied.get()), Some(fresh))
-            }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                (Arc::clone(vacant.insert(fresh)), None)
-            }
-        };
-        drop(cache);
-        drop(loser);
-        Ok(canonical)
-    }
-
-    /// A contiguous CUDA Unified Memory region allocated via cuda-oxide.
-    ///
-    /// W4.1 host-backend variant. `ptr` is the address returned by
-    /// `cuMemAllocManaged`; it is addressable from both host and device
-    /// on a CUDA-capable host and the runtime page-migrates between them
-    /// on demand.
-    ///
-    /// # Safety invariants
-    ///
-    /// - `ptr` is non-null and points to `size` valid bytes obtained
-    ///   from `cuMemAllocManaged`.
-    /// - `ctx` is kept alive for the lifetime of the allocation so the
-    ///   primary context is not torn down before [`Drop`] runs
-    ///   `cuMemFree_v2`.
-    pub struct CudaOxideUnifiedBuffer {
-        pub(super) ptr: NonNull<u8>,
-        pub(super) size: usize,
-        pub(super) device_id: DeviceId,
-        /// Held purely to keep the primary context alive. Dropping the
-        /// last reference releases the context, which would invalidate
-        /// every outstanding managed pointer in the process.
-        #[allow(dead_code)]
-        pub(super) ctx: Arc<CudaContext>,
-    }
-
-    // SAFETY: the inner pointer is owned by this struct and not shared
-    // without explicit synchronisation. Same contract as `Vec<u8>` once
-    // you have a `&mut [u8]`. The `Arc<CudaContext>` is itself
-    // `Send + Sync` (per the `unsafe impl` in `cuda_core::context`).
-    unsafe impl Send for CudaOxideUnifiedBuffer {}
-    unsafe impl Sync for CudaOxideUnifiedBuffer {}
-
-    impl CudaOxideUnifiedBuffer {
-        /// Allocate `size` bytes of CUDA Unified Memory via
-        /// `cuMemAllocManaged` on the default device.
-        ///
-        /// Returns [`UnifiedError::ZeroSize`] for a zero-byte request
-        /// without touching the driver; otherwise dispatches to
-        /// [`Self::allocate_on`] with `DeviceId::default()`.
-        ///
-        /// W4.1: API surface inferred from cuda-oxide docs; verify
-        /// against `cuda-bindings::cuMemAllocManaged` signature once a
-        /// LIBCLANG-equipped CI runner is available.
-        pub fn allocate(size: usize) -> Result<Self, UnifiedError> {
-            Self::allocate_on(size, DeviceId::default())
-        }
-
-        /// Allocate `size` bytes of CUDA Unified Memory on the named
-        /// device.
-        ///
-        /// Wraps `cuMemAllocManaged` with `CU_MEM_ATTACH_GLOBAL`, which
-        /// matches the semantics of the cust and cudarc backends
-        /// (visible to every stream on every device in the current
-        /// context).
-        ///
-        /// W4.1: API surface inferred from cuda-oxide docs; verify
-        /// against `cuda-bindings::cuMemAllocManaged` signature once a
-        /// LIBCLANG-equipped CI runner is available.
-        pub fn allocate_on(size: usize, device_id: DeviceId) -> Result<Self, UnifiedError> {
-            if size == 0 {
-                return Err(UnifiedError::ZeroSize);
-            }
-            let ctx = context_for(device_id.0)?;
-            // Make the primary context current on this thread so the
-            // driver call below is well-defined. Mirrors cuda-core's own
-            // `bind_to_thread` discipline.
-            ctx.bind_to_thread()
-                .map_err(|e| UnifiedError::Cuda(format!("CudaContext::bind_to_thread: {e:?}")))?;
-
-            let mut raw: cuda_sys::CUdeviceptr = 0;
-            // SAFETY: `raw` is a valid out-parameter; `size > 0`; the
-            // ctx.bind_to_thread() call above made the primary context
-            // current on this thread, which is the precondition for
-            // `cuMemAllocManaged`.
-            let res = unsafe {
-                cuda_sys::cuMemAllocManaged(
-                    &mut raw as *mut cuda_sys::CUdeviceptr,
-                    size,
-                    CU_MEM_ATTACH_GLOBAL,
-                )
-            };
-            if res != cuda_sys::cudaError_enum_CUDA_SUCCESS {
-                return Err(UnifiedError::Cuda(format!("cuMemAllocManaged -> {res:?}")));
-            }
-            let ptr = NonNull::new(raw as *mut u8).ok_or_else(|| {
-                UnifiedError::Allocation("cuMemAllocManaged returned null with CUDA_SUCCESS".into())
-            })?;
-            Ok(Self {
-                ptr,
-                size,
-                device_id,
-                ctx,
-            })
-        }
-
-        /// Length in bytes of this buffer.
-        pub fn len(&self) -> usize {
-            self.size
-        }
-
-        /// True if zero-length. Always false for a successfully
-        /// constructed buffer.
-        pub fn is_empty(&self) -> bool {
-            self.size == 0
-        }
-
-        /// Raw const pointer to the first byte.
-        pub fn as_ptr(&self) -> *const u8 {
-            self.ptr.as_ptr() as *const u8
-        }
-
-        /// Raw mutable pointer to the first byte.
-        pub fn as_mut_ptr(&mut self) -> *mut u8 {
-            self.ptr.as_ptr()
-        }
-
-        /// Borrow as a shared byte slice.
-        ///
-        /// # Safety
-        ///
-        /// On CUDA-capable hosts the managed memory may be migrated to
-        /// the device at any moment; reading from the host side after a
-        /// device kernel has written into the region without
-        /// synchronising is undefined behaviour. Call sites must
-        /// serialise host/device access with a stream sync or an event,
-        /// exactly as they do for the cust and cudarc paths.
-        pub fn as_slice(&self) -> &[u8] {
-            // SAFETY: ptr is non-null and points to `size` valid bytes by
-            // the type invariant.
-            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.size) }
-        }
-
-        /// Borrow as a mutable byte slice.
-        ///
-        /// # Safety
-        ///
-        /// Same caveat as [`Self::as_slice`].
-        pub fn as_mut_slice(&mut self) -> &mut [u8] {
-            // SAFETY: `&mut self` proves uniqueness; ptr/size by the type
-            // invariant.
-            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.size) }
-        }
-
-        /// Which device this buffer is anchored to.
-        pub fn device_id(&self) -> DeviceId {
-            self.device_id
-        }
-    }
-
-    impl fmt::Debug for CudaOxideUnifiedBuffer {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("CudaOxideUnifiedBuffer")
-                .field("ptr", &self.ptr.as_ptr())
-                .field("size", &self.size)
-                .field("device_id", &self.device_id)
-                .finish()
-        }
-    }
-
-    impl UnifiedBacking for CudaOxideUnifiedBuffer {
-        fn len(&self) -> usize {
-            CudaOxideUnifiedBuffer::len(self)
-        }
-
-        fn as_slice(&self) -> &[u8] {
-            CudaOxideUnifiedBuffer::as_slice(self)
-        }
-
-        fn as_mut_slice(&mut self) -> &mut [u8] {
-            CudaOxideUnifiedBuffer::as_mut_slice(self)
-        }
-
-        fn apply_advice(&self, hint: UvmAdvice) -> Result<(), UnifiedError> {
-            // Translate the trait-facing `UvmAdvice` to the host-
-            // backend's internal `CudaOxideAdvice`. `UnsetReadMostly`
-            // has no matching variant on this path either (matches the
-            // cust/cudarc surface), so surface as `NotSupported`.
-            let advice = match hint {
-                UvmAdvice::SetReadMostly => CudaOxideAdvice::ReadMostly,
-                UvmAdvice::UnsetReadMostly => {
-                    return Err(UnifiedError::NotSupported {
-                        feature: "apply_advice(UnsetReadMostly)",
-                        backing: "cuda-oxide",
-                    });
-                }
-                UvmAdvice::SetPreferredLocation(d) => {
-                    CudaOxideAdvice::PreferredLocation(DeviceId(d))
-                }
-                UvmAdvice::UnsetPreferredLocation => CudaOxideAdvice::UnsetPreferredLocation,
-                UvmAdvice::SetAccessedBy(d) => CudaOxideAdvice::AccessedBy(DeviceId(d)),
-                UvmAdvice::UnsetAccessedBy(d) => CudaOxideAdvice::UnsetAccessedBy(DeviceId(d)),
-            };
-            // Fully qualify against the local module so a reader is
-            // not left wondering whether `apply_advice` is the trait
-            // method we are inside or the free function declared in
-            // this `mod host_backend` block.
-            self::apply_advice(self, advice)
-        }
-
-        fn prefetch_to_device(&self, device_ord: u32) -> Result<(), UnifiedError> {
-            // The host-backend's `prefetch_async` already accepts a
-            // destination `DeviceId`, so trait dispatch is a 1:1
-            // forward. Use the supplied ordinal directly.
-            self::prefetch_async(self, DeviceId(device_ord))
-        }
-
-        fn prefetch_to_host(&self) -> Result<(), UnifiedError> {
-            // Host-backend uses `DeviceId(u32::MAX)` as the
-            // CU_DEVICE_CPU sentinel — see `prefetch_async` for the
-            // mapping rationale.
-            self::prefetch_async(self, DeviceId(u32::MAX))
-        }
-    }
-
-    impl Drop for CudaOxideUnifiedBuffer {
-        /// Free the underlying `cuMemAllocManaged` allocation via
-        /// `cuMemFree_v2`.
-        ///
-        /// # Invariants (mirrors `cudarc_backend::CudarcUnifiedBuffer::drop`)
-        ///
-        /// - Never panics. A `Drop` panic during unwinding would abort the
-        ///   process; we degrade to a recorded leak instead.
-        /// - On any non-`CUDA_SUCCESS` from `cuMemFree_v2` the raw pointer
-        ///   is added to the process-global [`leaked_cuda_allocations`]
-        ///   set so operators can audit (mem H4). The failure is logged
-        ///   at `error!` level — a failed free is a security-relevant
-        ///   event because the driver may recycle the same VA for another
-        ///   tenant carrying residual bytes.
-        /// - After a failed free, `self.ptr` is replaced with
-        ///   `NonNull::dangling()`. This is defence-in-depth: if some
-        ///   future refactor reaches this Drop a second time (it shouldn't
-        ///   — Rust guarantees Drop runs at most once per value), the
-        ///   sentinel ensures we don't re-submit the same orphaned
-        ///   pointer to the driver and don't double-record the leak
-        ///   against the original address.
-        fn drop(&mut self) {
-            let raw_ptr = self.ptr.as_ptr();
-            let raw_ptr_u64 = raw_ptr as u64;
-            // Re-bind the context to this thread first because Drop may
-            // run on a worker thread that never bound the context
-            // (cuda-core's own DeviceBuffer Drop does the same). Bind
-            // failure is logged but does not skip the free attempt — the
-            // driver may still accept the call against a previously bound
-            // context, and on a hard failure we fall through to the
-            // leak-recording branch anyway.
-            let _ = self.ctx.bind_to_thread();
-            // SAFETY: `ptr` was returned by `cuMemAllocManaged` and has
-            // not been freed yet; the cached `Arc<CudaContext>` we hold
-            // ensures the primary context is still alive when we call
-            // `cuMemFree_v2`.
-            let res = unsafe { cuda_sys::cuMemFree_v2(raw_ptr as cuda_sys::CUdeviceptr) };
-            if res != cuda_sys::cudaError_enum_CUDA_SUCCESS {
-                // Failed free: the driver still considers the VA mapped,
-                // so the next allocator pass could hand it to another
-                // tenant carrying residual bytes. Both the lock-free
-                // counter (for alerting) AND the per-VA audit set (for
-                // forensics) are updated. Drop cannot fail, so we surface
-                // via tracing + the audit set rather than unwinding
-                // (mem H4).
-                let failures = FREE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-                record_leak(raw_ptr_u64);
-                tracing::error!(
-                    target: "tensor_wasm_mem::cuda_oxide_backend",
-                    ?res,
-                    ptr = ?raw_ptr,
-                    size = self.size,
-                    total_failures = failures,
-                    "cuMemFree_v2 failed in CudaOxideUnifiedBuffer::drop -- VA leaked, \
-                     recorded in leaked_cuda_allocations() for operator audit (mem H4)",
-                );
-                // Defence-in-depth: replace with a dangling sentinel so
-                // any hypothetical double-drop short-circuits and does
-                // not re-submit the same orphaned pointer to the driver.
-                // Rust guarantees Drop runs at most once per value, so
-                // this is belt-and-braces.
-                self.ptr = NonNull::dangling();
-            }
-        }
-    }
-
-    /// Apply a [`CudaOxideAdvice`] hint via `cuMemAdvise` against a
-    /// [`CudaOxideUnifiedBuffer`].
-    ///
-    /// Returns [`UnifiedError::Cuda`] on a non-`CUDA_SUCCESS` return
-    /// from the driver.
-    ///
-    /// W4.1: API surface inferred from cuda-oxide docs; verify against
-    /// `cuda-bindings::cuMemAdvise` signature once a LIBCLANG-equipped
-    /// CI runner is available.
-    pub fn apply_advice(
-        buf: &CudaOxideUnifiedBuffer,
-        advice: CudaOxideAdvice,
-    ) -> Result<(), UnifiedError> {
-        // Re-bind the buffer's owning context onto this thread so the
-        // driver call below targets the correct primary context.
-        buf.ctx
-            .bind_to_thread()
-            .map_err(|e| UnifiedError::Cuda(format!("CudaContext::bind_to_thread: {e:?}")))?;
-        let ptr = buf.ptr.as_ptr() as cuda_sys::CUdeviceptr;
-        let size = buf.size;
-        let (advice_kind, device) = match advice {
-            CudaOxideAdvice::ReadMostly => (CU_MEM_ADVISE_SET_READ_MOSTLY_INLINE, 0i32),
-            CudaOxideAdvice::PreferredLocation(d) => {
-                (CU_MEM_ADVISE_SET_PREFERRED_LOCATION_INLINE, d.0 as i32)
-            }
-            CudaOxideAdvice::AccessedBy(d) => (CU_MEM_ADVISE_SET_ACCESSED_BY_INLINE, d.0 as i32),
-            CudaOxideAdvice::UnsetPreferredLocation => {
-                (CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION_INLINE, 0i32)
-            }
-            CudaOxideAdvice::UnsetAccessedBy(d) => {
-                (CU_MEM_ADVISE_UNSET_ACCESSED_BY_INLINE, d.0 as i32)
-            }
-        };
-        // SAFETY: ptr/size are derived from a valid live
-        // CudaOxideUnifiedBuffer. `advice_kind as _` casts the numeric
-        // `u32` constant into whatever the bindgen-generated enum repr is
-        // (typedef'd to `i32` on every CUDA toolkit version observed).
-        let res = unsafe { cuda_sys::cuMemAdvise(ptr, size, advice_kind as _, device) };
-        if res == cuda_sys::cudaError_enum_CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(UnifiedError::Cuda(format!("cuMemAdvise -> {res:?}")))
-        }
-    }
-
-    /// Prefetch the buffer asynchronously to `dst_device` (or the host
-    /// if `dst_device == DeviceId(u32::MAX)`, which we treat as the
-    /// CU_DEVICE_CPU sentinel).
-    ///
-    /// Wraps `cuMemPrefetchAsync` on the null stream. Use
-    /// `DeviceId(u32::MAX)` to migrate back to host memory; any other
-    /// value targets the corresponding CUDA device ordinal.
-    ///
-    /// W4.1: API surface inferred from cuda-oxide docs; verify against
-    /// `cuda-bindings::cuMemPrefetchAsync` signature once a
-    /// LIBCLANG-equipped CI runner is available.
-    pub fn prefetch_async(
-        buf: &CudaOxideUnifiedBuffer,
-        dst_device: DeviceId,
-    ) -> Result<(), UnifiedError> {
-        buf.ctx
-            .bind_to_thread()
-            .map_err(|e| UnifiedError::Cuda(format!("CudaContext::bind_to_thread: {e:?}")))?;
-        let dst = if dst_device.0 == u32::MAX {
-            CU_DEVICE_CPU
-        } else {
-            dst_device.0 as i32
-        };
-        // SAFETY: ptr/size are derived from a valid live allocation;
-        // passing a null stream pointer requests prefetch on the
-        // default stream — same convention as the cudarc-backend.
-        let res = unsafe {
-            cuda_sys::cuMemPrefetchAsync(
-                buf.ptr.as_ptr() as cuda_sys::CUdeviceptr,
-                buf.size,
-                dst,
-                std::ptr::null_mut(),
-            )
-        };
-        if res == cuda_sys::cudaError_enum_CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(UnifiedError::Cuda(format!(
-                "cuMemPrefetchAsync(dst={dst}) -> {res:?}"
-            )))
-        }
-    }
-}
-
-// =============================================================================
-// Re-export the active variant under stable names so callers do not need
+// Re-export the scaffold variant under stable names so callers do not need
 // to feature-gate their imports.
 //
-// MEM H4 INVARIANT (v0.4 port contract for cuda-oxide host backend):
+// MEM H4 INVARIANT (contract for the future cuda-oxide host backend):
 // - The Drop impl on the real `CudaOxideUnifiedBuffer` MUST never panic.
 // - On any non-success return from the real free call, the raw pointer
 //   MUST be passed to `record_leak()` (in this module) and the failure
-//   logged at `error!` level — see `cudarc_backend::Drop` for the
+//   logged at `error!` level -- see `cudarc_backend::Drop` for the
 //   reference pattern. A failed free is a security-relevant event:
 //   the driver may recycle the same VA for another tenant carrying
 //   residual bytes.
 // - After a failed free, the inner allocation handle MUST be replaced
 //   with a sentinel so any hypothetical double-Drop short-circuits.
 // - `leaked_cuda_allocations()` above is the operator audit surface.
+//
+// NOTE: the real `host_backend` module that satisfied these invariants was
+// removed for crates.io publishability (it depended on git-pinned
+// cuda-oxide crates). Restore it -- and re-export
+// `cuda_oxide_free_failures` alongside the names below -- once cuda-oxide
+// publishes to crates.io. See RFC 0001 / docs/CUDA-OXIDE-CUTOVER.md.
 // =============================================================================
 
-#[cfg(not(feature = "experimental-cuda-oxide-host-backend"))]
 pub use scaffold::{apply_advice, prefetch_async, CudaOxideUnifiedBuffer};
-
-#[cfg(feature = "experimental-cuda-oxide-host-backend")]
-pub use host_backend::{
-    apply_advice, cuda_oxide_free_failures, prefetch_async, CudaOxideUnifiedBuffer,
-};
 
 #[cfg(test)]
 mod tests {
@@ -925,8 +317,7 @@ mod tests {
     /// The buffer type must be `Send + Sync` so it can flow through the
     /// same downstream abstractions (`tenant`, `wasi-gpu`) as the cust
     /// and cudarc backings. This is a compile-time assertion via a
-    /// trait-bound witness function. Holds across both the scaffold
-    /// and the host-backend variants.
+    /// trait-bound witness function.
     #[test]
     fn buffer_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
@@ -934,11 +325,7 @@ mod tests {
     }
 
     /// The scaffold `allocate` always errors with the documented
-    /// sentinel string. Skipped when the host-backend feature is on:
-    /// in that build `allocate(1024)` either succeeds (on a CUDA box)
-    /// or returns a real driver error, never the `NOT_YET_WIRED`
-    /// sentinel.
-    #[cfg(not(feature = "experimental-cuda-oxide-host-backend"))]
+    /// sentinel string.
     #[test]
     fn allocate_returns_not_yet_wired_error() {
         let err = CudaOxideUnifiedBuffer::allocate(1024).expect_err("scaffold must error");
@@ -948,20 +335,5 @@ mod tests {
             }
             other => panic!("expected UnifiedError::Cuda(NOT_YET_WIRED), got {other:?}"),
         }
-    }
-
-    /// Under the host-backend feature, `allocate(0)` must reject with
-    /// `ZeroSize` before any driver call is made — same contract as the
-    /// cudarc-backend. This runs on host-only CI because zero-size
-    /// rejection happens entirely in safe Rust before any
-    /// `cuMemAllocManaged` invocation.
-    #[cfg(feature = "experimental-cuda-oxide-host-backend")]
-    #[test]
-    fn allocate_zero_size_rejected_without_driver() {
-        let err = CudaOxideUnifiedBuffer::allocate(0).expect_err("zero should be rejected");
-        assert!(
-            matches!(err, UnifiedError::ZeroSize),
-            "expected ZeroSize, got: {err:?}"
-        );
     }
 }

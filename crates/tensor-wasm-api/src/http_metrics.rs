@@ -64,6 +64,20 @@
 //! * one atomic `fetch_add` + `fetch_sub` for the in-flight gauge,
 //! * one [`Histogram::observe`] which is a single bucket-array sweep.
 //!
+//! ## In-flight gauge balancing
+//!
+//! The in-flight gauge is managed by an RAII [`InFlightGuard`]: construction
+//! increments the gauge and the guard's `Drop` decrements it. Because the
+//! guard lives on the middleware future's stack across `next.run(req).await`,
+//! the gauge is decremented on *every* exit path — normal completion, an
+//! early return, a panic, and crucially **future cancellation** (a client
+//! disconnect or an outer `tower::timeout` layer dropping the metrics future
+//! mid-`await`). The timeout/load-shed layers in `build_router` sit *outside*
+//! this middleware, so cancellation is the realistic leak path; the guard
+//! closes it. This replaces the previous manual `inc()`/`dec()` pair, which
+//! leaked `tensor_wasm_http_requests_in_flight{route,method}` permanently
+//! whenever the future was dropped between the two calls.
+//!
 //! No heap allocations on the steady-state path beyond what
 //! `prometheus-client` itself does on a cold-cache `get_or_create`. The
 //! `String` label clones are unavoidable today — `prometheus-client 0.24`
@@ -190,15 +204,60 @@ pub fn route_label(req: &Request, routes: &RouteAllowList) -> String {
     }
 }
 
+/// RAII guard that owns one balanced `inc()`/`dec()` of the in-flight gauge.
+///
+/// Mirrors the [`JobsActiveGuard`](crate::routes) idiom: construction
+/// increments the gauge for `(route, method)` and [`Drop`] decrements it, so
+/// the gauge is balanced on every exit path. Critically, because the guard is
+/// held on the middleware future's stack across `next.run(req).await`, the
+/// `Drop` also fires when that future is *cancelled* — i.e. a client
+/// disconnect, or an outer `tower::timeout` layer dropping the future
+/// mid-`await`. That cancellation path is exactly what the previous manual
+/// `inc()`/`dec()` pair leaked (`dec()` was never reached when the future was
+/// dropped between the two calls).
+///
+/// The guard owns a `dec` closure rather than the gauge directly. The
+/// closure captures the owned gauge handle returned by
+/// `Family::get_or_create_owned` (which is cheap — `prometheus-client`'s
+/// gauge wraps `Arc<AtomicI64>`, a single refcount bump — and crucially does
+/// *not* hold the `Family`'s internal `RwLock`, which must never be held
+/// across an `.await`). Capturing via a closure keeps this module free of a
+/// direct `prometheus-client` dependency: the concrete `Gauge<i64,
+/// AtomicI64>` type is inferred at the call site and never named here.
+struct InFlightGuard<F: FnMut()> {
+    dec: F,
+}
+
+impl<F: FnMut()> InFlightGuard<F> {
+    /// Build a guard from an already-incremented gauge's `dec` closure. The
+    /// caller increments before constructing so the inc/dec pair is visibly
+    /// balanced at the call site; the guard owns the matching `dec()` and
+    /// runs it in `Drop`. Keep the guard alive across `next.run(req).await`.
+    fn new(dec: F) -> Self {
+        Self { dec }
+    }
+}
+
+impl<F: FnMut()> Drop for InFlightGuard<F> {
+    /// Decrement the in-flight gauge. Runs on normal completion, early return,
+    /// panic, and future cancellation/timeout — guaranteeing the gauge is
+    /// balanced for every request that incremented it.
+    fn drop(&mut self) {
+        (self.dec)();
+    }
+}
+
 /// Tower middleware that emits the three HTTP-metric families per request.
 ///
 /// Operationally:
 ///
 /// 1. Resolve the route template via [`route_label`] (one extension lookup).
 /// 2. Snapshot [`Instant::now`] as the request-start time.
-/// 3. Increment the in-flight gauge for `(route, method)`.
+/// 3. Construct an [`InFlightGuard`] for `(route, method)` (increments the
+///    in-flight gauge; its `Drop` decrements it on every exit path,
+///    including cancellation/timeout).
 /// 4. Run the inner service.
-/// 5. Decrement the in-flight gauge.
+/// 5. Drop the guard, decrementing the in-flight gauge.
 /// 6. Compute elapsed seconds via [`Instant::elapsed`] (saturating).
 /// 7. Increment the request counter and observe the duration histogram for
 ///    `(route, method, status)`.
@@ -227,18 +286,23 @@ pub async fn http_metrics_middleware(req: Request, next: Next) -> Response {
         .metrics
         .http_requests_in_flight()
         .get_or_create_owned(&in_flight_labels);
+    // Increment now, then hand the matching `dec()` to an RAII guard. Because
+    // the guard lives on this future's stack across the `.await` below, the
+    // gauge is balanced on every exit path — normal completion, early return,
+    // panic, and (the realistic leak path) cancellation when an outer timeout
+    // layer or a client disconnect drops this future mid-`await`.
     in_flight.inc();
+    let _in_flight_guard = InFlightGuard::new(move || {
+        // `Gauge::dec` returns the previous value; discard it so the closure
+        // is `FnMut()` rather than `FnMut() -> i64`.
+        in_flight.dec();
+    });
     let start = Instant::now();
 
-    // Run the inner service. On panic, the Drop on `InFlightGuard` would be
-    // the safe way to release the gauge — but axum/tower do not unwind
-    // request handlers across a panic boundary (the default behaviour is to
-    // abort the connection without poisoning the rest of the pool). For the
-    // non-panic path we rely on the explicit `dec()` below; documented as a
-    // known limitation in the module-level docs.
+    // Run the inner service. If this future is dropped here (timeout /
+    // disconnect), `_in_flight_guard`'s `Drop` still runs and decrements the
+    // gauge — see the module-level "In-flight gauge balancing" docs.
     let response = next.run(req).await;
-
-    in_flight.dec();
 
     let elapsed = start.elapsed();
     // Saturating: `Duration::as_secs_f64` is already total-ordered for

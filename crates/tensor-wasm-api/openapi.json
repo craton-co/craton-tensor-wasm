@@ -94,6 +94,8 @@
         ],
         "summary": "Prometheus text exposition",
         "operationId": "metrics",
+        "description": "Open by default so Prometheus scrapers and k8s tooling can hit it without a bearer token. Operators may opt into a bearer-token gate by setting `TENSOR_WASM_API_METRICS_TOKEN`; when that env var is set the endpoint requires `Authorization: Bearer <token>` and returns `401` otherwise.",
+        "security": [],
         "responses": {
           "200": {
             "description": "Prometheus 0.0.4 text exposition",

@@ -11,12 +11,11 @@
 
 [graph]
 all-features = false
-# Evaluate the cuda-oxide-backend feature explicitly so its transitive
-# cuda-oxide host-crate pin shows up in the dependency graph that
-# cargo-deny inspects. (Historical: this previously also surfaced a
-# transitive Pliron git pin; W3.1 / 2026-05-27 confirmed Pliron is now
-# on crates.io and that transitive pin is expected to drop out once
-# cuda-oxide upstream upgrades.)
+# The workspace no longer carries any git-pinned dependency: the
+# cuda-oxide host/device crates (cuda-host/core/async/device/macros) were
+# removed for crates.io publishability, and pliron is consumed from
+# crates.io (0.15). There is therefore no feature whose transitive graph
+# needs to be force-evaluated for the git-source audit.
 features = []
 
 [advisories]
@@ -57,37 +56,21 @@ confidence-threshold = 0.93
 unknown-registry = "deny"
 unknown-git = "deny"
 
-# Allowlist for git-pinned sources. Each entry pins a specific rev
-# (NOT a branch) so dependabot + downstream verifiers know exactly
-# which commit they're trusting.
-allow-git = [
-    # NVlabs/cuda-oxide v0.1.0 tag SHA. Provides the cuda-host /
-    # cuda-core / cuda-device / cuda-macros / cuda-async crates
-    # consumed by the `cuda-oxide-backend` feature on tensor-wasm-mem
-    # and tensor-wasm-jit. Workspace deps live in the root Cargo.toml.
-    # Lands per RFC 0001 (rfcs/0001-cuda-oxide-integration.md).
-    # NOT yet on crates.io as of 2026-05-25 -- this is the ONLY
-    # remaining git-pinned supply-chain dependency in the Pliron
-    # pipeline after the W3.1 / 2026-05-27 discovery that pliron itself
-    # is now on crates.io (see the vaivaswatha/pliron historical entry
-    # below). Re-evaluated at v0.4 per the RFC's "TODO(v0.4 / when
-    # cuda-oxide ships v0.2)" inline note.
-    "https://github.com/NVlabs/cuda-oxide",
-
-    # vaivaswatha/pliron -- HISTORICAL NO-OP as of W3.1 (2026-05-27).
-    # Pliron published v0.15.0 to crates.io in 2026-05; tensor-wasm-jit
-    # now depends on the published crate directly (see
-    # crates/tensor-wasm-jit/Cargo.toml). cuda-oxide's own Cargo.toml
-    # may still git-pin an older internal Pliron rev, in which case
-    # this entry remains live as a transitive allowance until the
-    # wave-4 cuda-oxide bump confirms the transitive git source is
-    # gone from the resolved graph. Once that confirmation lands this
-    # row can be deleted. Tracked as a follow-up to RFC 0001 W3.1.
-    "https://github.com/vaivaswatha/pliron",
-]
-
-# Note: cargo-deny matches on the URL only, not the rev. The rev pins
-# above live in Cargo.toml (cuda-host/core/async) and in cuda-oxide's
-# own Cargo.toml (pliron). The reproducible-builds workflow
-# (`.github/workflows/sbom.yml` + the CycloneDX SBOM doc) captures
-# the resolved rev hashes per release artifact.
+# Allowlist for git-pinned sources. EMPTY: the workspace deliberately
+# carries no git dependency so every crate is publishable to crates.io
+# (which rejects manifests containing a `git` dependency, even an
+# optional/feature-gated one).
+#
+# Previously this allowed:
+#   * https://github.com/NVlabs/cuda-oxide — the cuda-host / cuda-core /
+#     cuda-async / cuda-device / cuda-macros crates behind the
+#     experimental cuda-oxide host backend. Removed with that feature.
+#   * https://github.com/vaivaswatha/pliron — a transitive pin that came
+#     in via cuda-oxide; moot now that pliron is consumed from crates.io
+#     (0.15) and cuda-oxide is no longer in the graph.
+#
+# Re-add the cuda-oxide URL here ONLY if the host backend is restored as a
+# git dependency (publishing will then be blocked again); the preferred
+# path is to depend on the crates.io versions once NVlabs publishes them.
+# See RFC 0001 / docs/CUDA-OXIDE-CUTOVER.md.
+allow-git = []

@@ -767,26 +767,57 @@ impl From<JsonRejection> for ApiError {
     }
 }
 
+/// SECURITY (api S-22, api T3): the single source of truth for the
+/// sanitised, client-safe wire `message` text for every [`ExecError`]
+/// variant.
+///
+/// Pre-W4.x the synchronous error paths used `err.to_string()` verbatim
+/// as the wire `message`, which leaked server-internal state to
+/// untrusted callers in two ways:
+///
+///   * `ExecError::Wasmtime(_)` surfaced the full wasmtime error chain
+///     (host pointer addresses, host file paths, internal stack-frame
+///     names).
+///   * The structured variants (`NotFound`, `MissingExport`, `Timeout`,
+///     `ModuleMemoryTooLarge`, `ModuleTooLarge`, `CapacityExhausted`,
+///     `EpochTickerNotRunning`) embedded internal instance IDs, deadline
+///     figures, declared memory sizes, capacity counters, and export
+///     names.
+///
+/// Both the synchronous [`From<ExecError> for ApiError`] mapper and the
+/// streaming terminal-error paths (the native `/invoke-stream` writer
+/// and the OpenAI-shape SSE gateway in [`crate::openai`]) route through
+/// this function so every surface emits the identical fixed string. The
+/// original (verbose) error is logged server-side with structured fields
+/// so operators retain forensics without leaking the same state into
+/// client responses.
+pub(crate) fn sanitised_exec_error_message(err: &ExecError) -> &'static str {
+    match err {
+        ExecError::NotFound(_) => "function not found",
+        ExecError::MissingExport(_) => "requested export not found in module",
+        ExecError::Timeout(_) => "invocation deadline exceeded",
+        // ExecError::Wasmtime collapses both runtime traps and compile
+        // failures; the executor distinguishes them only when converting
+        // to TensorWasmError. For the API surface we keep a single stable
+        // opaque message — the real chain is logged at the mapping site.
+        ExecError::Wasmtime(_) => "internal execution error",
+        ExecError::ModuleMemoryTooLarge { .. } => "module declares memory above per-instance cap",
+        ExecError::CapacityExhausted { .. } => "engine instance capacity exhausted; retry later",
+        ExecError::TenantCapacityExhausted { .. } => {
+            "tenant instance quota exhausted; reduce concurrency or retry later"
+        }
+        ExecError::ModuleTooLarge { .. } => "module bytes above per-tenant cap",
+        ExecError::EpochTickerNotRunning => "engine deadline ticker not running",
+    }
+}
+
 impl From<ExecError> for ApiError {
     fn from(err: ExecError) -> Self {
-        // SECURITY (api S-22, api T3): pre-W4.x this impl used
-        // `err.to_string()` verbatim as the wire `message`. That leaked
-        // server-internal state to untrusted callers in two ways:
-        //
-        //   * `ExecError::Wasmtime(_)` surfaced the full wasmtime error
-        //     chain (host pointer addresses, host file paths, internal
-        //     stack-frame names).
-        //   * The structured variants (`NotFound`, `MissingExport`,
-        //     `Timeout`, `ModuleMemoryTooLarge`, `ModuleTooLarge`,
-        //     `CapacityExhausted`, `EpochTickerNotRunning`) embedded
-        //     internal instance IDs, deadline figures, declared memory
-        //     sizes, capacity counters, and export names.
-        //
-        // We now branch per-variant and emit a fixed, stable wire
-        // message for every variant. The original (verbose) error is
-        // logged server-side via `tracing::warn!` / `tracing::error!`
-        // with structured fields so operators retain forensics without
-        // leaking the same state into client responses.
+        // The per-variant *message* text is centralised in
+        // [`sanitised_exec_error_message`] so the streaming paths emit
+        // the identical sanitised string; this impl owns the per-variant
+        // status / kind pairing and the structured server-side logging.
+        let message = sanitised_exec_error_message(&err).to_string();
         match &err {
             ExecError::NotFound(id) => {
                 tracing::warn!(
@@ -797,7 +828,7 @@ impl From<ExecError> for ApiError {
                 ApiError {
                     status: StatusCode::NOT_FOUND,
                     kind: "instance_not_found".to_string(),
-                    message: "function not found".to_string(),
+                    message,
                 }
             }
             ExecError::MissingExport(name) => {
@@ -809,7 +840,7 @@ impl From<ExecError> for ApiError {
                 ApiError {
                     status: StatusCode::BAD_REQUEST,
                     kind: "missing_export".to_string(),
-                    message: "requested export not found in module".to_string(),
+                    message,
                 }
             }
             ExecError::Timeout(ctx) => {
@@ -823,13 +854,9 @@ impl From<ExecError> for ApiError {
                 ApiError {
                     status: StatusCode::GATEWAY_TIMEOUT,
                     kind: "invoke_timeout".to_string(),
-                    message: "invocation deadline exceeded".to_string(),
+                    message,
                 }
             }
-            // ExecError::Wasmtime collapses both runtime traps and compile
-            // failures; the executor distinguishes them only when converting
-            // to TensorWasmError. For the API surface we keep a single 500
-            // with a stable opaque message — the real chain is logged.
             ExecError::Wasmtime(inner) => {
                 tracing::error!(
                     target: "tensor_wasm_api::routes",
@@ -840,7 +867,7 @@ impl From<ExecError> for ApiError {
                 ApiError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     kind: "wasmtime".to_string(),
-                    message: "internal execution error".to_string(),
+                    message,
                 }
             }
             // Per mem H5 + exec S-2: module's declared linear memory exceeds
@@ -860,7 +887,7 @@ impl From<ExecError> for ApiError {
                 ApiError {
                     status: StatusCode::PAYLOAD_TOO_LARGE,
                     kind: "module_memory_too_large".to_string(),
-                    message: "module declares memory above per-instance cap".to_string(),
+                    message,
                 }
             }
             // Per exec S-10: the engine-wide live-instance cap is
@@ -878,7 +905,7 @@ impl From<ExecError> for ApiError {
                 ApiError {
                     status: StatusCode::SERVICE_UNAVAILABLE,
                     kind: "capacity_exhausted".to_string(),
-                    message: "engine instance capacity exhausted; retry later".to_string(),
+                    message,
                 }
             }
             // Per-tenant fairness cap: this specific tenant is over its own
@@ -897,8 +924,7 @@ impl From<ExecError> for ApiError {
                 ApiError {
                     status: StatusCode::TOO_MANY_REQUESTS,
                     kind: "tenant_capacity_exhausted".to_string(),
-                    message: "tenant instance quota exhausted; reduce concurrency or retry later"
-                        .to_string(),
+                    message,
                 }
             }
             // Per B3.2: adversarial Wasm bytes that exceed the pre-compile
@@ -914,7 +940,7 @@ impl From<ExecError> for ApiError {
                 ApiError {
                     status: StatusCode::PAYLOAD_TOO_LARGE,
                     kind: "module_too_large".to_string(),
-                    message: "module bytes above per-tenant cap".to_string(),
+                    message,
                 }
             }
             // Per B3.2: spawn refused because the epoch ticker is down and
@@ -929,7 +955,7 @@ impl From<ExecError> for ApiError {
                 ApiError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     kind: "epoch_ticker_not_running".to_string(),
-                    message: "engine deadline ticker not running".to_string(),
+                    message,
                 }
             }
         }
@@ -2023,10 +2049,22 @@ pub async fn invoke_function_stream(
                     ),
                 })
             }
-            Err(e) => Err(StreamTerminalError {
-                kind: "wasm_error",
-                message: format!("{e}"),
-            }),
+            // SECURITY (api S-22, api T3): route the terminal error
+            // through the same per-variant sanitiser the synchronous
+            // `/invoke` path uses so the SSE error frame never leaks the
+            // raw wasmtime error chain (or other internal state) to the
+            // client. The verbose original is logged below.
+            Err(e) => {
+                tracing::warn!(
+                    target: "tensor_wasm_api::routes",
+                    error = ?e,
+                    "invoke-stream terminal error mapped to sanitised SSE frame",
+                );
+                Err(StreamTerminalError {
+                    kind: "wasm_error",
+                    message: sanitised_exec_error_message(&e).to_string(),
+                })
+            }
         };
         // Best-effort: if the receiver is gone (client disconnected)
         // we have nothing to deliver — the response future already

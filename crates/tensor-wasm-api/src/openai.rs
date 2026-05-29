@@ -921,13 +921,18 @@ fn make_terminal_event(
     err: Option<&ExecError>,
 ) -> Event {
     let payload = if let Some(err) = err {
+        // SECURITY (api S-22, api T3): emit the same fixed, sanitised
+        // per-variant text the synchronous `/invoke` path uses instead of
+        // the raw `ExecError` Display (which leaks the full wasmtime error
+        // chain and other internal state). The verbose original is logged
+        // upstream at the executor / mapping site.
         serde_json::json!({
             "id": id,
             "object": object_kind.chunk_object_kind(),
             "created": created,
             "model": model,
             "error": {
-                "message": format!("{err}"),
+                "message": crate::routes::sanitised_exec_error_message(err),
                 "type": "server_error",
                 "code": exec_error_code(err),
             },

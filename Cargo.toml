@@ -77,63 +77,28 @@ ptx-builder = "0.5"
 # the cust → cudarc migration spike (see `docs/CUDARC-SPIKE.md`) lands.
 cudarc = { version = "0.13", default-features = false, features = ["driver", "cuda-12000"] }
 
-# cuda-oxide — NVIDIA Labs' new Rust-to-CUDA compiler + host runtime, v0.1.0
-# alpha released 2026-05-09 (repo: github.com/NVlabs/cuda-oxide). Adopted as
-# the v0.5 cust successor per RFC 0001 (rfcs/0001-cuda-oxide-integration.md).
-# The three host-side crates we depend on here are `cuda-host` (the RAII
-# runtime: contexts, allocations, streams), `cuda-core` (the underlying
-# FFI surface that `cuda-host` wraps), and `cuda-async` (Tokio integration
-# for the back-pressure / future-sync path benchmarked in W4.6). The
-# kernel-authoring crates (`cuda-device`, `cuda-macros`) are NOT pulled in
-# here; the W4.5 "Path C" kernel-authoring surface lands in a follow-up.
+# cuda-oxide — NVIDIA Labs' new Rust-to-CUDA compiler + host runtime
+# (repo: github.com/NVlabs/cuda-oxide), the planned v0.5 cust successor per
+# RFC 0001 (rfcs/0001-cuda-oxide-integration.md).
 #
-# TOOLCHAIN ALIGNMENT: cuda-oxide pins `nightly-2026-04-03` in its own
-# rust-toolchain.toml. TensorWasm now pins the same channel (bumped
-# 2026-05-25 from `nightly-2026-03-15`), so the `cuda-oxide-backend`
-# feature on `tensor-wasm-mem` builds on the workspace default toolchain
-# — no `RUSTUP_TOOLCHAIN` override or branch-local rust-toolchain.toml
-# edit needed. The feature is still opt-in through v0.3.x because the
-# parity port (per RFC 0001 "Rollout — v0.4 (parity)") has not landed
-# yet; the toolchain alignment is the prerequisite, not the port.
+# REMOVED FOR CRATES.IO PUBLISHABILITY: the five cuda-oxide host/device
+# crates (`cuda-host`, `cuda-core`, `cuda-async`, `cuda-device`,
+# `cuda-macros`) were previously declared here as git-pinned workspace
+# dependencies (NVlabs/cuda-oxide v0.1.0 tag, rev
+# 4a56e4220aab8ce5d085a411e7f806cebb647d14). crates.io rejects ANY crate
+# whose manifest contains a `git` dependency — even an optional,
+# feature-gated one — so those entries blocked publishing `tensor-wasm-mem`
+# and everything downstream. They have been removed along with the
+# never-compiling `experimental-cuda-oxide-host-backend` feature that
+# consumed them (its host FFI surface was an inferred, `compile_error!`-
+# quarantined scaffold that had never built against the real bindings).
 #
-# Pliron (cuda-oxide's MLIR-like IR framework) is pinned in cuda-oxide's
-# own Cargo.toml to a git revision rather than crates.io. That pin
-# transitively lands in our lockfile when the feature is enabled; see
-# docs/REPRODUCIBLE-BUILDS.md for the cargo-deny allowlist row that the
-# v0.4 PR will add.
-#
-# TODO(v0.4 / when cuda-oxide ships v0.2): re-check whether `cuda-host`,
-# `cuda-core`, `cuda-async` are still the right entry points and whether
-# Pliron has published to crates.io.
-#
-# Source: NVlabs/cuda-oxide is published on GitHub but its workspace members
-# (`cuda-host`, `cuda-core`, `cuda-async`) are NOT yet on crates.io as of
-# 2026-05-25 (the crates.io `cuda-oxide` name is a different, unrelated
-# 2018-era project). For v0.3.1 we pin via git rev (the v0.1.0 tag SHA,
-# 4a56e4220aab8ce5d085a411e7f806cebb647d14) so the dep is reproducible
-# and dependabot can't silently flip it. v0.4 should switch to crates.io
-# versions once NVlabs publishes. Reproducibility audit-trail lives in
-# `docs/REPRODUCIBLE-BUILDS.md` §"git-pinned sources" and the matching
-# allowlist entries in `deny.toml`.
-#
-# Pliron (cuda-oxide's MLIR-like IR framework) is pinned in cuda-oxide's
-# own Cargo.toml at rev `b51e73b11648508188184451adebdcf63957b7fe`
-# (vaivaswatha/pliron). That pin transitively lands in our lockfile when
-# the cuda-oxide-backend feature is enabled; we do NOT redeclare it here
-# (cargo.lock captures it). `deny.toml` allowlists that specific rev so
-# `cargo deny check sources` doesn't reject the build.
-cuda-host   = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
-cuda-core   = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
-cuda-async  = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
-# `cuda-device` and `cuda-macros` are the kernel-authoring side of
-# cuda-oxide (device-side primitives + `#[kernel]` / `cuda_launch!`
-# proc-macros). Added at W4.1 (2026-05-27) so the new
-# `tensor-wasm-mem/cuda-oxide-host-backend` feature can toggle the
-# complete cuda-oxide surface with a single flag. Same git pin / SHA as
-# the other three host crates above so dependabot cannot drift them
-# apart.
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
-cuda-macros = { git = "https://github.com/NVlabs/cuda-oxide", rev = "4a56e4220aab8ce5d085a411e7f806cebb647d14", default-features = false }
+# The dep-less `cuda-oxide-backend` scaffold feature on `tensor-wasm-mem`
+# (and the crates.io-published `pliron` lever on `tensor-wasm-jit`) are
+# unaffected and still build. Re-add these git deps — or, preferably, the
+# crates.io versions — once NVlabs publishes cuda-oxide's workspace members
+# to crates.io. See RFC 0001 and docs/CUDA-OXIDE-CUTOVER.md for the cutover
+# plan.
 
 # HTTP / API
 axum = { version = "0.7", features = ["macros", "tracing"] }

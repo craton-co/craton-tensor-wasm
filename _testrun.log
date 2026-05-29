@@ -1,0 +1,805 @@
+warning: C:\Projects\tensor-wasm\crates\tensor-wasm-api\Cargo.toml: `default-features` is ignored for tensor-wasm-snapshot, since `default-features` was not specified for `workspace.dependencies.tensor-wasm-snapshot`, this could become a hard error in the future
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling cfg-if v1.0.4
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling windows-link v0.2.1
+   Compiling once_cell v1.21.4
+   Compiling windows-sys v0.61.2
+   Compiling version_check v0.9.5
+   Compiling memchr v2.8.0
+   Compiling itoa v1.0.18
+   Compiling pin-project-lite v0.2.17
+   Compiling log v0.4.29
+   Compiling parking_lot_core v0.9.12
+   Compiling scopeguard v1.2.0
+   Compiling zmij v1.0.21
+   Compiling tracing-core v0.1.36
+   Compiling lock_api v0.4.14
+   Compiling serde_json v1.0.150
+   Compiling zerocopy v0.8.48
+   Compiling getrandom v0.3.4
+   Compiling thiserror v1.0.69
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v1.3.0
+   Compiling getrandom v0.4.2
+   Compiling jobserver v0.1.34
+   Compiling syn v2.0.117
+   Compiling anyhow v1.0.102
+   Compiling fastrand v2.4.1
+   Compiling cc v1.2.62
+   Compiling regex-syntax v0.8.10
+   Compiling aho-corasick v1.1.4
+   Compiling tempfile v3.27.0
+   Compiling lazy_static v1.5.0
+   Compiling sharded-slab v0.1.7
+   Compiling tracing-log v0.2.0
+   Compiling nu-ansi-term v0.50.3
+   Compiling thread_local v1.1.9
+   Compiling prometheus-client v0.24.1
+   Compiling dtoa v1.0.11
+   Compiling tensor-wasm-core v0.3.7 (C:\Projects\tensor-wasm\crates\tensor-wasm-core)
+   Compiling bitflags v2.11.1
+   Compiling generic-array v0.14.7
+   Compiling ahash v0.8.12
+   Compiling subtle v2.6.1
+   Compiling typenum v1.20.0
+   Compiling bytes v1.11.1
+   Compiling pkg-config v0.3.33
+   Compiling cpufeatures v0.2.17
+   Compiling zstd-safe v7.2.4
+   Compiling mio v1.2.0
+   Compiling regex-automata v0.4.14
+   Compiling socket2 v0.6.3
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+   Compiling blake3 v1.8.5
+   Compiling sha2 v0.10.9
+   Compiling matchers v0.2.0
+   Compiling cpufeatures v0.3.0
+   Compiling arrayvec v0.7.6
+   Compiling constant_time_eq v0.4.2
+   Compiling arrayref v0.3.9
+   Compiling hmac v0.12.1
+   Compiling crossbeam-utils v0.8.21
+   Compiling equivalent v1.0.2
+   Compiling either v1.16.0
+   Compiling semver v1.0.28
+   Compiling hashbrown v0.17.1
+   Compiling virtue v0.0.18
+   Compiling crc32fast v1.5.0
+   Compiling unty v0.0.4
+   Compiling serde_derive v1.0.228
+   Compiling tracing-attributes v0.1.31
+   Compiling zerocopy-derive v0.8.48
+   Compiling thiserror-impl v1.0.69
+   Compiling prometheus-client-derive-encode v0.5.0
+   Compiling zeroize_derive v1.4.3
+   Compiling tokio-macros v2.7.0
+   Compiling zeroize v1.8.2
+   Compiling bincode_derive v2.0.1
+   Compiling tracing v0.1.44
+   Compiling indexmap v2.14.0
+   Compiling autocfg v1.5.1
+   Compiling target-lexicon v0.12.16
+   Compiling bumpalo v3.20.3
+   Compiling num-traits v0.2.19
+   Compiling slice-group-by v0.3.1
+   Compiling arbitrary v1.4.2
+   Compiling gimli v0.29.0
+   Compiling winapi-util v0.1.11
+   Compiling allocator-api2 v0.2.21
+   Compiling foldhash v0.1.5
+   Compiling futures-core v0.3.32
+   Compiling hashbrown v0.15.5
+   Compiling leb128 v0.2.6
+   Compiling leb128fmt v0.1.0
+   Compiling unicode-width v0.2.2
+   Compiling windows_x86_64_msvc v0.52.6
+   Compiling wasm-encoder v0.250.0
+   Compiling cranelift-isle v0.112.3
+   Compiling libc v0.2.186
+   Compiling cranelift-codegen-shared v0.112.3
+   Compiling cranelift-codegen-meta v0.112.3
+   Compiling ppv-lite86 v0.2.21
+   Compiling wast v250.0.0
+   Compiling windows-targets v0.52.6
+   Compiling crossbeam-epoch v0.9.18
+   Compiling rayon-core v1.13.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling wasmtime-versioned-export-macros v25.0.3
+   Compiling smallvec v1.15.1
+   Compiling tracing-serde v0.2.0
+   Compiling parking_lot v0.12.5
+   Compiling tracing-subscriber v0.3.23
+   Compiling tokio v1.52.3
+   Compiling zstd v0.13.3
+   Compiling hashbrown v0.14.5
+   Compiling bincode v2.0.1
+   Compiling wat v1.250.0
+   Compiling tensor-wasm-artifacts v0.3.7 (C:\Projects\tensor-wasm\crates\tensor-wasm-artifacts)
+   Compiling dashmap v6.2.1
+   Compiling cranelift-bitset v0.112.3
+   Compiling tensor-wasm-tenant v0.3.7 (C:\Projects\tensor-wasm\crates\tensor-wasm-tenant)
+   Compiling cranelift-entity v0.112.3
+   Compiling cranelift-codegen v0.112.3
+   Compiling thiserror v2.0.18
+   Compiling rustc-hash v2.1.2
+   Compiling futures-sink v0.3.32
+   Compiling regalloc2 v0.10.2
+   Compiling cranelift-bforest v0.112.3
+   Compiling wasmparser v0.217.1
+   Compiling cranelift-control v0.112.3
+   Compiling thiserror-impl v2.0.18
+   Compiling rayon v1.12.0
+   Compiling async-trait v0.1.89
+   Compiling object v0.36.7
+   Compiling wasmtime-types v25.0.3
+   Compiling futures-channel v0.3.32
+   Compiling cobs v0.3.0
+   Compiling windows-sys v0.52.0
+   Compiling termcolor v1.4.1
+   Compiling unicode-xid v0.2.6
+   Compiling wasmtime-component-util v25.0.3
+   Compiling id-arena v2.3.0
+   Compiling wasmprinter v0.217.1
+   Compiling postcard v1.1.3
+   Compiling wasmtime-fiber v25.0.3
+   Compiling wasm-encoder v0.217.1
+   Compiling futures-macro v0.3.32
+   Compiling itertools v0.12.1
+   Compiling wit-parser v0.217.1
+   Compiling futures-task v0.3.32
+   Compiling libm v0.2.16
+   Compiling heck v0.4.1
+   Compiling paste v1.0.15
+   Compiling slab v0.4.12
+   Compiling wasmtime-component-macro v25.0.3
+   Compiling futures-io v0.3.32
+   Compiling cranelift-frontend v0.112.3
+   Compiling futures-util v0.3.32
+   Compiling cranelift-native v0.112.3
+   Compiling wasmtime-wit-bindgen v25.0.3
+   Compiling cranelift-wasm v0.112.3
+   Compiling wasmtime-environ v25.0.3
+   Compiling wasmtime v25.0.3
+   Compiling wasmtime-jit-icache-coherence v25.0.3
+   Compiling encoding_rs v0.8.35
+   Compiling wasmtime-asm-macros v25.0.3
+   Compiling wasmtime-cranelift v25.0.3
+   Compiling wasmtime-slab v25.0.3
+   Compiling bitflags v1.3.2
+   Compiling sptr v0.3.2
+   Compiling tokio-stream v0.1.18
+   Compiling region v3.0.2
+   Compiling futures-executor v0.3.32
+   Compiling rustc_version v0.4.1
+   Compiling futures v0.3.32
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling signature v2.2.0
+   Compiling curve25519-dalek v4.1.3
+   Compiling cranelift-isle v0.111.9
+   Compiling cranelift-codegen-shared v0.111.9
+   Compiling ed25519 v2.2.3
+   Compiling cranelift-codegen-meta v0.111.9
+   Compiling serde_bytes v0.11.19
+   Compiling cranelift-bitset v0.111.9
+   Compiling hashbrown v0.13.2
+   Compiling cranelift-entity v0.111.9
+   Compiling rustc-hash v1.1.0
+   Compiling regalloc2 v0.9.3
+   Compiling ed25519-dalek v2.2.0
+   Compiling tensor-wasm-snapshot v0.3.7 (C:\Projects\tensor-wasm\crates\tensor-wasm-snapshot)
+   Compiling cranelift-bforest v0.111.9
+   Compiling wasmparser v0.218.1
+   Compiling cranelift-control v0.111.9
+   Compiling lru v0.12.5
+   Compiling hex v0.4.3
+   Compiling tokio-test v0.4.5
+   Compiling cranelift-codegen v0.111.9
+   Compiling crossbeam-channel v0.5.15
+   Compiling synstructure v0.13.2
+   Compiling wait-timeout v0.2.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.5
+   Compiling getrandom v0.2.17
+   Compiling wasm-encoder v0.218.1
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling percent-encoding v2.3.2
+   Compiling tensor-wasm-mem v0.3.7 (C:\Projects\tensor-wasm\crates\tensor-wasm-mem)
+   Compiling http v1.4.0
+   Compiling tensor-wasm-wasi-gpu v0.3.7 (C:\Projects\tensor-wasm\crates\tensor-wasm-wasi-gpu)
+   Compiling writeable v0.6.3
+   Compiling litemap v0.8.2
+   Compiling zerofrom v0.1.8
+   Compiling http-body v1.0.1
+   Compiling icu_normalizer_data v2.2.0
+   Compiling utf8_iter v1.0.4
+   Compiling yoke v0.8.2
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling icu_properties_data v2.2.0
+   Compiling tower-service v0.3.3
+   Compiling httparse v1.10.1
+   Compiling try-lock v0.2.5
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling icu_locale_core v2.2.0
+   Compiling icu_collections v2.2.0
+   Compiling want v0.3.1
+   Compiling form_urlencoded v1.2.2
+   Compiling icu_provider v2.2.0
+   Compiling sync_wrapper v1.0.2
+   Compiling rand_core v0.9.5
+   Compiling httpdate v1.0.3
+   Compiling tower-layer v0.3.3
+   Compiling icu_normalizer v2.2.0
+   Compiling icu_properties v2.2.0
+   Compiling byteorder v1.5.0
+   Compiling atomic-waker v1.1.2
+   Compiling hyper v1.9.0
+   Compiling rand_core v0.6.4
+   Compiling tokio-util v0.7.18
+   Compiling base64 v0.22.1
+   Compiling rustversion v1.0.22
+   Compiling hdrhistogram v7.5.4
+   Compiling idna_adapter v1.2.2
+   Compiling ipnet v2.12.0
+   Compiling tower v0.5.3
+   Compiling tensor-wasm-jit v0.3.7 (C:\Projects\tensor-wasm\crates\tensor-wasm-jit)
+   Compiling hyper-util v0.1.20
+   Compiling idna v1.1.0
+   Compiling rand_chacha v0.3.1
+   Compiling http-body-util v0.1.3
+   Compiling quick-error v1.2.3
+   Compiling fnv v1.0.7
+   Compiling tensor-wasm-exec v0.3.7 (C:\Projects\tensor-wasm\crates\tensor-wasm-exec)
+   Compiling ryu v1.0.23
+   Compiling bit-vec v0.8.0
+   Compiling rusty-fork v0.3.1
+   Compiling rand v0.8.6
+   Compiling bit-set v0.8.0
+   Compiling serde_urlencoded v0.7.1
+   Compiling url v2.5.8
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling rand_chacha v0.9.0
+   Compiling opentelemetry v0.26.0
+   Compiling glob v0.3.3
+   Compiling mime v0.3.17
+   Compiling unarray v0.1.4
+   Compiling tower-http v0.6.11
+   Compiling proptest v1.11.0
+   Compiling axum-core v0.4.5
+   Compiling axum-macros v0.4.2
+   Compiling serde_path_to_error v0.1.20
+   Compiling opentelemetry_sdk v0.26.0
+   Compiling matchit v0.7.3
+   Compiling uuid v1.23.1
+   Compiling temp-env v0.3.6
+   Compiling anstyle v1.0.14
+   Compiling utf8parse v0.2.2
+   Compiling tracing-opentelemetry v0.27.0
+   Compiling once_cell_polyfill v1.70.2
+   Compiling anstyle-wincon v3.0.11
+   Compiling anstyle-parse v1.0.0
+   Compiling anstyle-query v1.1.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling colorchoice v1.0.5
+   Compiling anstream v1.0.0
+   Compiling heck v0.5.0
+   Compiling clap_lex v1.1.0
+   Compiling strsim v0.11.1
+   Compiling clap_derive v4.6.1
+   Compiling regex v1.12.3
+   Compiling axum v0.7.9
+   Compiling clap_builder v4.6.0
+   Compiling half v2.7.1
+   Compiling plotters-backend v0.3.7
+   Compiling ciborium-io v0.2.2
+   Compiling same-file v1.0.6
+   Compiling plotters-svg v0.3.7
+   Compiling itertools v0.10.5
+   Compiling ciborium-ll v0.2.2
+   Compiling cast v0.3.0
+   Compiling plotters v0.3.7
+   Compiling ciborium v0.2.2
+   Compiling criterion-plot v0.5.0
+   Compiling walkdir v2.5.0
+   Compiling tinytemplate v1.2.1
+   Compiling ring v0.17.14
+   Compiling tensor-wasm-api v0.3.7 (C:\Projects\tensor-wasm\crates\tensor-wasm-api)
+   Compiling is-terminal v0.4.17
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling rustls-pki-types v1.14.1
+   Compiling untrusted v0.9.0
+   Compiling rustls v0.23.40
+   Compiling clap v4.6.1
+   Compiling roff v1.1.1
+   Compiling criterion v0.5.1
+   Compiling webpki-roots v1.0.7
+   Compiling predicates-core v1.0.10
+   Compiling clap_mangen v0.2.33
+   Compiling clap_complete v4.6.5
+   Compiling windows-sys v0.59.0
+   Compiling float-cmp v0.10.0
+   Compiling pin-project-internal v1.1.11
+   Compiling encode_unicode v1.0.0
+   Compiling assert_cmd v2.2.2
+   Compiling termtree v0.5.1
+   Compiling normalize-line-endings v0.3.0
+   Compiling difflib v0.4.0
+   Compiling console v0.15.11
+   Compiling predicates-tree v1.0.13
+   Compiling predicates v3.1.4
+   Compiling bstr v1.12.1
+   Compiling pin-project v1.1.11
+   Compiling linked-hash-map v0.5.6
+   Compiling similar v2.7.0
+   Compiling tensor-wasm-bench v0.3.7 (C:\Projects\tensor-wasm\crates\tensor-wasm-bench)
+   Compiling insta v1.42.2
+warning: method `tombstone_count` is never used
+   --> crates\tensor-wasm-tenant\src\registry.rs:555:19
+    |
+213 | impl TenantRegistry {
+    | ------------------- method in this implementation
+...
+555 |     pub(crate) fn tombstone_count(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling rustls-webpki v0.103.13
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+warning: `tensor-wasm-tenant` (lib test) generated 1 warning
+   Compiling tensor-wasm-cli v0.3.7 (C:\Projects\tensor-wasm\crates\tensor-wasm-cli)
+    Finished `test` profile [unoptimized] target(s) in 36m 25s
+     Running unittests src\lib.rs (C:/Projects/tw-test-target\debug\deps\tensor_wasm_api-51d5f65ad7e34093.exe)
+
+running 160 tests
+test audit::tests::audit_config_disabled_is_noop ... ok
+test audit::tests::extract_subject_from_xfcc_envoy_format ... ok
+test audit::tests::classify_state_mutating_routes ... ok
+test audit::tests::actor_from_dev_context_renders_as_dev ... ok
+test audit::tests::classify_read_only_routes_returns_none ... ok
+test audit::tests::capturing_sink_records_emission ... ok
+test audit::tests::audit_config_from_env_falls_back_to_stdout_when_unset ... ok
+test audit::tests::actor_from_bearer_context_renders_as_bearer ... ok
+test audit::tests::noop_sink_drops_records ... ok
+test audit::tests::gated_extract_honours_xfcc_from_trusted_peer ... ok
+test audit::tests::extract_subject_returns_none_when_header_has_no_subject ... ok
+test audit::tests::gated_extract_drops_xfcc_when_peer_unknown ... ok
+test audit::tests::parse_function_id_recognises_canonical_routes ... ok
+test audit::tests::record_round_trips_through_serde_json ... ok
+test audit::tests::gated_extract_drops_xfcc_when_no_proxies_trusted ... ok
+test audit::tests::trusted_proxies_cidr_membership_v4 ... ok
+test audit::tests::trusted_proxies_bare_ip_normalised_to_host_route ... ok
+test audit::tests::trusted_proxies_malformed_entries_are_skipped ... ok
+test audit::tests::token_scope_view_from_scope_is_stable_order ... ok
+test audit::tests::record_serialises_with_stable_keys ... ok
+test audit::tests::extract_subject_returns_none_when_header_absent ... ok
+test audit::tests::trusted_proxies_cidr_membership_v6 ... ok
+test audit::tests::trusted_proxies_warn_once_dedup ... ok
+test config::tests::parse_bool_accepts_case_insensitive ... ok
+test config::tests::parse_bool_rejects_garbage ... ok
+test config::tests::parse_hex_key_rejects_short ... ok
+test config::tests::default_is_all_none_or_false ... ok
+test config::tests::parse_hex_key_accepts_uppercase ... ok
+test config::tests::parse_hex_key_rejects_non_hex ... ok
+test audit::tests::trusted_proxies_empty_input_trusts_nobody ... ok
+test config::tests::config_error_display_messages_are_descriptive ... ok
+test audit::tests::file_sink_appends_jsonl_records ... ok
+test config::tests::with_snapshot_hmac_key_builder_sets_field ... ok
+test config::tests::with_snapshot_require_signature_builder_sets_field ... ok
+test config::tests::parse_hex_key_round_trips_lowercase ... ok
+test audit::tests::file_sink_offloads_write_under_runtime ... ok
+test middleware::tests::auth_config_from_env_opt_in_values_enable_dev_mode ... ok
+test middleware::tests::auth_config_from_env_non_truthy_opt_in_forbids_dev_mode ... ok
+test middleware::tests::auth_config_dev_mode_when_empty ... ok
+test middleware::tests::auth_config_from_env_empty_without_opt_in_forbids_dev_mode ... ok
+test http_metrics::tests::route_allowlist_default_covers_known_routes ... ok
+test http_metrics::tests::route_label_falls_back_to_unknown_when_extension_missing ... ok
+test middleware::tests::auth_config_programmatic_constructors_allow_dev_mode ... ok
+test middleware::tests::body_limit_layer_constructs ... ok
+test middleware::tests::concurrency_limit_layer_constructs ... ok
+test http_metrics::tests::route_allowlist_rejects_unlisted ... ok
+test middleware::tests::auth_config_accepts_matching_token ... ok
+test middleware::tests::auth_config_from_tokens_defaults_to_wildcard_scope ... ok
+test middleware::tests::auth_config_from_env_with_tokens_is_not_dev_mode ... ok
+test middleware::tests::auth_config_from_scopes_round_trips ... ok
+test middleware::tests::cors_config_from_origins_round_trips ... ok
+test middleware::tests::cors_layer_constructs_empty_allowlist ... ok
+test middleware::tests::cors_config_default_is_empty_allowlist ... ok
+test middleware::tests::bearer_auth_passes_through_when_dev_mode_allowed ... ok
+test middleware::tests::bearer_auth_fails_closed_when_dev_mode_not_allowed ... ok
+test middleware::tests::extract_tenant_parses_header_value ... ok
+test middleware::tests::extract_tenant_rejects_garbage_header ... ok
+test middleware::tests::parse_bearer_credentials_empty_token_is_some_empty ... ok
+test middleware::tests::parse_bearer_credentials_is_case_insensitive ... ok
+test middleware::tests::parse_bearer_credentials_trims_surrounding_whitespace ... ok
+test middleware::tests::sanitise_traceparent_filters_non_printable_bytes ... ok
+test middleware::tests::parse_bearer_credentials_accepts_canonical_scheme ... ok
+test middleware::tests::extract_tenant_errors_when_required_and_missing ... ok
+test middleware::tests::parse_bearer_credentials_accepts_tab_separator ... ok
+test middleware::tests::parse_bearer_credentials_rejects_other_schemes ... ok
+test middleware::tests::extract_tenant_default_zero_when_optional ... ok
+test middleware::tests::parse_bearer_credentials_returns_none_for_no_whitespace ... ok
+test middleware::tests::sanitise_traceparent_passes_through_well_formed_value ... ok
+test middleware::tests::cors_layer_constructs_with_origins ... ok
+test middleware::tests::sanitise_traceparent_rejects_embedded_nul ... ok
+test middleware::tests::sanitise_traceparent_truncates_oversized_input_to_64_bytes ... ok
+test middleware::tests::trace_layer_with_propagation_constructs ... ok
+test openai::tests::chat_completions_request_accepts_empty_messages ... ok
+test openai::tests::openai_error_envelope_serialises_to_openai_shape ... ok
+test middleware::tests::sanitise_traceparent_rejects_crlf_injection ... ok
+test middleware::tests::timeout_layer_constructs ... ok
+test middleware::tests::trace_layer_constructs ... ok
+test openai::tests::chat_completions_request_deserialises_minimal_body ... ok
+test openai::tests::completions_request_accepts_array_prompt ... ok
+test openai_translator::tests::parse_empty_yields_empty_map ... ok
+test openai::tests::openai_error_invalid_request_carries_param ... ok
+test openai_translator::tests::parse_single_entry ... ok
+test openai_translator::tests::parse_multiple_entries ... ok
+test openai_translator::tests::translate_chat_completions_assembles_role_tagged_prompt ... ok
+test openai_translator::tests::translate_chat_completions_default_role_is_user ... ok
+test openai_translator::tests::translate_completions_rejects_unsupported_knobs ... ok
+test openai::tests::completions_request_deserialises_minimal_body ... ok
+test rate_limit::tests::bucket_allows_up_to_burst_immediately ... ok
+test openai_translator::tests::translate_completions_array_prompt_joined_with_newlines ... ok
+test openai_translator::tests::parse_tolerates_whitespace ... ok
+test openai_translator::tests::translate_chat_completions_empty_messages_yields_only_marker ... ok
+test openai_translator::tests::translate_completions_returns_function_id_on_hit ... ok
+test rate_limit::tests::bucket_refills_at_qps_rate_with_manual_clock ... ok
+test openai_translator::tests::translate_chat_completions_rejects_nonempty_tools ... ok
+test openai_translator::tests::translate_completions_returns_model_not_found_on_miss ... ok
+test openai_translator::tests::parse_skips_malformed_entries ... ok
+test rate_limit::tests::middleware_passthrough_when_limiter_disabled ... ok
+test rate_limit::tests::reject_carries_retry_after_at_least_one_second ... ok
+test rate_limit::tests::config_disabled_when_either_zero ... ok
+test rate_limit::tests::disabled_limiter_admits_unconditionally ... ok
+test routes::tests::api_error_constructors_carry_status ... ok
+test rate_limit::tests::middleware_admits_burst_then_rejects_with_retry_after ... ok
+test rate_limit::tests::middleware_passthrough_when_no_limiter_in_extensions ... ok
+test rate_limit::tests::separate_tokens_have_separate_buckets ... ok
+test rate_limit::tests::token_id_dev_is_distinct_from_real_tokens ... ok
+test routes::tests::evict_jobs_noop_when_under_cap ... ok
+test routes::tests::app_state_default_is_empty ... ok
+test routes::tests::exec_error_capacity_exhausted_maps_to_stable_503_message ... ok
+test routes::tests::app_state_with_metrics_swaps_handle ... ok
+test routes::tests::app_state_try_new_constructs ... ok
+test routes::tests::evict_jobs_falls_back_to_oldest_when_all_pending ... ok
+test routes::tests::exec_error_epoch_ticker_not_running_maps_to_stable_500_message ... ok
+test routes::tests::evict_jobs_prefers_terminal_oldest_first ... ok
+test routes::tests::exec_error_not_found_maps_to_stable_404_message ... ok
+test routes::tests::exec_error_module_too_large_maps_to_stable_413_message ... ok
+test routes::tests::function_record_skips_wasm_bytes_on_wire ... ok
+test routes::tests::jobs_active_guard_drop_decrements_on_panic_path ... ok
+test routes::tests::exec_error_missing_export_maps_to_stable_400_message ... ok
+test routes::tests::exec_error_module_memory_too_large_maps_to_stable_413_message ... ok
+test routes::tests::exec_error_timeout_maps_to_invoke_timeout ... ok
+test server::tests::metrics_auth_default_is_unauthenticated ... ok
+test routes::tests::jobs_active_guard_release_decrements_exactly_once ... ok
+test server::tests::parse_bearer_token_accepts_canonical_scheme ... ok
+test token_scope::tests::parse_bare_entry_trims_whitespace ... ok
+test server::tests::metrics_unauthorized_envelope_shape ... ok
+test token_scope::tests::parse_bare_entry_yields_wildcard ... ok
+test token_scope::tests::parse_env_bare_token_after_scoped_token ... ok
+test routes::tests::exec_error_compile_maps_to_wasmtime_500 ... ok
+test token_scope::tests::parse_env_drops_malformed_entry_but_keeps_others ... ok
+test server::tests::parse_bearer_token_rejects_non_bearer_and_empty ... ok
+test server::tests::parse_bearer_token_rejects_control_bytes ... ok
+test token_scope::tests::parse_empty_entry_errors ... ok
+test token_scope::tests::parse_empty_tenant_list_errors ... ok
+test token_scope::tests::parse_env_empty_returns_default ... ok
+test token_scope::tests::parse_env_handles_whitespace_around_entries ... ok
+test token_scope::tests::parse_env_mixed_bare_and_scoped ... ok
+test token_scope::tests::parse_env_scoped_token_with_long_tenant_list ... ok
+test token_scope::tests::parse_invalid_tenant_errors ... ok
+test token_scope::tests::parse_env_two_scoped_tokens_with_continuation_lists ... ok
+test token_scope::tests::parse_env_three_bare_tokens ... ok
+test token_scope::tests::parse_env_single_bare_token ... ok
+test token_scope::tests::parse_missing_bearer_errors ... ok
+test token_scope::tests::parse_missing_eq_errors ... ok
+test token_scope::tests::parse_multi_tenant_entry ... ok
+test token_scope::tests::parse_multi_tenant_entry_with_whitespace ... ok
+test token_scope::tests::parse_unknown_key_errors ... ok
+test token_scope::tests::parse_wildcard_entry_yields_wildcard ... ok
+test token_scope::tests::tenant_scope_wildcard_admits_arbitrary ... ok
+test trace_propagation::tests::current_trace_id_is_none_without_subscriber ... ok
+test token_scope::tests::parse_single_tenant_entry ... ok
+test token_scope::tests::parse_tenant_list_with_trailing_comma_is_invalid ... ok
+test token_scope::tests::parse_wildcard_mixed_with_ids_errors ... ok
+test token_scope::tests::tenant_scope_allows_in_set ... ok
+test trace_propagation::tests::extract_parent_context_with_no_trace_header_is_safe ... ok
+test trace_propagation::tests::extract_parent_context_with_valid_traceparent_returns_non_empty ... ok
+test trace_propagation::tests::header_map_extractor_missing_returns_none ... ok
+test trace_propagation::tests::header_map_extractor_returns_value ... ok
+test trace_propagation::tests::install_w3c_propagator_is_idempotent ... ok
+test rate_limit::tests::per_token_eviction_does_not_disturb_other_tokens ... ok
+test rate_limit::tests::per_tenant_buckets_are_bounded_under_distinct_tenant_fan_out ... ok
+
+test result: ok. 160 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.07s
+
+     Running tests\async_invoke_flow.rs (C:/Projects/tw-test-target\debug\deps\async_invoke_flow-ec0114039038ac33.exe)
+
+running 2 tests
+test deploy_then_invoke_async_then_poll ... ok
+test invoke_async_failure_recorded_as_failed_with_kind ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+
+     Running tests\audit_log_test.rs (C:/Projects/tw-test-target\debug\deps\audit_log_test-d8070c05c1477dd3.exe)
+
+running 8 tests
+test metrics_and_jobs_get_emit_no_audit_record ... ok
+test healthz_emits_no_audit_record ... ok
+test create_function_emits_audit_record ... ok
+test invoke_with_out_of_scope_tenant_emits_403_record ... ok
+test delete_function_emits_audit_record ... ok
+test audit_log_disabled_mode_swallows_records ... ok
+test audit_record_round_trips_through_serde_json ... ok
+test invoke_async_emits_audit_record ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+
+     Running tests\auth.rs (C:/Projects/tw-test-target\debug\deps\auth-7d463abaab80f3f5.exe)
+
+running 10 tests
+test malformed_authorization_header_is_401 ... ok
+test lowercase_bearer_scheme_is_accepted ... ok
+test protected_route_still_requires_auth ... ok
+test unknown_bearer_token_is_401 ... ok
+test dev_mode_no_auth_required ... ok
+test healthz_endpoint_is_unauthenticated_even_with_tokens_configured ... ok
+test metrics_endpoint_is_unauthenticated ... ok
+test missing_authorization_header_is_401 ... ok
+test uppercase_bearer_scheme_is_accepted ... ok
+test valid_bearer_token_passes_through ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+
+     Running tests\config_debug_does_not_leak_key.rs (C:/Projects/tw-test-target\debug\deps\config_debug_does_not_leak_key-0c96c4ac88d55168.exe)
+
+running 2 tests
+test app_config_debug_redacts_hmac_key ... ok
+test app_config_debug_without_key_does_not_say_redacted ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests\error_envelope_does_not_leak_paths.rs (C:/Projects/tw-test-target\debug\deps\error_envelope_does_not_leak_paths-8768e3b96d6d669a.exe)
+
+running 1 test
+test invoke_trap_error_envelope_does_not_leak_host_internals ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s
+
+     Running tests\error_envelopes.rs (C:/Projects/tw-test-target\debug\deps\error_envelopes-a00b3da21d82d907.exe)
+
+running 9 tests
+test kind_invalid_name ... ok
+test kind_invalid_json ... ok
+test kind_missing_tenant ... ok
+test kind_not_found ... ok
+test kind_tenant_header_invalid ... ok
+test kind_invalid_wasm_short_payload ... ok
+test kind_body_too_large ... ok
+test kind_unauthorized ... ok
+test kind_invalid_wasm_bad_magic ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+     Running tests\function_cross_tenant.rs (C:/Projects/tw-test-target\debug\deps\function_cross_tenant-0205ebce2c5e6337.exe)
+
+running 6 tests
+test create_function_rejects_other_tenant_with_scoped_token ... ok
+test invoke_function_rejects_cross_tenant ... ok
+test invoke_function_async_rejects_cross_tenant ... ok
+test token_scope_layer_runs_before_resource_check ... ok
+test delete_function_rejects_cross_tenant ... ok
+test same_tenant_operations_still_succeed ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.91s
+
+     Running tests\function_name_validation.rs (C:/Projects/tw-test-target\debug\deps\function_name_validation-4dadb3371bf6502b.exe)
+
+running 5 tests
+test whitespace_only_name_is_rejected ... ok
+test oversized_name_is_rejected ... ok
+test empty_name_is_rejected ... ok
+test embedded_nul_name_is_rejected ... ok
+test well_formed_name_is_accepted ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+
+     Running tests\get_job_cross_tenant.rs (C:/Projects/tw-test-target\debug\deps\get_job_cross_tenant-2c5659e9abb7d446.exe)
+
+running 3 tests
+test cross_tenant_read_is_blocked_for_pending_jobs ... ok
+test token_scope_layer_runs_before_resource_check ... ok
+test get_job_rejects_cross_tenant_read_with_tenant_scope_denied ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+     Running tests\header_hardening_test.rs (C:/Projects/tw-test-target\debug\deps\header_hardening_test-55bff72085653224.exe)
+
+running 6 tests
+test authorization_with_embedded_nul_rejected ... ok
+test duplicate_tenant_header_rejected ... ok
+test authorization_with_control_bytes_rejected ... ok
+test missing_tenant_when_required ... ok
+test invalid_tenant_header_distinct_from_missing ... ok
+test oversized_authorization_header_rejected ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests\host_validate_runs_before_trace_layer.rs (C:/Projects/tw-test-target\debug\deps\host_validate_runs_before_trace_layer-b7b74f8d0d5f5ce2.exe)
+
+running 1 test
+test host_validate_rejects_before_trace_layer_allocates_span ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests\host_validate_startup_warn.rs (C:/Projects/tw-test-target\debug\deps\host_validate_startup_warn-7dc82add0e050b85.exe)
+
+running 3 tests
+test no_warn_when_neither_var_set ... ok
+test warns_when_tokens_set_but_trusted_hosts_unset ... ok
+test no_warn_when_both_vars_set ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running tests\host_validate_test.rs (C:/Projects/tw-test-target\debug\deps\host_validate_test-5d3f3917aa63f58f.exe)
+
+running 13 tests
+test host_validate_default_port_strip_443 ... ok
+test host_validate_rejects_http2_authority_when_unlisted ... ok
+test host_validate_accepts_listed_host_case_insensitive ... ok
+test host_validate_port_bound_entry_requires_exact_match ... ok
+test host_validate_rejects_missing_host_when_configured ... ok
+test host_validate_accepts_listed_host ... ok
+test host_validate_default_port_strip_80 ... ok
+test host_validate_passes_through_when_allowlist_empty ... ok
+test trusted_hosts_contains_is_case_insensitive ... ok
+test host_validate_uses_http2_authority_fallback ... ok
+test host_validate_rejects_unlisted_host ... ok
+test trusted_hosts_from_raw_empty_is_allow_all ... ok
+test trusted_hosts_from_raw_parses_comma_separated_list ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests\http_integration.rs (C:/Projects/tw-test-target\debug\deps\http_integration-dbf3638d24d87c83.exe)
+
+running 11 tests
+test create_function_rejects_invalid_base64 ... ok
+test delete_unknown_returns_404 ... ok
+test get_unknown_job_returns_404 ... ok
+test healthz_returns_ok ... ok
+test create_function_rejects_short_payload ... ok
+test create_function_with_valid_wasm ... ok
+test create_function_rejects_non_wasm ... ok
+test metrics_returns_text ... ok
+test invoke_unknown_returns_404 ... ok
+test deploy_then_invoke_round_trip ... ok
+test invoke_module_without_start_or_main_is_400 ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+     Running tests\http_metrics_test.rs (C:/Projects/tw-test-target\debug\deps\http_metrics_test-05f7fdba91c7c620.exe)
+
+running 4 tests
+test healthz_increments_counter_with_route_template_label ... ok
+test invoke_with_bogus_id_uses_route_template_label_not_uuid ... ok
+test unauthorized_401_is_still_counted ... ok
+test create_function_post_emits_counter_and_histogram ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+     Running tests\invoke_envelope_shape.rs (C:/Projects/tw-test-target\debug\deps\invoke_envelope_shape-f99750caef48a202.exe)
+
+running 3 tests
+test invoke_async_envelope_produces_accepted ... ok
+test invoke_envelope_with_only_args_succeeds ... ok
+test invoke_envelope_matches_empty_body_response ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     Running tests\invoke_ignores_body.rs (C:/Projects/tw-test-target\debug\deps\invoke_ignores_body-e438654b0198f189.exe)
+
+running 5 tests
+test invoke_async_accepts_1kib_body_with_unknown_fields ... ok
+test invoke_rejects_malformed_json_body ... ok
+test invoke_async_rejects_malformed_json_body ... ok
+test invoke_accepts_1kib_body_with_unknown_fields ... ok
+test invoke_accepts_empty_body ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+
+     Running tests\invoke_stream_real_emit.rs (C:/Projects/tw-test-target\debug\deps\invoke_stream_real_emit-814160febf4f5f4d.exe)
+
+running 2 tests
+test emit_chunk_three_times_surfaces_three_sse_chunk_events ... ok
+test emit_chunk_three_times_surfaces_three_chunks_on_octet_branch ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.93s
+
+     Running tests\invoke_stream_restored.rs (C:/Projects/tw-test-target\debug\deps\invoke_stream_restored-51dba0db6e7d8186.exe)
+
+running 5 tests
+test unknown_function_id_returns_404 ... ok
+test oversized_body_returns_413 ... ok
+test default_accept_returns_octet_stream ... ok
+test sse_negotiation_returns_event_stream_content_type ... ok
+test cross_tenant_returns_403 ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.35s
+
+     Running tests\invoke_with_args.rs (C:/Projects/tw-test-target\debug\deps\invoke_with_args-0a6aa8a308735406.exe)
+
+running 3 tests
+test invoke_with_args_rejects_non_numeric ... ok
+test invoke_with_args_returns_sum ... ok
+test invoke_without_export_falls_back_to_start ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.27s
+
+     Running tests\invoke_with_typed_args.rs (C:/Projects/tw-test-target\debug\deps\invoke_with_typed_args-e92e373bbb8c40d6.exe)
+
+running 4 tests
+test invoke_with_string_arg_rejected_with_invalid_args ... ok
+test invoke_with_two_i32_args_returns_sum_via_spawn_config_path ... ok
+test invoke_with_i64_arg_escalates_above_i32_max ... ok
+test invoke_with_f64_arg_round_trips_through_response ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+
+     Running tests\jobs_active_gauge.rs (C:/Projects/tw-test-target\debug\deps\jobs_active_gauge-6d9c880c948ea242.exe)
+
+running 3 tests
+test invoke_async_panic_path_drop_guard_decrements_jobs_active ... ok
+test invoke_async_increments_jobs_active_then_decrements_on_completion ... ok
+test invoke_async_failure_path_also_decrements_jobs_active ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+
+     Running tests\kernel_registry_authz.rs (C:/Projects/tw-test-target\debug\deps\kernel_registry_authz-0d926bb540ed4030.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\kernel_registry_routes.rs (C:/Projects/tw-test-target\debug\deps\kernel_registry_routes-29ee308551dcf664.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\openai_chat_role_tagging.rs (C:/Projects/tw-test-target\debug\deps\openai_chat_role_tagging-2a0ab2c33fbe678d.exe)
+
+running 5 tests
+test assembled_prompt_empty_role_defaults_to_user ... ok
+test assembled_prompt_handles_multimodal_content_array_text_only ... ok
+test assembled_prompt_carries_system_user_assistant_role_tags ... ok
+test assembled_prompt_preserves_message_order ... ok
+test translator_assembles_full_prompt_into_translated_request ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests\openai_completions_happy.rs (C:/Projects/tw-test-target\debug\deps\openai_completions_happy-fa6e13278cc6e590.exe)
+
+running 2 tests
+memory allocation of 4294967296 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p tensor-wasm-api --test openai_completions_happy`
+
+Caused by:
+  process didn't exit successfully: `C:/Projects/tw-test-target\debug\deps\openai_completions_happy-fa6e13278cc6e590.exe` (exit code: 0xc0000409, STATUS_STACK_BUFFER_OVERRUN)
+note: test exited abnormally; to see the full output pass --no-capture to the harness.

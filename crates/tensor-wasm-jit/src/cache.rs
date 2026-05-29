@@ -556,6 +556,37 @@ impl KernelCache {
         }
     }
 
+    /// Byte-cap eviction (DoS mitigation — see
+    /// [`KernelCacheConfig::max_total_bytes`]). Reuse the SAME LRU policy
+    /// queue that drives the count cap: pop least-recently-used keys and
+    /// evict them until the running PTX-byte total fits under `cap`. We
+    /// never evict down to an empty cache — the loop stops once at most one
+    /// entry (the most-recently-used, i.e. typically the entry just
+    /// inserted) remains, so a single entry larger than `cap` is still
+    /// served rather than wedging dispatch.
+    ///
+    /// A no-op when no byte cap is configured. Factored out of [`Self::put`]
+    /// so EVERY L1 insert site — `put` and the L2 disk-hit promotion in
+    /// [`Self::get`] — binds the byte cap, not just `put`. Holds the `lru`
+    /// lock across the whole eviction burst (one acquisition for the loop)
+    /// exactly as the count-cap loop does; `evict_key` keeps
+    /// [`Self::total_bytes`] in step with each storage removal.
+    fn enforce_byte_cap(&self) {
+        if let Some(cap) = self.config.max_total_bytes {
+            if self.total_bytes.load(Ordering::Relaxed) > cap {
+                let mut lru = self.lru.lock();
+                while self.total_bytes.load(Ordering::Relaxed) > cap && self.storage.len() > 1 {
+                    match lru.pop_lru() {
+                        Some((evict_key, ())) => {
+                            self.evict_key(&evict_key);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
     /// Insert (or replace) a kernel. If the insert pushes the cache over
     /// the count cap (or, when configured, the byte cap), evicts LRU
     /// entries from storage and the policy queue until both caps are
@@ -647,28 +678,9 @@ impl KernelCache {
             }
         }
         // Byte-cap eviction (DoS mitigation — see
-        // `KernelCacheConfig::max_total_bytes`). Reuse the SAME LRU policy
-        // queue that drives the count cap: pop least-recently-used keys and
-        // evict them until the running PTX-byte total fits under `cap`. We
-        // never evict the just-inserted key down to an empty cache — the
-        // loop stops once at most one entry (the most-recently-used, i.e.
-        // typically the entry we just inserted) remains, so a single entry
-        // larger than `cap` is still served rather than wedging dispatch.
-        if let Some(cap) = self.config.max_total_bytes {
-            if self.total_bytes.load(Ordering::Relaxed) > cap {
-                let mut lru = self.lru.lock();
-                while self.total_bytes.load(Ordering::Relaxed) > cap
-                    && self.storage.len() > 1
-                {
-                    match lru.pop_lru() {
-                        Some((evict_key, ())) => {
-                            self.evict_key(&evict_key);
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
+        // `KernelCacheConfig::max_total_bytes`). Shared with the L2
+        // disk-promotion path so both insert sites bind the byte cap.
+        self.enforce_byte_cap();
     }
 
     /// Look up a kernel; best-effort touches the LRU position.
@@ -779,6 +791,13 @@ impl KernelCache {
                             self.evict_key(&evicted_key);
                         }
                     }
+                    // Byte-cap parity: `put` enforces BOTH the count cap and the
+                    // byte cap on every insert, but this promotion path used to
+                    // run only count-cap eviction — so an L2 disk hit could push
+                    // `total_bytes` past `config.max_total_bytes` and leave it
+                    // over the cap until the next `put`. Run the shared byte-cap
+                    // eviction here too so both caps bind on every L1 insert.
+                    self.enforce_byte_cap();
                     self.cache_hits_total.fetch_add(1, Ordering::Relaxed);
                     return Some(arc);
                 }
@@ -847,13 +866,37 @@ impl KernelCache {
         // BLAKE3 integrity tag); the cheap wrapper `clone()` we hand to `put`
         // copies only the 32-byte hash + fingerprint + an `Arc` refcount
         // bump, not the PTX text.
-        let manifest = &entry.0;
         let emitted = Arc::new(crate::ptx_emit::EmittedPtx {
             text: entry.1.clone(),
-            launch_geometry: (0, 0), // v0.4: extend KernelManifest to carry geometry
+            // TODO(v0.4, format-version bump): thread the real launch geometry
+            // through. `KernelManifest` does NOT currently carry it, and adding a
+            // `launch_geometry` field is NOT compile-safe today: `KernelManifest`
+            // is constructed via the (non-`#[non_exhaustive]`-bypassing) public
+            // `KernelManifest::new` whose call sites live OUTSIDE this crate
+            // (tensor-wasm-cli, tensor-wasm-api, and several integration tests) —
+            // a new required ctor arg breaks all of them. It would also break the
+            // HMAC-signed v2 envelope: `canonical_signed_bytes` would have to fold
+            // geometry in (invalidating every previously-signed manifest, i.e. a
+            // `twasm-kmf-v2` -> `-v3` magic bump) OR leave it unsigned/forgeable.
+            // Geometry is only a launch hint (not a security boundary), but the
+            // signed-format break is real, so this is deferred to a manifest
+            // format-version bump. Until then an L3 registry hit keeps (0, 0),
+            // exactly as the L2 path did before the V2 disk-envelope fix. The
+            // fingerprint inconsistency (the correctness half of this bug) IS
+            // fixed below.
+            launch_geometry: (0, 0),
         });
+        // Fingerprint MUST match the cache key under which this entry is
+        // inserted. `put` keys L1 entries by `CacheKey` (whose `blueprint` is the
+        // blueprint fingerprint) and the L2 disk reader reconstructs with
+        // `fingerprint == key.blueprint` (see `DiskCache::get`). Using
+        // `manifest.digest_as_u64()` (the PTX digest) here made the promoted
+        // entry's `fingerprint` disagree with `key.blueprint`, breaking
+        // diagnostics/log correlation and the `OffloadedFunction.fingerprint`
+        // contract for registry-sourced entries. Key on `key.blueprint` so L1,
+        // L2, and L3 entries are all fingerprinted consistently.
         let cached = CachedKernel::new(
-            manifest.digest_as_u64(), // see Step 4 — add helper
+            key.blueprint,
             emitted,
             CompiledHandle::default(),
         );

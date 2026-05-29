@@ -257,6 +257,12 @@ pub trait ArtifactStore: Send + Sync {
     /// content-addressed key; a subsequent [`Self::get`] can still fail
     /// with an integrity variant if that record was tampered with.
     ///
+    /// For [`DiskArtifactStore`] this probe is rotation-aware: it resolves
+    /// against every accepted read key (active or retired), so a blob
+    /// written under a now-retired key — and still visible to [`Self::get`]
+    /// — also reports `true` here, rather than appearing absent and leaking
+    /// past GC.
+    ///
     /// Returns [`ArtifactError::Io`] only on an underlying probe fault
     /// that is neither "present" nor "absent" (e.g. a `metadata` call
     /// failing for a reason other than not-found).
@@ -267,10 +273,14 @@ pub trait ArtifactStore: Send + Sync {
     /// "was it there?" boolean and the POSIX `unlink`-of-missing
     /// convention GC callers expect).
     ///
-    /// For [`DiskArtifactStore`] this unlinks the `{hash}.{key_fp}.bin`
-    /// file under this store's key; for [`InMemoryArtifactStore`] it
-    /// drops the map entry. Returns [`ArtifactError::Io`] on an
-    /// underlying delete fault other than not-found.
+    /// For [`DiskArtifactStore`] this is rotation-aware: it resolves which
+    /// accepted key (active or retired) actually holds the blob — the same
+    /// resolution [`Self::get`] / [`Self::list`] use — and unlinks the
+    /// `{hash}.{key_fp}.bin` file (plus any sidecar) under THAT key, so a
+    /// blob written under a now-retired key can still be GC'd. For
+    /// [`InMemoryArtifactStore`] it drops the map entry. Returns
+    /// [`ArtifactError::Io`] on an underlying delete fault other than
+    /// not-found.
     fn remove(&self, hash: &ContentHash) -> Result<bool, ArtifactError>;
 }
 
@@ -538,16 +548,19 @@ impl<R: Read> Read for MacReader<'_, R> {
 /// Verification uses constant-time comparison.
 pub struct DiskArtifactStore {
     dir: PathBuf,
-    /// Active signing key — the key new `put`s sign with and the key the
-    /// `contains` / `remove` probes resolve against. Cached out of the
-    /// provider once at construction so the hot write/probe paths don't
-    /// re-enter the provider (a rotating provider may mint keys on
-    /// demand). Held in a `Zeroizing` so it's scrubbed on drop.
+    /// Active signing key — the key new `put`s sign with. Cached out of the
+    /// provider once at construction so the hot write path doesn't re-enter
+    /// the provider (a rotating provider may mint keys on demand). Held in a
+    /// `Zeroizing` so it's scrubbed on drop. Reads (`get` / `get_to`) and
+    /// the rotation-aware probes (`contains` / `remove` / `metadata`)
+    /// resolve against [`KeyProvider::read_keys`], not just this key.
     hmac_key: Zeroizing<[u8; 32]>,
     /// `blake3(active_key)[..8]` rendered as 16 ascii-hex chars, computed
-    /// once at construction. Used as the per-key filename segment by
-    /// `path_for`, `put`, `contains`, and `remove`; caching it here avoids
-    /// re-hashing the key on every store operation.
+    /// once at construction. Used as the active-key filename segment by
+    /// `path_for` / `meta_path_for` (and thus `put` / `put_with_metadata`);
+    /// caching it here avoids re-hashing the active key on every write. The
+    /// rotation-aware read/probe paths derive per-key fingerprints on demand
+    /// via `key_fingerprint_hex` instead.
     key_fp_hex: String,
     /// Pluggable source of signing keys. For a single-key store this is a
     /// [`SingleKeyProvider`]; for a rotating store it yields the active
@@ -623,11 +636,20 @@ impl DiskArtifactStore {
     /// key. Sits next to the blob with a `.meta.json` extension in place
     /// of `.bin`, so it shares the blob's content-addressed + key-
     /// partitioned naming and is filtered out of `list` (which only
-    /// matches `.bin`).
+    /// matches `.bin`). Counterpart helper [`Self::meta_path_for_key`]
+    /// resolves the sidecar under an arbitrary accepted read key.
     fn meta_path_for(&self, hash: &ContentHash) -> PathBuf {
+        self.meta_path_for_key(hash, &self.key_fp_hex)
+    }
+
+    /// On-disk path for the metadata sidecar of `hash` under the key whose
+    /// fingerprint is `key_fp_hex`. Used by the rotation-aware `metadata`
+    /// read so a sidecar written under a now-retired key is still found,
+    /// and by `remove` so the sidecar is unlinked under the same key as the
+    /// blob it describes.
+    fn meta_path_for_key(&self, hash: &ContentHash, key_fp_hex: &str) -> PathBuf {
         let hash_hex = hash.to_string();
-        let key_hex = &self.key_fp_hex;
-        self.dir.join(format!("{hash_hex}.{key_hex}.meta.json"))
+        self.dir.join(format!("{hash_hex}.{key_fp_hex}.meta.json"))
     }
 
     /// Insert `payload` (exactly like [`ArtifactStore::put`]) and write an
@@ -685,15 +707,29 @@ impl DiskArtifactStore {
         Ok(hash)
     }
 
-    /// Read the [`ArtifactMetadata`] sidecar for `hash` under the active
-    /// key.
+    /// Read the [`ArtifactMetadata`] sidecar for `hash` under whichever
+    /// accepted key (active or retired) the blob actually lives under.
     ///
-    /// Returns [`ArtifactError::NotFound`] if no sidecar exists (either
-    /// because the blob was written via plain `put`, or because it lives
-    /// under a different key). A malformed sidecar surfaces as
+    /// Rotation-aware: this resolves the blob's key with the same
+    /// [`Self::resolve_read_key`] probe `get` / `list` use, then reads the
+    /// sidecar partitioned under that key's fingerprint. A blob written
+    /// under a now-retired key (and its sidecar) is therefore still
+    /// readable here after rotation, matching what `get` exposes.
+    ///
+    /// Returns [`ArtifactError::NotFound`] if no blob exists under any
+    /// accepted key, or if the blob exists but carries no sidecar (e.g. it
+    /// was written via plain `put`). A malformed sidecar surfaces as
     /// [`ArtifactError::Metadata`].
     pub fn metadata(&self, hash: &ContentHash) -> Result<ArtifactMetadata, ArtifactError> {
-        let meta_path = self.meta_path_for(hash);
+        // Find which accepted key holds the blob, then read the sidecar
+        // under that same key's fingerprint. If no blob is resolvable the
+        // sidecar (if any) is orphaned/foreign — report NotFound.
+        let (_blob_path, key) = match self.resolve_read_key(hash)? {
+            Some(found) => found,
+            None => return Err(ArtifactError::NotFound(hash.to_string())),
+        };
+        let fp = key_fingerprint_hex(&key);
+        let meta_path = self.meta_path_for_key(hash, &fp);
         let bytes = match std::fs::read(&meta_path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -715,36 +751,33 @@ impl DiskArtifactStore {
         })
     }
 
-    /// Pass 1 of the streaming `get_to`: verify the HMAC of the blob at
-    /// `path` under `key` *without* exposing any decoded bytes. Streams
-    /// the compressed body through the running MAC and compares the
+    /// Pass 1 of the streaming `get_to`: verify the HMAC of the blob held
+    /// open by `reader` under `key` *without* exposing any decoded bytes.
+    /// Streams the compressed body through the running MAC and compares the
     /// trailing tag in constant time. On success returns the validated
     /// header's content hash and the byte range of the zstd body, so pass
-    /// 2 can re-open and decode without re-reading the header.
+    /// 2 can rewind the SAME handle and decode without re-reading the
+    /// header.
+    ///
+    /// TOCTOU note: `get_to` opens the file exactly once and passes the
+    /// resulting handle here for pass 1 and to [`Self::decode_to_writer`]
+    /// for pass 2 (after a `seek` back to start). Because both passes read
+    /// the one handle's bytes, the bytes decoded in pass 2 are *exactly*
+    /// the bytes authenticated in pass 1 — a concurrent `remove`+`put` that
+    /// swaps the path's contents between passes cannot smuggle unverified
+    /// bytes to `out` (a swap unlinks the old inode but our open handle
+    /// keeps reading it). `reader` is positioned at the start of the file
+    /// on entry. The caller supplies `file_len` (already stat'd) so this
+    /// does not re-`metadata` the handle.
     ///
     /// Returns the same integrity error surface as [`ArtifactStore::get`].
     fn verify_blob(
         &self,
-        path: &std::path::Path,
+        reader: &mut BufReader<File>,
+        file_len: u64,
         key: &[u8; 32],
+        path: &std::path::Path,
     ) -> Result<VerifiedBlob, ArtifactError> {
-        let file = match File::open(path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ArtifactError::NotFound(path.display().to_string()));
-            }
-            Err(e) => {
-                warn!(target: "tensor_wasm_artifacts", file = %path.display(), error = %e, "open failed");
-                return Err(ArtifactError::Io);
-            }
-        };
-        let file_len = file
-            .metadata()
-            .map_err(|e| {
-                warn!(target: "tensor_wasm_artifacts", file = %path.display(), error = %e, "metadata failed");
-                ArtifactError::Io
-            })?
-            .len();
         let min_len = (ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN) as u64;
         if file_len < min_len {
             return Err(ArtifactError::BadMagic);
@@ -752,7 +785,6 @@ impl DiskArtifactStore {
         let prefix_end = file_len - ARTIFACT_HMAC_LEN as u64;
         let body_len = prefix_end - ARTIFACT_HEADER_LEN as u64;
 
-        let mut reader = BufReader::with_capacity(STREAM_BUF_LEN, file);
         let mut mac = new_mac(key);
 
         let mut header = [0u8; ARTIFACT_HEADER_LEN];
@@ -778,7 +810,7 @@ impl DiskArtifactStore {
         // bytes. We do NOT decode here: the goal of pass 1 is solely to
         // authenticate, so no decoded byte exists yet to leak.
         {
-            let mut body_take = Read::take(&mut reader, body_len);
+            let mut body_take = Read::take(&mut *reader, body_len);
             let mut scratch = [0u8; STREAM_BUF_LEN];
             loop {
                 let n = body_take.read(&mut scratch).map_err(|e| {
@@ -811,24 +843,29 @@ impl DiskArtifactStore {
     }
 
     /// Pass 2 of the streaming `get_to`: stream-decode the already-verified
-    /// blob at `path` directly into `out`, enforcing the decompressed-size
-    /// cap and recomputing the content hash as defence-in-depth. Only
-    /// called after [`Self::verify_blob`] has authenticated the same file,
-    /// so every byte written to `out` is authenticated.
+    /// blob directly into `out`, enforcing the decompressed-size cap and
+    /// recomputing the content hash as defence-in-depth. Only called after
+    /// [`Self::verify_blob`] has authenticated the bytes of the SAME open
+    /// handle, so every byte written to `out` is authenticated.
+    ///
+    /// TOCTOU fix: this consumes the very handle pass 1 verified — the
+    /// caller rewinds it (`seek(SeekFrom::Start(0))`) and hands it back
+    /// here rather than re-opening `path`. Re-opening was the old race: a
+    /// concurrent `remove`+`put` could swap the path's contents between the
+    /// two opens, so pass 2 would decode bytes that pass 1 never
+    /// HMAC-authenticated (the content-hash recheck below caught a swapped
+    /// payload, but only *after* unverified bytes had already streamed to
+    /// `out`). Reusing the handle pins the inode, so the decoded bytes are
+    /// byte-for-byte the authenticated ones. `reader` is positioned at the
+    /// start of the file on entry. `path` is used only for diagnostics.
     fn decode_to_writer(
         &self,
-        path: &std::path::Path,
+        reader: &mut BufReader<File>,
         verified: &VerifiedBlob,
         requested: &ContentHash,
         out: &mut dyn Write,
+        path: &std::path::Path,
     ) -> Result<u64, ArtifactError> {
-        let file = File::open(path).map_err(|e| {
-            // The file verified moments ago; a NotFound here means a
-            // concurrent unlink raced us. Treat any open failure as Io.
-            warn!(target: "tensor_wasm_artifacts", file = %path.display(), error = %e, "reopen failed (decode pass)");
-            ArtifactError::Io
-        })?;
-        let mut reader = BufReader::with_capacity(STREAM_BUF_LEN, file);
         // Skip the header — already validated in pass 1.
         let mut header = [0u8; ARTIFACT_HEADER_LEN];
         reader.read_exact(&mut header).map_err(|e| {
@@ -846,7 +883,7 @@ impl DiskArtifactStore {
         // that forwards to `out`. Because the blob is already
         // authenticated, streaming decoded bytes to the caller honours
         // the "no unverified bytes exposed" invariant.
-        let body_take = Read::take(&mut reader, verified.body_len);
+        let body_take = Read::take(&mut *reader, verified.body_len);
         let decoder = zstd::stream::read::Decoder::new(body_take).map_err(|e| {
             warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed (decode pass)");
             ArtifactError::Decompression(e.to_string())
@@ -1454,25 +1491,72 @@ impl ArtifactStore for DiskArtifactStore {
     }
 
     fn get_to(&self, hash: &ContentHash, out: &mut dyn Write) -> Result<u64, ArtifactError> {
-        // Two-pass streaming: the HMAC covers the whole compressed blob,
-        // so we must authenticate before exposing any decoded byte. Pass 1
-        // (`verify_blob`) streams the compressed body through the MAC and
-        // checks the tag WITHOUT decoding — no decoded byte exists to
-        // leak. Only once that passes does pass 2 (`decode_to_writer`)
-        // re-open the file and stream-decode straight into `out`.
+        // Two-pass streaming over a SINGLE open handle: the HMAC covers the
+        // whole compressed blob, so we must authenticate before exposing any
+        // decoded byte. Pass 1 (`verify_blob`) streams the compressed body
+        // through the MAC and checks the tag WITHOUT decoding — no decoded
+        // byte exists to leak. Pass 2 (`decode_to_writer`) then rewinds the
+        // SAME handle and stream-decodes straight into `out`.
         //
-        // Tradeoff: this reads the compressed body off disk twice (it is
-        // re-opened, not buffered in RAM). That keeps peak heap bounded by
+        // TOCTOU fix: the file is opened exactly once and both passes read
+        // that handle. The previous code re-opened the path for pass 2, so a
+        // concurrent `remove`+`put` between the two opens could swap the
+        // path's contents and pass 2 would decode bytes pass 1 never
+        // HMAC-verified — weakening the doc-promised invariant that `out`
+        // only ever sees authenticated bytes (the content-hash recheck
+        // caught a swapped payload, but only after unverified bytes had
+        // streamed out). Holding one handle pins the inode: an unlink+swap
+        // unlinks the directory entry but our handle keeps reading the
+        // original, authenticated bytes. We rewind with `seek(Start(0))`
+        // between passes rather than re-opening.
+        //
+        // Tradeoff: this reads the compressed body off disk twice (re-read
+        // via `seek`, not buffered in RAM). That keeps peak heap bounded by
         // the I/O buffers regardless of payload size — the alternative
-        // (buffer the whole decoded payload, verify, then write) would
-        // hold up to MAX_DECOMPRESSED_LEN resident, which is exactly what
-        // `get` already does and what the streaming path exists to avoid.
+        // (buffer the whole decoded payload, verify, then write) would hold
+        // up to MAX_DECOMPRESSED_LEN resident, which is exactly what `get`
+        // already does and what the streaming path exists to avoid.
+        use std::io::{Seek, SeekFrom};
+
         let (path, key) = match self.resolve_read_key(hash)? {
             Some(found) => found,
             None => return Err(ArtifactError::NotFound(hash.to_string())),
         };
-        let verified = self.verify_blob(&path, &key)?;
-        self.decode_to_writer(&path, &verified, hash, out)
+
+        // Open ONCE; both passes consume this handle.
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Raced an unlink between resolve and open: a genuine miss.
+                return Err(ArtifactError::NotFound(hash.to_string()));
+            }
+            Err(e) => {
+                warn!(target: "tensor_wasm_artifacts", file = %path.display(), error = %e, "open failed (get_to)");
+                return Err(ArtifactError::Io);
+            }
+        };
+        let file_len = file
+            .metadata()
+            .map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", file = %path.display(), error = %e, "metadata failed (get_to)");
+                ArtifactError::Io
+            })?
+            .len();
+
+        let mut reader = BufReader::with_capacity(STREAM_BUF_LEN, file);
+
+        // Pass 1: authenticate from this handle.
+        let verified = self.verify_blob(&mut reader, file_len, &key, &path)?;
+
+        // Rewind the SAME handle so pass 2 decodes the exact bytes pass 1
+        // authenticated — not whatever a racing writer may have swapped in.
+        reader.seek(SeekFrom::Start(0)).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", file = %path.display(), error = %e, "rewind failed (get_to decode pass)");
+            ArtifactError::Io
+        })?;
+
+        // Pass 2: decode from the same (now-rewound) handle.
+        self.decode_to_writer(&mut reader, &verified, hash, out, &path)
     }
 
     fn list(&self) -> Result<Vec<ContentHash>, ArtifactError> {
@@ -1500,34 +1584,37 @@ impl ArtifactStore for DiskArtifactStore {
     }
 
     fn contains(&self, hash: &ContentHash) -> Result<bool, ArtifactError> {
-        // Stat-only existence probe: no open, no decode, no HMAC. A
-        // not-found error from `metadata` means "absent"; any other
-        // fault (permissions, I/O) is a genuine probe failure and
-        // surfaces as `Io` rather than masquerading as "absent".
-        let path = self.path_for(hash);
-        match std::fs::metadata(&path) {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => {
-                warn!(
-                    target: "tensor_wasm_artifacts",
-                    file = %path.display(),
-                    error = %e,
-                    "contains metadata probe failed"
-                );
-                Err(ArtifactError::Io)
-            }
-        }
+        // Rotation-aware stat-only existence probe: no open, no decode, no
+        // HMAC. Resolves against every accepted read key (active first) with
+        // the same [`Self::resolve_read_key`] probe `get` / `list` use, so a
+        // blob written under a now-retired key reports `true` (the old code
+        // checked only the active key, so such a blob was visible to `get`
+        // yet reported absent here — a GC-leak hazard). `resolve_read_key`
+        // returns `Ok(None)` on a genuine miss across all keys and
+        // [`ArtifactError::Io`] on a probe fault that is neither present nor
+        // absent.
+        Ok(self.resolve_read_key(hash)?.is_some())
     }
 
     fn remove(&self, hash: &ContentHash) -> Result<bool, ArtifactError> {
-        // Unlink the per-key blob. A not-found error is the "nothing to
-        // remove" path and returns `false`, not an error — this matches
-        // `HashMap::remove`'s boolean and lets idempotent GC retries
-        // stay quiet. Any other delete fault is a real `Io`.
-        let path = self.path_for(hash);
+        // Rotation-aware unlink: resolve which accepted key (active or
+        // retired) actually holds the blob with the same
+        // [`Self::resolve_read_key`] probe `get` / `list` use, then unlink
+        // under THAT key. The old code unlinked only under the active key,
+        // so a blob written under a now-retired key was visible to `get` but
+        // could never be removed here — a GC leak that contradicted the
+        // rotation story. A genuine miss across all keys returns `false`,
+        // not an error — this matches `HashMap::remove`'s boolean and lets
+        // idempotent GC retries stay quiet.
+        let (path, key) = match self.resolve_read_key(hash)? {
+            Some(found) => found,
+            None => return Ok(false),
+        };
         let removed = match std::fs::remove_file(&path) {
             Ok(()) => true,
+            // Raced a concurrent remove between resolve and unlink: the
+            // entry is already gone, which is the same "nothing removed"
+            // outcome as a genuine miss.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
                 warn!(
@@ -1540,11 +1627,14 @@ impl ArtifactStore for DiskArtifactStore {
             }
         };
         // Best-effort: drop the metadata sidecar too so it never outlives
-        // the blob it describes. A missing sidecar is the common case
-        // (plain `put` writes none); any other unlink fault is logged but
-        // does not flip the blob-removal result, since the blob — the
-        // authoritative entry — is already gone.
-        let meta_path = self.meta_path_for(hash);
+        // the blob it describes. The sidecar is partitioned under the SAME
+        // key fingerprint as the blob, so resolve its path under the key we
+        // just unlinked. A missing sidecar is the common case (plain `put`
+        // writes none); any other unlink fault is logged but does not flip
+        // the blob-removal result, since the blob — the authoritative entry
+        // — is already gone.
+        let fp = key_fingerprint_hex(&key);
+        let meta_path = self.meta_path_for_key(hash, &fp);
         if let Err(e) = std::fs::remove_file(&meta_path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 warn!(

@@ -1629,6 +1629,23 @@ impl TensorWasmExecutor {
         if let Some(m) = &self.metrics {
             m.active_instances().dec();
         }
+        // Capture the owning tenant id BEFORE we attempt `try_unwrap`, while
+        // we can still cheaply read it. We need it on the try_unwrap-failure
+        // branch below to decrement the per-tenant fairness counter (the
+        // engine-wide slot release alone used to leave the per-tenant count
+        // leaked). Only read it when a per-tenant cap is configured —
+        // otherwise `tenant_counts` is never populated and we skip the
+        // per-instance lock entirely, exactly mirroring `terminate`'s
+        // discipline. The lock here is uncontended on the common path (we hold
+        // the only handle after the `DashMap::remove` above); a racing
+        // in-flight call would briefly hold it, which is correct — we want the
+        // post-call tenant. We drop the lock guard before `try_unwrap` so we
+        // are not ourselves holding a strong borrow that would defeat it.
+        let owning_tenant = if self.engine.config().max_instances_per_tenant.is_some() {
+            Some(handle.lock().await.tenant_id())
+        } else {
+            None
+        };
         // Unwrap the Arc<Mutex<_>>: we need the sole strong reference to move
         // the instance out into the warm channel.
         //
@@ -1653,21 +1670,35 @@ impl TensorWasmExecutor {
                 // instance). But we already removed the entry from the
                 // registry, so the engine-wide admission slot it occupied
                 // would otherwise leak permanently (no `terminate` /
-                // `release_instance_slot` will ever run for this id). Release
-                // the engine-wide slot here so a racing detach does not erode
-                // the `max_instances` budget. We do NOT touch the per-tenant
-                // count: that decrement requires the tenant id, which lives
-                // behind the still-locked instance we cannot read without
-                // racing the in-flight call; the per-tenant leak (only when a
-                // per-tenant cap is configured) is the lesser, bounded evil
-                // versus blocking on the contended lock here. The happy path
-                // above intentionally leaves the slot charged (the pool owns it).
+                // `release_instance_slot` will ever run for this id). The
+                // racing in-flight call is the pool path's *non-terminating*
+                // `call_export_with_args` (see `invoke`): when it finishes it
+                // merely drops its Arc clone — it never calls `terminate` /
+                // `release_instance_slot`, and the registry entry is already
+                // gone, so NO other code path will ever decrement this slot.
+                // We therefore must release BOTH counters here, exactly
+                // mirroring the `release_instance_slot` the `Some` path's
+                // caller (`InstancePool::release`) would have run. This is the
+                // sole decrement for this slot, so it cannot double-count:
+                // - engine-wide slot: released here (was previously the only
+                //   release, hence correct);
+                // - per-tenant slot: now released here too (using the tenant
+                //   id captured up-front above), closing the unbounded
+                //   per-tenant leak that the old "lesser, bounded evil"
+                //   comment described. The decrement is skipped when no
+                //   per-tenant cap is configured (`owning_tenant` is `None`),
+                //   matching `terminate` / `release_instance_slot`.
+                // The happy path above intentionally leaves the slot charged
+                // (the pool owns it and releases via `release_instance_slot`).
                 self.instance_count.fetch_sub(1, Ordering::AcqRel);
+                if let Some(tenant) = owning_tenant {
+                    decrement_tenant_count(&self.tenant_counts, tenant);
+                }
                 warn!(
                     target: "tensor_wasm_exec::executor",
                     %id,
                     "detach_pooled_instance: outstanding Arc reference (racing in-flight call); \
-                     instance not pooled, engine-wide slot released",
+                     instance not pooled, both engine-wide and per-tenant slots released",
                 );
                 None
             }

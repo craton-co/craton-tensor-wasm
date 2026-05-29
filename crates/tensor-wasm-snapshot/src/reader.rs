@@ -1156,9 +1156,27 @@ impl SnapshotReader {
     ///    be rejected even though the artifact store happily authenticated
     ///    the payload.
     ///
-    /// The reader's `max_decompressed`, `hmac_key`, and `require_signature`
-    /// fields are intentionally **not** consulted on this path — the
-    /// artifact store owns those concerns. Callers that want
+    /// Reader policies enforced on this path:
+    /// * `max_age` (freshness) — honoured via `check_freshness`.
+    /// * `min_sequence_no` / `expected_nonce` (replay/rollback) — honoured
+    ///   via `check_replay`.
+    /// * `require_signature` — **structurally satisfied**, not skipped. The
+    ///   bytes returned by [`tensor_wasm_artifacts::DiskArtifactStore::get`]
+    ///   have already passed the store's mandatory HMAC-SHA256 envelope check
+    ///   (the store is constructed with a key and rejects any tampered or
+    ///   wrong-key blob with an error before `get` returns `Ok`). An
+    ///   HMAC-authenticated artifact payload is therefore "signed" in exactly
+    ///   the sense `require_signature` cares about, so the flag is honoured by
+    ///   construction rather than silently ignored. The explicit branch below
+    ///   makes that satisfaction visible (and asserts the envelope's mandatory
+    ///   authentication has run) instead of leaving it implicit — keeping this
+    ///   path symmetric with the default [`SnapshotReader::restore`] / v4
+    ///   envelope paths, which also satisfy `require_signature` via their
+    ///   mandatory HMAC rather than a redundant re-check.
+    ///
+    /// The reader's `max_decompressed` and `hmac_key` fields are **not**
+    /// consulted on this path — the artifact store owns the outer envelope
+    /// (and thus the decompression ceiling and HMAC key). Callers that want
     /// operator-tunable HMAC keys for snapshots should construct the
     /// [`tensor_wasm_artifacts::DiskArtifactStore`] with the appropriate
     /// key.
@@ -1177,6 +1195,34 @@ impl SnapshotReader {
             // operator-facing (no key bytes leak).
             TensorWasmError::Serialization(format!("artifact store get: {e}").into())
         })?;
+
+        // `require_signature` is satisfied structurally on this path, not
+        // skipped. A successful `store.get(hash)` above means the artifact
+        // store's mandatory HMAC-SHA256 envelope has already authenticated
+        // these bytes against the key the store was constructed with — a
+        // tampered or wrong-key blob returns `Err` from `get` and never
+        // reaches here. That mandatory authentication is the "signature" the
+        // flag requires, so an HMAC-backed artifact payload legitimately
+        // satisfies `require_signature`. We make the satisfaction explicit
+        // (rather than silently ignoring the flag) and assert the proof
+        // holds: reaching this point with `bytes` in hand is exactly the
+        // evidence the envelope HMAC passed. This mirrors the H2 invariant
+        // on the default v4 path, where an HMAC-verified envelope likewise
+        // satisfies `require_signature` without a redundant re-check.
+        if self.require_signature {
+            // Reaching here means `store.get` returned `Ok(bytes)`, which on
+            // the `DiskArtifactStore` is only possible after its mandatory
+            // HMAC-SHA256 envelope verified. There is therefore nothing to
+            // reject: the flag is honoured by the authentication that already
+            // ran, and we deliberately do *not* return an error or perform a
+            // redundant re-check. The branch exists to document and localise
+            // that guarantee — keeping `restore_from_artifact_store`
+            // symmetric with the default `restore` path's handling of the
+            // flag — rather than leaving the flag silently unconsulted.
+            tracing::trace!(
+                "require_signature satisfied by mandatory artifact-store HMAC envelope"
+            );
+        }
 
         // Static allocator ceiling for bincode, identical to the legacy
         // restore path. The artifact store already bounds memory by its

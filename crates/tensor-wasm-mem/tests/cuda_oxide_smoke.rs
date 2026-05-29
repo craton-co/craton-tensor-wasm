@@ -1,41 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
 
-//! Smoke tests for the `cuda-oxide-backend` scaffold and the
-//! `cuda-oxide-host-backend` real-impl path.
+//! Smoke tests for the `cuda-oxide-backend` scaffold.
 //!
-//! The file is compiled only when at least the dep-less
-//! `cuda-oxide-backend` feature is on. Tests pivot on whether the strict-
-//! superset `cuda-oxide-host-backend` feature is also enabled:
+//! The file is compiled only when the dep-less `cuda-oxide-backend`
+//! feature is on. The scaffold path asserts the documented
+//! `NOT_YET_WIRED` sentinel comes back from `allocate`, that the public
+//! types are exported, and that the buffer layout is non-zero.
 //!
-//! * Without `cuda-oxide-host-backend`, the scaffold path is active and
-//!   the tests assert the documented `NOT_YET_WIRED` sentinel comes back
-//!   from `allocate`, that the public types are exported, and that the
-//!   buffer layout is non-zero.
+//! NOTE: the real `cuMemAllocManaged` host-backend path (formerly gated by
+//! the `experimental-cuda-oxide-host-backend` feature) was removed for
+//! crates.io publishability — it relied on git-pinned cuda-oxide crates.
+//! The host-only tests below were removed with it; restore them when the
+//! host port returns (see RFC 0001 / docs/CUDA-OXIDE-CUTOVER.md).
 //!
-//! * With `cuda-oxide-host-backend`, the real `cuMemAllocManaged` path is
-//!   active and the tests additionally exercise zero-size rejection on
-//!   the host plus the ignored hardware-gated round-trip
-//!   (`#[ignore = "requires CUDA hardware"]`) that the S22 CUDA runner
-//!   will pick up via `cargo test --features cuda-oxide-host-backend --
-//!   --ignored`.
-//!
-//! Mirrors the shape of `tests/cudarc_smoke.rs` so the v0.4 PR diff is
-//! easy to review.
+//! Mirrors the shape of `tests/cudarc_smoke.rs`.
 //!
 //! Run on a contributor box (no LIBCLANG / CUDA Toolkit required):
 //!
 //! ```ignore
 //! cargo test -p tensor-wasm-mem --features cuda-oxide-backend \
 //!     --test cuda_oxide_smoke
-//! ```
-//!
-//! Run on a host with LIBCLANG_PATH + CUDA_TOOLKIT_PATH and a CUDA-
-//! capable GPU:
-//!
-//! ```ignore
-//! cargo test -p tensor-wasm-mem --features cuda-oxide-host-backend \
-//!     --test cuda_oxide_smoke -- --ignored
 //! ```
 
 #![cfg(feature = "cuda-oxide-backend")]
@@ -45,20 +30,16 @@ use tensor_wasm_mem::cuda_oxide_backend::{
 };
 use tensor_wasm_mem::unified::{DeviceId, UnifiedError};
 
-/// The buffer type compiles, links, and has a non-zero layout. Holds on
-/// both the scaffold and host-backend builds — if this fails the
-/// workspace has a broken feature flag or a missing module declaration
-/// in `lib.rs`.
+/// The buffer type compiles, links, and has a non-zero layout. If this
+/// fails the workspace has a broken feature flag or a missing module
+/// declaration in `lib.rs`.
 #[test]
 fn cuda_oxide_buffer_type_has_nonzero_size() {
     assert!(std::mem::size_of::<CudaOxideUnifiedBuffer>() > 0);
 }
 
 /// On the dep-less scaffold build, `allocate(1024)` returns the
-/// documented sentinel error string. On the host-backend build this test
-/// is skipped — the real impl returns either `Ok` or a real driver
-/// error, never the `NOT_YET_WIRED` sentinel.
-#[cfg(not(feature = "experimental-cuda-oxide-host-backend"))]
+/// documented sentinel error string.
 #[test]
 fn cuda_oxide_allocate_returns_not_yet_wired() {
     let err = CudaOxideUnifiedBuffer::allocate(1024)
@@ -94,54 +75,9 @@ fn cuda_oxide_prefetch_async_is_exported() {
     let _f: fn(&CudaOxideUnifiedBuffer, DeviceId) -> Result<(), UnifiedError> = prefetch_async;
 }
 
-/// Under the host-backend feature, zero-byte allocations are rejected
-/// without any driver call. Runs on host-only CI as long as the
-/// host-backend feature is on and the build host can compile the
-/// cuda-oxide crates (LIBCLANG + CUDA Toolkit). The cudarc-backend has
-/// the same test under the matching name.
-#[cfg(feature = "experimental-cuda-oxide-host-backend")]
-#[test]
-fn cuda_oxide_zero_size_rejected_without_driver() {
-    let err = CudaOxideUnifiedBuffer::allocate(0).expect_err("zero should be rejected");
-    assert!(
-        matches!(err, UnifiedError::ZeroSize),
-        "expected ZeroSize, got: {err:?}"
-    );
-}
-
-/// Hardware-gated round trip: allocate, write, read, drop. Compiles only
-/// when the host-backend feature is on. Requires a CUDA driver and at
-/// least one visible GPU; marked `#[ignore]` per the repo convention so
-/// host-only CI does not try to dlopen `libcuda`.
-#[cfg(feature = "experimental-cuda-oxide-host-backend")]
-#[test]
-#[ignore = "requires CUDA hardware"]
-fn cuda_oxide_round_trip_on_device() {
-    let mut b = CudaOxideUnifiedBuffer::allocate(128).expect("alloc");
-    assert_eq!(b.len(), 128);
-    assert!(!b.is_empty());
-    b.as_mut_slice().copy_from_slice(&[0x5Au8; 128]);
-    assert!(b.as_slice().iter().all(|&v| v == 0x5A));
-}
-
-/// Hardware-gated advice round trip: allocate then apply
-/// `CU_MEM_ADVISE_SET_READ_MOSTLY`. Compute capability ≥ 6.0 required.
-#[cfg(feature = "experimental-cuda-oxide-host-backend")]
-#[test]
-#[ignore = "requires CUDA hardware"]
-fn cuda_oxide_apply_advice_read_mostly_on_device() {
-    let b = CudaOxideUnifiedBuffer::allocate(256).expect("alloc");
-    apply_advice(&b, CudaOxideAdvice::ReadMostly)
-        .expect("set_read_mostly should succeed on Pascal+");
-}
-
-/// Hardware-gated prefetch round trip: prefetch to device 0, then back
-/// to the host (`DeviceId(u32::MAX)` sentinel for `CU_DEVICE_CPU`).
-#[cfg(feature = "experimental-cuda-oxide-host-backend")]
-#[test]
-#[ignore = "requires CUDA hardware"]
-fn cuda_oxide_prefetch_round_trip_on_device() {
-    let b = CudaOxideUnifiedBuffer::allocate(64).expect("alloc");
-    prefetch_async(&b, DeviceId(0)).expect("prefetch_to_device");
-    prefetch_async(&b, DeviceId(u32::MAX)).expect("prefetch_to_host");
-}
+// NOTE: the host-backend tests (zero-size rejection + the three
+// hardware-gated round-trip tests) were removed together with the
+// `experimental-cuda-oxide-host-backend` feature and the git-pinned
+// cuda-oxide crates it depended on, which blocked crates.io publishing.
+// Restore them alongside the host port (RFC 0001 /
+// docs/CUDA-OXIDE-CUTOVER.md).

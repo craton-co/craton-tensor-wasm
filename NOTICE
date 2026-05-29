@@ -16,13 +16,18 @@ This product includes software developed by:
   The prometheus-client-rust Authors        — Apache-2.0 OR MIT
   The clap Authors                          — MIT OR Apache-2.0
 
-The following are OPTIONAL, feature-gated git dependencies. They are NOT
-pulled into the default workspace build and are NOT present in the default
-release artifact; they resolve only when their owning feature flag is
-enabled (e.g. `experimental-cuda-oxide-host-backend`):
-  NVIDIA Labs (cuda-oxide: cuda-host,       — Apache-2.0
-    cuda-core, cuda-async)
-  Vaivaswatha Nagaraj (vaivaswatha/pliron,  — Apache-2.0 WITH LLVM-exception
-    transitive via cuda-oxide)
+The following are OPTIONAL, feature-gated crates.io dependencies, pulled in
+only when their owning feature flag is enabled (e.g. `cuda-oxide-backend`
+on tensor-wasm-jit):
+  Vaivaswatha Nagaraj (pliron)              — Apache-2.0 WITH LLVM-exception
 
 See `docs/RISKS.md` for upstream pinning notes.
+
+NOTE: the git-pinned cuda-oxide host/device crates (cuda-host, cuda-core,
+cuda-async, cuda-device, cuda-macros) and the transitive git pin of pliron
+that came with them were removed from the workspace so the crates can be
+published to crates.io (which rejects manifests containing git
+dependencies). pliron above is now consumed as a published crates.io
+version, not a git rev. The NVIDIA Labs cuda-oxide attribution will return
+once those crates are re-added from crates.io — see RFC 0001 /
+docs/CUDA-OXIDE-CUTOVER.md.
