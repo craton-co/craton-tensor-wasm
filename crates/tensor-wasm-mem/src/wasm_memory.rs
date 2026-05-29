@@ -66,6 +66,39 @@ pub const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// spec maximum is fail-fast on the host side.
 pub const HARD_MAX_LINEAR_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
+/// Resolve the effective backing-allocation cap from Wasmtime's reported
+/// `maximum`.
+///
+/// Wasmtime reports a linear memory that declares **no explicit upper bound**
+/// as the wasm32 architectural ceiling ([`HARD_MAX_LINEAR_MEMORY_BYTES`], 4 GiB)
+/// rather than `None`. Because this creator pre-allocates the whole cap up
+/// front (so `memory.grow` is just a size check — see [`TensorWasmLinearMemory`]),
+/// an unbounded `(memory N)` — the overwhelmingly common shape — would otherwise
+/// eagerly allocate the full 4 GiB at instantiation. That aborts the process on
+/// hosts without memory overcommit (e.g. Windows: `memory allocation of
+/// 4294967296 bytes failed`) and wastes address space everywhere else, defeating
+/// the [`DEFAULT_MAX_BYTES`] default-cap the docs promise for unbounded memories.
+///
+/// So `None` *and* an at-or-above-ceiling `maximum` both resolve to
+/// [`DEFAULT_MAX_BYTES`]; an explicit bound below the ceiling is honoured
+/// verbatim. (`> HARD_MAX_LINEAR_MEMORY_BYTES` is unreachable for wasm32 — its
+/// maximum is the ceiling — but the callers keep the `TooLarge` reject as
+/// defence for any future memory64 path.)
+fn effective_max_bytes(maximum_bytes: Option<usize>) -> usize {
+    match maximum_bytes {
+        // No declared bound → default cap.
+        None => DEFAULT_MAX_BYTES,
+        // Exactly the wasm32 architectural ceiling is how Wasmtime reports an
+        // *unbounded* memory32 → treat as "no explicit bound" → default cap.
+        Some(m) if m == HARD_MAX_LINEAR_MEMORY_BYTES => DEFAULT_MAX_BYTES,
+        // An explicit bound (below the ceiling) is honoured verbatim; a
+        // genuinely-oversized request (> ceiling, e.g. a synthetic/memory64
+        // declaration) is returned unchanged so the caller's `> HARD_MAX`
+        // `TooLarge` reject still fires (and reports the real requested size).
+        Some(m) => m,
+    }
+}
+
 /// A Wasm linear memory backed by [`UnifiedBuffer`].
 ///
 /// The buffer is allocated at construction time with the requested *maximum*
@@ -106,7 +139,7 @@ impl TensorWasmLinearMemory {
         maximum_bytes: Option<usize>,
         device_id: DeviceId,
     ) -> Result<Self, UnifiedError> {
-        let max = maximum_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+        let max = effective_max_bytes(maximum_bytes);
         if max > HARD_MAX_LINEAR_MEMORY_BYTES {
             return Err(UnifiedError::TooLarge {
                 requested: max as u64,
@@ -159,7 +192,7 @@ impl TensorWasmLinearMemory {
         device_id: DeviceId,
         tenant_ctx: Arc<tensor_wasm_tenant::TenantContext>,
     ) -> Result<Self, tensor_wasm_core::error::TensorWasmError> {
-        let max = maximum_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+        let max = effective_max_bytes(maximum_bytes);
         if max > HARD_MAX_LINEAR_MEMORY_BYTES {
             return Err(UnifiedError::TooLarge {
                 requested: max as u64,
@@ -723,7 +756,7 @@ unsafe impl MemoryCreator for TensorWasmMemoryCreator {
         reserved_size_in_bytes: Option<usize>,
         guard_size_in_bytes: usize,
     ) -> Result<Box<dyn LinearMemory>, String> {
-        let max = maximum.unwrap_or(DEFAULT_MAX_BYTES);
+        let max = effective_max_bytes(maximum);
         // Enforce HARD_MAX_LINEAR_MEMORY_BYTES on the cap declared by the
         // module's MemoryType BEFORE any backing allocation runs. Wasmtime's
         // ResourceLimiter only fires on `memory.grow`, not on initial

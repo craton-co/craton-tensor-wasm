@@ -30,9 +30,9 @@ use tensor_wasm_core::types::TenantId;
 /// exactly the bytes written back out via `emit-chunk`.
 const ECHO_PROMPT_WAT: &str = r#"
 (module
-  (import "wasi:tensor/host" "input-len" (func $len (result i32)))
-  (import "wasi:tensor/host" "read-input" (func $read (param i32 i32) (result i32)))
-  (import "wasi:tensor/host" "emit-chunk" (func $emit (param i32 i32) (result i32)))
+  (import "wasi:tensor/host@0.1.0" "input-len" (func $len (result i32)))
+  (import "wasi:tensor/host@0.1.0" "read-input" (func $read (param i32 i32) (result i32)))
+  (import "wasi:tensor/host@0.1.0" "emit-chunk" (func $emit (param i32 i32) (result i32)))
   (memory (export "memory") 2)
   (func (export "_start")
     (local $written i32)

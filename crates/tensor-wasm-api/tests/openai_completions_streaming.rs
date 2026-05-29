@@ -35,7 +35,7 @@ use tensor_wasm_core::types::TenantId;
 
 const EMIT_THREE_WAT: &str = r#"
 (module
-  (import "wasi:tensor/host" "emit-chunk"
+  (import "wasi:tensor/host@0.1.0" "emit-chunk"
     (func $emit (param i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "abc")
