@@ -865,6 +865,74 @@ fn check_module_memory_within_cap(module: &Module, cap_bytes: usize) -> Result<(
     Ok(())
 }
 
+/// Pre-compile sibling of [`check_module_memory_within_cap`] that walks the
+/// module's declared linear-memory types directly from the raw Wasm bytes via
+/// [`wasmparser`], *before* [`Module::new`] runs.
+///
+/// `check_module_memory_within_cap` needs a compiled [`Module`], but under the
+/// pooling allocator a module declaring an oversized *initial* memory is
+/// rejected by wasmtime at compile time — so that post-compile walk never runs
+/// for the initial-size case and the caller sees an opaque
+/// [`ExecError::Wasmtime`] instead of the structured
+/// [`ExecError::ModuleMemoryTooLarge`]. Running the identical cap arithmetic on
+/// the raw bytes up-front makes the rejection backend-independent and preserves
+/// the precise requested-byte figure regardless of the configured allocator.
+///
+/// Parse/validation errors are deliberately *not* surfaced here: a malformed
+/// module is left for [`Module::new`] to reject with its richer diagnostics —
+/// this pass only ever refines the memory-cap case, never swallows other
+/// failures.
+fn check_raw_module_memory_within_cap(wasm: &[u8], cap_bytes: usize) -> Result<(), ExecError> {
+    use wasmparser::{Parser, Payload, TypeRef};
+    let cap_u64 = cap_bytes as u64;
+    let check = |mt: &wasmparser::MemoryType| -> Result<(), ExecError> {
+        // Wasm linear-memory sizes are page counts; the default page size is
+        // 64 KiB, overridable per-memory by the custom-page-sizes proposal
+        // (`page_size_log2`). Saturating arithmetic so a pathological
+        // declaration cannot wrap on the multiply.
+        let page_size: u64 = 1u64 << u64::from(mt.page_size_log2.unwrap_or(16));
+        let min_bytes = mt.initial.saturating_mul(page_size);
+        if min_bytes > cap_u64 {
+            return Err(ExecError::ModuleMemoryTooLarge {
+                requested_bytes: min_bytes,
+                limit_bytes: cap_u64,
+            });
+        }
+        if let Some(max_pages) = mt.maximum {
+            let max_bytes = max_pages.saturating_mul(page_size);
+            if max_bytes > cap_u64 {
+                return Err(ExecError::ModuleMemoryTooLarge {
+                    requested_bytes: max_bytes,
+                    limit_bytes: cap_u64,
+                });
+            }
+        }
+        Ok(())
+    };
+    for payload in Parser::new(0).parse_all(wasm) {
+        // Bail to `Module::new` on any parse hiccup — we only refine here.
+        let Ok(payload) = payload else { return Ok(()) };
+        match payload {
+            Payload::MemorySection(reader) => {
+                for mem in reader {
+                    let Ok(mt) = mem else { return Ok(()) };
+                    check(&mt)?;
+                }
+            }
+            Payload::ImportSection(reader) => {
+                for im in reader {
+                    let Ok(im) = im else { return Ok(()) };
+                    if let TypeRef::Memory(mt) = im.ty {
+                        check(&mt)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Best-effort refinement of a pooling-allocator instantiation error into a
 /// typed [`ExecError::ModuleMemoryTooLarge`] (MED finding).
 ///
@@ -1276,6 +1344,18 @@ impl TensorWasmExecutor {
         cfg: &SpawnConfig,
         wasm: &[u8],
     ) -> Result<(TensorWasmInstance, Module, ModuleHash), ExecError> {
+        // Pre-compile memory-cap walk (exec-S-2 / mem-H5): reject a module
+        // whose *declared* linear memory exceeds the engine cap with a
+        // structured `ModuleMemoryTooLarge` BEFORE `Module::new` (and before
+        // any instance slot is charged). Under the pooling allocator an
+        // oversized *initial* memory is otherwise refused by wasmtime at
+        // compile time with an opaque "memory ... exceeds the limit" error
+        // that masks the typed variant the post-compile
+        // `check_module_memory_within_cap` already produces for the
+        // declared-maximum and imported cases. Checking the raw bytes here
+        // makes the rejection — and its precise requested-byte figure —
+        // backend-independent (on-demand vs. pooling).
+        check_raw_module_memory_within_cap(wasm, self.engine.config().effective_memory_cap())?;
         let slot_guard = self.charge_instance_slot(cfg.tenant_id)?;
         // Compile (and cache) the module first; the cap check lives
         // inside `compile_module_cached` so an oversized blob fails
@@ -1867,14 +1947,20 @@ impl TensorWasmExecutor {
             .get_func(&mut guard.store, export)
             .ok_or_else(|| ExecError::MissingExport(export.to_string()))?;
 
-        // Branch on argument arity: the empty-args case uses the typed
-        // fast path so we don't disturb the behaviour every existing
-        // `() -> ()` test relies on (and so the dynamic-call overhead
-        // stays off the bench path). The non-empty case takes the
-        // dynamic `Func::call_async` path with `&[Val]` IO buffers; the
-        // result vec is pre-sized to the export's declared result arity
-        // so wasmtime can write straight into it.
-        let call_outcome = if args.is_empty() {
+        // Branch on the export's full signature. The typed fast path is
+        // reserved for genuine `() -> ()` exports — no args AND no results
+        // — so we don't disturb the behaviour every existing void-export
+        // test relies on (and so the dynamic-call overhead stays off the
+        // bench path). A no-arg export that nonetheless RETURNS a value
+        // (e.g. `tick: () -> i32`) must NOT take this branch: a
+        // `typed::<(), ()>` view of it is rejected by wasmtime with
+        // "type mismatch with results: expected 0 types, found N". Every
+        // other shape — args present, results present, or both — takes the
+        // dynamic `Func::call_async` path with `&[Val]` IO buffers (params
+        // may legitimately be empty); the result vec is pre-sized to the
+        // export's declared result arity so wasmtime can write into it.
+        let func_ty = func.ty(&guard.store);
+        let call_outcome = if args.is_empty() && func_ty.results().len() == 0 {
             match func.typed::<(), ()>(&guard.store) {
                 Ok(typed) => typed
                     .call_async(&mut guard.store, ())
@@ -1884,7 +1970,6 @@ impl TensorWasmExecutor {
             }
         } else {
             let params: Vec<Val> = args.iter().copied().map(WasmArg::into_val).collect();
-            let func_ty = func.ty(&guard.store);
             // `Val::I32(0)` is just a placeholder — wasmtime overwrites
             // every slot before returning. The element count must match
             // the export's declared result arity exactly or wasmtime
