@@ -16,8 +16,7 @@ tracks this as item #6.
 
 ## Motivation
 
-The v0.5 external audit (RFP in [`docs/SECURITY-AUDIT-RFP.md`](SECURITY-AUDIT-RFP.md))
-will probe two questions about the JIT pipeline:
+The v0.5 external audit will probe two questions about the JIT pipeline:
 
 1. **Soundness** — can the JIT-emitted PTX produce a different result
    than the original Wasm body, in any condition?
@@ -129,8 +128,6 @@ implements the standard `|g - c| <= max(abs, rel * |c|) OR ulp_dist
 ## Related docs
 
 - [SECURITY-AUDIT.md](SECURITY-AUDIT.md) — internal pre-audit posture
-- [SECURITY-AUDIT-RFP.md](SECURITY-AUDIT-RFP.md) — RFP shape for the
-  v0.5 external audit
 - [AUTO-OFFLOAD.md](AUTO-OFFLOAD.md) — pipeline this oracle covers
 - [RISKS.md](RISKS.md) — current "differential testing limited to
   unit tests" callout (item to close once v0.4 wires this end-to-end)

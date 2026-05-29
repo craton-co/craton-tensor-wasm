@@ -162,9 +162,7 @@ for the exact per-task status.
 | Unified content-addressed artifact store | `tensor-wasm-artifacts` | Landed — `DiskArtifactStore` fully implemented and now backs snapshots (T40) and the JIT disk cache (T30). | [`docs/ARTIFACT-STORE.md`](docs/ARTIFACT-STORE.md) |
 
 The full v0.3.7 landings list is in
-[`CHANGELOG.md`](CHANGELOG.md#037---2026-05-28); v0.4 deliverables are
-tracked in
-[`ACTIONABLE-ITEMS-PENDING.md`](ACTIONABLE-ITEMS-PENDING.md#v04-feature-roadmap-added-2026-05-28).
+[`CHANGELOG.md`](CHANGELOG.md#037---2026-05-28).
 
 Full taxonomy: [`docs/BUILD.md`](docs/BUILD.md).
 

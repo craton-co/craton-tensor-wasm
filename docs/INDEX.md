@@ -233,6 +233,7 @@ mechanism that produces every other change that touches them.
 | [../CHANGELOG.md](../CHANGELOG.md) | W3.1 | Keep-a-Changelog log of every notable change, grouped by semver release; the `[Unreleased]` section tracks the v0.2–v0.4 wave work staged on `main`. |
 | [MIGRATION-v0-to-v1.md](MIGRATION-v0-to-v1.md) | W3.2 | Operational checklist a v0.x deployment follows to land on v1.0 cleanly, populated continuously between v0.1 and v1.0. |
 | [PATH-TO-V1.md](PATH-TO-V1.md) | — | The proposed five-milestone roadmap from the current v0.1.0 preview to a v1.0 production release, with explicit anti-goals and open decisions. |
+| [FEATURE-STATUS.md](FEATURE-STATUS.md) | — | Canonical per-feature status matrix (Wired / Landed / Scaffold / Hardware-gated / Planned-v0.4) mapping each major feature to its crate(s) and Cargo feature flag; the single source of truth that README, CHANGELOG, and OPENAI-COMPAT defer to for status. |
 | [../rfcs/README.md](../rfcs/README.md) | W1.7 | Lightweight RFC process: one contributor writes a doc, opens a PR, gives reviewers a week, and a maintainer decides. |
 | [../rfcs/TEMPLATE.md](../rfcs/TEMPLATE.md) | W1.7 | The required starting point for a new RFC; copy to `rfcs/0000-short-kebab-slug.md` and fill in the sections in order. |
 

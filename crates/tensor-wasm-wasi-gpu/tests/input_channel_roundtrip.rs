@@ -61,9 +61,9 @@ fn make_engine_and_linker() -> (wasmtime::Engine, wasmtime::Linker<TestStore>) {
 /// i32`.
 const ECHO_INPUT_WAT: &str = r#"
 (module
-  (import "wasi:tensor/host" "input-len" (func $len (result i32)))
-  (import "wasi:tensor/host" "read-input" (func $read (param i32 i32) (result i32)))
-  (import "wasi:tensor/host" "emit-chunk" (func $emit (param i32 i32) (result i32)))
+  (import "wasi:tensor/host@0.1.0" "input-len" (func $len (result i32)))
+  (import "wasi:tensor/host@0.1.0" "read-input" (func $read (param i32 i32) (result i32)))
+  (import "wasi:tensor/host@0.1.0" "emit-chunk" (func $emit (param i32 i32) (result i32)))
   (memory (export "memory") 1)
 
   ;; Read all staged input into [1024, 1024+n) and emit exactly the
@@ -158,7 +158,7 @@ async fn read_input_clamps_to_available_bytes() {
 async fn read_input_rejects_out_of_bounds_pointer() {
     const OOB_WAT: &str = r#"
     (module
-      (import "wasi:tensor/host" "read-input" (func $read (param i32 i32) (result i32)))
+      (import "wasi:tensor/host@0.1.0" "read-input" (func $read (param i32 i32) (result i32)))
       (memory (export "memory") 1)
       ;; One page = 65536 bytes. Asking to write 16 bytes at offset
       ;; 1_000_000 is well past the end of linear memory.

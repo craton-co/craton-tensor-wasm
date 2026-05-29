@@ -102,6 +102,30 @@ pub struct KernelManifest {
     /// Covered by the v2 signature envelope — tampering with this
     /// field invalidates the signature.
     pub publisher: String,
+    /// Optional launch geometry hint `(grid_size, block_size)` the
+    /// kernel expects, mirroring [`EmittedPtx::launch_geometry`] on the
+    /// freshly-emitted path. Used by the JIT L3 registry-promotion path
+    /// (`KernelCache::get_with_registry_fallback`) to populate the
+    /// promoted L1 entry's geometry instead of falling back to `(0, 0)`.
+    ///
+    /// **Deliberately NOT covered by the v2 signature envelope.**
+    /// Launch geometry is an advisory *launch hint*, not a security
+    /// boundary — the PTX content itself is authenticated by `digest`
+    /// (and transitively by the signature, which binds `digest`). Folding
+    /// geometry into [`KernelManifest::canonical_signed_bytes`] would
+    /// invalidate every previously-signed `twasm-kmf-v2` blob (a magic
+    /// bump to `-v3` plus a dual-version verify path) for no security
+    /// gain, so it is carried as an unsigned hint instead. A bad actor
+    /// who could rewrite this field could at worst mis-hint a launch grid
+    /// for a kernel whose code is already separately authenticated.
+    ///
+    /// `#[serde(default)]` makes manifests serialized before this field
+    /// existed deserialize cleanly (the field reads back as `None`), so
+    /// older on-disk blobs and wire payloads remain forward-compatible.
+    ///
+    /// [`EmittedPtx::launch_geometry`]: crate::ptx_emit::EmittedPtx::launch_geometry
+    #[serde(default)]
+    pub launch_geometry: Option<(u32, u32)>,
 }
 
 impl KernelManifest {
@@ -113,6 +137,14 @@ impl KernelManifest {
     /// `[0u8; 32]` here and filled in afterwards by [`sign_manifest`],
     /// because the publisher's HMAC key is what produces the
     /// signature value.
+    ///
+    /// The optional `launch_geometry` hint defaults to `None`; publishers
+    /// that know the kernel's grid/block geometry chain
+    /// [`Self::with_launch_geometry`] after this constructor to set it.
+    /// Keeping this signature stable (geometry is set via the builder, not
+    /// a new positional argument) is intentional so the cross-crate
+    /// callers in tensor-wasm-cli / tensor-wasm-api and the integration
+    /// tests keep compiling unchanged.
     pub fn new(
         name: String,
         version: String,
@@ -130,7 +162,23 @@ impl KernelManifest {
             signature,
             published_unix_ms,
             publisher,
+            launch_geometry: None,
         }
+    }
+
+    /// Builder: attach an optional launch-geometry hint
+    /// `(grid_size, block_size)` to this manifest and return it.
+    ///
+    /// This is the publisher-facing way to populate the
+    /// [`KernelManifest::launch_geometry`] field without widening
+    /// [`KernelManifest::new`]'s signature. Because geometry is carried
+    /// as an *unsigned* hint (see the field docs), this may be called
+    /// either before or after [`sign_manifest`] without affecting
+    /// signature verification — the canonical signed bytes do not include
+    /// it. Pass `None` to explicitly clear any previously-set hint.
+    pub fn with_launch_geometry(mut self, launch_geometry: Option<(u32, u32)>) -> Self {
+        self.launch_geometry = launch_geometry;
+        self
     }
 
     /// First 8 bytes of `digest` interpreted as a little-endian `u64`.
@@ -150,6 +198,14 @@ impl KernelManifest {
     /// exact wire layout. The output never contains the
     /// `signature` field itself — the MAC is computed over this
     /// blob and stored in `signature`.
+    ///
+    /// The optional `launch_geometry` hint is DELIBERATELY excluded from
+    /// this envelope (see [`KernelManifest::launch_geometry`]): it is an
+    /// advisory launch hint, not a security boundary, so adding it here
+    /// (and bumping the `twasm-kmf-v2` magic) would needlessly invalidate
+    /// every previously-signed manifest. Keeping the envelope byte-for-
+    /// byte identical to the prior v2 form means existing signed blobs
+    /// continue to verify unchanged.
     pub(crate) fn canonical_signed_bytes(&self) -> Vec<u8> {
         // Pre-size: 12 (magic) + 6*8 (length prefixes) + name + version
         // + publisher + 8 (ts) + 4 (sm) + 32 (digest). The exact size
@@ -1191,5 +1247,92 @@ mod tests {
             Err(RegistryError::BadSignature(name)) => assert_eq!(name, "matmul.f32"),
             other => panic!("v1-shaped signature MUST NOT verify under v2 MAC: {other:?}"),
         }
+    }
+
+    // --- launch_geometry: unsigned hint, back-compat ---------------------
+
+    /// `KernelManifest::new` defaults `launch_geometry` to `None`, and
+    /// `with_launch_geometry` is the way to set it. This is the L3
+    /// promotion path's source of truth — the cache reads
+    /// `manifest.launch_geometry` and falls back to `(0, 0)` on `None`.
+    #[test]
+    fn launch_geometry_defaults_none_and_builder_sets_it() {
+        let digest = [0u8; 32];
+        let m = KernelManifest::new(
+            "matmul.f32".to_string(),
+            "1.0.0".to_string(),
+            80,
+            digest,
+            [0u8; 32],
+            0,
+            "p".to_string(),
+        );
+        assert_eq!(m.launch_geometry, None, "new() must default geometry to None");
+        let m = m.with_launch_geometry(Some((8, 128)));
+        assert_eq!(m.launch_geometry, Some((8, 128)));
+        // Clearing back to None is supported.
+        assert_eq!(m.with_launch_geometry(None).launch_geometry, None);
+    }
+
+    /// Geometry rides OUTSIDE the v2 HMAC envelope: setting (or changing)
+    /// it must NOT change the canonical signed bytes, so a manifest signed
+    /// without geometry still verifies after geometry is attached. This is
+    /// what lets the L3 promotion path carry geometry without a
+    /// `twasm-kmf-v2` -> `-v3` format break.
+    #[test]
+    fn launch_geometry_is_unsigned_and_does_not_affect_mac() {
+        let key = [0x42u8; 32];
+        let reg = InMemoryRegistry::new(key);
+        let ptx = "// fake ptx\n".to_string();
+        // Sign WITHOUT geometry (the historical v2 flow).
+        let signed = signed_manifest("matmul.f32", "1.0.0", &ptx, &key);
+        let bytes_before = signed.canonical_signed_bytes();
+        // Attach geometry AFTER signing.
+        let with_geo = signed.with_launch_geometry(Some((8, 128)));
+        let bytes_after = with_geo.canonical_signed_bytes();
+        assert_eq!(
+            bytes_before, bytes_after,
+            "launch_geometry must not alter the canonical signed bytes"
+        );
+        // The original (geometry-less) signature still verifies.
+        reg.verify_signature(&with_geo)
+            .expect("manifest must still verify after attaching unsigned geometry hint");
+    }
+
+    /// Round-trip: a geometry-bearing manifest survives the on-disk
+    /// bincode codec (the same `(manifest, ptx)` envelope `DiskRegistry`
+    /// persists), and a blob serialized WITHOUT the field (older format)
+    /// deserializes with `launch_geometry == None` thanks to
+    /// `#[serde(default)]`.
+    #[test]
+    fn launch_geometry_round_trips_and_old_blobs_default_none() {
+        let key = [0x42u8; 32];
+        let ptx = "// fake ptx\n".to_string();
+        let m = signed_manifest("matmul.f32", "1.0.0", &ptx, &key)
+            .with_launch_geometry(Some((4, 256)));
+
+        // Round-trip through the real disk codec.
+        let blob: ManifestBlob = (m.clone(), ptx.clone());
+        let encoded = encode_manifest_blob(&blob).expect("encode");
+        let (decoded, decoded_ptx) = decode_manifest_blob(&encoded).expect("decode");
+        assert_eq!(decoded.launch_geometry, Some((4, 256)));
+        assert_eq!(decoded_ptx, ptx);
+        // And the signature still verifies after the codec round-trip.
+        verify_manifest_signature(&decoded, &key).expect("decoded manifest must verify");
+
+        // Simulate an OLD blob that predates the field by serializing a
+        // manifest whose geometry is None — it must decode to None, not
+        // error, proving `#[serde(default)]` keeps old blobs readable.
+        let old = signed_manifest("conv2d.f32", "2.0.0", &ptx, &key);
+        assert_eq!(old.launch_geometry, None);
+        let old_blob: ManifestBlob = (old, ptx.clone());
+        let old_encoded = encode_manifest_blob(&old_blob).expect("encode old");
+        let (old_decoded, _) = decode_manifest_blob(&old_encoded).expect("decode old");
+        assert_eq!(
+            old_decoded.launch_geometry, None,
+            "geometry-less blob must deserialize to None"
+        );
+        verify_manifest_signature(&old_decoded, &key)
+            .expect("geometry-less (old-shape) manifest must still verify");
     }
 }

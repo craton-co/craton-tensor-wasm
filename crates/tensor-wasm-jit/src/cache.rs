@@ -868,23 +868,18 @@ impl KernelCache {
         // bump, not the PTX text.
         let emitted = Arc::new(crate::ptx_emit::EmittedPtx {
             text: entry.1.clone(),
-            // TODO(v0.4, format-version bump): thread the real launch geometry
-            // through. `KernelManifest` does NOT currently carry it, and adding a
-            // `launch_geometry` field is NOT compile-safe today: `KernelManifest`
-            // is constructed via the (non-`#[non_exhaustive]`-bypassing) public
-            // `KernelManifest::new` whose call sites live OUTSIDE this crate
-            // (tensor-wasm-cli, tensor-wasm-api, and several integration tests) —
-            // a new required ctor arg breaks all of them. It would also break the
-            // HMAC-signed v2 envelope: `canonical_signed_bytes` would have to fold
-            // geometry in (invalidating every previously-signed manifest, i.e. a
-            // `twasm-kmf-v2` -> `-v3` magic bump) OR leave it unsigned/forgeable.
-            // Geometry is only a launch hint (not a security boundary), but the
-            // signed-format break is real, so this is deferred to a manifest
-            // format-version bump. Until then an L3 registry hit keeps (0, 0),
-            // exactly as the L2 path did before the V2 disk-envelope fix. The
-            // fingerprint inconsistency (the correctness half of this bug) IS
-            // fixed below.
-            launch_geometry: (0, 0),
+            // Thread the real launch geometry through from the manifest.
+            // `KernelManifest::launch_geometry` is an optional, unsigned
+            // hint (publishers set it via `KernelManifest::with_launch_geometry`);
+            // when present we promote it onto the L1 entry so a registry-sourced
+            // kernel carries the same geometry an L1/L2 hit would. When the
+            // manifest omits it (older blobs, or publishers that never set it) we
+            // fall back to `(0, 0)`, exactly as before — geometry is a launch
+            // hint, not a correctness invariant for resolution. The earlier
+            // `(0, 0)` hard-code lost geometry on every L3 hit (the bug the V2
+            // disk envelope fixed on L2); this closes the L3 gap without a signed-
+            // format break, since the hint rides outside the v2 HMAC envelope.
+            launch_geometry: entry.0.launch_geometry.unwrap_or((0, 0)),
         });
         // Fingerprint MUST match the cache key under which this entry is
         // inserted. `put` keys L1 entries by `CacheKey` (whose `blueprint` is the

@@ -58,7 +58,7 @@ sits behind its owning crate's existing feature flag or is gated
 Per-item rationale, cost, and risk live in
 [`docs/PATH-TO-V1.md#post-v036-strategic-features`](docs/PATH-TO-V1.md#post-v036-strategic-features);
 the v0.4+ tracking table in
-[`ACTIONABLE-ITEMS-PENDING.md`](ACTIONABLE-ITEMS-PENDING.md#v04-feature-roadmap-added-2026-05-28)
+`ACTIONABLE-ITEMS-PENDING.md`
 marks the eight rows below as 🟡 scaffold landed.
 
 A late-cycle wave of wire-up tasks (T30, T33–T41) closed several of
