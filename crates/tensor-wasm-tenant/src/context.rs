@@ -42,7 +42,8 @@ use loom::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(feature = "loom"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::mem_pool::{DriverMemPool, MemPoolError};
@@ -136,6 +137,147 @@ impl IsolationKind {
 impl std::fmt::Display for IsolationKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+/// Returned by [`TenantContext::try_acquire_op`] /
+/// [`TenantContext::try_acquire_ops`] when a tenant has exhausted its
+/// time-windowed operation-rate budget.
+///
+/// Distinct from the byte-cap errors (`TensorWasmError::MemoryExhausted` /
+/// `GpuMemoryExhausted`), which are high-water-mark *capacity* refusals: a
+/// rate-limit refusal is transient — the same request will succeed once the
+/// token bucket refills. The struct carries enough context for a scheduler to
+/// back off intelligently (how many tokens were asked for, how many were
+/// available, and the configured steady-state rate) and is deliberately a
+/// crate-local type rather than a new `TensorWasmError` variant: the rate
+/// limiter is an additive, opt-in noisy-neighbour control that this crate owns
+/// end-to-end, and `tensor-wasm-core` (which owns `TensorWasmError`) is a
+/// separate component this crate must not edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimited {
+    /// Tokens (operations) the caller requested.
+    pub requested: u64,
+    /// Tokens available in the bucket at the moment of refusal (after the
+    /// time-based refill was applied). Always `< requested`.
+    pub available: u64,
+    /// Configured steady-state refill rate in tokens per second
+    /// (`ops_per_sec` passed to [`TenantContextBuilder::with_rate_limit`]).
+    pub ops_per_sec: u64,
+    /// Configured bucket depth (`burst` passed to
+    /// [`TenantContextBuilder::with_rate_limit`]).
+    pub burst: u64,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rate limited: requested {} ops, {} available (rate {}/s, burst {})",
+            self.requested, self.available, self.ops_per_sec, self.burst
+        )
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+/// A monotonic-clock token bucket guarding a tenant's operation rate.
+///
+/// The bucket holds up to `burst` tokens and refills at `ops_per_sec` tokens
+/// per second, computed lazily from the elapsed time since the last
+/// observation — there is no background timer thread. Each admitted operation
+/// removes one (or `n`) tokens; a request that cannot be fully satisfied is
+/// rejected with [`RateLimited`] and removes *no* tokens (all-or-nothing), so
+/// a burst of large requests cannot partially drain the bucket and starve
+/// smaller ones mid-flight.
+///
+/// State is `Mutex`-guarded rather than a lock-free atomic pair: the refill
+/// math reads the last-refill instant and the token count together and writes
+/// both back, which is a small critical section but genuinely needs to be
+/// atomic *as a unit*. The lock is held only for the duration of that
+/// arithmetic (no I/O, no syscalls beyond `Instant::now`), so contention is
+/// negligible next to the work an admitted operation actually goes on to do.
+#[derive(Debug)]
+struct TokenBucket {
+    /// Steady-state refill rate, tokens per second. The fractional-token
+    /// accounting (a 100 ops/s bucket refills 1 token every 10 ms) is carried
+    /// on `TokenBucketState::tokens` (an `f64`), so sub-token credit is not
+    /// lost between calls even though the rate itself is a whole number.
+    ops_per_sec: u64,
+    /// Maximum tokens the bucket can hold (the burst depth).
+    burst: u64,
+    /// Mutable bucket state, guarded as a unit.
+    state: Mutex<TokenBucketState>,
+}
+
+#[derive(Debug)]
+struct TokenBucketState {
+    /// Current token count, carried as `f64` to preserve fractional refill
+    /// credit between observations.
+    tokens: f64,
+    /// Last instant the bucket was refilled. Advanced on every
+    /// `try_acquire`, so the next call only credits time since this point.
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    /// Construct a bucket that starts full (`burst` tokens available), so the
+    /// first `burst` operations are admitted immediately before any refill is
+    /// needed. `ops_per_sec` and `burst` are both clamped to a minimum of 1
+    /// so a `with_rate_limit(0, 0)` cannot wedge the tenant into a
+    /// never-admits state — the builder documents that "no rate limit" is
+    /// expressed by *not* calling `with_rate_limit` at all (the `None` default).
+    fn new(ops_per_sec: u64, burst: u64) -> Self {
+        let burst = burst.max(1);
+        let ops_per_sec = ops_per_sec.max(1);
+        Self {
+            ops_per_sec,
+            burst,
+            state: Mutex::new(TokenBucketState {
+                tokens: burst as f64,
+                last_refill: Instant::now(),
+            }),
+        }
+    }
+
+    /// Refill credit accrued over `elapsed`, capped at `burst`.
+    fn refilled(&self, tokens: f64, elapsed: Duration) -> f64 {
+        let credit = elapsed.as_secs_f64() * self.ops_per_sec as f64;
+        (tokens + credit).min(self.burst as f64)
+    }
+
+    /// Attempt to remove `n` tokens, refilling for elapsed wall-clock time
+    /// first. Admits (returns `Ok`) only if at least `n` tokens are available
+    /// after the refill; otherwise returns [`RateLimited`] and leaves the
+    /// bucket untouched (all-or-nothing).
+    ///
+    /// `now` is injected rather than read internally so tests can drive the
+    /// refill deterministically without sleeping; the public
+    /// [`TenantContext::try_acquire_op`] passes `Instant::now()`.
+    fn try_acquire_at(&self, n: u64, now: Instant) -> Result<(), RateLimited> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // `now` may predate `last_refill` only if a caller injected a
+        // non-monotonic instant in a test; `checked_duration_since` yields
+        // `None` there and we credit nothing rather than panicking.
+        let elapsed = now
+            .checked_duration_since(state.last_refill)
+            .unwrap_or(Duration::ZERO);
+        let available = self.refilled(state.tokens, elapsed);
+        let need = n as f64;
+        if available + f64::EPSILON < need {
+            return Err(RateLimited {
+                requested: n,
+                available: available as u64,
+                ops_per_sec: self.ops_per_sec,
+                burst: self.burst,
+            });
+        }
+        state.tokens = available - need;
+        state.last_refill = now;
+        Ok(())
     }
 }
 
@@ -288,6 +430,16 @@ pub struct TenantContext {
     /// crates already depend on, so the graph stays acyclic. Set via
     /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`].
     driver_mem_pool: Option<Arc<dyn DriverMemPool>>,
+
+    /// Optional time-windowed operation-rate limiter. `None` (the default)
+    /// preserves the historical pure high-water-mark byte-cap behaviour —
+    /// no per-operation rate is enforced. When set via
+    /// [`TenantContextBuilder::with_rate_limit`], every
+    /// [`Self::try_acquire_op`] / [`Self::try_acquire_ops`] consults a
+    /// monotonic-clock token bucket and refuses (with [`RateLimited`]) once
+    /// the tenant's steady-state rate plus burst is exceeded, addressing
+    /// noisy-neighbour scheduling without touching the byte counters above.
+    rate_limiter: Option<TokenBucket>,
 
     // Real `cust::context::Context` under the `cuda` feature; otherwise a
     // unit stub so the rest of the crate compiles on CUDA-less hosts.
@@ -511,6 +663,91 @@ impl TenantContext {
             }
         };
         self.publish_gpu_memory_gauge(after);
+    }
+
+    /// Capability-checked variant of [`Self::consume_gpu_bytes`].
+    ///
+    /// Performs the same [`Self::check_capability`] gate the CPU path uses
+    /// ([`Self::consume_bytes_with_capability`]) before touching the GPU
+    /// counter, so the GPU side gets the identical cross-tenant isolation
+    /// guarantee: a [`TenantCapability`] minted for a different tenant is
+    /// rejected with [`TensorWasmError::TenantIsolationViolation`] and the
+    /// `gpu_bytes_in_use` counter is left untouched. On a matching capability
+    /// the behaviour is exactly that of the uncapped [`Self::consume_gpu_bytes`]
+    /// (cap check, `checked_add`, optional driver-pin, metrics publish).
+    ///
+    /// Until this method landed, the GPU counter had *no* capability-gated
+    /// form (unlike `consume_bytes` / `consume_bytes_with_capability`); the
+    /// uncapped [`Self::consume_gpu_bytes`] is retained for the 0.3 line in
+    /// the same way the CPU path keeps its unchecked variant.
+    pub fn consume_gpu_bytes_with_capability(
+        &self,
+        cap: &TenantCapability,
+        n: u64,
+    ) -> Result<(), TensorWasmError> {
+        self.check_capability(cap, "quota.consume_gpu_bytes")?;
+        self.consume_gpu_bytes(n)
+    }
+
+    /// Capability-checked variant of [`Self::release_gpu_bytes`].
+    ///
+    /// Mirrors [`Self::release_bytes_with_capability`] on the GPU side:
+    /// returns [`TensorWasmError::TenantIsolationViolation`] if `cap` was
+    /// minted for a different tenant (leaving the counter untouched);
+    /// otherwise releases exactly as the uncapped [`Self::release_gpu_bytes`]
+    /// (saturating on underflow) and returns `Ok(())`. The public signature
+    /// is `Result` because the capability check is fallible, even though the
+    /// underflow path of the underlying release is a best-effort clamp.
+    pub fn release_gpu_bytes_with_capability(
+        &self,
+        cap: &TenantCapability,
+        bytes: u64,
+    ) -> Result<(), TensorWasmError> {
+        self.check_capability(cap, "quota.release_gpu_bytes")?;
+        self.release_gpu_bytes(bytes);
+        Ok(())
+    }
+
+    /// Attempt to admit a single operation against this tenant's
+    /// time-windowed rate limit.
+    ///
+    /// Convenience wrapper over [`Self::try_acquire_ops`] with `n == 1`. See
+    /// that method for the full contract.
+    pub fn try_acquire_op(&self) -> Result<(), RateLimited> {
+        self.try_acquire_ops(1)
+    }
+
+    /// Attempt to admit `n` operations against this tenant's time-windowed
+    /// rate limit.
+    ///
+    /// When no rate limit was configured (the default — see
+    /// [`TenantContextBuilder::with_rate_limit`]), this is an unconditional
+    /// `Ok(())`, preserving the historical pure byte-cap behaviour. When a
+    /// limit is configured, a monotonic-clock token bucket is refilled for
+    /// the wall-clock time elapsed since the last call and then asked for `n`
+    /// tokens; the call returns `Ok(())` and removes the tokens if at least
+    /// `n` are available, or [`RateLimited`] (leaving the bucket untouched)
+    /// otherwise. The admission is all-or-nothing, so a large request never
+    /// partially drains the bucket.
+    ///
+    /// This gate is orthogonal to the byte caps: it does not read or mutate
+    /// `bytes_in_use` / `gpu_bytes_in_use`. A typical scheduler calls
+    /// `try_acquire_op` per kernel launch (or `try_acquire_ops(bytes)` for a
+    /// bytes/sec budget) and, on `Err`, defers or sheds the request rather
+    /// than failing it permanently — unlike a byte-cap refusal, a rate-limit
+    /// refusal clears on its own once the bucket refills.
+    pub fn try_acquire_ops(&self, n: u64) -> Result<(), RateLimited> {
+        match &self.rate_limiter {
+            Some(bucket) => bucket.try_acquire_at(n, Instant::now()),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether a time-windowed rate limit is configured for this tenant
+    /// (i.e. [`TenantContextBuilder::with_rate_limit`] was called). When
+    /// `false`, [`Self::try_acquire_op`] always admits.
+    pub fn has_rate_limit(&self) -> bool {
+        self.rate_limiter.is_some()
     }
 
     /// Atomically reserve `n` bytes against the quota.
@@ -934,6 +1171,14 @@ pub struct TenantContextBuilder {
     /// enforcement; set via
     /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`].
     driver_mem_pool: Option<Arc<dyn DriverMemPool>>,
+    /// `(ops_per_sec, burst)` for the time-windowed operation-rate limiter.
+    /// `None` (the default) means no rate limit — see
+    /// [`TenantContext::try_acquire_op`]. Set via
+    /// [`TenantContextBuilder::with_rate_limit`]; materialised into a
+    /// [`TokenBucket`] at [`Self::build`] time so the bucket's monotonic
+    /// clock starts ticking when the context goes live, not when the builder
+    /// was created.
+    rate_limit: Option<(u64, u64)>,
     #[cfg(feature = "cuda")]
     cuda_device_index: Option<u32>,
     metrics: Option<TensorWasmMetrics>,
@@ -953,6 +1198,7 @@ impl TenantContextBuilder {
             cuda_mem_pool_quota_bytes: None,
             gpu_memory_bytes_cap: None,
             driver_mem_pool: None,
+            rate_limit: None,
             #[cfg(feature = "cuda")]
             cuda_device_index: None,
             metrics: None,
@@ -1067,6 +1313,33 @@ impl TenantContextBuilder {
         self
     }
 
+    /// Enable a time-windowed operation-rate limiter on this tenant.
+    ///
+    /// `ops_per_sec` is the steady-state refill rate (operations admitted per
+    /// second once the burst budget is spent); `burst` is the bucket depth —
+    /// the maximum number of operations that can be admitted back-to-back
+    /// before the steady-state rate gates further ones. The bucket starts
+    /// full, so the first `burst` operations after `build()` are admitted
+    /// immediately. Both arguments are clamped to a minimum of `1` internally
+    /// so a `(0, 0)` configuration cannot wedge the tenant into a
+    /// never-admits state.
+    ///
+    /// Use this to bound a noisy neighbour's scheduling footprint without
+    /// touching its memory caps: a value such as `with_rate_limit(1000, 200)`
+    /// admits short bursts of up to 200 kernel launches while holding the
+    /// long-run average at 1000/s. The same primitive expresses a bytes/sec
+    /// budget by passing the byte count to
+    /// [`TenantContext::try_acquire_ops`] instead of `1`.
+    ///
+    /// **Default = no rate limit.** Omitting this call (the default) leaves
+    /// [`TenantContext::try_acquire_op`] an unconditional `Ok(())`, preserving
+    /// the historical pure high-water-mark byte-cap behaviour. The limiter is
+    /// purely additive and orthogonal to the byte counters.
+    pub fn with_rate_limit(mut self, ops_per_sec: u64, burst: u64) -> Self {
+        self.rate_limit = Some((ops_per_sec, burst));
+        self
+    }
+
     /// Set the CUDA device index this tenant's context should be built
     /// against. Only meaningful when the `cuda` feature is enabled and
     /// the isolation is `ContextIsolated`. Defaults to device 0.
@@ -1138,6 +1411,9 @@ impl TenantContextBuilder {
             gpu_bytes_in_use: AtomicU64::new(0),
             cuda_mem_pool_quota_bytes: self.cuda_mem_pool_quota_bytes,
             driver_mem_pool: self.driver_mem_pool,
+            rate_limiter: self
+                .rate_limit
+                .map(|(ops_per_sec, burst)| TokenBucket::new(ops_per_sec, burst)),
             cu_context,
             metrics: self.metrics,
             metrics_labels,
@@ -1646,6 +1922,118 @@ mod tests {
             final_value < u64::MAX / 2,
             "final {final_value} suggests wrap-around — the race was not fixed",
         );
+    }
+
+    #[test]
+    fn rate_limit_absent_by_default_always_admits() {
+        // No `with_rate_limit` → the historical pure byte-cap behaviour:
+        // `try_acquire_op` is an unconditional Ok and `has_rate_limit` is
+        // false. Pins the backwards-compat contract.
+        let ctx = TenantContext::builder(TenantId(30)).build();
+        assert!(!ctx.has_rate_limit());
+        for _ in 0..10_000 {
+            ctx.try_acquire_op().expect("no limiter must always admit");
+        }
+    }
+
+    #[test]
+    fn token_bucket_admits_up_to_burst_then_rejects() {
+        // Deterministic, no sleep: drive the bucket at a fixed instant so no
+        // refill happens between calls. A full bucket of depth 5 admits
+        // exactly 5 ops, then rejects.
+        let bucket = TokenBucket::new(/*ops_per_sec*/ 100, /*burst*/ 5);
+        let t0 = Instant::now();
+        for i in 0..5 {
+            bucket
+                .try_acquire_at(1, t0)
+                .unwrap_or_else(|_| panic!("op {i} within burst must be admitted"));
+        }
+        let err = bucket
+            .try_acquire_at(1, t0)
+            .expect_err("6th op past burst must be rejected");
+        assert_eq!(err.requested, 1);
+        assert_eq!(err.available, 0);
+        assert_eq!(err.ops_per_sec, 100);
+        assert_eq!(err.burst, 5);
+    }
+
+    #[test]
+    fn token_bucket_refills_over_time() {
+        // Inject elapsed time rather than sleeping: at 10 ops/s, one token
+        // accrues every 100 ms. Drain the bucket, then advance the injected
+        // clock and confirm refilled tokens are admitted.
+        let bucket = TokenBucket::new(/*ops_per_sec*/ 10, /*burst*/ 2);
+        let t0 = Instant::now();
+        // Drain the initial burst of 2.
+        bucket.try_acquire_at(1, t0).unwrap();
+        bucket.try_acquire_at(1, t0).unwrap();
+        assert!(bucket.try_acquire_at(1, t0).is_err(), "bucket drained");
+
+        // 100 ms later → exactly one token refilled.
+        let t1 = t0 + Duration::from_millis(100);
+        bucket
+            .try_acquire_at(1, t1)
+            .expect("one token should have refilled after 100ms");
+        assert!(
+            bucket.try_acquire_at(1, t1).is_err(),
+            "only one token refilled; second must be rejected"
+        );
+
+        // 1 s after t0 → bucket fully refilled, but capped at burst (2),
+        // not 10. So exactly 2 admits then a reject.
+        let t2 = t0 + Duration::from_secs(1);
+        bucket.try_acquire_at(1, t2).unwrap();
+        bucket.try_acquire_at(1, t2).unwrap();
+        assert!(
+            bucket.try_acquire_at(1, t2).is_err(),
+            "refill is capped at burst depth"
+        );
+    }
+
+    #[test]
+    fn token_bucket_acquire_n_is_all_or_nothing() {
+        // A request larger than the available tokens is rejected without
+        // partially draining the bucket.
+        let bucket = TokenBucket::new(100, 5);
+        let t0 = Instant::now();
+        let err = bucket
+            .try_acquire_at(8, t0)
+            .expect_err("8 > burst 5 must reject");
+        assert_eq!(err.requested, 8);
+        assert_eq!(err.available, 5);
+        // Nothing was removed — a subsequent in-budget request still sees the
+        // full bucket.
+        bucket
+            .try_acquire_at(5, t0)
+            .expect("full burst still available after a rejected over-budget request");
+    }
+
+    #[test]
+    fn try_acquire_ops_via_builder_uses_bytes_per_sec_budget() {
+        // The same primitive expresses a bytes/sec budget: pass the byte
+        // count to `try_acquire_ops`. burst=1000 bytes admits a 600+400
+        // pair, then rejects a third that would exceed the bucket.
+        let ctx = TenantContext::builder(TenantId(31))
+            .with_rate_limit(/*bytes_per_sec*/ 1_000, /*burst*/ 1_000)
+            .build();
+        assert!(ctx.has_rate_limit());
+        ctx.try_acquire_ops(600).unwrap();
+        ctx.try_acquire_ops(400).unwrap();
+        let err = ctx
+            .try_acquire_ops(1)
+            .expect_err("bucket drained to zero bytes");
+        assert_eq!(err.burst, 1_000);
+    }
+
+    #[test]
+    fn rate_limit_zero_args_clamped_to_one() {
+        // `with_rate_limit(0, 0)` must not wedge the tenant into never-admit:
+        // both args clamp to 1, so the first op is admitted (full bucket of 1)
+        // and the second is rejected at the same instant.
+        let bucket = TokenBucket::new(0, 0);
+        let t0 = Instant::now();
+        bucket.try_acquire_at(1, t0).expect("clamped burst of 1 admits one");
+        assert!(bucket.try_acquire_at(1, t0).is_err());
     }
 
     #[test]

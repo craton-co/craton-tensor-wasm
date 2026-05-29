@@ -56,6 +56,11 @@ interface host {
     /// input shape is too big for the host to accept" from "your
     /// input bytes are malformed."
     kernel-args-unsupported,
+    /// A device-memory handle (from `alloc`) passed to `free` /
+    /// `memcpy-h2d` / `memcpy-d2h` is not registered, or belongs to
+    /// another instance. Mirrors `invalid-kernel` for device buffers:
+    /// a guest cannot forge another instance's handle.
+    invalid-handle,
   }
 
   /// Opaque handle to a compiled PTX kernel. Scoped to the calling
@@ -141,6 +146,61 @@ interface host {
   /// Block until all outstanding GPU work on the calling context has
   /// finished. On no-CUDA hosts this is a no-op.
   sync: func() -> result<_, abi-error>;
+
+  /// Opaque handle to an explicit device-memory allocation. Scoped to
+  /// the calling instance — passing a handle that belongs to another
+  /// instance to `free` / `memcpy-h2d` / `memcpy-d2h` is rejected with
+  /// `invalid-handle`.
+  type device-handle = u64;
+
+  /// Allocate an explicit device buffer of `size` bytes and return a
+  /// handle.
+  ///
+  /// Unlike the CUDA Unified Memory pointer arguments accepted by
+  /// `launch` (which require a UVM-capable host), an explicit device
+  /// buffer works on any CUDA host: the guest stages bytes into it with
+  /// `memcpy-h2d`, launches a kernel against the device pointer, then
+  /// reads results back with `memcpy-d2h`.
+  ///
+  /// Hard caps enforced by the host:
+  ///   * `MAX_DEVICE_ALLOC_BYTES` = 256 MiB per call.
+  ///   * `MAX_DEVICE_ALLOCS_PER_INSTANCE` = 4096 live buffers per
+  ///     instance.
+  ///   * `MAX_TOTAL_DEVICE_BYTES` = 16 * `MAX_DEVICE_ALLOC_BYTES`
+  ///     aggregate per instance.
+  /// Exceeding any cap returns `quota-exceeded`. A zero-size request
+  /// returns `invalid-args`.
+  ///
+  /// On no-CUDA hosts the arguments are validated and a handle is
+  /// reserved in the per-instance registry, but no real device memory
+  /// is allocated and the call returns `not-available` — matching the
+  /// `launch` no-CUDA stub.
+  alloc: func(size: u64) -> result<device-handle, abi-error>;
+
+  /// Release a device buffer previously returned by `alloc`. Passing a
+  /// handle that is unknown or belongs to another instance returns
+  /// `invalid-handle`. Double-free returns `invalid-handle`.
+  free: func(handle: device-handle) -> result<_, abi-error>;
+
+  /// Copy `len` bytes from the caller's linear memory at `src-ptr` into
+  /// the device buffer named by `handle`.
+  ///
+  /// The host bounds-checks `[src-ptr, src-ptr + len)` against the
+  /// caller's linear memory (out-of-bounds / overflow returns
+  /// `invalid-pointer`) and checks `len` against the buffer's allocated
+  /// size (a copy past the end returns `invalid-args`). On no-CUDA hosts
+  /// the arguments are validated and the call returns `not-available`.
+  memcpy-h2d: func(handle: device-handle, src-ptr: u32, len: u32) -> result<_, abi-error>;
+
+  /// Copy `len` bytes from the device buffer named by `handle` into the
+  /// caller's linear memory at `dst-ptr`.
+  ///
+  /// The host bounds-checks `[dst-ptr, dst-ptr + len)` against the
+  /// caller's linear memory (out-of-bounds / overflow returns
+  /// `invalid-pointer`) and checks `len` against the buffer's allocated
+  /// size (a copy past the end returns `invalid-args`). On no-CUDA hosts
+  /// the arguments are validated and the call returns `not-available`.
+  memcpy-d2h: func(dst-ptr: u32, handle: device-handle, len: u32) -> result<_, abi-error>;
 
   /// Most recent error message recorded by any wasi-cuda call on this
   /// instance, as a UTF-8 string. Empty string means no error recorded.

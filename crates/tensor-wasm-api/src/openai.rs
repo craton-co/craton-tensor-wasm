@@ -974,6 +974,7 @@ fn exec_error_code(err: &ExecError) -> &'static str {
     match err {
         ExecError::Timeout(_) => "deadline_elapsed",
         ExecError::CapacityExhausted { .. } => "capacity_exhausted",
+        ExecError::TenantCapacityExhausted { .. } => "tenant_capacity_exhausted",
         ExecError::ModuleMemoryTooLarge { .. } => "module_memory_too_large",
         ExecError::ModuleTooLarge { .. } => "module_too_large",
         ExecError::MissingExport(_) => "missing_export",

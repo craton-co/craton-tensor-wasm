@@ -74,12 +74,38 @@ tracing-subscriber.workspace = true
 # compat suite runs cleanly under each backend feature.
 tensor-wasm-snapshot = { workspace = true }
 
+# Integration test for the `mock-cuda` seam. Gated on the feature so the
+# default `cargo test` (no GPU, no mock) does not try to compile it; CI
+# runs it with `cargo test -p tensor-wasm-mem --features mock-cuda`.
+[[test]]
+name = "mock_cuda_branches"
+required-features = ["mock-cuda"]
+
 [features]
 # Default is empty so `cargo build` works on hosts without a CUDA toolkit
 # (cust's build script panics without one). The `unified-memory` feature is
 # opt-in via `--features unified-memory` on CUDA hosts. CI may also enable it
 # once stub libraries are provisioned.
 default = []
+# `mock-cuda` provides hardware-free test doubles for the CUDA backings
+# (see `src/mock_cuda.rs`). It is dep-less and off by default. Its purpose
+# is to make three logic paths CI-runnable on a host with no GPU — paths
+# that previously only ran behind `#[ignore]`'d hardware tests:
+#
+#   * the tenant-accounting ROLLBACK branch of
+#     `UnifiedBuffer::new_with_visible_window_on_with_tenant_context`
+#     (`release_gpu_bytes` after a failed driver allocation),
+#   * the leak-recording / free-on-drop `Drop` discipline of the CUDA
+#     backings, and
+#   * the tenant-pool free-on-drop path (`TenantPoolBacking::drop` ->
+#     `TenantMemPool::deallocate`).
+#
+# The mocks (`MockUnifiedBacking` implementing `UnifiedBacking`, and
+# `MockDriverMemPool` implementing `tensor_wasm_core::mem_pool::DriverMemPool`)
+# expose an INJECTABLE allocation failure so a test can deterministically
+# trigger the failure/rollback branch that real hardware never fails on in
+# CI. Enable with `--features mock-cuda`.
+mock-cuda = []
 unified-memory = ["dep:cust"]
 # `cudarc-backend` is the cust → cudarc migration spike. When enabled it
 # pulls in the `cudarc` crate and exposes a parallel `UnifiedBuffer`

@@ -35,6 +35,8 @@ Last updated: 2026-05-28 (v0.3.7 — workspace version bump)
 
 A third option has appeared since W1.2 wrote the spike: NVlabs `cuda-oxide` v0.1.0 alpha (released 2026-05-09) is now under evaluation per [`rfcs/0001-cuda-oxide-integration.md`](../rfcs/0001-cuda-oxide-integration.md), which proposes a three-way live evaluation with a contingent v0.5 default flip.
 
+**Cross-cutting verification gap:** all three backends (cust, cudarc, cuda-oxide) share the property that their allocation / advise / prefetch paths are exercised on hosted CI only against the link-time stub libraries — the real driver calls have never run in CI. The complete inventory of these written-but-unverified-on-hardware paths, and the gated [`.github/workflows/gpu.yml`](../.github/workflows/gpu.yml) lane that closes the gap, is in [`docs/HARDWARE-GATED-WORK.md`](HARDWARE-GATED-WORK.md).
+
 **Owner:** GPU integration maintainers.
 
 ---
@@ -139,6 +141,7 @@ The following items from the audit cycle remain open at v0.1.0:
 - **Snapshot fuzz harness** for structure-aware mutation of valid snapshots (a byte-fuzz target exists at `fuzz/fuzz_targets/fuzz_snapshot_restore.rs`).
 - **End-to-end multi-tenant load test** (1000 cold starts/sec SLO claim is unverified).
 - **`cust` migration plan** to `cudarc` — spike landed (see the cust EOL row above and `docs/CUDARC-SPIKE.md`); full cutover still pending.
+- **Hardware verification of the CUDA paths** — the allocation / prefetch backends, the `cuStreamAddCallback` async dispatch, the device-memory host functions, `try_grow_in_place`, the experimental wmma MatMul lowering, and the cuda-oxide host backend are all written but unverified on real silicon. Inventory and the gated `gpu.yml` CI lane that validates them: [`docs/HARDWARE-GATED-WORK.md`](HARDWARE-GATED-WORK.md).
 
 Each is tracked as a GitHub issue with the `risk-register` label.
 

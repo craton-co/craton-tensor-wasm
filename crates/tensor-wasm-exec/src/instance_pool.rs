@@ -327,7 +327,7 @@ impl InstancePool {
         // `max_instances`, charging the replacement before releasing
         // the spent one would trip CapacityExhausted.
         drop(spent);
-        executor.release_instance_slot();
+        executor.release_instance_slot(cfg.tenant_id);
 
         // Streaming spawns are never recycled — count the drop and
         // stop here. See module docs.
@@ -393,7 +393,7 @@ impl InstancePool {
                 "pool reset exceeded deadline; replacement instance dropped to keep invoke latency bounded",
             );
             drop(replacement);
-            executor.release_instance_slot();
+            executor.release_instance_slot(cfg.tenant_id);
             self.drops_total.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -407,7 +407,7 @@ impl InstancePool {
             }
             Err(TrySendError::Full(dropped)) | Err(TrySendError::Disconnected(dropped)) => {
                 drop(dropped);
-                executor.release_instance_slot();
+                executor.release_instance_slot(cfg.tenant_id);
                 self.drops_total.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -460,7 +460,7 @@ impl InstancePool {
                     // Channel filled by a concurrent pre-warm? Drop
                     // and release the slot — defence against the
                     // (theoretical) double-build race.
-                    executor.release_instance_slot();
+                    executor.release_instance_slot(cfg.tenant_id);
                 } else {
                     self.warm_total.fetch_add(1, Ordering::Relaxed);
                 }
@@ -469,7 +469,7 @@ impl InstancePool {
                 let module = module_opt.as_ref().expect("module captured on i==0");
                 let inst = executor.rebuild_pooled_from_module(cfg, module).await?;
                 if sender.try_send(inst).is_err() {
-                    executor.release_instance_slot();
+                    executor.release_instance_slot(cfg.tenant_id);
                 } else {
                     self.warm_total.fetch_add(1, Ordering::Relaxed);
                 }
@@ -497,7 +497,7 @@ impl InstancePool {
                 // invariant honest.
                 let (inst, module, _) = executor.build_pooled_instance(cfg, wasm).await?;
                 drop(inst);
-                executor.release_instance_slot();
+                executor.release_instance_slot(cfg.tenant_id);
                 module
             }
         };
@@ -524,7 +524,7 @@ impl InstancePool {
                 let local = entry;
                 while let Ok(inst) = local.receiver.try_recv() {
                     drop(inst);
-                    executor.release_instance_slot();
+                    executor.release_instance_slot(cfg.tenant_id);
                     self.warm_total.fetch_sub(1, Ordering::Relaxed);
                 }
                 o.get().clone()
@@ -573,9 +573,10 @@ impl InstancePool {
     /// out is dropped, and the corresponding slot is released.
     pub fn shutdown(&self, executor: &TensorWasmExecutor) {
         for entry in self.pools.iter() {
+            let tenant = entry.key().tenant_id;
             while let Ok(inst) = entry.value().receiver.try_recv() {
                 drop(inst);
-                executor.release_instance_slot();
+                executor.release_instance_slot(tenant);
                 self.warm_total.fetch_sub(1, Ordering::Relaxed);
                 self.drops_total.fetch_add(1, Ordering::Relaxed);
             }

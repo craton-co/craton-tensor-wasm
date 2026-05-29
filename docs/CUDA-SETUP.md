@@ -726,6 +726,8 @@ GitHub-hosted runners have no GPU. The Craton TensorWasm CI workflow does **not*
 
 Tests that actually launch kernels are marked `#[ignore = "requires CUDA hardware"]` and skipped on hosted runners. They execute on the S22 self-hosted runner, which has the real toolkit installed per the matrix at the top of this document.
 
+The full inventory of code paths that are written but **unverified on hardware** because of this gap — and the on-demand `.github/workflows/gpu.yml` lane that runs the `#[ignore]`d suite plus the `--features cuda` benches once a `[self-hosted, gpu]` runner registers — is catalogued in [`docs/HARDWARE-GATED-WORK.md`](HARDWARE-GATED-WORK.md).
+
 ---
 
 ## Cross-references
@@ -734,6 +736,7 @@ Tests that actually launch kernels are marked `#[ignore = "requires CUDA hardwar
 - [`docs/MPS-SETUP.md`](MPS-SETUP.md) — full NVIDIA MPS operations guide (daemon, capabilities, limits, systemd unit).
 - [`docs/PERFORMANCE.md`](PERFORMANCE.md) — measured numbers, sizing guidance for `wasm_memory` / `gpu_memory`, SKU-specific baselines.
 - [`docs/RISKS.md`](RISKS.md) — v0.1.0 known limitations, the `cust → cudarc` migration timeline, and tracked upstream issues.
+- [`docs/HARDWARE-GATED-WORK.md`](HARDWARE-GATED-WORK.md) — inventory of CUDA code paths written but unverified on hardware, and the gated `gpu.yml` CI lane that validates them once a self-hosted GPU runner registers.
 - [`docs/CUDARC-SPIKE.md`](CUDARC-SPIKE.md) — the cust → cudarc migration spike: API mapping, parallel-backend strategy, cutover gates.
 - [`docs/PATH-TO-V1.md`](PATH-TO-V1.md) — v0.2 milestone exit criteria, including the S22 runner provisioning that this document targets.
 - [NVIDIA CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/) — upstream reference.

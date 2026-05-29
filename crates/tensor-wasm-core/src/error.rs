@@ -113,6 +113,94 @@ fn is_retryable_io_kind(kind: io::ErrorKind) -> bool {
     )
 }
 
+/// Number of consecutive bare (un-prefixed) hex digits that trips the
+/// long-hex redaction rule used by [`redact`]. Sixteen digits is a 64-bit
+/// value printed without a `0x` prefix; the floor is high enough that short
+/// bare-hex / decimal literals embedded in ordinary diagnostics (a `byte 42`
+/// offset, a small error code) are left intact.
+const LONG_HEX_THRESHOLD: usize = 16;
+
+/// Returns `true` if `b` is an ASCII hex digit (`0-9`, `a-f`, `A-F`).
+fn is_hex_digit(b: u8) -> bool {
+    b.is_ascii_digit() || matches!(b, b'a'..=b'f' | b'A'..=b'F')
+}
+
+/// Masks pointer-, path-, and long-hex-shaped tokens in `s`, returning a new
+/// `String`. See [`TensorWasmError::redacted_inner`] for the exact rules; this
+/// is the hand-rolled, dependency-free scanner backing that accessor.
+fn redact(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Tokens are delimited by ASCII whitespace; copy whitespace verbatim
+        // so the redacted text keeps the original layout.
+        if bytes[i].is_ascii_whitespace() {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        // Find the end of the current whitespace-delimited token.
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let token = &s[start..i];
+        out.push_str(&redact_token(token));
+    }
+    out
+}
+
+/// Redacts a single whitespace-delimited token, preserving trailing ASCII
+/// punctuation (`:`, `,`, `;`, `.`, closing brackets/quotes) so a masked
+/// token embedded in prose keeps its surrounding punctuation.
+fn redact_token(token: &str) -> String {
+    const MASK: &str = "<redacted>";
+
+    // Peel trailing punctuation off so e.g. `0x1234,` masks the address but
+    // keeps the comma.
+    let trimmed = token.trim_end_matches(|c: char| {
+        matches!(c, ':' | ',' | ';' | '.' | ')' | ']' | '}' | '\'' | '"' | '`')
+    });
+    let suffix = &token[trimmed.len()..];
+    let core = trimmed;
+
+    if core.is_empty() {
+        return token.to_string();
+    }
+
+    let bytes = core.as_bytes();
+    let masked = {
+        // Pointer-shaped: `0x` / `0X` followed by >=1 hex digit.
+        if core.len() > 2
+            && bytes[0] == b'0'
+            && (bytes[1] == b'x' || bytes[1] == b'X')
+            && bytes[2..].iter().all(|&b| is_hex_digit(b))
+        {
+            true
+        // Unix-style path: starts with `/` and contains another `/`.
+        } else if bytes[0] == b'/' && core[1..].contains('/') {
+            true
+        // Windows-style path: drive letter + `:\` + body.
+        } else if core.len() > 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\'
+        {
+            true
+        // Long bare hex run (>= threshold digits, no `0x` prefix).
+        } else {
+            core.len() >= LONG_HEX_THRESHOLD && bytes.iter().all(|&b| is_hex_digit(b))
+        }
+    };
+
+    if masked {
+        format!("{MASK}{suffix}")
+    } else {
+        token.to_string()
+    }
+}
+
 /// The unified error type for every TensorWasm crate.
 ///
 /// Variants are deliberately broad — host-level code matches on the variant to
@@ -326,6 +414,47 @@ impl TensorWasmError {
             | TensorWasmError::Serialization(s) => Some(s),
             _ => None,
         }
+    }
+
+    /// Returns the inner diagnostic string with the most obviously sensitive
+    /// token shapes masked, as an operator-log middle tier between the fully
+    /// opaque [`Display`](std::fmt::Display) and the raw [`inner()`](Self::inner)
+    /// / [`Debug`](std::fmt::Debug) text.
+    ///
+    /// For the four vendor-string variants (`CudaError`, `WasmTrap`,
+    /// `WasmCompile`, `Serialization`) this returns `Some` with a redacted
+    /// copy of the inner string; for every other variant (including `Io`,
+    /// whose source is reachable via [`std::error::Error::source`]) it returns
+    /// `None`, mirroring [`inner()`](Self::inner).
+    ///
+    /// # Redaction rules
+    ///
+    /// Scanning is hand-rolled (no `regex` dependency) and replaces each of the
+    /// following token shapes with the literal `<redacted>`:
+    ///
+    /// * **Pointer-shaped tokens** — a `0x` / `0X` prefix followed by one or
+    ///   more hex digits (`0x7ffe0000`). Catches raw addresses and instruction
+    ///   pointers echoed by wasmtime / cust.
+    /// * **Unix-style paths** — a run beginning with `/` that contains at least
+    ///   one more `/` (`/dev/shm/tenant`, `/tmp/mod.wasm`). A lone `/` (e.g. a
+    ///   division operator in a diagnostic) is left intact.
+    /// * **Windows-style paths** — a drive letter followed by `:\` and a path
+    ///   body (`C:\Users\...`).
+    /// * **Long bare hex tokens** — a run of 16 or more hex digits *without* a
+    ///   `0x` prefix (e.g. a 64-bit address printed bare, or a hash). The
+    ///   16-digit floor keeps short bare-hex / decimal literals that appear in
+    ///   ordinary diagnostics (`byte 42`, a small error code) from being
+    ///   swallowed. Note that any `0x`-prefixed run, however short, is masked
+    ///   by the pointer rule above.
+    ///
+    /// A token is delimited by ASCII whitespace; punctuation immediately
+    /// adjacent to a token (a trailing `:` or `,`) is preserved. The masking is
+    /// deliberately conservative — it is a defence-in-depth aid for operator
+    /// logs, **not** a guarantee that the result is safe for tenant-facing
+    /// output. Anything shown to end-users must still go through the opaque
+    /// [`Display`](std::fmt::Display).
+    pub fn redacted_inner(&self) -> Option<String> {
+        self.inner().map(redact)
     }
 
     /// Returns a stable, machine-readable variant name (used in metrics labels).
@@ -641,5 +770,83 @@ mod tests {
         assert_eq!(e1.inner(), Some("hello"));
         assert_eq!(e2.inner(), Some("hello"));
         assert_eq!(e3.inner(), Some("hello"));
+    }
+
+    #[test]
+    fn redacted_inner_masks_pointer() {
+        // A `0x`-prefixed address must be masked; the surrounding prose
+        // survives.
+        let e = TensorWasmError::CudaError("ctx not current at 0x7ffe0000".into());
+        let r = e.redacted_inner().expect("vendor variant yields Some");
+        assert!(
+            !r.contains("0x7ffe0000"),
+            "pointer must be masked, got: {r}",
+        );
+        assert!(r.contains("<redacted>"), "expected mask token, got: {r}");
+        assert!(r.contains("ctx not current at"), "prose must survive: {r}");
+    }
+
+    #[test]
+    fn redacted_inner_masks_unix_path() {
+        let e = TensorWasmError::WasmCompile("bad module at /dev/shm/tenant-7/mod.wasm".into());
+        let r = e.redacted_inner().expect("vendor variant yields Some");
+        assert!(
+            !r.contains("/dev/shm/tenant-7"),
+            "unix path must be masked, got: {r}",
+        );
+        assert!(r.contains("<redacted>"), "expected mask token, got: {r}");
+        assert!(r.contains("bad module at"), "prose must survive: {r}");
+    }
+
+    #[test]
+    fn redacted_inner_masks_windows_path() {
+        let e = TensorWasmError::Serialization("read failed: C:\\Users\\op\\secret.json".into());
+        let r = e.redacted_inner().expect("vendor variant yields Some");
+        assert!(
+            !r.contains("C:\\Users"),
+            "windows path must be masked, got: {r}",
+        );
+        assert!(r.contains("<redacted>"), "expected mask token, got: {r}");
+    }
+
+    #[test]
+    fn redacted_inner_masks_long_hex() {
+        // A 64-bit address printed without a `0x` prefix (16 hex digits) trips
+        // the long-hex rule.
+        let e = TensorWasmError::WasmTrap("trap at deadbeefcafebabe".into());
+        let r = e.redacted_inner().expect("vendor variant yields Some");
+        assert!(
+            !r.contains("deadbeefcafebabe"),
+            "long hex token must be masked, got: {r}",
+        );
+        assert!(r.contains("<redacted>"), "expected mask token, got: {r}");
+    }
+
+    #[test]
+    fn redacted_inner_preserves_ordinary_text() {
+        // Ordinary diagnostic prose — words, a lone `/` (division, not a
+        // path), and small integers — must pass through untouched, so the
+        // redaction does not destroy operator-useful detail. (A `0x`-prefixed
+        // literal is intentionally NOT used here: the documented
+        // pointer-shaped rule masks any `0x` + hex run, including short ones.)
+        let e = TensorWasmError::WasmCompile("invalid opcode at index 3 / 4 byte 42".into());
+        let r = e.redacted_inner().expect("vendor variant yields Some");
+        assert_eq!(
+            r, "invalid opcode at index 3 / 4 byte 42",
+            "ordinary text must be preserved verbatim",
+        );
+    }
+
+    #[test]
+    fn redacted_inner_none_for_structured_variants() {
+        // Mirrors `inner()`: variants without a vendor string have nothing to
+        // redact and return `None`.
+        let mem = TensorWasmError::MemoryExhausted {
+            requested: 1,
+            limit: 1,
+        };
+        let io = TensorWasmError::Io(io::Error::other("/secret/path"));
+        assert!(mem.redacted_inner().is_none());
+        assert!(io.redacted_inner().is_none());
     }
 }

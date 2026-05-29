@@ -22,7 +22,9 @@ use tensor_wasm_core::error::{Result, TensorWasmError};
 use tracing::{debug, instrument};
 
 use crate::format::{SNAPSHOT_VERSION_V2, SNAPSHOT_VERSION_V3};
-use crate::writer::{check_blob_size, limits, payload_crc32, Snapshot, SNAPSHOT_MAGIC};
+use crate::writer::{
+    check_blob_size, limits, payload_crc32, Snapshot, SnapshotMetadata, SNAPSHOT_MAGIC,
+};
 
 #[cfg(feature = "signed-snapshots")]
 use crate::format::{SignatureKind, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN};
@@ -738,6 +740,98 @@ impl SnapshotReader {
         Ok(snapshot)
     }
 
+    /// Streaming restore: authenticate `bytes`, then hand each restored
+    /// memory blob to `sink` one at a time, freeing each blob's backing
+    /// allocation **before** the next is decoded out of the owned
+    /// [`Snapshot`]. Returns the snapshot's [`SnapshotMetadata`] — every
+    /// field except the three large `Vec<u8>` payloads.
+    ///
+    /// # Why this exists (lower peak memory)
+    ///
+    /// [`SnapshotReader::restore`] returns the whole [`Snapshot`] by value,
+    /// so the caller transitively holds `wasm_memory + gpu_memory +
+    /// registers` resident simultaneously — for a multi-GiB GPU snapshot
+    /// that is a large peak. `restore_streaming` instead moves each blob
+    /// into the sink and drops the reader's copy immediately afterward, so
+    /// the reader never holds more than one blob beyond what the sink itself
+    /// chooses to retain. A sink that writes straight to disk, a GPU
+    /// `cuMemcpyHtoD`, or an `mmap`'d region keeps the reader-side resident
+    /// set bounded by a single blob rather than the full snapshot.
+    ///
+    /// # Residual unavoidable copy
+    ///
+    /// The wire format stores `wasm_memory`/`gpu_memory`/`registers` as
+    /// owned, length-prefixed `serde_bytes` fields, and `bincode` decodes
+    /// each into an owned `Vec<u8>` in one shot — there is no incremental
+    /// "decode the next N bytes of this field" hook in the `serde`/`bincode`
+    /// data model. So the full decoded [`Snapshot`] does momentarily exist
+    /// before the first blob is handed off. What this method eliminates is
+    /// the *downstream* redundancy: the caller no longer has to keep the
+    /// whole struct alive after consuming it, and each blob is released as
+    /// soon as the sink has taken it (via [`std::mem::take`]) rather than at
+    /// the end of a `restore` caller's scope. Where the buffered
+    /// decompression `Vec` could be dropped earlier, it is (it is consumed
+    /// by the bincode decode and dropped before the sink runs).
+    ///
+    /// # Verify-before-expose
+    ///
+    /// This method delegates the entire authenticate-then-parse pipeline to
+    /// [`SnapshotReader::restore`] (HMAC/Ed25519 verification, the v4
+    /// artifact-envelope HMAC, the zip-bomb cap, magic/version consistency,
+    /// per-blob caps, CRC32, freshness, and replay). The sink is invoked
+    /// **only** on the `Ok(Snapshot)` returned by that pipeline — no byte of
+    /// any blob is passed to `sink` until every integrity and signature
+    /// check has already passed. A tampered or wrong-key blob returns `Err`
+    /// from `restore` and the sink is never touched.
+    #[instrument(skip(self, bytes, sink), fields(input_len = bytes.len()))]
+    pub fn restore_streaming<S: SnapshotSink>(
+        &self,
+        bytes: &[u8],
+        sink: &mut S,
+    ) -> Result<SnapshotMetadata> {
+        // Full authenticate-then-parse pipeline. Nothing below this line runs
+        // unless every signature / integrity check has already passed, so the
+        // verify-before-expose invariant is inherited verbatim from `restore`.
+        let mut snapshot = self.restore(bytes)?;
+
+        // Stream each blob to the sink and drop the reader's copy right after.
+        // `mem::take` swaps in an empty `Vec` (no allocation) so the owned
+        // bytes move into the sink call and are freed as soon as the sink
+        // returns, rather than all three living until the `Snapshot` drops.
+        sink.wasm_memory(std::mem::take(&mut snapshot.wasm_memory))?;
+        sink.gpu_memory(std::mem::take(&mut snapshot.gpu_memory))?;
+        sink.registers(std::mem::take(&mut snapshot.registers))?;
+
+        debug!(version = snapshot.version, "snapshot restored (streaming)");
+        Ok(snapshot.metadata)
+    }
+
+    /// Streaming restore that writes the three memory blobs, in canonical
+    /// order (`wasm_memory`, then `gpu_memory`, then `registers`), to a
+    /// single [`std::io::Write`] sink.
+    ///
+    /// Thin convenience wrapper over [`SnapshotReader::restore_streaming`]
+    /// for the common "concatenate the payload to a file / socket" case.
+    /// The blobs are written back-to-back with no framing — the caller is
+    /// expected to already know each blob's length from the returned
+    /// [`SnapshotMetadata`] (or from an out-of-band manifest). Each blob is
+    /// dropped immediately after it is written, so the reader-side peak is
+    /// one blob rather than the whole snapshot.
+    ///
+    /// The verify-before-expose ordering is identical to
+    /// [`SnapshotReader::restore_streaming`]: `out` is written to only after
+    /// the full authentication pipeline in [`SnapshotReader::restore`] has
+    /// succeeded.
+    #[instrument(skip(self, bytes, out), fields(input_len = bytes.len()))]
+    pub fn restore_to_writer<W: std::io::Write>(
+        &self,
+        bytes: &[u8],
+        out: &mut W,
+    ) -> Result<SnapshotMetadata> {
+        let mut sink = WriteSink { out };
+        self.restore_streaming(bytes, &mut sink)
+    }
+
     /// Compare `created_unix_ms` against the host's wall clock and the
     /// configured `max_age`. Returns
     /// [`TensorWasmError::SnapshotTooOld`] if the snapshot is older than
@@ -1334,6 +1428,148 @@ impl SnapshotReader {
             "snapshot restored via artifact envelope (T40 default)",
         );
         Ok(Some(snapshot))
+    }
+}
+
+/// Receiver for the memory blobs produced by
+/// [`SnapshotReader::restore_streaming`].
+///
+/// Each method is called **at most once**, in canonical order
+/// (`wasm_memory`, then `gpu_memory`, then `registers`), and only after the
+/// reader has fully authenticated and validated the snapshot — see the
+/// verify-before-expose note on [`SnapshotReader::restore_streaming`]. The
+/// blob is moved into the call by value so the implementation can take
+/// ownership (write it to disk, copy it to the GPU, hand it to an `mmap`'d
+/// region…) without an extra copy; the reader drops its own reference the
+/// instant the method returns.
+///
+/// Returning `Err` from any method aborts the restore and propagates the
+/// error to the [`SnapshotReader::restore_streaming`] caller. Subsequent
+/// blob callbacks are skipped.
+pub trait SnapshotSink {
+    /// Consume the Wasm linear-memory blob.
+    fn wasm_memory(&mut self, bytes: Vec<u8>) -> Result<()>;
+    /// Consume the GPU device-memory blob.
+    fn gpu_memory(&mut self, bytes: Vec<u8>) -> Result<()>;
+    /// Consume the register-file blob.
+    fn registers(&mut self, bytes: Vec<u8>) -> Result<()>;
+}
+
+/// [`SnapshotSink`] adapter that concatenates the three blobs, in canonical
+/// order, into a single [`std::io::Write`]. Backs
+/// [`SnapshotReader::restore_to_writer`].
+struct WriteSink<'a, W: std::io::Write> {
+    out: &'a mut W,
+}
+
+impl<W: std::io::Write> WriteSink<'_, W> {
+    fn write_blob(&mut self, bytes: Vec<u8>) -> Result<()> {
+        // Write, then let `bytes` drop at the end of this call so the blob's
+        // allocation is released before the next blob is decoded out of the
+        // owned `Snapshot`.
+        self.out.write_all(&bytes).map_err(|e| {
+            TensorWasmError::Serialization(format!("restore_to_writer: {e}").into())
+        })
+    }
+}
+
+impl<W: std::io::Write> SnapshotSink for WriteSink<'_, W> {
+    fn wasm_memory(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.write_blob(bytes)
+    }
+    fn gpu_memory(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.write_blob(bytes)
+    }
+    fn registers(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.write_blob(bytes)
+    }
+}
+
+// Memory-mapped restore input path (non-default `mmap` feature). These
+// methods map the snapshot file read-only and feed the mapped bytes through
+// the unchanged verify-then-decode pipeline, avoiding a full read-into-`Vec`
+// of the on-disk blob. Per-method docs carry the full rationale, the
+// verify-before-expose note, and the mmap soundness contract.
+#[cfg(feature = "mmap")]
+impl SnapshotReader {
+    /// Restore a snapshot by memory-mapping the file at `path` instead of
+    /// reading it wholly into a `Vec<u8>` first, then feed the mapped bytes
+    /// through the unchanged verify-then-decode pipeline.
+    ///
+    /// Available only under the non-default `mmap` feature.
+    ///
+    /// # Lower peak memory on the input side
+    ///
+    /// [`SnapshotReader::restore`] takes a `&[u8]`, so a file-based caller
+    /// would normally `std::fs::read` the whole compressed blob into an
+    /// owned `Vec<u8>`. This wrapper maps the file read-only and hands the
+    /// region straight to [`SnapshotReader::restore`]: the OS pages the
+    /// compressed bytes in on demand and can evict clean pages under memory
+    /// pressure, so the compressed input no longer has to be wholly resident
+    /// as an owned allocation. The decompressed payload and decoded
+    /// [`Snapshot`] still follow the usual restore path — this only removes
+    /// the read-into-`Vec` copy on the input side.
+    ///
+    /// # Verify-before-expose
+    ///
+    /// The mapped bytes flow into [`SnapshotReader::restore`] unchanged, so
+    /// the full authenticate-then-parse pipeline runs before any payload byte
+    /// is exposed, exactly as on the in-memory path.
+    ///
+    /// # Safety / soundness
+    ///
+    /// `memmap2::Mmap` is sound only while the underlying file is not mutated
+    /// by another process for the duration of this call (a concurrent
+    /// truncation can fault the reader). Treat the snapshot file as immutable
+    /// — which matches how blobs are produced (atomic-rename of a finished
+    /// tempfile) and consumed (read-only restore). The map is dropped before
+    /// this method returns.
+    #[cfg_attr(docsrs, doc(cfg(feature = "mmap")))]
+    #[instrument(skip(self), fields(path = %path.as_ref().display()))]
+    pub fn restore_from_path_mmap<P: AsRef<std::path::Path>>(
+        &self,
+        path: P,
+    ) -> Result<Snapshot> {
+        let file = std::fs::File::open(path.as_ref()).map_err(|e| {
+            TensorWasmError::Serialization(format!("restore_from_path_mmap open: {e}").into())
+        })?;
+        // SAFETY: we require (and document) that the snapshot file is not
+        // mutated by another process for the duration of this call. The map
+        // is read-only and dropped before we return.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
+            TensorWasmError::Serialization(format!("restore_from_path_mmap mmap: {e}").into())
+        })?;
+        // Feed the mapped bytes through the unchanged verify-then-decode
+        // pipeline. Authentication runs before any payload byte is exposed.
+        self.restore(&mmap)
+    }
+
+    /// Streaming counterpart to [`SnapshotReader::restore_from_path_mmap`]:
+    /// map the file and stream the decoded blobs to `sink`. Combines the
+    /// input-side mmap saving with the output-side per-blob streaming of
+    /// [`SnapshotReader::restore_streaming`]. Returns the snapshot metadata.
+    ///
+    /// Verify-before-expose is preserved: the mapped bytes go through the
+    /// full authentication pipeline before any blob reaches `sink`.
+    #[cfg_attr(docsrs, doc(cfg(feature = "mmap")))]
+    #[instrument(skip(self, sink), fields(path = %path.as_ref().display()))]
+    pub fn restore_streaming_from_path_mmap<P: AsRef<std::path::Path>, S: SnapshotSink>(
+        &self,
+        path: P,
+        sink: &mut S,
+    ) -> Result<SnapshotMetadata> {
+        let file = std::fs::File::open(path.as_ref()).map_err(|e| {
+            TensorWasmError::Serialization(
+                format!("restore_streaming_from_path_mmap open: {e}").into(),
+            )
+        })?;
+        // SAFETY: same immutability contract as `restore_from_path_mmap`.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
+            TensorWasmError::Serialization(
+                format!("restore_streaming_from_path_mmap mmap: {e}").into(),
+            )
+        })?;
+        self.restore_streaming(&mmap, sink)
     }
 }
 

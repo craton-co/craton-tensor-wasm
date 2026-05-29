@@ -169,6 +169,7 @@ need more than ~8 co-located tenants on one GPU.
 | [CUDA-KERNELS.md](CUDA-KERNELS.md) | W4.5 | Practical guide for developers writing CUDA kernels that load and dispatch under TensorWasm's `wasi:cuda` surface, covering both explicit and auto-offload paths. |
 | [PLIRON-PIPELINE.md](PLIRON-PIPELINE.md) | — | Four-wave implementation plan for the Pliron-based auto-offload pipeline (Wasm to PTX via the interim `LoweredOp` IR and cuda-oxide), companion to RFC 0001. |
 | [CUDA-OXIDE-CUTOVER.md](CUDA-OXIDE-CUTOVER.md) | — | Eight-step cutover runbook for the day cuda-oxide v0.2 ships: dependency bump through default-backend flip, gated on four pre-conditions per RFC 0001 Option C. |
+| [HARDWARE-GATED-WORK.md](HARDWARE-GATED-WORK.md) | — | Authoritative inventory of the CUDA code paths that are written but unverified on hardware (allocation/prefetch backends, async dispatch, device-memory host fns, `try_grow_in_place`, experimental wmma MatMul, cuda-oxide host backend) and how the gated `gpu.yml` CI lane validates each. |
 
 ## Operations
 

@@ -1066,13 +1066,47 @@ impl SnapshotWriter {
         let (snapshot_ref, total_uncompressed_bytes) = self.build_snapshot_ref(state)?;
         let payload = bincode::serde::encode_to_vec(&snapshot_ref, bincode::config::legacy())
             .map_err(|e| TensorWasmError::Serialization(format!("bincode encode: {e}").into()))?;
+        // Capture the length now so the post-encode `debug!` does not have to
+        // keep `payload` alive past the envelope encode purely to read
+        // `payload.len()`.
+        let payload_len = payload.len();
+
+        // RESIDUAL UNAVOIDABLE COPY (streaming-restore audit, this wave).
+        //
+        // The ideal here is to stream the bincode output directly into the
+        // artifact envelope's zstd encoder so the full uncompressed `payload`
+        // never lives as an intermediate `Vec<u8>` (this is the same
+        // optimisation `capture_legacy` already performs with
+        // `encode_into_std_write` against the inline zstd encoder above). The
+        // legacy inline path can do that because it owns its own
+        // `zstd::stream::write::Encoder`; the artifact envelope, by contrast,
+        // is sealed behind `tensor_wasm_artifacts::encode_envelope_to_vec`,
+        // whose only public entry point takes the payload as a `&[u8]` slice.
+        // There is no `encode_envelope_to_writer` (the `MacWriter` tee that
+        // would make one possible is private to the artifacts crate), so the
+        // envelope encoder must be handed a fully-materialised slice.
+        //
+        // We therefore cannot avoid holding `payload` (the full uncompressed
+        // bincode blob) across the `encode_envelope_to_vec` call, which itself
+        // allocates the compressed envelope. For a multi-GiB GPU snapshot the
+        // transient peak is `payload` (uncompressed) + the envelope buffer
+        // (compressed, typically a fraction of `payload`). `payload` is
+        // dropped at the end of this function, before the envelope is handed
+        // to the caller.
+        //
+        // Closing this fully requires a `Write`-streaming encode entry point
+        // in `tensor-wasm-artifacts` (tracked separately — this crate must
+        // not reach across the crate boundary to add it). The restore side
+        // does avoid the analogous redundant copy via
+        // `SnapshotReader::restore_streaming` (see `reader.rs`).
         let envelope =
             tensor_wasm_artifacts::encode_envelope_to_vec(&payload, hmac_key).map_err(|e| {
                 TensorWasmError::Serialization(format!("artifact envelope encode: {e}").into())
             })?;
+        drop(payload);
         debug!(
             uncompressed = total_uncompressed_bytes,
-            encoded = payload.len(),
+            encoded = payload_len,
             envelope = envelope.len(),
             "snapshot captured via artifact envelope (T40 default)",
         );

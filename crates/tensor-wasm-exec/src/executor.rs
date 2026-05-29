@@ -19,6 +19,7 @@ use lru::LruCache;
 use tensor_wasm_core::metrics::TensorWasmMetrics;
 use tensor_wasm_core::types::{InstanceId, TenantId};
 use tensor_wasm_jit::cache::KernelCache;
+use tensor_wasm_jit::rewrite::{rewrite_wasm, RewriteOptions};
 use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, instrument, warn};
@@ -141,12 +142,55 @@ pub enum ExecError {
     /// slot in the registry. Mapped to
     /// [`tensor_wasm_core::error::TensorWasmError::MemoryExhausted`] on
     /// the conversion boundary (the API layer surfaces it as 503).
+    /// The executor refused to admit a new instance because an
+    /// admission-control ceiling is already saturated. Surfaced for two
+    /// rejections that the API layer treats identically (503, retryable):
+    ///
+    ///   * the engine-wide live-instance ceiling
+    ///     ([`crate::engine::EngineConfig::max_instances`], exec S-10); or
+    ///   * the spawning tenant's per-tenant fairness cap
+    ///     ([`crate::engine::EngineConfig::max_instances_per_tenant`]), even
+    ///     though the engine-wide ceiling may still have headroom. One tenant
+    ///     hitting its per-tenant cap is refused here WITHOUT affecting any
+    ///     other tenant's ability to spawn.
+    ///
+    /// Surfaced from [`TensorWasmExecutor::spawn_instance`] *before* any
+    /// compile / instantiate work; the failed spawn never consumes a slot
+    /// (engine-wide or per-tenant). Mapped to
+    /// [`tensor_wasm_core::error::TensorWasmError::MemoryExhausted`] on the
+    /// conversion boundary (the API layer surfaces it as 503).
+    ///
+    /// This is the *engine-wide* ceiling: the shared `max_instances` budget is
+    /// saturated and the spawn would succeed once aggregate load drops. The
+    /// remedy is retry-with-backoff and it is no single tenant's fault, so the
+    /// API layer maps it to 503. The per-tenant fairness cap is a distinct
+    /// condition — see [`ExecError::TenantCapacityExhausted`].
     #[error("instance capacity exhausted: {active} active, limit {limit}")]
     CapacityExhausted {
-        /// Live-instance count observed at the rejection point
+        /// Engine-wide live-instance count observed at the rejection point
         /// (post-increment, so `active > limit`).
         active: usize,
-        /// Configured engine-wide ceiling.
+        /// Configured engine-wide `max_instances` ceiling that was exceeded.
+        limit: usize,
+    },
+    /// A single tenant exceeded its per-tenant fairness cap
+    /// ([`crate::engine::EngineConfig::max_instances_per_tenant`]) while the
+    /// shared engine-wide budget still had room. This is semantically
+    /// distinct from [`ExecError::CapacityExhausted`]: the offending tenant is
+    /// over *its own* quota, so the corrective action is for that tenant to
+    /// reduce concurrency — not to wait for global load to drop. The API layer
+    /// maps it to 429 (`tenant_capacity_exhausted`) rather than 503, giving
+    /// callers a quota-specific retry signal. Other tenants are unaffected.
+    #[error(
+        "tenant {tenant} instance capacity exhausted: {active} active, limit {limit}"
+    )]
+    TenantCapacityExhausted {
+        /// The tenant whose per-tenant cap was hit (the spawn's owner).
+        tenant: TenantId,
+        /// That tenant's live-instance count at the rejection point
+        /// (post-increment, so `active > limit`).
+        active: usize,
+        /// The configured per-tenant `max_instances_per_tenant` ceiling.
         limit: usize,
     },
     /// The submitted Wasm module is larger than the configured
@@ -253,6 +297,17 @@ impl From<ExecError> for tensor_wasm_core::error::TensorWasmError {
                 requested: active as u64,
                 limit: limit as u64,
             },
+            // The per-tenant fairness cap collapses to the same resource-
+            // exhaustion shape on the native `TensorWasmError` boundary (the
+            // tenant distinction is preserved on the richer API-layer mapping,
+            // not here). Tenant id is dropped — `TensorWasmError` has no field
+            // for it and it is logged at the rejection site.
+            ExecError::TenantCapacityExhausted { active, limit, .. } => {
+                TensorWasmError::MemoryExhausted {
+                    requested: active as u64,
+                    limit: limit as u64,
+                }
+            }
             ExecError::ModuleTooLarge { len, max } => TensorWasmError::MemoryExhausted {
                 requested: len as u64,
                 limit: max as u64,
@@ -579,6 +634,19 @@ pub struct TensorWasmExecutor {
     /// commits in a single CAS rather than racing against in-flight
     /// spawns that have already passed the check but not yet inserted.
     instance_count: Arc<AtomicUsize>,
+    /// Per-tenant live-instance counts, used to enforce
+    /// [`crate::engine::EngineConfig::max_instances_per_tenant`] (fairness
+    /// bound). Keyed by the spawning [`TenantId`]; the value is the number
+    /// of slots that tenant currently holds. Bumped (with rollback on a
+    /// failed spawn) alongside the engine-wide `instance_count` in
+    /// [`Self::charge_instance_slot`] and decremented in [`Self::terminate`]
+    /// / [`Self::release_instance_slot`]. Empty entries are pruned on
+    /// decrement so a tenant that churns instances does not leak map keys.
+    /// Independent of `instance_count` — the engine-wide cap and the
+    /// per-tenant cap are checked in the same admission step but tracked
+    /// separately so one tenant hitting its cap never perturbs another's
+    /// accounting.
+    tenant_counts: Arc<DashMap<TenantId, usize>>,
     /// Optional metrics handle. When `Some`, spawn/terminate operations
     /// increment the corresponding Prometheus counters / gauges.
     metrics: Option<TensorWasmMetrics>,
@@ -659,6 +727,14 @@ fn lru_cap(requested: usize) -> NonZeroUsize {
 /// zero live instances.
 struct InstanceSlotGuard {
     counter: Arc<AtomicUsize>,
+    /// Per-tenant rollback handle. `Some` carries the per-tenant count map
+    /// plus the tenant whose count was bumped alongside the engine-wide
+    /// `counter`; on a non-committed drop both the engine-wide and the
+    /// per-tenant count are rolled back in lockstep. `None` means no
+    /// per-tenant charge was made (per-tenant cap disabled, or this guard
+    /// only re-protects the engine-wide count — e.g. the post-charge
+    /// register guard in `spawn_instance`).
+    tenant_rollback: Option<(Arc<DashMap<TenantId, usize>>, TenantId)>,
     committed: bool,
 }
 
@@ -666,6 +742,23 @@ impl InstanceSlotGuard {
     fn new(counter: Arc<AtomicUsize>) -> Self {
         Self {
             counter,
+            tenant_rollback: None,
+            committed: false,
+        }
+    }
+
+    /// Construct a guard that, on a non-committed drop, rolls back BOTH the
+    /// engine-wide count and the `tenant`'s per-tenant count. Used by
+    /// [`TensorWasmExecutor::charge_instance_slot`] when a per-tenant cap is
+    /// configured so a failed spawn never leaks either counter.
+    fn with_tenant(
+        counter: Arc<AtomicUsize>,
+        tenant_counts: Arc<DashMap<TenantId, usize>>,
+        tenant: TenantId,
+    ) -> Self {
+        Self {
+            counter,
+            tenant_rollback: Some((tenant_counts, tenant)),
             committed: false,
         }
     }
@@ -682,6 +775,24 @@ impl Drop for InstanceSlotGuard {
             // for admission ordering; the rollback only undoes a count
             // that no other thread depends on observing.
             self.counter.fetch_sub(1, Ordering::Relaxed);
+            if let Some((tenant_counts, tenant)) = &self.tenant_rollback {
+                decrement_tenant_count(tenant_counts, *tenant);
+            }
+        }
+    }
+}
+
+/// Decrement (and prune-on-zero) a tenant's per-tenant live-instance count.
+/// Shared by [`InstanceSlotGuard`]'s rollback, [`TensorWasmExecutor::terminate`],
+/// and [`TensorWasmExecutor::release_instance_slot`] so the prune-empty-entry
+/// policy lives in exactly one place. A `None`/zero entry is a no-op (a
+/// double-decrement cannot drive the count negative).
+fn decrement_tenant_count(tenant_counts: &DashMap<TenantId, usize>, tenant: TenantId) {
+    if let Entry::Occupied(mut e) = tenant_counts.entry(tenant) {
+        let v = e.get_mut();
+        *v = v.saturating_sub(1);
+        if *v == 0 {
+            e.remove();
         }
     }
 }
@@ -783,6 +894,7 @@ impl TensorWasmExecutor {
             next_instance_id: Arc::new(AtomicU64::new(1)),
             module_cache: Arc::new(parking_lot::Mutex::new(LruCache::new(cap))),
             instance_count: Arc::new(AtomicUsize::new(0)),
+            tenant_counts: Arc::new(DashMap::new()),
             metrics: None,
             ticker_warned: Arc::new(OnceLock::new()),
             pool: None,
@@ -803,6 +915,7 @@ impl TensorWasmExecutor {
             next_instance_id: Arc::new(AtomicU64::new(1)),
             module_cache: Arc::new(parking_lot::Mutex::new(LruCache::new(cap))),
             instance_count: Arc::new(AtomicUsize::new(0)),
+            tenant_counts: Arc::new(DashMap::new()),
             metrics: Some(metrics),
             ticker_warned: Arc::new(OnceLock::new()),
             pool: None,
@@ -889,6 +1002,18 @@ impl TensorWasmExecutor {
     /// the call site.
     pub fn module_cache_len(&self) -> usize {
         self.module_cache.lock().len()
+    }
+
+    /// Current per-tenant **admission** count for `tenant`, or `0` if the
+    /// tenant holds no live slots. This is the counter the per-tenant
+    /// fairness cap
+    /// ([`crate::engine::EngineConfig::max_instances_per_tenant`]) is
+    /// enforced against in `spawn_instance`. Exposed for tests and operators
+    /// that want to confirm a tenant's footprint; the count only moves when
+    /// the per-tenant cap is configured (it is otherwise left at 0 and the
+    /// map stays empty).
+    pub fn tenant_instance_count(&self, tenant: TenantId) -> usize {
+        self.tenant_counts.get(&tenant).map(|e| *e.value()).unwrap_or(0)
     }
 
     /// Current **admission** count, sampled atomically. This is the counter
@@ -1015,13 +1140,22 @@ impl TensorWasmExecutor {
         Ok((module, key))
     }
 
-    /// Internal: charge a live-instance slot if the engine cap is configured.
-    /// Returns an [`InstanceSlotGuard`] that rolls the increment back unless
-    /// `commit()` is called. Used by [`Self::spawn_instance`] and
+    /// Internal: charge a live-instance slot, enforcing both the engine-wide
+    /// [`max_instances`](crate::engine::EngineConfig::max_instances) ceiling
+    /// and the optional per-tenant
+    /// [`max_instances_per_tenant`](crate::engine::EngineConfig::max_instances_per_tenant)
+    /// fairness cap keyed by `tenant`. Returns an [`InstanceSlotGuard`] that
+    /// rolls BOTH counts back unless `commit()` is called. Used by
     /// [`Self::build_pooled_instance`] / [`Self::rebuild_pooled_from_module`]
-    /// so the pool's pre-spawn / reset paths share the same admission
-    /// accounting as the bare spawn path.
-    fn charge_instance_slot(&self) -> Result<InstanceSlotGuard, ExecError> {
+    /// (and transitively [`Self::spawn_instance`]) so the pool's pre-spawn /
+    /// reset paths share the same admission accounting as the bare spawn
+    /// path.
+    ///
+    /// Charge order is engine-wide first, then per-tenant. If the per-tenant
+    /// cap rejects, the engine-wide charge is rolled back before returning so
+    /// a tenant hitting its cap never erodes the shared ceiling.
+    fn charge_instance_slot(&self, tenant: TenantId) -> Result<InstanceSlotGuard, ExecError> {
+        // Engine-wide ceiling (exec S-10).
         if let Some(max) = self.engine.config().max_instances {
             let new_count = self.instance_count.fetch_add(1, Ordering::AcqRel) + 1;
             if new_count > max {
@@ -1034,17 +1168,67 @@ impl TensorWasmExecutor {
         } else {
             self.instance_count.fetch_add(1, Ordering::AcqRel);
         }
-        Ok(InstanceSlotGuard::new(self.instance_count.clone()))
+
+        // Per-tenant fairness cap. When unset, the engine-wide charge above
+        // is the whole story and the guard carries no per-tenant rollback.
+        let Some(per_tenant_max) = self.engine.config().max_instances_per_tenant else {
+            return Ok(InstanceSlotGuard::new(self.instance_count.clone()));
+        };
+
+        // Charge the per-tenant count under the DashMap entry lock so the
+        // read-modify-write is atomic against concurrent spawns of the SAME
+        // tenant (different tenants take different shards / entries and never
+        // serialise against each other). On overflow, roll the engine-wide
+        // charge back so the rejected spawn consumes neither counter.
+        let mut entry = self.tenant_counts.entry(tenant).or_insert(0);
+        let new_tenant_count = *entry + 1;
+        if new_tenant_count > per_tenant_max {
+            // Drop the entry guard before mutating other state; the count was
+            // never incremented so there is nothing to roll back on the
+            // per-tenant side.
+            drop(entry);
+            self.instance_count.fetch_sub(1, Ordering::Relaxed);
+            // Distinct from the engine-wide `CapacityExhausted` above: this is
+            // a per-tenant fairness rejection (the offending tenant is over its
+            // own quota while the shared budget still has room). It carries the
+            // tenant id so the API layer can surface a quota-specific 429
+            // (`tenant_capacity_exhausted`) instead of a generic 503. Still log
+            // it server-side for operator visibility.
+            warn!(
+                target: "tensor_wasm_exec::executor",
+                tenant = %tenant,
+                active = new_tenant_count,
+                limit = per_tenant_max,
+                "per-tenant instance cap exhausted; refusing spawn (other tenants unaffected)",
+            );
+            return Err(ExecError::TenantCapacityExhausted {
+                tenant,
+                active: new_tenant_count,
+                limit: per_tenant_max,
+            });
+        }
+        *entry = new_tenant_count;
+        drop(entry);
+        Ok(InstanceSlotGuard::with_tenant(
+            self.instance_count.clone(),
+            self.tenant_counts.clone(),
+            tenant,
+        ))
     }
 
-    /// Internal: explicitly release a live-instance slot. Used by
-    /// [`InstancePool`] when an instance held in a warm channel is dropped
-    /// (channel full on release, reset failed, pool shutdown). Mirrors the
-    /// slot release that [`Self::terminate`] performs for the registered
-    /// case, but does not touch the registry — pooled-but-not-handed-out
-    /// instances were never registered.
-    pub(crate) fn release_instance_slot(&self) {
+    /// Internal: explicitly release a live-instance slot charged for
+    /// `tenant`. Used by [`InstancePool`] when an instance held in a warm
+    /// channel is dropped (channel full on release, reset failed, pool
+    /// shutdown). Mirrors the slot release that [`Self::terminate`] performs
+    /// for the registered case — both the engine-wide and the per-tenant
+    /// count are decremented — but does not touch the registry, since
+    /// pooled-but-not-handed-out instances were never registered. The
+    /// `tenant` is the same one the matching
+    /// [`Self::charge_instance_slot`] was keyed under (the pool always knows
+    /// it via the channel's `(tenant, module_hash)` key).
+    pub(crate) fn release_instance_slot(&self, tenant: TenantId) {
         self.instance_count.fetch_sub(1, Ordering::AcqRel);
+        decrement_tenant_count(&self.tenant_counts, tenant);
     }
 
     /// Internal: compile + instantiate a Wasm module without registering
@@ -1071,7 +1255,7 @@ impl TensorWasmExecutor {
         cfg: &SpawnConfig,
         wasm: &[u8],
     ) -> Result<(TensorWasmInstance, Module, ModuleHash), ExecError> {
-        let slot_guard = self.charge_instance_slot()?;
+        let slot_guard = self.charge_instance_slot(cfg.tenant_id)?;
         // Compile (and cache) the module first; the cap check lives
         // inside `compile_module_cached` so an oversized blob fails
         // before the digest computation matters. The digest is computed
@@ -1108,7 +1292,7 @@ impl TensorWasmExecutor {
         cfg: &SpawnConfig,
         module: &Module,
     ) -> Result<TensorWasmInstance, ExecError> {
-        let slot_guard = self.charge_instance_slot()?;
+        let slot_guard = self.charge_instance_slot(cfg.tenant_id)?;
         let inst = self.instantiate_detached(cfg, module).await?;
         if let Some(m) = &self.metrics {
             m.instance_spawns_total().inc();
@@ -1355,6 +1539,123 @@ impl TensorWasmExecutor {
         }
     }
 
+    /// Internal: when [`EngineConfig::auto_offload`](crate::engine::EngineConfig::auto_offload)
+    /// is enabled, consult the analyser and rewrite offload-candidate
+    /// function bodies into JIT-dispatch trampolines, returning the
+    /// rewritten bytes. On every fallback condition — flag disabled, no JIT
+    /// cache attached (the trampoline's `tensor-wasm:jit/host` imports would
+    /// be unlinkable), analysis error, rewrite error, or a rewrite that
+    /// swapped nothing — the original `wasm` slice is borrowed unchanged.
+    /// This is the activation point for the swap the `auto_offload` module
+    /// documents as consultation-only: with the flag off it stays exactly
+    /// that.
+    ///
+    /// Never returns an error: a failure to analyse or rewrite must not fail
+    /// a spawn, so every error path logs and falls back to the original
+    /// module.
+    fn maybe_rewrite_for_offload<'w>(
+        &self,
+        cfg: &SpawnConfig,
+        wasm: &'w [u8],
+    ) -> std::borrow::Cow<'w, [u8]> {
+        use std::borrow::Cow;
+
+        if !self.engine.config().auto_offload {
+            return Cow::Borrowed(wasm);
+        }
+        // The rewritten module imports `tensor-wasm:jit/host` (dispatch /
+        // alloc / free). Those imports only link when a `KernelCache` is
+        // attached (`with_jit_cache`) — without one the rewritten module
+        // would fail to instantiate, which is strictly worse than running
+        // the original on the CPU. Skip the rewrite and fall back.
+        let Some(cache) = self.jit_cache.as_ref() else {
+            debug!(
+                target: "tensor_wasm_exec::executor",
+                tenant = %cfg.tenant_id,
+                "auto_offload enabled but no JIT cache attached; falling back to original module",
+            );
+            return Cow::Borrowed(wasm);
+        };
+
+        // Resolve the detector thresholds once and use the SAME config for
+        // the consultation pass and the rewrite so they agree on candidates.
+        let detector = self
+            .engine
+            .config()
+            .auto_offload_detector
+            .unwrap_or_default();
+
+        // Consultation pass: emit the per-function verdicts (the historical
+        // consultation-only behaviour) and decide whether any function is
+        // worth offloading before paying for the rewrite. If analysis
+        // errors, fall back.
+        let verdicts = match crate::auto_offload::analyse_with_config(wasm, &detector) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    target: "tensor_wasm_exec::executor",
+                    tenant = %cfg.tenant_id,
+                    error = %e,
+                    "auto_offload analysis failed; falling back to original module",
+                );
+                return Cow::Borrowed(wasm);
+            }
+        };
+        let any_offload = verdicts.iter().any(|v| {
+            matches!(
+                v.verdict,
+                tensor_wasm_jit::detector::DetectorVerdict::Offload
+            )
+        });
+        if !any_offload {
+            // No candidate — nothing to rewrite. Borrow the original.
+            return Cow::Borrowed(wasm);
+        }
+
+        // Rewrite. Thread the spawning tenant so the cache pre-population is
+        // keyed under the tenant the runtime dispatch looks up against
+        // (cache keys are tenant-scoped), and the resolved detector so the
+        // rewrite swaps exactly the functions the consultation flagged.
+        let opts = RewriteOptions {
+            tenant_id: cfg.tenant_id,
+            detector,
+            ..RewriteOptions::default()
+        };
+        match rewrite_wasm(wasm, &opts, cache) {
+            Ok(outcome) if !outcome.offloaded_functions.is_empty() => {
+                info!(
+                    target: "tensor_wasm_exec::executor",
+                    tenant = %cfg.tenant_id,
+                    offloaded = outcome.offloaded_functions.len(),
+                    total_defined = outcome.total_defined_functions,
+                    "auto_offload rewrite applied; instantiating trampoline-augmented module",
+                );
+                Cow::Owned(outcome.rewritten_wasm)
+            }
+            Ok(_) => {
+                // The detector flagged a candidate but the rewriter declined
+                // every swap (e.g. unsupported signature / lowering refusal).
+                // Nothing changed — borrow the original to skip a needless
+                // recompile of identical-but-reencoded bytes.
+                debug!(
+                    target: "tensor_wasm_exec::executor",
+                    tenant = %cfg.tenant_id,
+                    "auto_offload rewrite swapped no functions; using original module",
+                );
+                Cow::Borrowed(wasm)
+            }
+            Err(e) => {
+                warn!(
+                    target: "tensor_wasm_exec::executor",
+                    tenant = %cfg.tenant_id,
+                    error = %e,
+                    "auto_offload rewrite failed; falling back to original module",
+                );
+                Cow::Borrowed(wasm)
+            }
+        }
+    }
+
     /// Compile + instantiate a Wasm module. Returns the assigned [`InstanceId`].
     ///
     /// # Deadline / ticker contract
@@ -1380,6 +1681,17 @@ impl TensorWasmExecutor {
         cfg: SpawnConfig,
         wasm: &[u8],
     ) -> Result<InstanceId, ExecError> {
+        // Auto-offload (opt-in via `EngineConfig::auto_offload`). When
+        // enabled, consult the analyser and — if any function is flagged —
+        // rewrite the module's offload-candidate bodies into JIT-dispatch
+        // trampolines, then instantiate the rewritten module instead of the
+        // original. Any failure (analysis error, rewrite error, no JIT cache
+        // to link the trampoline imports, or a rewrite that swaps nothing)
+        // falls back to the original bytes — enabling the flag can never
+        // fail a spawn that would otherwise have succeeded. Returns a `Cow`
+        // so the disabled / fallback paths borrow the caller's slice with
+        // zero copies.
+        let effective_wasm = self.maybe_rewrite_for_offload(&cfg, wasm);
         // Refactored to share the detached compile+instantiate path
         // (`build_pooled_instance`) with [`InstancePool`]. The semantics
         // are byte-for-byte preserved: admission control runs first
@@ -1387,12 +1699,26 @@ impl TensorWasmExecutor {
         // register. The split lets the pool reuse the heavy work
         // without the registry insert when holding warm instances in a
         // channel.
-        let (inst, _module, _module_hash) = self.build_pooled_instance(&cfg, wasm).await?;
+        let (inst, _module, _module_hash) =
+            self.build_pooled_instance(&cfg, effective_wasm.as_ref()).await?;
         // `build_pooled_instance` returns with the slot committed (charged),
         // so a failure between here and the registry insert must release
         // the slot explicitly. Wrap it in a `defer`-style guard so any
         // `?` from `register_pooled_instance` does not leak the count.
-        let slot_guard = InstanceSlotGuard::new(self.instance_count.clone());
+        // `build_pooled_instance` committed BOTH the engine-wide and (when a
+        // per-tenant cap is configured) the per-tenant count, so this
+        // re-protect guard must roll back both on a failed register. Use the
+        // tenant-aware constructor only when the per-tenant cap is active so
+        // we don't decrement a per-tenant entry that was never charged.
+        let slot_guard = if self.engine.config().max_instances_per_tenant.is_some() {
+            InstanceSlotGuard::with_tenant(
+                self.instance_count.clone(),
+                self.tenant_counts.clone(),
+                cfg.tenant_id,
+            )
+        } else {
+            InstanceSlotGuard::new(self.instance_count.clone())
+        };
         let id = self.register_pooled_instance(inst)?;
         // Successful register: defuse the rollback so the slot stays
         // charged until `terminate`. (Without this defuse the guard's
@@ -1577,13 +1903,28 @@ impl TensorWasmExecutor {
     #[instrument(skip(self), fields(instance = %id))]
     pub async fn terminate(&self, id: InstanceId) -> Result<(), ExecError> {
         match self.instances.remove(&id) {
-            Some(_) => {
+            Some((_, handle)) => {
                 // Release the admission slot reserved at spawn time
                 // (exec S-10). The decrement only runs on successful
                 // removal — a `NotFound` terminate must not free a
                 // slot it never charged, or a tenant could double-
                 // terminate to inflate their effective cap.
                 self.instance_count.fetch_sub(1, Ordering::AcqRel);
+                // Mirror the engine-wide release on the per-tenant count
+                // (fairness cap). Only taken when a per-tenant cap is
+                // configured — otherwise `tenant_counts` is never populated
+                // and we skip the per-instance lock entirely, preserving the
+                // historical lock-free terminate path. When the cap IS active,
+                // read the owning tenant off the now-removed instance and
+                // decrement its slot, pruning the map entry at zero. Locking
+                // the per-instance mutex to read the tenant is uncontended on
+                // the common path (the registry held the only handle); a
+                // racing in-flight call would briefly hold it, which is
+                // correct — we want the post-call tenant.
+                if self.engine.config().max_instances_per_tenant.is_some() {
+                    let tenant = handle.lock().await.tenant_id();
+                    decrement_tenant_count(&self.tenant_counts, tenant);
+                }
                 if let Some(m) = &self.metrics {
                     m.instance_terminations_total().inc();
                     m.active_instances().dec();

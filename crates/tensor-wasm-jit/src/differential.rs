@@ -614,6 +614,244 @@ pub fn conv2d_reference(
 }
 
 // ---------------------------------------------------------------------
+// Structural oracle for the EXPERIMENTAL wmma MatMul lowering (gate).
+//
+// We cannot execute PTX in this environment, so the oracle that gates
+// the `enable_experimental_matmul` flag validates the STRUCTURE of the
+// emitted instruction sequence rather than a numeric readback: the
+// correct fragment shapes, the correct number of `wmma.mma.sync` ops for
+// the tiling, correct accumulator chaining (the mma's `c` and `d`
+// operands name the same accumulator fragment), and register-declaration
+// consistency (every `%rb`/`%f` fragment register the wmma ops name is
+// covered by the `.reg` header). This is the same class of structural
+// assertion the `ptx_emit` unit tests use; the proptest harness drives
+// it across random m16n16k16 inputs so the gate must pass before anyone
+// flips the feature on.
+// ---------------------------------------------------------------------
+
+/// A single mismatch found by [`check_wmma_structure`]. The proptest
+/// gate fails on any non-empty report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WmmaStructuralError {
+    /// The expected number of `wmma.mma.sync` ops (one per k16 tile)
+    /// was not emitted.
+    MmaCountMismatch {
+        /// Number of `wmma.mma.sync` ops the tiling requires.
+        expected: usize,
+        /// Number actually emitted.
+        actual: usize,
+    },
+    /// A required wmma load/store op is missing from the sequence.
+    MissingOp(&'static str),
+    /// An operand or accumulator fragment had the wrong register count.
+    FragmentShapeMismatch {
+        /// Which fragment (a/b/c/d).
+        which: &'static str,
+        /// Register count the m16n16k16 contract requires.
+        expected: usize,
+        /// Register count found in the emitted operand list.
+        actual: usize,
+    },
+    /// The mma.sync's `c` accumulator operand and `d` result operand are
+    /// not the same fragment — the accumulator is not chained in place.
+    AccumulatorNotChained,
+    /// A fragment register named by a wmma op is outside the range the
+    /// `.reg` header declares.
+    RegisterDeclInconsistent(&'static str),
+}
+
+/// Expected wmma fragment register count for the m16n16k16 shape. Mirrors
+/// `ptx_emit::WMMA_OPERAND_FRAG_REGS` / `WMMA_ACC_FRAG_REGS` (both 8);
+/// re-declared here so the oracle is an INDEPENDENT check rather than a
+/// tautology against the emitter's own constants.
+const WMMA_FRAG_REGS: usize = 8;
+
+/// Parse the `{...}` operand list that follows the first occurrence of
+/// `marker` in `text`, returning the comma-separated register tokens.
+fn fragment_operands(text: &str, marker: &str) -> Option<Vec<String>> {
+    let start = text.find(marker)?;
+    let rest = &text[start..];
+    let open = rest.find('{')?;
+    let close = rest[open..].find('}')? + open;
+    let inner = &rest[open + 1..close];
+    Some(
+        inner
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+    )
+}
+
+/// Parse the count `N` from a `.reg .<class> %<prefix><N>;` declaration.
+fn reg_decl_count(text: &str, prefix: &str) -> Option<u32> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with(".reg") && line.contains(&format!("%{prefix}<")) {
+            return line
+                .split('<')
+                .nth(1)
+                .and_then(|s| s.split('>').next())
+                .and_then(|s| s.trim().parse().ok());
+        }
+    }
+    None
+}
+
+/// Returns the max index used by a `%prefixN` register token list, or
+/// `None` if any token is malformed.
+fn max_reg_index(tokens: &[String], prefix: &str) -> Option<u32> {
+    let needle = format!("%{prefix}");
+    let mut max = None;
+    for t in tokens {
+        let n: u32 = t.strip_prefix(&needle)?.parse().ok()?;
+        max = Some(max.map_or(n, |m: u32| m.max(n)));
+    }
+    max
+}
+
+/// Validate the structure of the EXPERIMENTAL wmma MatMul PTX for a
+/// single `m16n16k16` tile. Returns the (possibly empty) list of
+/// structural errors; an empty list is a PASS.
+///
+/// This is the gate the differential proptest runs across random
+/// matmul inputs. It encodes the m16n16k16 contract independently of the
+/// emitter so a regression in `ptx_emit` surfaces here as a divergence
+/// rather than silently changing both sides.
+pub fn check_wmma_structure(ptx: &str, m: u32, n: u32, k: u32) -> Vec<WmmaStructuralError> {
+    let mut errs = Vec::new();
+
+    // One mma.sync per 16x16x16 tile. For the single modelled shape this
+    // is the product of the per-dimension tile counts (== 1 for 16/16/16).
+    let tiles_m = m.div_ceil(16) as usize;
+    let tiles_n = n.div_ceil(16) as usize;
+    let tiles_k = k.div_ceil(16) as usize;
+    let expected_mma = tiles_m * tiles_n * tiles_k;
+    let actual_mma = ptx.matches("wmma.mma.sync.aligned").count();
+    if actual_mma != expected_mma {
+        errs.push(WmmaStructuralError::MmaCountMismatch {
+            expected: expected_mma,
+            actual: actual_mma,
+        });
+    }
+
+    // Required ops in the sequence.
+    for (needle, label) in [
+        ("wmma.load.a.sync.aligned.row.m16n16k16", "wmma.load.a"),
+        ("wmma.load.b.sync.aligned.col.m16n16k16", "wmma.load.b"),
+        ("wmma.load.c.sync.aligned.row.m16n16k16", "wmma.load.c"),
+        ("wmma.store.d.sync.aligned.row.m16n16k16", "wmma.store.d"),
+    ] {
+        if !ptx.contains(needle) {
+            errs.push(WmmaStructuralError::MissingOp(label));
+        }
+    }
+
+    // Fragment shapes: a/b operands and the c/d accumulator must each
+    // name exactly WMMA_FRAG_REGS registers.
+    let frag_checks: [(&str, &str); 3] = [
+        ("wmma.load.a.sync.aligned.row.m16n16k16", "a"),
+        ("wmma.load.b.sync.aligned.col.m16n16k16", "b"),
+        ("wmma.load.c.sync.aligned.row.m16n16k16", "c"),
+    ];
+    for (marker, which) in frag_checks {
+        if let Some(ops) = fragment_operands(ptx, marker) {
+            if ops.len() != WMMA_FRAG_REGS {
+                errs.push(WmmaStructuralError::FragmentShapeMismatch {
+                    which,
+                    expected: WMMA_FRAG_REGS,
+                    actual: ops.len(),
+                });
+            }
+        }
+    }
+
+    // Accumulator chaining: the mma.sync names four fragments
+    // `d, a, b, c`; `d` and `c` must be identical (paired accumulator).
+    if let Some(mma_ops) = fragment_operands(ptx, "wmma.mma.sync.aligned") {
+        // The operand list is the FIRST {…}; for `d, a, b, c` the four
+        // fragments are concatenated, so the d-fragment is the first
+        // WMMA_FRAG_REGS tokens and the c-fragment is the last
+        // WMMA_FRAG_REGS tokens of the full four-fragment register list.
+        // `fragment_operands` only captured the first braces group (the
+        // `d` fragment); we re-parse the full instruction to compare d vs c.
+        let _ = mma_ops; // d-fragment shape is covered by the store check.
+        if let Some(line) = ptx.lines().find(|l| l.contains("wmma.mma.sync.aligned")) {
+            // Collect every {...} group on the (possibly continued) mma
+            // instruction. The emitter writes it on one logical line.
+            let groups: Vec<Vec<String>> = collect_brace_groups(line);
+            if groups.len() == 4 {
+                let d_frag = &groups[0];
+                let c_frag = &groups[3];
+                if d_frag != c_frag {
+                    errs.push(WmmaStructuralError::AccumulatorNotChained);
+                }
+                if d_frag.len() != WMMA_FRAG_REGS {
+                    errs.push(WmmaStructuralError::FragmentShapeMismatch {
+                        which: "d",
+                        expected: WMMA_FRAG_REGS,
+                        actual: d_frag.len(),
+                    });
+                }
+            } else {
+                errs.push(WmmaStructuralError::AccumulatorNotChained);
+            }
+        }
+    }
+
+    // Register-declaration consistency: every %rb/%f fragment register
+    // named by the wmma ops must be inside the `.reg` header's declared
+    // range (count == max_index + 1).
+    let collect_all = |marker: &str, prefix: &str| -> Option<u32> {
+        fragment_operands(ptx, marker).and_then(|ops| max_reg_index(&ops, prefix))
+    };
+    let rb_max = [
+        collect_all("wmma.load.a.sync.aligned.row.m16n16k16", "rb"),
+        collect_all("wmma.load.b.sync.aligned.col.m16n16k16", "rb"),
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    if let Some(used) = rb_max {
+        match reg_decl_count(ptx, "rb") {
+            Some(decl) if decl > used => {}
+            _ => errs.push(WmmaStructuralError::RegisterDeclInconsistent("rb")),
+        }
+    }
+    if let Some(used) = collect_all("wmma.load.c.sync.aligned.row.m16n16k16", "f") {
+        match reg_decl_count(ptx, "f") {
+            Some(decl) if decl > used => {}
+            _ => errs.push(WmmaStructuralError::RegisterDeclInconsistent("f")),
+        }
+    }
+
+    errs
+}
+
+/// Collect every `{...}` register-list group on a single PTX line, in
+/// order. Used to pull the four fragments off the `wmma.mma.sync`
+/// instruction (`d, a, b, c`).
+fn collect_brace_groups(line: &str) -> Vec<Vec<String>> {
+    let mut groups = Vec::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close_rel) = after.find('}') else {
+            break;
+        };
+        let inner = &after[..close_rel];
+        let toks: Vec<String> = inner
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        groups.push(toks);
+        rest = &after[close_rel + 1..];
+    }
+    groups
+}
+
+// ---------------------------------------------------------------------
 // CUDA runtime detection.
 // ---------------------------------------------------------------------
 
@@ -749,6 +987,48 @@ mod tests {
             }
             other => panic!("expected HostOnlyOk, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wmma_structure_accepts_opt_in_emission() {
+        use crate::ptx_emit::{emit_with, EmitConfig};
+        let bp = TensorWasmKernelBlueprint::new("matmul").push(TensorWasmOp::MatMul {
+            m: 16,
+            n: 16,
+            k: 16,
+        });
+        let cfg = EmitConfig {
+            enable_experimental_matmul: true,
+            ..EmitConfig::default()
+        };
+        let ptx = emit_with(&bp, &cfg).expect("opt-in emit");
+        let errs = check_wmma_structure(&ptx.text, 16, 16, 16);
+        assert!(errs.is_empty(), "structural oracle flagged: {errs:?}");
+    }
+
+    #[test]
+    fn wmma_structure_rejects_unchained_accumulator() {
+        // Hand-craft a wmma block where the mma's `d` and `c` fragments
+        // differ — the exact silent-miscompile the oracle must catch.
+        let ptx = "\
+            .reg .b32   %rb<16>;\n\
+            .reg .f32   %f<16>;\n\
+            wmma.load.a.sync.aligned.row.m16n16k16.global.f16 {%rb0, %rb1, %rb2, %rb3, %rb4, %rb5, %rb6, %rb7}, [%rd0], 16;\n\
+            wmma.load.b.sync.aligned.col.m16n16k16.global.f16 {%rb8, %rb9, %rb10, %rb11, %rb12, %rb13, %rb14, %rb15}, [%rd2], 16;\n\
+            wmma.load.c.sync.aligned.row.m16n16k16.global.f32 {%f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7}, [%rd3], 16;\n\
+            wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32 {%f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7}, {%rb0, %rb1, %rb2, %rb3, %rb4, %rb5, %rb6, %rb7}, {%rb8, %rb9, %rb10, %rb11, %rb12, %rb13, %rb14, %rb15}, {%f8, %f9, %f10, %f11, %f12, %f13, %f14, %f15};\n\
+            wmma.store.d.sync.aligned.row.m16n16k16.global.f32 [%rd1], {%f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7}, 16;\n";
+        let errs = check_wmma_structure(ptx, 16, 16, 16);
+        assert!(errs.contains(&WmmaStructuralError::AccumulatorNotChained));
+    }
+
+    #[test]
+    fn wmma_structure_rejects_missing_store() {
+        let ptx = "\
+            wmma.load.a.sync.aligned.row.m16n16k16.global.f16 {%rb0, %rb1, %rb2, %rb3, %rb4, %rb5, %rb6, %rb7}, [%rd0], 16;\n\
+            wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32 {%f0}, {%rb0}, {%rb8}, {%f0};\n";
+        let errs = check_wmma_structure(ptx, 16, 16, 16);
+        assert!(errs.contains(&WmmaStructuralError::MissingOp("wmma.store.d")));
     }
 
     #[test]

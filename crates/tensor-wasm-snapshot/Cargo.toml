@@ -55,6 +55,12 @@ zeroize = { workspace = true, optional = true }
 # to emit and parse the legacy envelope byte-for-byte; this feature is
 # purely additive for v0.3.8.
 tensor-wasm-artifacts = { workspace = true, optional = true }
+# Optional memory-mapped input path for restore. When the `mmap` feature is
+# enabled, `SnapshotReader::restore_from_path_mmap` maps the snapshot file
+# read-only instead of reading it wholly into a `Vec<u8>`, then feeds the
+# mapped bytes through the unchanged verify-then-decode pipeline. Off by
+# default so the no-feature build keeps its current dependency surface.
+memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -96,8 +102,15 @@ signed-snapshots = ["dep:hmac", "dep:sha2", "dep:subtle", "dep:zeroize", "dep:ed
 # `SnapshotWriter::with_legacy_envelope()` / `SnapshotWriter::capture_legacy`
 # also opt out per-call when the feature is enabled.
 artifact-backing = ["dep:tensor-wasm-artifacts"]
+# Memory-mapped restore input path (non-default). Pulls in the optional
+# `memmap2` dependency and enables `SnapshotReader::restore_from_path_mmap`
+# / `restore_streaming_from_path_mmap`, which map the snapshot file instead
+# of reading it into a `Vec<u8>` before restore. Purely additive: it changes
+# only how the input bytes are sourced; the verify-then-decode pipeline is
+# unchanged, so authentication still runs before any payload byte is exposed.
+mmap = ["dep:memmap2"]
 
 [package.metadata.docs.rs]
 all-features = false
-features = ["signed-snapshots", "artifact-backing"]
+features = ["signed-snapshots", "artifact-backing", "mmap"]
 rustdoc-args = ["--cfg", "docsrs"]

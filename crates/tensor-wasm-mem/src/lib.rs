@@ -27,6 +27,8 @@ pub mod cuda_oxide_backend;
 #[cfg(feature = "cudarc-backend")]
 pub mod cudarc_backend;
 pub mod isolation;
+#[cfg(feature = "mock-cuda")]
+pub mod mock_cuda;
 pub mod pinned_host;
 pub mod pool;
 pub mod unified;

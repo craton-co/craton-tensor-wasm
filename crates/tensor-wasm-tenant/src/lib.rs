@@ -48,7 +48,8 @@ pub mod context;
 pub mod registry;
 
 pub use context::{
-    isolation_downgrade_count, IsolationKind, TenantCapability, TenantContext, TenantContextBuilder,
+    isolation_downgrade_count, IsolationKind, RateLimited, TenantCapability, TenantContext,
+    TenantContextBuilder,
 };
 pub use registry::{
     MpsDecision, RegistryAdminCapability, RegistryError, TenantRegistry, MPS_CONTROL_PATH,

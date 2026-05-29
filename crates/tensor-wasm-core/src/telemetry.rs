@@ -278,6 +278,7 @@ mod tests {
 /// raced in between the `INIT.is_completed()` check and `try_init`) drops
 /// the freshly-built provider without touching the global slot.
 #[cfg(feature = "otlp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "otlp")))]
 pub fn init_with_otlp(
     level: LogLevel,
     json: bool,
@@ -429,6 +430,7 @@ fn run_otlp_init(level: LogLevel, json: bool, otlp_env_var: &str) -> Result<(), 
 /// `PropagatorRejected` variant) does not break downstream code. The
 /// enum has no `Default` impl — construct variants explicitly.
 #[cfg(feature = "otlp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "otlp")))]
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum OtlpInitError {

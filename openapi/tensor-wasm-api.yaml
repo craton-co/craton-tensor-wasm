@@ -1217,6 +1217,17 @@ components:
             - not_implemented
             - snapshot_signing_not_configured
             - snapshot_signature_invalid
+            # Executor admission / resource limits (mapped from ExecError).
+            # `capacity_exhausted` (503) is the engine-wide instance ceiling;
+            # `tenant_capacity_exhausted` (429) is a single tenant over its
+            # per-tenant fairness cap (max_instances_per_tenant) — distinct
+            # retry semantics (reduce your own concurrency vs. wait for global
+            # load to drop).
+            - capacity_exhausted
+            - tenant_capacity_exhausted
+            - module_too_large
+            - module_memory_too_large
+            - epoch_ticker_not_running
         message:
           type: string
           description: Human-readable description (not part of the contract).

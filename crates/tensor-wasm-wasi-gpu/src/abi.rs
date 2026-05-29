@@ -61,6 +61,35 @@ pub const FN_LAST_ERROR_LEN: &str = "wasi_cuda_last_error_len";
 ///   `-2` knows it must fix its buffer rather than assume "no error."
 pub const FN_LAST_ERROR_COPY: &str = "wasi_cuda_last_error_copy";
 
+/// Function name: `alloc(size_lo, size_hi) -> i64`.
+///
+/// Allocates an explicit device buffer of `size` bytes (the `u64` size is
+/// split into two i32 halves on the raw ABI to fit the i32-only import
+/// shape; the Component-Model binding sees a single `u64`). Returns a
+/// non-negative device-buffer handle on success, or a negative
+/// [`AbiError`] code on failure. Unlike the Unified-Memory pointer path used
+/// by `launch`, the returned handle names a discrete device allocation that
+/// works on any CUDA host.
+pub const FN_ALLOC: &str = "wasi_cuda_alloc";
+
+/// Function name: `free(handle_lo, handle_hi) -> i32`. Releases a buffer
+/// previously returned by [`FN_ALLOC`]. Returns 0 on success, a negative
+/// [`AbiError`] on failure ([`AbiError::InvalidHandle`] for an unknown or
+/// cross-owner handle).
+pub const FN_FREE: &str = "wasi_cuda_free";
+
+/// Function name: `memcpy_h2d(handle_lo, handle_hi, src_ptr, len) -> i32`.
+/// Copies `len` bytes from the guest linear-memory region `[src_ptr,
+/// src_ptr+len)` into the device buffer named by `handle`. Returns 0 on
+/// success, a negative [`AbiError`] on failure.
+pub const FN_MEMCPY_H2D: &str = "wasi_cuda_memcpy_h2d";
+
+/// Function name: `memcpy_d2h(dst_ptr, handle_lo, handle_hi, len) -> i32`.
+/// Copies `len` bytes from the device buffer named by `handle` into the
+/// guest linear-memory region `[dst_ptr, dst_ptr+len)`. Returns 0 on
+/// success, a negative [`AbiError`] on failure.
+pub const FN_MEMCPY_D2H: &str = "wasi_cuda_memcpy_d2h";
+
 /// Negative i32 status codes returned by the wasi-cuda host functions.
 ///
 /// These are stable across TensorWasm versions; client code may match on the
@@ -105,6 +134,12 @@ pub enum AbiError {
     /// malformed." See `wit/wasi-cuda.wit` and
     /// [`crate::kernel_args::parse_argv`] for the contract.
     KernelArgsUnsupported = -10,
+    /// A device-memory handle (from `alloc`) was passed to `free` /
+    /// `memcpy-h2d` / `memcpy-d2h` that is not registered, or that belongs
+    /// to another instance. Mirrors [`AbiError::InvalidKernel`] for the
+    /// kernel registry: a guest cannot forge another instance's device
+    /// buffer handle. See [`crate::device_mem::DeviceMemRegistry`].
+    InvalidHandle = -11,
 }
 
 impl AbiError {
@@ -126,6 +161,7 @@ impl AbiError {
             AbiError::InvalidDimensions => "invalid_dimensions",
             AbiError::InvalidArgs => "invalid_args",
             AbiError::KernelArgsUnsupported => "kernel_args_unsupported",
+            AbiError::InvalidHandle => "invalid_handle",
         }
     }
 }
@@ -169,6 +205,7 @@ mod tests {
         assert_eq!(AbiError::InvalidDimensions.code(), -8);
         assert_eq!(AbiError::InvalidArgs.code(), -9);
         assert_eq!(AbiError::KernelArgsUnsupported.code(), -10);
+        assert_eq!(AbiError::InvalidHandle.code(), -11);
     }
 
     #[test]
@@ -181,6 +218,7 @@ mod tests {
             AbiError::KernelArgsUnsupported.name(),
             "kernel_args_unsupported"
         );
+        assert_eq!(AbiError::InvalidHandle.name(), "invalid_handle");
     }
 
     #[test]
@@ -192,6 +230,10 @@ mod tests {
             FN_LAST_ERROR_PTR,
             FN_LAST_ERROR_LEN,
             FN_LAST_ERROR_COPY,
+            FN_ALLOC,
+            FN_FREE,
+            FN_MEMCPY_H2D,
+            FN_MEMCPY_D2H,
         ] {
             assert!(name.starts_with("wasi_cuda_"));
         }

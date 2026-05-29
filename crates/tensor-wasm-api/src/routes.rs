@@ -793,6 +793,26 @@ impl From<ExecError> for ApiError {
                     message: "engine instance capacity exhausted; retry later".to_string(),
                 }
             }
+            // Per-tenant fairness cap: this specific tenant is over its own
+            // instance quota while the shared engine budget still has room.
+            // 429 (not 503) tells the caller it is a quota condition — the
+            // remedy is to reduce *their* concurrency, not to wait for global
+            // load to drop. The tenant id / counters are server-internal
+            // (already logged at the exec rejection site).
+            ExecError::TenantCapacityExhausted { active, limit, .. } => {
+                tracing::warn!(
+                    target: "tensor_wasm_api::routes",
+                    active = *active,
+                    limit = *limit,
+                    "exec error: per-tenant instance capacity exhausted",
+                );
+                ApiError {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    kind: "tenant_capacity_exhausted".to_string(),
+                    message: "tenant instance quota exhausted; reduce concurrency or retry later"
+                        .to_string(),
+                }
+            }
             // Per B3.2: adversarial Wasm bytes that exceed the pre-compile
             // size cap. 413 mirrors the body-too-large family. The
             // observed length and configured cap are operator-only state.

@@ -1455,7 +1455,12 @@
               "invalid_request",
               "not_implemented",
               "snapshot_signing_not_configured",
-              "snapshot_signature_invalid"
+              "snapshot_signature_invalid",
+              "capacity_exhausted",
+              "tenant_capacity_exhausted",
+              "module_too_large",
+              "module_memory_too_large",
+              "epoch_ticker_not_running"
             ]
           },
           "message": {

@@ -13,7 +13,7 @@
 //! Cranelift output is NOT replaced. Activating the swap requires
 //! the rewrite pipeline in `tensor_wasm_jit::rewrite`.
 
-use tensor_wasm_jit::detector::{classify_default, BlockIR, DetectorVerdict, Op};
+use tensor_wasm_jit::detector::{classify, BlockIR, DetectorConfig, DetectorVerdict, Op};
 use tracing::{debug, info, instrument};
 use wasmparser::{Operator, Parser, Payload};
 
@@ -69,9 +69,29 @@ fn op_to_detector_op(op: &Operator<'_>) -> Op {
 }
 
 /// Analyse Wasm bytes, emit per-function `tracing` events, and return the
-/// list of verdicts.
+/// list of verdicts, using the default detector configuration
+/// ([`DetectorConfig::default`]).
+///
+/// Thin wrapper over [`analyse_with_config`] preserving the historical
+/// signature for the consultation-only call sites.
 #[instrument(skip(wasm), fields(wasm_bytes = wasm.len()))]
 pub fn analyse(wasm: &[u8]) -> Result<Vec<OffloadVerdict>, AnalyseError> {
+    analyse_with_config(wasm, &DetectorConfig::default())
+}
+
+/// Analyse Wasm bytes against an explicit detector configuration, emit
+/// per-function `tracing` events, and return the list of verdicts.
+///
+/// The default-config wrapper [`analyse`] keeps the historical
+/// consultation-only behaviour; this entry point lets the executor's
+/// auto-offload activation path consult with the *same* detector thresholds
+/// the rewrite will use, so the consultation verdict and the rewrite agree
+/// on which functions are offload candidates.
+#[instrument(skip(wasm, cfg), fields(wasm_bytes = wasm.len()))]
+pub fn analyse_with_config(
+    wasm: &[u8],
+    cfg: &DetectorConfig,
+) -> Result<Vec<OffloadVerdict>, AnalyseError> {
     let mut verdicts = Vec::new();
     let mut func_idx: u32 = 0;
     for payload in Parser::new(0).parse_all(wasm) {
@@ -99,7 +119,7 @@ pub fn analyse(wasm: &[u8]) -> Result<Vec<OffloadVerdict>, AnalyseError> {
             // offload setup cost.
             let trip_count = if saw_loop { Some(128) } else { None };
             let block = BlockIR::new(format!("func{func_idx}"), detector_ops.clone(), trip_count);
-            let v = classify_default(&block);
+            let v = classify(&block, cfg);
             let op_count = detector_ops.len();
             let v128 = detector_ops.iter().filter(|o| o.is_v128()).count();
             let v128_ratio = if op_count == 0 {

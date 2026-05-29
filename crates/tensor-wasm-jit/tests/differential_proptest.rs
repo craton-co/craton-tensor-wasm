@@ -30,11 +30,11 @@
 
 use proptest::prelude::*;
 use tensor_wasm_jit::differential::{
-    conv2d_reference, matmul_reference, reference_eval, BlueprintKind, DifferentialOracle, Dtype,
-    OracleVerdict, Tolerance, ToleranceTable,
+    check_wmma_structure, conv2d_reference, matmul_reference, reference_eval, BlueprintKind,
+    DifferentialOracle, Dtype, OracleVerdict, Tolerance, ToleranceTable,
 };
 use tensor_wasm_jit::ir::{GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
-use tensor_wasm_jit::ptx_emit::emit;
+use tensor_wasm_jit::ptx_emit::{emit, emit_with, EmitConfig};
 
 // ---------------------------------------------------------------------
 // Strategies — small inputs only so proptest shrinks remain readable.
@@ -100,11 +100,12 @@ fn vector_add_blueprint(lanes: u32) -> TensorWasmKernelBlueprint {
         })
 }
 
-/// Matmul blueprint (IR-level placeholder). The PTX emitter rejects
-/// `TensorWasmOp::MatMul` with `NotYetImplemented` today, so the
-/// proptest harness asserts that contract AND drives the CPU
-/// reference via [`matmul_reference`] directly. The blueprint exists
-/// here so the oracle's `BlueprintKind::classify` path is exercised.
+/// Matmul blueprint (IR-level). The PTX emitter refuses
+/// `TensorWasmOp::MatMul` with `NotYetImplemented` under the default
+/// config; only the EXPERIMENTAL `enable_experimental_matmul` flag lowers
+/// the modelled `m16n16k16` shape to a wmma sequence (validated by the
+/// structural oracle, not on hardware). The proptest harness asserts the
+/// safe default AND drives the CPU reference via [`matmul_reference`].
 fn matmul_blueprint(m: u32, n: u32, k: u32) -> TensorWasmKernelBlueprint {
     TensorWasmKernelBlueprint::new("matmul").push(TensorWasmOp::MatMul { m, n, k })
 }
@@ -255,10 +256,15 @@ proptest! {
         }
     }
 
-    /// matmul: drive against the standalone `matmul_reference`. The
-    /// IR-level `TensorWasmOp::MatMul` is rejected by the PTX
-    /// emitter today (NotYetImplemented), so this proptest asserts
-    /// that contract instead of attempting an emit.
+    /// matmul: drive against the standalone `matmul_reference` for the
+    /// CPU ground truth, and gate the EXPERIMENTAL wmma lowering via the
+    /// structural oracle.
+    ///
+    /// The default-config emit must ALWAYS refuse matmul
+    /// (`NotYetImplemented`) — this is the safe-default pin. Only the
+    /// modelled `m16n16k16` shape, emitted with the experimental flag on,
+    /// is structurally validated by [`check_wmma_structure`]. Any other
+    /// shape is still refused even with the flag on.
     #[test]
     fn matmul_host_only(case in matmul_inputs()) {
         let (m, k, n, a, b) = case;
@@ -273,14 +279,34 @@ proptest! {
             ToleranceTable::default().for_blueprint(BlueprintKind::Matmul, Dtype::F32);
         prop_assert_eq!(tol.ulps, 2);
 
-        // PTX emit for IR-level matmul is intentionally not wired —
-        // assert the error contract so a future emitter regression
-        // shows up here, not in a downstream cache test.
-        let emit_result = emit(&bp);
+        // SAFE-DEFAULT PIN: default-config emit must refuse matmul.
         prop_assert!(
-            emit_result.is_err(),
-            "PTX emit unexpectedly succeeded for IR-level matmul"
+            emit(&bp).is_err(),
+            "default-config PTX emit unexpectedly succeeded for matmul"
         );
+
+        // EXPERIMENTAL opt-in path. Only the modelled 16x16x16 shape is
+        // lowered; the structural oracle is the GATE that must pass
+        // before the feature can be flipped on in a shipping path.
+        let exp_cfg = EmitConfig {
+            enable_experimental_matmul: true,
+            ..EmitConfig::default()
+        };
+        if (m, n, k) == (16, 16, 16) {
+            let ptx = emit_with(&bp, &exp_cfg)
+                .map_err(|e| TestCaseError::fail(format!("opt-in emit: {e:?}")))?;
+            let errs = check_wmma_structure(&ptx.text, 16, 16, 16);
+            prop_assert!(
+                errs.is_empty(),
+                "wmma structural oracle flagged the emitted PTX: {errs:?}"
+            );
+        } else {
+            // Unmodelled shape: refused even with the flag on.
+            prop_assert!(
+                emit_with(&bp, &exp_cfg).is_err(),
+                "opt-in emit must still refuse non-16x16x16 matmul ({m}x{n}x{k})"
+            );
+        }
 
         // Naive recomputation for tolerance spot-check.
         for i in 0..m {
@@ -297,6 +323,29 @@ proptest! {
             }
         }
     }
+}
+
+/// Dedicated structural-oracle gate for the EXPERIMENTAL wmma lowering.
+/// Deterministically exercises the modelled `m16n16k16` shape so the gate
+/// runs even if proptest never samples exactly (16,16,16). This is the
+/// case the team must keep green before enabling
+/// `enable_experimental_matmul` anywhere it can reach a GPU launch.
+#[test]
+fn wmma_m16n16k16_structural_gate() {
+    let bp = matmul_blueprint(16, 16, 16);
+    let exp_cfg = EmitConfig {
+        enable_experimental_matmul: true,
+        ..EmitConfig::default()
+    };
+    let ptx = emit_with(&bp, &exp_cfg).expect("opt-in emit for m16n16k16");
+    let errs = check_wmma_structure(&ptx.text, 16, 16, 16);
+    assert!(errs.is_empty(), "wmma structural gate failed: {errs:?}");
+
+    // Safe-default pin lives alongside the gate.
+    assert!(
+        emit(&bp).is_err(),
+        "default-config emit must refuse matmul"
+    );
 }
 
 // ---------------------------------------------------------------------

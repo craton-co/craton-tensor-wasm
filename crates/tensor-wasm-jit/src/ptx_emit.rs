@@ -21,16 +21,58 @@
 //! This is a contract with `tensor_wasm_exec::jit_dispatch`: the scratch buffer's
 //! `args` half maps to `in_ptr`, the `results` half maps to `out_ptr`.
 //!
-//! ## What is intentionally NOT lowered
+//! ## What is intentionally NOT lowered (default)
 //!
-//! [`TensorWasmOp::MatMul`] is currently rejected at emit time with
+//! [`TensorWasmOp::MatMul`] is **by default** rejected at emit time with
 //! [`EmitError::NotYetImplemented`]. A real wmma lowering needs fragment-
 //! handle materialisation (loading the `a`/`b` operand tiles into the
-//! `%r0..%r7` row/col handles) and a paired `StoreUnified` that writes the
+//! fragment register handles) and a paired store that writes the
 //! accumulator fragments back to global memory — neither of which the
-//! current IR-to-PTX path encodes. Emitting a syntactically-valid-but-
+//! default IR-to-PTX path encodes. Emitting a syntactically-valid-but-
 //! semantically-broken wmma block would silently corrupt GPU state on
 //! launch, so we refuse instead. See v0.4 roadmap.
+//!
+//! ## EXPERIMENTAL / UNVERIFIED ON HARDWARE: opt-in wmma MatMul
+//!
+//! Setting [`EmitConfig::enable_experimental_matmul`] to `true` flips the
+//! emitter into lowering [`TensorWasmOp::MatMul`] with `m == n == k == 16`
+//! to a wmma `m16n16k16` fragment-load → `wmma.mma.sync` → fragment-store
+//! sequence. This flag defaults to `false` and the safe refusal above
+//! remains the default behaviour; nothing in the auto-offload pipeline
+//! sets it. The generated PTX is **NOT verified on real GPU hardware** in
+//! this environment — its structural correctness (fragment shapes, mma.sync
+//! count, accumulator chaining, register declarations) is gated behind the
+//! differential oracle in [`crate::differential`], which MUST pass before
+//! anyone enables this flag in a shipping path.
+//!
+//! ### wmma m16n16k16 tile / fragment contract
+//!
+//! The lowering targets the sm_80 `wmma.mma.sync.aligned.row.col.m16n16k16`
+//! shape with f16 operand fragments and an f32 accumulator (`.f32.f32`):
+//!
+//! * **Tile shape.** One warp cooperatively computes a single
+//!   `C[16x16] += A[16x16] * B[16x16]` tile. A is loaded `row` major, B is
+//!   loaded `col` major (the canonical `.row.col` operand layout).
+//! * **Operand fragments.** Each of the A and B operand fragments is held
+//!   in [`WMMA_OPERAND_FRAG_REGS`] (`8`) packed `.b32` registers per warp
+//!   (two f16 lanes per `.b32`), materialised with
+//!   `wmma.load.a`/`wmma.load.b`.
+//! * **Accumulator fragment.** The C accumulator is held in
+//!   [`WMMA_ACC_FRAG_REGS`] (`8`) `.f32` registers per warp, initialised
+//!   from global memory with `wmma.load.c` and written back with
+//!   `wmma.store.d`. The accumulator is *chained*: the `wmma.mma.sync`
+//!   reads the same `%fa…` accumulator registers it writes (paired
+//!   accumulator — `D = A*B + C` with `C` and `D` aliasing the same
+//!   fragment), so back-to-back tiles over a longer `k` would accumulate
+//!   correctly.
+//! * **Alignment / leading dimension.** `wmma.load.*`/`wmma.store.*`
+//!   require the base pointer to be **128-bit aligned** and the supplied
+//!   leading-dimension (stride, in elements) to be a multiple of 8 for the
+//!   f16 operands and a multiple of 4 for the f32 accumulator. We assume a
+//!   tightly-packed row-major tile, so the stride equals the tile width
+//!   (`16`) and the caller guarantees the `in_ptr`/`out_ptr` buffers are
+//!   16-byte aligned (the unified-memory allocator already over-aligns to
+//!   256 bytes, so this holds for every legitimate caller).
 
 use std::fmt::Write;
 
@@ -92,6 +134,22 @@ pub fn is_valid_ptx_identifier(s: &str) -> bool {
     bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
 }
 
+/// Number of `.b32` registers in one wmma `m16n16k16` operand (A or B)
+/// fragment, per warp. f16 operands pack two lanes per `.b32`, so a
+/// 16-wide row spread across the warp's 32 lanes lands in 8 registers.
+pub const WMMA_OPERAND_FRAG_REGS: u32 = 8;
+
+/// Number of `.f32` registers in the wmma `m16n16k16` f32 accumulator
+/// fragment, per warp. The 16x16 = 256 accumulator elements distributed
+/// over 32 lanes give 8 elements (registers) per lane.
+pub const WMMA_ACC_FRAG_REGS: u32 = 8;
+
+/// The only MatMul tile dimension the experimental wmma lowering accepts.
+/// `m == n == k == 16` is the single sm_80 wmma shape this emitter models;
+/// any other dimensions fall back to [`EmitError::NotYetImplemented`] even
+/// when the experimental flag is on.
+pub const WMMA_TILE_DIM: u32 = 16;
+
 /// Default PTX target architecture.
 pub const DEFAULT_TARGET: &str = "sm_80";
 
@@ -107,6 +165,20 @@ pub struct EmitConfig {
     pub ptx_version: String,
     /// Emit `__launch_bounds__` annotation on the entry.
     pub launch_bounds: bool,
+    /// EXPERIMENTAL / UNVERIFIED ON HARDWARE.
+    ///
+    /// When `true`, [`emit_with`] lowers a `MatMul { m: 16, n: 16, k: 16 }`
+    /// op to a wmma `m16n16k16` fragment-load → `wmma.mma.sync` →
+    /// fragment-store sequence (see the module docs for the tile/fragment
+    /// contract). When `false` — the default — `MatMul` is refused with
+    /// [`EmitError::NotYetImplemented`], the safe behaviour the
+    /// auto-offload pipeline relies on.
+    ///
+    /// This MUST stay `false` outside of explicitly opted-in experiments:
+    /// the emitted PTX cannot be validated on a GPU here, so its
+    /// correctness is gated solely behind the differential oracle's
+    /// structural assertions (see [`crate::differential`]).
+    pub enable_experimental_matmul: bool,
 }
 
 impl Default for EmitConfig {
@@ -115,6 +187,9 @@ impl Default for EmitConfig {
             target: DEFAULT_TARGET.to_string(),
             ptx_version: DEFAULT_PTX_VERSION.to_string(),
             launch_bounds: true,
+            // SAFETY DEFAULT: MatMul stays refused unless a caller flips
+            // this on for an experiment. Never default this to `true`.
+            enable_experimental_matmul: false,
         }
     }
 }
@@ -150,13 +225,17 @@ pub fn emit(blueprint: &TensorWasmKernelBlueprint) -> Result<EmittedPtx, EmitErr
 
 /// Allocate fresh registers and track the per-op body lines.
 ///
-/// Returns `(body_text, max_f32_reg, max_s32_reg, max_s64_reg, max_pred_reg)`
-/// where `max_*` is one greater than the highest register index used (i.e.
-/// the count to declare in `.reg .f32 %f<N>;`). Counts are floored at 1 so
-/// the declaration is always well-formed even for empty kernels.
+/// Returns `(body_text, max_f32_reg, max_s32_reg, max_s64_reg,
+/// max_pred_reg, max_b32_reg)` where `max_*` is one greater than the
+/// highest register index used (i.e. the count to declare in
+/// `.reg .f32 %f<N>;`). Counts are floored at 1 so the declaration is
+/// always well-formed even for empty kernels. `max_b32_reg` is the wmma
+/// operand-fragment `.b32 %rb<N>` count and is `0` unless an experimental
+/// MatMul was lowered.
 fn lower_body(
     blueprint: &TensorWasmKernelBlueprint,
-) -> Result<(String, u32, u32, u32, u32), EmitError> {
+    cfg: &EmitConfig,
+) -> Result<(String, u32, u32, u32, u32, u32), EmitError> {
     // PERF (T20): pre-size the body buffer rather than letting `writeln!`
     // grow it by doubling. Each lowered op emits a comment line plus one
     // or more instruction lines (`add.f32 %f… %f… %f…;`, ~32 ASCII chars
@@ -176,8 +255,13 @@ fn lower_body(
     // element count `n` from the param load in the prologue; nothing else
     // currently uses the s32 reg class.
     let max_s32 = 1u32;
-    let max_s64 = 2u32; // %rd0 (in_ptr), %rd1 (out_ptr)
+    let mut max_s64 = 2u32; // %rd0 (in_ptr), %rd1 (out_ptr)
     let max_pred = 2u32;
+    // EXPERIMENTAL: high-water mark of the `.b32` wmma operand-fragment
+    // register class (`%rb<N>`). Stays 0 unless an experimental MatMul is
+    // lowered, in which case the header declares exactly the fragment
+    // registers the `wmma.load.a`/`wmma.load.b` ops use.
+    let mut max_b32 = 0u32;
     // Running byte offset into the input / output buffers; advances 4 bytes
     // per lane (f32 = 4 bytes). Loads consume from `%rd0+in_off`; stores
     // consume from `%rd1+out_off`. Wraps via wrapping_add — overflow at u32
@@ -236,20 +320,39 @@ fn lower_body(
                     value_stack.push(dst);
                 }
             }
-            TensorWasmOp::MatMul { .. } => {
-                // Lowering wmma m16n16k16 requires fragment-handle
-                // materialisation (a/b operand tiles into `%r0..%r7`) and a
-                // paired store that writes the accumulator fragments back
-                // to global memory. Neither is encoded by the current IR-
-                // to-PTX path. The previous emitter wrote a wmma.mma.sync
-                // line referencing undefined `%r1..%r7` and never emitted
-                // the matching store, so the kernel would have read
-                // garbage and discarded its results. Refuse instead — the
-                // caller (rewrite.rs) treats this as a deopt and keeps
-                // the function on the CPU path. Deferred to v0.4.
-                return Err(EmitError::NotYetImplemented(
-                    "MatMul lowering deferred to v0.4",
-                ));
+            TensorWasmOp::MatMul { m, n, k } => {
+                // SAFETY DEFAULT: unless the caller explicitly opted into
+                // the experimental wmma lowering, MatMul is refused so the
+                // auto-offload pipeline deopts to the CPU path rather than
+                // launch a kernel that cannot be verified on hardware here.
+                if !cfg.enable_experimental_matmul {
+                    return Err(EmitError::NotYetImplemented(
+                        "MatMul lowering deferred to v0.4",
+                    ));
+                }
+                // The experimental lowering models exactly one sm_80 wmma
+                // shape: m16n16k16. Any other tile dimension is still
+                // refused even with the flag on — emitting an unmodelled
+                // shape would be the same silent-miscompile hazard the
+                // refusal exists to prevent.
+                if (*m, *n, *k) != (WMMA_TILE_DIM, WMMA_TILE_DIM, WMMA_TILE_DIM) {
+                    return Err(EmitError::NotYetImplemented(
+                        "experimental wmma lowering only models m16n16k16",
+                    ));
+                }
+                // EXPERIMENTAL / UNVERIFIED ON HARDWARE.
+                //
+                // wmma m16n16k16 fragment-load → wmma.mma.sync →
+                // fragment-store. See the module docs for the full
+                // tile/fragment + alignment contract. The PTX produced
+                // here is validated ONLY by the differential oracle's
+                // structural assertions; it has NOT been run on a GPU.
+                lower_wmma_m16n16k16(
+                    &mut body,
+                    &mut next_f,
+                    &mut max_b32,
+                    &mut max_s64,
+                )?;
             }
             TensorWasmOp::LoadUnified { lanes } => {
                 let _ = writeln!(
@@ -292,7 +395,130 @@ fn lower_body(
 
     // `.reg .* %x<N>;` requires N >= 1, even if no register is used.
     let max_f = next_f.max(1);
-    Ok((body, max_f, max_s32, max_s64, max_pred))
+    Ok((body, max_f, max_s32, max_s64, max_pred, max_b32))
+}
+
+/// EXPERIMENTAL / UNVERIFIED ON HARDWARE.
+///
+/// Lower one `MatMul { m: 16, n: 16, k: 16 }` op to a wmma `m16n16k16`
+/// fragment-load → `wmma.mma.sync` → fragment-store sequence targeting
+/// sm_80 (`.row.col`, f16 operands, f32 accumulator).
+///
+/// The emitted sequence is, per warp:
+///
+/// 1. Materialise the A operand fragment ([`WMMA_OPERAND_FRAG_REGS`]
+///    `.b32` regs) from `%rd0` with `wmma.load.a.sync.aligned.row`.
+/// 2. Materialise the B operand fragment (same width) from the second
+///    tile in `%rd0` with `wmma.load.b.sync.aligned.col`.
+/// 3. Load the C accumulator fragment ([`WMMA_ACC_FRAG_REGS`] `.f32`
+///    regs) from `%rd0`'s third tile with `wmma.load.c.sync.aligned.row`.
+/// 4. `wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32` — the accumulator
+///    is **paired**: the same `%f` registers appear as both the `c`
+///    operand and the `d` result, so `D = A*B + C` chains in place.
+/// 5. Write the accumulator back to `%rd1` with
+///    `wmma.store.d.sync.aligned.row`.
+///
+/// Register accounting:
+/// * A and B fragments are allocated in the `.b32 %rb` class
+///   (`max_b32` high-water mark) — `2 * WMMA_OPERAND_FRAG_REGS` registers.
+/// * The accumulator is allocated in the existing `.f32 %f` class
+///   (`next_f`) — [`WMMA_ACC_FRAG_REGS`] registers.
+/// * The load/store base pointers are derived into the `.s64 %rd` class;
+///   the highest `%rd` index used is recorded in `max_s64`.
+///
+/// Alignment / leading-dimension assumptions are documented on the module
+/// (`row` stride == tile width == 16, 128-bit aligned base pointers).
+fn lower_wmma_m16n16k16(
+    body: &mut String,
+    next_f: &mut u32,
+    max_b32: &mut u32,
+    max_s64: &mut u32,
+) -> Result<(), EmitError> {
+    // Allocate the contiguous operand-fragment register windows. Each
+    // operand fragment occupies `WMMA_OPERAND_FRAG_REGS` `.b32` regs;
+    // `wmma.load`/`mma.sync` name the window by its base index `%rbN`.
+    let a_frag_base = *max_b32;
+    *max_b32 = max_b32
+        .checked_add(WMMA_OPERAND_FRAG_REGS)
+        .ok_or(EmitError::TooManyRegisters)?;
+    let b_frag_base = *max_b32;
+    *max_b32 = max_b32
+        .checked_add(WMMA_OPERAND_FRAG_REGS)
+        .ok_or(EmitError::TooManyRegisters)?;
+
+    // Accumulator fragment in the f32 class, chained through mma.sync.
+    let acc_frag_base = *next_f;
+    *next_f = next_f
+        .checked_add(WMMA_ACC_FRAG_REGS)
+        .ok_or(EmitError::TooManyRegisters)?;
+
+    // Derive the three tile base pointers into the s64 class. `%rd0`
+    // holds the input pointer (A tile); B and C tiles follow it at the
+    // tile-stride offset (16x16 f16 = 512 B for A/B, 16x16 f32 = 1024 B
+    // for C). `%rd1` holds the output (D tile) pointer. We materialise
+    // %rd2 (B base) and %rd3 (C base) so the loads name distinct bases.
+    let b_base = *max_s64; // %rd2
+    let c_base = b_base + 1; // %rd3
+    *max_s64 = c_base
+        .checked_add(1)
+        .ok_or(EmitError::TooManyRegisters)?; // declare through %rd3
+
+    // Leading dimension (stride in elements) for the row/col loads. A
+    // tightly-packed 16-wide tile has stride 16.
+    let stride = WMMA_TILE_DIM;
+    // Byte offsets of the B and C tiles within the input buffer. A is
+    // 16x16 f16 (512 B); B is 16x16 f16 (512 B); C is 16x16 f32 (1024 B).
+    const A_TILE_BYTES: u32 = WMMA_TILE_DIM * WMMA_TILE_DIM * 2; // f16
+    const B_TILE_BYTES: u32 = WMMA_TILE_DIM * WMMA_TILE_DIM * 2; // f16
+    let b_tile_off = A_TILE_BYTES;
+    let c_tile_off = A_TILE_BYTES + B_TILE_BYTES;
+
+    let _ = writeln!(
+        body,
+        "    // EXPERIMENTAL / UNVERIFIED ON HARDWARE: wmma m16n16k16 \
+         (row.col, f16xf16->f32)"
+    );
+
+    // Render a `{%rbB, %rbB+1, …}` fragment register list.
+    let frag_list = |base: u32, count: u32, prefix: &str| -> String {
+        let regs: Vec<String> = (0..count).map(|i| format!("%{prefix}{}", base + i)).collect();
+        format!("{{{}}}", regs.join(", "))
+    };
+    let a_list = frag_list(a_frag_base, WMMA_OPERAND_FRAG_REGS, "rb");
+    let b_list = frag_list(b_frag_base, WMMA_OPERAND_FRAG_REGS, "rb");
+    let acc_list = frag_list(acc_frag_base, WMMA_ACC_FRAG_REGS, "f");
+
+    // Tile base-pointer setup.
+    let _ = writeln!(body, "    add.s64 %rd{b_base}, %rd0, {b_tile_off};");
+    let _ = writeln!(body, "    add.s64 %rd{c_base}, %rd0, {c_tile_off};");
+
+    // 1+2. Operand-fragment loads (A row-major, B col-major).
+    let _ = writeln!(
+        body,
+        "    wmma.load.a.sync.aligned.row.m16n16k16.global.f16 {a_list}, [%rd0], {stride};"
+    );
+    let _ = writeln!(
+        body,
+        "    wmma.load.b.sync.aligned.col.m16n16k16.global.f16 {b_list}, [%rd{b_base}], {stride};"
+    );
+    // 3. Accumulator load (paired: read C into the same regs mma writes).
+    let _ = writeln!(
+        body,
+        "    wmma.load.c.sync.aligned.row.m16n16k16.global.f32 {acc_list}, [%rd{c_base}], {stride};"
+    );
+    // 4. The mma. `d` and `c` alias `acc_list` — paired accumulator.
+    let _ = writeln!(
+        body,
+        "    wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32 \
+         {acc_list}, {a_list}, {b_list}, {acc_list};"
+    );
+    // 5. Store the accumulator fragment back to the D tile in %rd1.
+    let _ = writeln!(
+        body,
+        "    wmma.store.d.sync.aligned.row.m16n16k16.global.f32 [%rd1], {acc_list}, {stride};"
+    );
+
+    Ok(())
 }
 
 /// Emit PTX text for a blueprint with caller-supplied config.
@@ -335,7 +561,7 @@ pub fn emit_with(
     // Lower the body first so we know how many registers to declare. This
     // is the critical fix for the prior sham allocator: declare exactly
     // what we use, not a fixed `8` that overflowed silently.
-    let (body, max_f, max_s32, max_s64, max_pred) = lower_body(blueprint)?;
+    let (body, max_f, max_s32, max_s64, max_pred, max_b32) = lower_body(blueprint, cfg)?;
 
     let _ = writeln!(text, ".visible .entry {}(", blueprint.entry);
     let _ = writeln!(text, "    .param .u64 {}_param_in_ptr,", blueprint.entry);
@@ -354,6 +580,12 @@ pub fn emit_with(
     let _ = writeln!(text, "    .reg .s32   %r<{max_s32}>;");
     let _ = writeln!(text, "    .reg .s64   %rd<{max_s64}>;");
     let _ = writeln!(text, "    .reg .f32   %f<{max_f}>;");
+    // EXPERIMENTAL: wmma operand-fragment registers. Only declared when a
+    // wmma MatMul was lowered (max_b32 > 0); otherwise omitted entirely so
+    // the default-path PTX is byte-for-byte unchanged.
+    if max_b32 > 0 {
+        let _ = writeln!(text, "    .reg .b32   %rb<{max_b32}>;");
+    }
     let _ = writeln!(text);
 
     // Prologue: load the .param declarations into the registers the body
@@ -425,6 +657,91 @@ mod tests {
         });
         let err = emit(&bp).expect_err("MatMul emission must fail until v0.4");
         assert!(matches!(err, EmitError::NotYetImplemented(_)));
+    }
+
+    /// SAFETY-DEFAULT PIN: the default `EmitConfig` must keep refusing
+    /// MatMul. This locks in the constraint that the experimental wmma
+    /// lowering is opt-in only — a regression that flips the default on
+    /// would fail here before it could reach a GPU launch path.
+    #[test]
+    fn matmul_refused_under_default_config() {
+        let bp = TensorWasmKernelBlueprint::new("matmul_16x16x16").push(TensorWasmOp::MatMul {
+            m: 16,
+            n: 16,
+            k: 16,
+        });
+        // Default config: flag is off.
+        assert!(!EmitConfig::default().enable_experimental_matmul);
+        let err = emit_with(&bp, &EmitConfig::default())
+            .expect_err("MatMul must be refused with the flag off");
+        assert!(matches!(err, EmitError::NotYetImplemented(_)));
+        // The convenience `emit` wrapper uses the default config, so it
+        // must refuse too.
+        assert!(matches!(emit(&bp), Err(EmitError::NotYetImplemented(_))));
+    }
+
+    /// EXPERIMENTAL opt-in: with the flag on, an m16n16k16 MatMul lowers
+    /// to the wmma fragment-load → mma.sync → fragment-store sequence.
+    #[test]
+    fn matmul_opt_in_emits_wmma_sequence() {
+        let bp = TensorWasmKernelBlueprint::new("matmul").push(TensorWasmOp::MatMul {
+            m: 16,
+            n: 16,
+            k: 16,
+        });
+        let cfg = EmitConfig {
+            enable_experimental_matmul: true,
+            ..EmitConfig::default()
+        };
+        let out = emit_with(&bp, &cfg).expect("opt-in emit must succeed");
+        // Fragment loads for both operands + the accumulator.
+        assert!(out.text.contains("wmma.load.a.sync.aligned.row.m16n16k16"));
+        assert!(out.text.contains("wmma.load.b.sync.aligned.col.m16n16k16"));
+        assert!(out.text.contains("wmma.load.c.sync.aligned.row.m16n16k16"));
+        // Exactly one mma.sync for a single k16 tile.
+        assert_eq!(out.text.matches("wmma.mma.sync.aligned").count(), 1);
+        // Paired store of the accumulator fragment.
+        assert!(out.text.contains("wmma.store.d.sync.aligned.row.m16n16k16"));
+        // The operand-fragment register class must be declared.
+        assert!(out.text.contains(".reg .b32   %rb<"));
+        // The prominent experimental marker rides in the body.
+        assert!(out.text.contains("EXPERIMENTAL / UNVERIFIED ON HARDWARE"));
+    }
+
+    /// Even with the flag on, only the modelled m16n16k16 shape is
+    /// lowered — any other tile is still refused (never silently
+    /// miscompiled).
+    #[test]
+    fn matmul_opt_in_rejects_non_16_shape() {
+        let bp = TensorWasmKernelBlueprint::new("matmul").push(TensorWasmOp::MatMul {
+            m: 32,
+            n: 32,
+            k: 32,
+        });
+        let cfg = EmitConfig {
+            enable_experimental_matmul: true,
+            ..EmitConfig::default()
+        };
+        assert!(matches!(
+            emit_with(&bp, &cfg),
+            Err(EmitError::NotYetImplemented(_))
+        ));
+    }
+
+    /// The default (flag-off) PTX must be byte-identical to before the
+    /// experimental wmma support was added for non-MatMul blueprints: the
+    /// `.b32 %rb` operand-fragment declaration only appears when a wmma
+    /// MatMul is actually lowered.
+    #[test]
+    fn no_wmma_reg_decl_without_matmul() {
+        let bp = TensorWasmKernelBlueprint::new("vector_add")
+            .push(TensorWasmOp::LoadUnified { lanes: 4 })
+            .push(TensorWasmOp::LoadUnified { lanes: 4 })
+            .push(TensorWasmOp::VecAdd { lanes: 4 })
+            .push(TensorWasmOp::StoreUnified { lanes: 4 });
+        let out = emit(&bp).expect("emit");
+        assert!(!out.text.contains("%rb<"));
+        assert!(!out.text.contains("wmma."));
     }
 
     /// MatMul anywhere in the op stream taints the whole blueprint —

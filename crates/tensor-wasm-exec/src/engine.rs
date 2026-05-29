@@ -113,6 +113,62 @@ pub struct EngineConfig {
     /// [`std::thread::available_parallelism`] (floored at 1) at executor
     /// construction time.
     pub max_concurrent_compiles: Option<usize>,
+    /// Opt-in: activate the auto-offload Wasm rewrite on the spawn path.
+    ///
+    /// When `false` (the default) the
+    /// [`auto_offload::analyse`](crate::auto_offload::analyse) pass remains
+    /// consultation-only — it emits `tracing` verdicts but Wasmtime's
+    /// Cranelift output is never replaced, exactly matching the historical
+    /// behaviour. When `true`,
+    /// [`TensorWasmExecutor::spawn_instance`](crate::executor::TensorWasmExecutor::spawn_instance)
+    /// runs the analyser and, if any function is flagged for offload, feeds
+    /// the module through
+    /// [`tensor_wasm_jit::rewrite::rewrite_wasm`] to produce a
+    /// trampoline-augmented module which is instantiated *instead of* the
+    /// original. The original bytes are always retained as a fallback: any
+    /// analysis or rewrite failure (or a rewrite that swaps nothing) is
+    /// logged and the spawn proceeds with the unmodified module, so enabling
+    /// this flag can never fail a spawn that would otherwise have succeeded.
+    ///
+    /// Requires a [`KernelCache`](tensor_wasm_jit::cache::KernelCache)
+    /// attached to the executor via
+    /// [`TensorWasmExecutor::with_jit_cache`](crate::executor::TensorWasmExecutor::with_jit_cache)
+    /// for the rewritten guest's `tensor-wasm:jit/host` imports to link;
+    /// without one, the rewrite is skipped (the trampoline imports would be
+    /// unlinkable) and the original module is used.
+    pub auto_offload: bool,
+    /// Detector thresholds the auto-offload activation path uses to decide
+    /// which function bodies are offload candidates.
+    ///
+    /// `None` (the default) selects
+    /// [`tensor_wasm_jit::detector::DetectorConfig::default`] — the
+    /// production-conservative thresholds. Embedders (and tests) that want a
+    /// more aggressive offload policy can supply tuned thresholds here; the
+    /// same config is threaded into BOTH the consultation pass
+    /// ([`auto_offload::analyse_with_config`](crate::auto_offload::analyse_with_config))
+    /// and the
+    /// [`tensor_wasm_jit::rewrite::RewriteOptions::detector`] used for the
+    /// rewrite, so the consultation verdict and the rewrite always agree on
+    /// which functions to swap. Ignored entirely when
+    /// [`Self::auto_offload`] is `false`.
+    pub auto_offload_detector: Option<tensor_wasm_jit::detector::DetectorConfig>,
+    /// Optional per-tenant cap on the number of concurrently-live instances
+    /// a single [`TenantId`](tensor_wasm_core::types::TenantId) may hold.
+    ///
+    /// Complements the engine-wide [`Self::max_instances`] ceiling with a
+    /// fairness bound: one tenant spawning in a loop cannot starve every
+    /// other tenant of the shared instance budget. Enforced in the same
+    /// admission path as `max_instances` (keyed by the spawning
+    /// [`SpawnConfig::tenant_id`](crate::executor::SpawnConfig::tenant_id)),
+    /// with the same charge-before-compile / roll-back-on-failure
+    /// accounting. When a tenant exceeds its cap the spawn is refused with
+    /// [`ExecError::CapacityExhausted`](crate::executor::ExecError::CapacityExhausted)
+    /// (reused for the per-tenant case to keep the cross-crate error mapping
+    /// non-breaking; the offending tenant is logged server-side) carrying the
+    /// tenant's own count and per-tenant `limit`, without affecting any other
+    /// tenant. `None` (the default) disables the per-tenant cap — only the
+    /// engine-wide `max_instances` applies.
+    pub max_instances_per_tenant: Option<usize>,
 }
 
 impl EngineConfig {
@@ -159,6 +215,15 @@ impl Default for EngineConfig {
             // construction. Keeps the default tied to the host's core
             // count without pulling in a `num_cpus` dependency.
             max_concurrent_compiles: None,
+            // Consultation-only by default: the analyser still runs and
+            // emits verdicts, but Wasmtime's Cranelift output is not
+            // replaced unless an embedder opts in.
+            auto_offload: false,
+            // None => default detector thresholds when the swap is enabled.
+            auto_offload_detector: None,
+            // No per-tenant fairness cap by default — only the engine-wide
+            // `max_instances` ceiling applies.
+            max_instances_per_tenant: None,
         }
     }
 }

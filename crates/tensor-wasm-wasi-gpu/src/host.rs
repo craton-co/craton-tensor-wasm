@@ -12,6 +12,21 @@
 //! When the `cuda` feature is enabled (S16+ on real hardware) the bodies
 //! switch to real CUDA dispatch via the `cust` crate.
 //!
+//! ## Explicit device-memory surface
+//!
+//! Alongside `load_ptx` / `launch` / `sync`, this module wires the explicit
+//! device-buffer functions `alloc` / `free` / `memcpy_h2d` / `memcpy_d2h`.
+//! Where `launch`'s pointer arguments rely on CUDA Unified Memory (a guest
+//! offset doubling as a device address), the device-buffer surface lets a
+//! guest manage discrete device allocations that work on any CUDA host.
+//! Handles are owner-scoped in a per-instance [`crate::device_mem::DeviceMemRegistry`]
+//! with an aggregate-bytes cap, mirroring the kernel registry — a guest
+//! cannot forge another instance's handle. On no-CUDA hosts the bodies
+//! validate their arguments (bounds-checking guest pointers, rejecting
+//! oversize / zero requests) and return [`AbiError::NotAvailable`] like the
+//! `launch` stub; the `#[cfg(feature = "cuda")]` `cuMemAlloc` / `cuMemcpy*`
+//! paths are gated and UNVERIFIED-PENDING-HARDWARE.
+//!
 //! NOTE: Cuda-feature code paths in this file are compile-tested on CUDA
 //! hosts only; on no-CUDA hosts only the `#[cfg(not(feature = "cuda"))]`
 //! branches are exercised. The cuda branches must be kept consistent with
@@ -64,7 +79,7 @@
 //! [`AbiError::InvalidPointer`]. The distinction keeps the error
 //! story crisp for guest debugging.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -74,12 +89,15 @@ use tracing::{info, info_span, warn, Instrument};
 use wasmtime::{Caller, Linker};
 
 use crate::abi::{
-    AbiError, FN_LAST_ERROR_COPY, FN_LAST_ERROR_LEN, FN_LAUNCH, FN_LOAD_PTX, FN_SYNC,
-    MAX_BLOCK_DIM, MAX_GRID_DIM, MAX_PTX_BYTES, MAX_THREADS_PER_BLOCK, MODULE,
+    AbiError, FN_ALLOC, FN_FREE, FN_LAST_ERROR_COPY, FN_LAST_ERROR_LEN, FN_LAUNCH, FN_LOAD_PTX,
+    FN_MEMCPY_D2H, FN_MEMCPY_H2D, FN_SYNC, MAX_BLOCK_DIM, MAX_GRID_DIM, MAX_PTX_BYTES,
+    MAX_THREADS_PER_BLOCK, MODULE,
 };
 use crate::async_dispatch::BackPressure;
+use crate::device_mem::{DeviceMemEntry, DeviceMemRegistry, MAX_DEVICE_ALLOC_BYTES};
 use crate::kernel_args::{parse_argv, LoweredArg, LoweredArgSnapshot};
 use crate::registry::{KernelEntry, KernelRegistry};
+use crate::scheduler::SchedulerContext;
 
 /// Maximum byte length of a single recorded `last_error` message.
 ///
@@ -174,6 +192,23 @@ pub struct WasiCudaContext {
     /// back to the historical `acquire_borrowed` behaviour and host
     /// functions never reject on deadline grounds.
     pub bp_deadline: Mutex<Option<Instant>>,
+    /// Per-instance registry of explicit device-memory allocations
+    /// (the `alloc` / `free` / `memcpy-*` host surface). Mirrors
+    /// [`registry`](Self::registry) but for device buffers: handles are
+    /// owner-scoped so a guest cannot forge another instance's handle,
+    /// and an aggregate-bytes cap bounds total pinned device memory.
+    pub device_mem: Arc<DeviceMemRegistry>,
+    /// Count of kernel launches that passed validation, acquired a
+    /// back-pressure permit, and reached the dispatch path on this
+    /// instance. Bumped on the no-CUDA stub path (just before the
+    /// `NotAvailable` return) and on the CUDA happy path. Telemetry
+    /// only — `Relaxed` ordering, surfaced via
+    /// [`InstanceMetricsSnapshot`].
+    pub(crate) kernels_launched: AtomicU64,
+    /// Count of launches refused by the back-pressure acquire path
+    /// (semaphore saturated or per-invocation deadline tripped) on this
+    /// instance. Telemetry only — `Relaxed` ordering.
+    pub(crate) back_pressure_rejections: AtomicU64,
 }
 
 impl WasiCudaContext {
@@ -192,6 +227,9 @@ impl WasiCudaContext {
             last_lowered_args: Mutex::new(Vec::new()),
             wasi_cuda_enabled: AtomicBool::new(false),
             bp_deadline: Mutex::new(None),
+            device_mem: Arc::new(DeviceMemRegistry::new()),
+            kernels_launched: AtomicU64::new(0),
+            back_pressure_rejections: AtomicU64::new(0),
         }
     }
 
@@ -210,12 +248,66 @@ impl WasiCudaContext {
             last_lowered_args: Mutex::new(Vec::new()),
             wasi_cuda_enabled: AtomicBool::new(false),
             bp_deadline: Mutex::new(None),
+            device_mem: Arc::new(DeviceMemRegistry::new()),
+            kernels_launched: AtomicU64::new(0),
+            back_pressure_rejections: AtomicU64::new(0),
         }
     }
 
     /// Borrow the shared back-pressure handle for observability / sharing.
     pub fn back_pressure(&self) -> &Arc<BackPressure> {
         &self.back_pressure
+    }
+
+    /// Borrow the per-instance device-memory registry for observability
+    /// / sharing. The `alloc` / `free` / `memcpy-*` host functions drive
+    /// this; embedders rarely need to touch it directly.
+    pub fn device_mem(&self) -> &Arc<DeviceMemRegistry> {
+        &self.device_mem
+    }
+
+    /// Collect a read-only [`InstanceMetricsSnapshot`] for this instance.
+    ///
+    /// Pure read of the existing atomics / registry counters — never
+    /// mutates host state. The `yield_count` field is `0`; use
+    /// [`Self::metrics_snapshot_with_scheduler`] to fold in the cooperative
+    /// scheduler's yield counter when the embedder holds the matching
+    /// [`SchedulerContext`] (the wasi-cuda context does not own it).
+    pub fn metrics_snapshot(&self) -> InstanceMetricsSnapshot {
+        InstanceMetricsSnapshot {
+            kernels_launched: self.kernels_launched.load(Ordering::Relaxed),
+            bytes_pinned: self.registry.total_ptx_bytes(),
+            back_pressure_rejections: self.back_pressure_rejections.load(Ordering::Relaxed),
+            yield_count: 0,
+            device_bytes_allocated: self.device_mem.total_device_bytes(),
+        }
+    }
+
+    /// Like [`Self::metrics_snapshot`] but folds in the cooperative-yield
+    /// count from the matching [`SchedulerContext`].
+    ///
+    /// The executor keeps the wasi-cuda context and the scheduler context
+    /// as sibling per-instance fields; this accessor lets an
+    /// operator-facing metrics endpoint produce one combined snapshot from
+    /// both without the wasi-cuda context having to own the scheduler.
+    pub fn metrics_snapshot_with_scheduler(
+        &self,
+        scheduler: &SchedulerContext,
+    ) -> InstanceMetricsSnapshot {
+        let mut snap = self.metrics_snapshot();
+        snap.yield_count = scheduler.yield_count();
+        snap
+    }
+
+    /// Record that a launch reached the dispatch path. Telemetry only.
+    fn record_kernel_launched(&self) {
+        self.kernels_launched.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a launch was refused by the back-pressure path.
+    /// Telemetry only.
+    fn record_back_pressure_rejection(&self) {
+        self.back_pressure_rejections.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Install a per-invocation absolute deadline that drives the
@@ -377,6 +469,44 @@ impl WasiCudaContext {
     }
 }
 
+/// Aggregated, read-only view of a single instance's wasi-cuda activity.
+///
+/// Produced by [`WasiCudaContext::metrics_snapshot`] /
+/// [`WasiCudaContext::metrics_snapshot_with_scheduler`]. Every field is a
+/// pure read of an existing atomic / counter, so collecting a snapshot is
+/// cheap and never mutates host state — it is safe to call from an
+/// operator-facing metrics endpoint on the hot path.
+///
+/// Counter semantics:
+/// - [`kernels_launched`](Self::kernels_launched) and
+///   [`back_pressure_rejections`](Self::back_pressure_rejections) are
+///   monotonically-increasing lifetime counters for the instance.
+/// - [`bytes_pinned`](Self::bytes_pinned) and
+///   [`device_bytes_allocated`](Self::device_bytes_allocated) are *current*
+///   gauges (sum over live registry entries), so they fall when kernels /
+///   buffers are released.
+/// - [`yield_count`](Self::yield_count) comes from the matching
+///   [`SchedulerContext`]; it is `0` when a snapshot is taken without one
+///   (the wasi-cuda context does not own the scheduler — they are sibling
+///   fields on the executor's per-instance state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InstanceMetricsSnapshot {
+    /// Lifetime count of kernel launches that reached the dispatch path.
+    pub kernels_launched: u64,
+    /// Current aggregate retained PTX bytes across live kernels (the
+    /// host-memory the registry has "pinned" for this instance).
+    pub bytes_pinned: u64,
+    /// Lifetime count of launches refused by the back-pressure path
+    /// (semaphore saturated or per-invocation deadline tripped).
+    pub back_pressure_rejections: u64,
+    /// Cumulative cooperative-`yield()` calls observed by the matching
+    /// [`SchedulerContext`], or `0` when the snapshot was taken without one.
+    pub yield_count: u32,
+    /// Current aggregate live device-buffer bytes allocated via the
+    /// explicit `alloc` surface.
+    pub device_bytes_allocated: u64,
+}
+
 /// Trait implemented by store data types that can hand out a [`WasiCudaContext`].
 ///
 /// `tensor-wasm-exec`'s `InstanceState` will implement this in a follow-up wiring
@@ -495,6 +625,90 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
         }
         sync_impl(&caller).map_or_else(|e| e.code(), |_| 0)
     })?;
+
+    // Explicit device-memory surface (alloc / free / memcpy-h2d /
+    // memcpy-d2h). The raw ABI is i32-only, so the WIT-level `u64` size and
+    // `device-handle` are split into `(lo, hi)` i32 halves on the wire and
+    // reassembled host-side by `join_u64`. Every body is capability-gated
+    // exactly like the launch path above.
+    linker.func_wrap(
+        MODULE,
+        FN_ALLOC,
+        |mut caller: Caller<'_, T>, size_lo: i32, size_hi: i32| -> i64 {
+            if !caller
+                .data()
+                .wasi_cuda()
+                .wasi_cuda_enabled
+                .load(Ordering::Acquire)
+            {
+                return AbiError::NotAvailable.code() as i64;
+            }
+            match alloc_impl(&mut caller, join_u64(size_lo, size_hi)) {
+                Ok(handle) => handle as i64,
+                Err(e) => e.code() as i64,
+            }
+        },
+    )?;
+
+    linker.func_wrap(
+        MODULE,
+        FN_FREE,
+        |mut caller: Caller<'_, T>, handle_lo: i32, handle_hi: i32| -> i32 {
+            if !caller
+                .data()
+                .wasi_cuda()
+                .wasi_cuda_enabled
+                .load(Ordering::Acquire)
+            {
+                return AbiError::NotAvailable.code();
+            }
+            free_impl(&mut caller, join_u64(handle_lo, handle_hi)).map_or_else(|e| e.code(), |_| 0)
+        },
+    )?;
+
+    linker.func_wrap(
+        MODULE,
+        FN_MEMCPY_H2D,
+        |mut caller: Caller<'_, T>,
+         handle_lo: i32,
+         handle_hi: i32,
+         src_ptr: i32,
+         len: i32|
+         -> i32 {
+            if !caller
+                .data()
+                .wasi_cuda()
+                .wasi_cuda_enabled
+                .load(Ordering::Acquire)
+            {
+                return AbiError::NotAvailable.code();
+            }
+            memcpy_h2d_impl(&mut caller, join_u64(handle_lo, handle_hi), src_ptr, len)
+                .map_or_else(|e| e.code(), |_| 0)
+        },
+    )?;
+
+    linker.func_wrap(
+        MODULE,
+        FN_MEMCPY_D2H,
+        |mut caller: Caller<'_, T>,
+         dst_ptr: i32,
+         handle_lo: i32,
+         handle_hi: i32,
+         len: i32|
+         -> i32 {
+            if !caller
+                .data()
+                .wasi_cuda()
+                .wasi_cuda_enabled
+                .load(Ordering::Acquire)
+            {
+                return AbiError::NotAvailable.code();
+            }
+            memcpy_d2h_impl(&mut caller, dst_ptr, join_u64(handle_lo, handle_hi), len)
+                .map_or_else(|e| e.code(), |_| 0)
+        },
+    )?;
 
     // Note: `FN_LAST_ERROR_PTR` is deliberately NOT registered. The original
     // "host hands the guest a pointer into a pre-allocated buffer" shape
@@ -615,6 +829,375 @@ fn read_bytes<T>(caller: &mut Caller<'_, T>, ptr: i32, len: i32) -> Result<Vec<u
         return Err(AbiError::InvalidPointer);
     }
     Ok(data[start..end].to_vec())
+}
+
+/// Reassemble a `u64` from the two i32 halves the i32-only ABI carries.
+///
+/// The WIT-level `u64` (`alloc` size, `device-handle`) is split into a low
+/// and high 32-bit word on the wire — see the `FN_ALLOC` / `FN_FREE` doc
+/// comments in `abi.rs`. Each half is reinterpreted through `as u32` so a
+/// guest that set the high bit (a "negative" i32) round-trips to the
+/// intended unsigned value.
+fn join_u64(lo: i32, hi: i32) -> u64 {
+    ((hi as u32 as u64) << 32) | (lo as u32 as u64)
+}
+
+/// Validate that `[ptr, ptr + len)` is a real region inside the caller's
+/// linear memory, returning the `(start, end)` byte range on success.
+///
+/// `ptr` / `len` arrive as i32 from the wire but model WIT `u32`, so we
+/// reinterpret through `as u32` (a guest may legitimately pass an offset
+/// with the high bit set). Mirrors the `checked_add` + bounds pattern in
+/// [`read_bytes`] and `validate_launch_args`: an overflow or an
+/// out-of-bounds end returns [`AbiError::InvalidPointer`].
+fn checked_guest_region<T>(
+    caller: &mut Caller<'_, T>,
+    ptr: i32,
+    len: u32,
+) -> Result<(usize, usize), AbiError> {
+    let memory = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or(AbiError::InvalidPointer)?;
+    let mem_len = memory.data(&caller).len();
+    let start = ptr as u32 as usize;
+    let end = start
+        .checked_add(len as usize)
+        .ok_or(AbiError::InvalidPointer)?;
+    if end > mem_len {
+        return Err(AbiError::InvalidPointer);
+    }
+    Ok((start, end))
+}
+
+/// `alloc(size)` host implementation.
+///
+/// Validates the size against [`MAX_DEVICE_ALLOC_BYTES`] (zero-size →
+/// [`AbiError::InvalidArgs`]; oversize → [`AbiError::QuotaExceeded`]), then
+/// reserves a handle in the per-instance [`DeviceMemRegistry`] (which
+/// enforces the count + aggregate-bytes caps). On the no-CUDA path no real
+/// device memory is allocated and the call returns [`AbiError::NotAvailable`]
+/// *after* the handle is recorded — mirroring the launch stub so tests can
+/// still exercise the registry lifecycle. On the CUDA path the real
+/// `cuMemAlloc` runs first and its device pointer is stored in the entry.
+fn alloc_impl<T: HasWasiCuda>(caller: &mut Caller<'_, T>, size: u64) -> Result<u64, AbiError> {
+    let _span = info_span!(
+        "wasi_cuda.alloc",
+        instance = %caller.data().wasi_cuda().instance_id,
+        size = size,
+    )
+    .entered();
+    if size == 0 {
+        caller
+            .data()
+            .wasi_cuda()
+            .record_error("alloc: size must be > 0");
+        return Err(AbiError::InvalidArgs);
+    }
+    if size > MAX_DEVICE_ALLOC_BYTES {
+        caller.data().wasi_cuda().record_error(format!(
+            "alloc: size {size} exceeds MAX_DEVICE_ALLOC_BYTES {MAX_DEVICE_ALLOC_BYTES}"
+        ));
+        return Err(AbiError::QuotaExceeded);
+    }
+    let owner = caller.data().wasi_cuda().instance_id;
+    let device_mem = caller.data().wasi_cuda().device_mem.clone();
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        // No device to allocate from, but we still track the handle in the
+        // per-instance registry — exactly like the launch stub records its
+        // parsed argv before returning `NotAvailable`. This exercises the
+        // count + aggregate-bytes caps and the owner check on the no-CUDA
+        // path so a guest's `free` of the handle (and the metrics
+        // device-bytes gauge) behave consistently across feature configs.
+        // The handle is retained (not rolled back) so the alloc→free
+        // lifecycle is observable; the wire return is still `NotAvailable`.
+        let _handle = device_mem.insert(DeviceMemEntry { owner, size })?;
+        caller.data().wasi_cuda().record_error(format!(
+            "alloc: CUDA not available on this host (requested {size} bytes; \
+             handle tracked in registry)"
+        ));
+        Err(AbiError::NotAvailable)
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        // UNVERIFIED-PENDING-HARDWARE: this branch is compile-tested on
+        // CUDA hosts only and has not been exercised on real GPU hardware.
+        // It is written against the same cust 0.3.x surface the launch path
+        // uses (`cust::sys` raw driver calls). Keep it in lockstep with the
+        // cust API if a future bump renames these symbols.
+        //
+        // `cuMemAlloc` returns a `CUdeviceptr`; we store it in the registry
+        // entry so the memcpy paths can drive `cuMemcpyHtoD` /
+        // `cuMemcpyDtoH` against it. On any driver error we record the
+        // status and return `LaunchFailed` (the existing "driver said no"
+        // code).
+        use cust::sys as cuda_sys;
+        let mut device_ptr: cuda_sys::CUdeviceptr = 0;
+        // SAFETY: `cuMemAlloc` writes a fresh device pointer into
+        // `device_ptr`; `size` is bounded by MAX_DEVICE_ALLOC_BYTES above.
+        let status = unsafe { cuda_sys::cuMemAlloc_v2(&mut device_ptr, size as usize) };
+        if status != cuda_sys::CUresult::CUDA_SUCCESS {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("alloc: cuMemAlloc failed with status {status:?}"));
+            return Err(AbiError::LaunchFailed);
+        }
+        let handle = match device_mem.insert(DeviceMemEntry {
+            owner,
+            size,
+            device_ptr,
+        }) {
+            Ok(h) => h,
+            Err(e) => {
+                // Registry cap tripped after the driver alloc succeeded:
+                // free the device memory we just grabbed so the cap
+                // rejection does not leak it.
+                // SAFETY: `device_ptr` is the value cuMemAlloc just wrote.
+                unsafe {
+                    let _ = cuda_sys::cuMemFree_v2(device_ptr);
+                }
+                return Err(e);
+            }
+        };
+        Ok(handle)
+    }
+}
+
+/// `free(handle)` host implementation.
+///
+/// Removes the owner's allocation from the registry (cross-owner / unknown
+/// / double-free → [`AbiError::InvalidHandle`]). On the CUDA path the real
+/// `cuMemFree` runs against the stored device pointer.
+fn free_impl<T: HasWasiCuda>(caller: &mut Caller<'_, T>, handle: u64) -> Result<(), AbiError> {
+    let _span = info_span!(
+        "wasi_cuda.free",
+        instance = %caller.data().wasi_cuda().instance_id,
+        handle = handle,
+    )
+    .entered();
+    let owner = caller.data().wasi_cuda().instance_id;
+    let device_mem = caller.data().wasi_cuda().device_mem.clone();
+    let entry = match device_mem.free(handle, owner) {
+        Ok(e) => e,
+        Err(e) => {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("free: handle {handle} {}", e.name()));
+            return Err(e);
+        }
+    };
+    let _ = &entry;
+
+    #[cfg(feature = "cuda")]
+    {
+        // UNVERIFIED-PENDING-HARDWARE: see `alloc_impl`. Release the device
+        // pointer recorded at alloc time. A free that the registry accepted
+        // but the driver rejects is logged but still reported as success —
+        // the registry slot is already gone, so the guest's view (handle no
+        // longer valid) is correct regardless of the driver's verdict.
+        use cust::sys as cuda_sys;
+        // SAFETY: `entry.device_ptr` was produced by `cuMemAlloc` in
+        // `alloc_impl` and has not been freed (the registry slot guaranteed
+        // single ownership until this `free`).
+        let status = unsafe { cuda_sys::cuMemFree_v2(entry.device_ptr) };
+        if status != cuda_sys::CUresult::CUDA_SUCCESS {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("free: cuMemFree failed with status {status:?}"));
+        }
+    }
+
+    Ok(())
+}
+
+/// `memcpy_h2d(handle, src_ptr, len)` host implementation.
+///
+/// Bounds-checks the guest source region, checks `len` against the buffer's
+/// allocated size, and copies host→device. On the no-CUDA path the
+/// validation runs and the call returns [`AbiError::NotAvailable`].
+fn memcpy_h2d_impl<T: HasWasiCuda>(
+    caller: &mut Caller<'_, T>,
+    handle: u64,
+    src_ptr: i32,
+    len: i32,
+) -> Result<(), AbiError> {
+    let _span = info_span!(
+        "wasi_cuda.memcpy_h2d",
+        instance = %caller.data().wasi_cuda().instance_id,
+        handle = handle,
+    )
+    .entered();
+    let owner = caller.data().wasi_cuda().instance_id;
+    let device_mem = caller.data().wasi_cuda().device_mem.clone();
+    let dev = match device_mem.lookup(handle, owner) {
+        Ok(d) => d,
+        Err(e) => {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("memcpy_h2d: handle {handle} {}", e.name()));
+            return Err(e);
+        }
+    };
+    let len_u32 = len as u32;
+    // A copy longer than the buffer is a structural argument error — the
+    // guest asked to write past the end of its own device allocation.
+    if (len_u32 as u64) > dev.size {
+        caller.data().wasi_cuda().record_error(format!(
+            "memcpy_h2d: len {len_u32} exceeds device buffer size {}",
+            dev.size
+        ));
+        return Err(AbiError::InvalidArgs);
+    }
+    // Bounds-check the guest source region BEFORE any driver work, so an OOB
+    // copy surfaces as InvalidPointer (memory fault) rather than a driver
+    // error.
+    let (start, end) = match checked_guest_region(caller, src_ptr, len_u32) {
+        Ok(r) => r,
+        Err(e) => {
+            caller.data().wasi_cuda().record_error(format!(
+                "memcpy_h2d: source region [{src_ptr}, +{len_u32}) out of bounds"
+            ));
+            return Err(e);
+        }
+    };
+    let _ = (start, end);
+
+    #[cfg(feature = "cuda")]
+    {
+        // UNVERIFIED-PENDING-HARDWARE: see `alloc_impl`. Copy the validated
+        // guest bytes into the device buffer via `cuMemcpyHtoD`. We take a
+        // fresh `Memory::data` borrow here (no await has happened since the
+        // bounds-check, so the slice is still valid) and hand its base
+        // pointer to the driver.
+        use cust::sys as cuda_sys;
+        let memory = caller
+            .get_export("memory")
+            .and_then(|e| e.into_memory())
+            .ok_or(AbiError::InvalidPointer)?;
+        let src = &memory.data(&caller)[start..end];
+        // SAFETY: `dev.device_ptr` is a live `cuMemAlloc` pointer of at
+        // least `dev.size >= len_u32` bytes; `src` is `len_u32` bytes inside
+        // the caller's linear memory (bounds-checked above).
+        let status = unsafe {
+            cuda_sys::cuMemcpyHtoD_v2(
+                dev.device_ptr,
+                src.as_ptr() as *const std::ffi::c_void,
+                len_u32 as usize,
+            )
+        };
+        if status != cuda_sys::CUresult::CUDA_SUCCESS {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("memcpy_h2d: cuMemcpyHtoD failed: {status:?}"));
+            return Err(AbiError::LaunchFailed);
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        caller
+            .data()
+            .wasi_cuda()
+            .record_error("memcpy_h2d: CUDA not available on this host");
+        Err(AbiError::NotAvailable)
+    }
+}
+
+/// `memcpy_d2h(dst_ptr, handle, len)` host implementation.
+///
+/// Bounds-checks the guest destination region, checks `len` against the
+/// buffer's allocated size, and copies device→host. On the no-CUDA path the
+/// validation runs and the call returns [`AbiError::NotAvailable`].
+fn memcpy_d2h_impl<T: HasWasiCuda>(
+    caller: &mut Caller<'_, T>,
+    dst_ptr: i32,
+    handle: u64,
+    len: i32,
+) -> Result<(), AbiError> {
+    let _span = info_span!(
+        "wasi_cuda.memcpy_d2h",
+        instance = %caller.data().wasi_cuda().instance_id,
+        handle = handle,
+    )
+    .entered();
+    let owner = caller.data().wasi_cuda().instance_id;
+    let device_mem = caller.data().wasi_cuda().device_mem.clone();
+    let dev = match device_mem.lookup(handle, owner) {
+        Ok(d) => d,
+        Err(e) => {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("memcpy_d2h: handle {handle} {}", e.name()));
+            return Err(e);
+        }
+    };
+    let len_u32 = len as u32;
+    if (len_u32 as u64) > dev.size {
+        caller.data().wasi_cuda().record_error(format!(
+            "memcpy_d2h: len {len_u32} exceeds device buffer size {}",
+            dev.size
+        ));
+        return Err(AbiError::InvalidArgs);
+    }
+    let (start, end) = match checked_guest_region(caller, dst_ptr, len_u32) {
+        Ok(r) => r,
+        Err(e) => {
+            caller.data().wasi_cuda().record_error(format!(
+                "memcpy_d2h: dest region [{dst_ptr}, +{len_u32}) out of bounds"
+            ));
+            return Err(e);
+        }
+    };
+    let _ = (start, end);
+
+    #[cfg(feature = "cuda")]
+    {
+        // UNVERIFIED-PENDING-HARDWARE: see `alloc_impl`. Copy device bytes
+        // back into the validated guest region via `cuMemcpyDtoH`.
+        use cust::sys as cuda_sys;
+        let memory = caller
+            .get_export("memory")
+            .and_then(|e| e.into_memory())
+            .ok_or(AbiError::InvalidPointer)?;
+        let dst = &mut memory.data_mut(&mut *caller)[start..end];
+        // SAFETY: `dev.device_ptr` is a live `cuMemAlloc` pointer of at
+        // least `len_u32` bytes; `dst` is `len_u32` writable bytes inside
+        // the caller's linear memory (bounds-checked above).
+        let status = unsafe {
+            cuda_sys::cuMemcpyDtoH_v2(
+                dst.as_mut_ptr() as *mut std::ffi::c_void,
+                dev.device_ptr,
+                len_u32 as usize,
+            )
+        };
+        if status != cuda_sys::CUresult::CUDA_SUCCESS {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("memcpy_d2h: cuMemcpyDtoH failed: {status:?}"));
+            return Err(AbiError::LaunchFailed);
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        caller
+            .data()
+            .wasi_cuda()
+            .record_error("memcpy_d2h: CUDA not available on this host");
+        Err(AbiError::NotAvailable)
+    }
 }
 
 fn load_ptx_impl<T: HasWasiCuda>(
@@ -1004,7 +1587,17 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
     // process-wide; only the deadline is per-instance. Without an
     // installed deadline this collapses to the pre-T36 behaviour.
     let bp = caller.data().wasi_cuda().deadline_aware_back_pressure();
-    let _permit = bp.acquire_borrowed().await?;
+    let _permit = match bp.acquire_borrowed().await {
+        Ok(p) => p,
+        Err(e) => {
+            // Telemetry: a refused acquire (semaphore saturated or the
+            // per-invocation deadline tripped) counts as a back-pressure
+            // rejection for this instance. Pure counter bump; the error is
+            // propagated unchanged.
+            caller.data().wasi_cuda().record_back_pressure_rejection();
+            return Err(e);
+        }
+    };
 
     // Resolve argv now, after the permit has been acquired. Pointer args
     // are resolved against the caller's current linear-memory snapshot;
@@ -1230,6 +1823,9 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
             .last_lowered_args
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = lowered_args;
+        // Telemetry: a successful launch + synchronize counts as one
+        // dispatched kernel for this instance.
+        caller.data().wasi_cuda().record_kernel_launched();
         // `handle` is still in scope here; it (and the Arc<Module>) is
         // released by Drop now that synchronize has returned. The clone
         // moved into the blocking task may still hold the Arc briefly,
@@ -1252,6 +1848,12 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
             .last_lowered_args
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = lowered_args;
+        // Telemetry: the launch passed validation, acquired a permit, and
+        // reached the dispatch path — count it as launched even though the
+        // no-CUDA stub does not actually run the kernel. This mirrors the
+        // CUDA happy path's bump so the metric reflects "launches dispatched"
+        // consistently across feature configurations.
+        caller.data().wasi_cuda().record_kernel_launched();
         caller.data().wasi_cuda().record_error(format!(
             "launch: CUDA not available on this host (argv parsed: {parsed_count} args)"
         ));
@@ -1764,5 +2366,426 @@ mod tests {
         assert!(reg.remove(id).is_some());
         // handle still readable; no UAF possible.
         assert_eq!(handle.entry, "k");
+    }
+
+    // ----------------------------------------------------------------
+    // Explicit device-memory host functions (no-CUDA path).
+    // ----------------------------------------------------------------
+
+    /// WAT exposing the four device-memory host functions plus an `alloc`
+    /// that splits a `u64` size into `(lo, hi)`. Each exported wrapper
+    /// returns the raw ABI code so tests can assert on it.
+    fn device_mem_wat() -> String {
+        format!(
+            r#"
+            (module
+              (import "{m}" "{fn_alloc}"
+                (func $alloc (param i32 i32) (result i64)))
+              (import "{m}" "{fn_free}"
+                (func $free (param i32 i32) (result i32)))
+              (import "{m}" "{fn_h2d}"
+                (func $h2d (param i32 i32 i32 i32) (result i32)))
+              (import "{m}" "{fn_d2h}"
+                (func $d2h (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              ;; alloc(size_lo, size_hi) -> i64
+              (func (export "do_alloc") (param i32 i32) (result i64)
+                (call $alloc (local.get 0) (local.get 1)))
+              ;; free(handle_lo, handle_hi) -> i32
+              (func (export "do_free") (param i32 i32) (result i32)
+                (call $free (local.get 0) (local.get 1)))
+              ;; memcpy_h2d(handle_lo, handle_hi, src_ptr, len) -> i32
+              (func (export "do_h2d") (param i32 i32 i32 i32) (result i32)
+                (call $h2d (local.get 0) (local.get 1) (local.get 2) (local.get 3)))
+              ;; memcpy_d2h(dst_ptr, handle_lo, handle_hi, len) -> i32
+              (func (export "do_d2h") (param i32 i32 i32 i32) (result i32)
+                (call $d2h (local.get 0) (local.get 1) (local.get 2) (local.get 3)))
+            )
+            "#,
+            m = MODULE,
+            fn_alloc = FN_ALLOC,
+            fn_free = FN_FREE,
+            fn_h2d = FN_MEMCPY_H2D,
+            fn_d2h = FN_MEMCPY_D2H,
+        )
+    }
+
+    /// `memcpy-h2d` with an out-of-bounds source region must return
+    /// `InvalidPointer` — the bounds-check runs before any (no-op on this
+    /// path) driver work. We pre-seed a tracked handle on the registry so
+    /// the handle lookup succeeds and the failure is attributable to the
+    /// source region, not the handle.
+    #[tokio::test]
+    async fn memcpy_h2d_oob_source_returns_invalid_pointer() {
+        let mut config = wasmtime::Config::new();
+        config.async_support(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut linker: Linker<Dummy> = Linker::new(&engine);
+        add_to_linker(&mut linker).expect("add_to_linker");
+
+        let mut ctx = WasiCudaContext::new(InstanceId(300));
+        ctx.enable_wasi_cuda();
+        // Pre-seed a 1 MiB device buffer owned by this instance so the
+        // handle lookup inside memcpy succeeds.
+        let handle = ctx
+            .device_mem()
+            .insert(crate::device_mem::DeviceMemEntry {
+                owner: InstanceId(300),
+                size: 1024 * 1024,
+            })
+            .expect("insert");
+
+        let module = wasmtime::Module::new(&engine, wat::parse_str(device_mem_wat()).unwrap())
+            .expect("compile");
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+        let h2d = instance
+            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "do_h2d")
+            .expect("typed func");
+        // src_ptr = 70000 is past the single 64 KiB page; len = 16 still in
+        // the buffer's size budget but the source region is OOB.
+        let rc = h2d
+            .call_async(&mut store, (handle as i32, 0, 70000, 16))
+            .await
+            .expect("call");
+        assert_eq!(
+            rc,
+            AbiError::InvalidPointer.code(),
+            "OOB source region must return InvalidPointer, got {rc}"
+        );
+    }
+
+    /// `memcpy-h2d` with `len` larger than the device buffer's allocated
+    /// size returns `InvalidArgs` — a structural argument error distinct
+    /// from a memory fault.
+    #[tokio::test]
+    async fn memcpy_h2d_oversize_len_returns_invalid_args() {
+        let mut config = wasmtime::Config::new();
+        config.async_support(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut linker: Linker<Dummy> = Linker::new(&engine);
+        add_to_linker(&mut linker).expect("add_to_linker");
+
+        let mut ctx = WasiCudaContext::new(InstanceId(301));
+        ctx.enable_wasi_cuda();
+        // Buffer is only 8 bytes; a 16-byte copy overruns it.
+        let handle = ctx
+            .device_mem()
+            .insert(crate::device_mem::DeviceMemEntry {
+                owner: InstanceId(301),
+                size: 8,
+            })
+            .expect("insert");
+
+        let module = wasmtime::Module::new(&engine, wat::parse_str(device_mem_wat()).unwrap())
+            .expect("compile");
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+        let h2d = instance
+            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "do_h2d")
+            .expect("typed func");
+        let rc = h2d
+            .call_async(&mut store, (handle as i32, 0, 0, 16))
+            .await
+            .expect("call");
+        assert_eq!(
+            rc,
+            AbiError::InvalidArgs.code(),
+            "len > buffer size must return InvalidArgs, got {rc}"
+        );
+    }
+
+    /// A guest cannot operate on a handle owned by another instance:
+    /// `free` / `memcpy-h2d` / `memcpy-d2h` on a cross-owner handle all
+    /// return `InvalidHandle`. The handle is seeded under a *different*
+    /// `InstanceId` than the running context.
+    #[tokio::test]
+    async fn device_mem_cross_owner_handle_rejected() {
+        let mut config = wasmtime::Config::new();
+        config.async_support(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut linker: Linker<Dummy> = Linker::new(&engine);
+        add_to_linker(&mut linker).expect("add_to_linker");
+
+        let mut ctx = WasiCudaContext::new(InstanceId(302));
+        ctx.enable_wasi_cuda();
+        // Seed a handle owned by a *different* instance (999). The running
+        // context (302) must not be able to free / copy it.
+        let foreign = ctx
+            .device_mem()
+            .insert(crate::device_mem::DeviceMemEntry {
+                owner: InstanceId(999),
+                size: 4096,
+            })
+            .expect("insert");
+
+        let module = wasmtime::Module::new(&engine, wat::parse_str(device_mem_wat()).unwrap())
+            .expect("compile");
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+
+        let free = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "do_free")
+            .expect("typed func");
+        let rc = free
+            .call_async(&mut store, (foreign as i32, 0))
+            .await
+            .expect("call");
+        assert_eq!(
+            rc,
+            AbiError::InvalidHandle.code(),
+            "cross-owner free must return InvalidHandle, got {rc}"
+        );
+
+        let h2d = instance
+            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "do_h2d")
+            .expect("typed func");
+        let rc = h2d
+            .call_async(&mut store, (foreign as i32, 0, 0, 16))
+            .await
+            .expect("call");
+        assert_eq!(
+            rc,
+            AbiError::InvalidHandle.code(),
+            "cross-owner memcpy_h2d must return InvalidHandle, got {rc}"
+        );
+
+        let d2h = instance
+            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "do_d2h")
+            .expect("typed func");
+        let rc = d2h
+            .call_async(&mut store, (0, foreign as i32, 0, 16))
+            .await
+            .expect("call");
+        assert_eq!(
+            rc,
+            AbiError::InvalidHandle.code(),
+            "cross-owner memcpy_d2h must return InvalidHandle, got {rc}"
+        );
+        // The foreign handle is still present and still owned by 999.
+        assert!(store
+            .data()
+            .wasi_cuda()
+            .device_mem()
+            .lookup(foreign, InstanceId(999))
+            .is_ok());
+    }
+
+    /// `alloc` of zero bytes is a structural error (`InvalidArgs`); an
+    /// oversize request trips the per-call cap (`QuotaExceeded`). Both are
+    /// rejected before the no-CUDA `NotAvailable` stub.
+    #[tokio::test]
+    async fn alloc_rejects_zero_and_oversize() {
+        let mut config = wasmtime::Config::new();
+        config.async_support(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut linker: Linker<Dummy> = Linker::new(&engine);
+        add_to_linker(&mut linker).expect("add_to_linker");
+
+        let mut ctx = WasiCudaContext::new(InstanceId(303));
+        ctx.enable_wasi_cuda();
+        let module = wasmtime::Module::new(&engine, wat::parse_str(device_mem_wat()).unwrap())
+            .expect("compile");
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+        let alloc = instance
+            .get_typed_func::<(i32, i32), i64>(&mut store, "do_alloc")
+            .expect("typed func");
+
+        // size = 0
+        let rc = alloc.call_async(&mut store, (0, 0)).await.expect("call");
+        assert_eq!(
+            rc,
+            AbiError::InvalidArgs.code() as i64,
+            "zero-size alloc must return InvalidArgs, got {rc}"
+        );
+
+        // size = MAX_DEVICE_ALLOC_BYTES + 1 (split into lo/hi).
+        let oversize = crate::device_mem::MAX_DEVICE_ALLOC_BYTES + 1;
+        let lo = (oversize & 0xffff_ffff) as i32;
+        let hi = (oversize >> 32) as i32;
+        let rc = alloc.call_async(&mut store, (lo, hi)).await.expect("call");
+        assert_eq!(
+            rc,
+            AbiError::QuotaExceeded.code() as i64,
+            "oversize alloc must return QuotaExceeded, got {rc}"
+        );
+    }
+
+    /// On the no-CUDA path `alloc` returns `NotAvailable` (like the launch
+    /// stub) but still tracks the handle in the registry; the guest can
+    /// then `free` it. A second free of the same handle fails with
+    /// `InvalidHandle` (double-free protection), and the aggregate
+    /// device-bytes gauge returns to zero.
+    #[tokio::test]
+    async fn alloc_tracks_handle_then_free_lifecycle() {
+        let mut config = wasmtime::Config::new();
+        config.async_support(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut linker: Linker<Dummy> = Linker::new(&engine);
+        add_to_linker(&mut linker).expect("add_to_linker");
+
+        let mut ctx = WasiCudaContext::new(InstanceId(304));
+        ctx.enable_wasi_cuda();
+        let module = wasmtime::Module::new(&engine, wat::parse_str(device_mem_wat()).unwrap())
+            .expect("compile");
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+        let alloc = instance
+            .get_typed_func::<(i32, i32), i64>(&mut store, "do_alloc")
+            .expect("typed func");
+        let free = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "do_free")
+            .expect("typed func");
+
+        // alloc 4096 bytes — no-CUDA path returns NotAvailable.
+        let rc = alloc.call_async(&mut store, (4096, 0)).await.expect("call");
+        assert_eq!(
+            rc,
+            AbiError::NotAvailable.code() as i64,
+            "no-CUDA alloc must return NotAvailable, got {rc}"
+        );
+        // But the handle was tracked: exactly one live allocation of 4096.
+        assert_eq!(store.data().wasi_cuda().device_mem().len(), 1);
+        assert_eq!(
+            store.data().wasi_cuda().device_mem().total_device_bytes(),
+            4096
+        );
+        // The handle id is 1 (registry hands out sequential ids from 1).
+        let handle: u64 = 1;
+        let rc = free
+            .call_async(&mut store, (handle as i32, 0))
+            .await
+            .expect("call");
+        assert_eq!(rc, 0, "free of a tracked handle must succeed, got {rc}");
+        assert!(store.data().wasi_cuda().device_mem().is_empty());
+        assert_eq!(
+            store.data().wasi_cuda().device_mem().total_device_bytes(),
+            0
+        );
+        // Double-free fails.
+        let rc = free
+            .call_async(&mut store, (handle as i32, 0))
+            .await
+            .expect("call");
+        assert_eq!(
+            rc,
+            AbiError::InvalidHandle.code(),
+            "double-free must return InvalidHandle, got {rc}"
+        );
+    }
+
+    /// The aggregate device-bytes cap is enforced by the registry that the
+    /// `alloc` host fn writes through: inserting buffers totalling
+    /// `MAX_TOTAL_DEVICE_BYTES` succeeds; one more trips `QuotaExceeded`.
+    #[test]
+    fn device_mem_aggregate_cap_via_registry() {
+        use crate::device_mem::{
+            DeviceMemEntry, MAX_DEVICE_ALLOC_BYTES, MAX_TOTAL_DEVICE_BYTES,
+        };
+        let ctx = WasiCudaContext::new(InstanceId(305));
+        let reg = ctx.device_mem();
+        let per = MAX_DEVICE_ALLOC_BYTES;
+        let count = (MAX_TOTAL_DEVICE_BYTES / per) as usize;
+        for _ in 0..count {
+            reg.insert(DeviceMemEntry {
+                owner: InstanceId(305),
+                size: per,
+            })
+            .expect("under cap");
+        }
+        assert_eq!(
+            reg.insert(DeviceMemEntry {
+                owner: InstanceId(305),
+                size: per,
+            })
+            .unwrap_err(),
+            AbiError::QuotaExceeded
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Per-instance metrics snapshot.
+    // ----------------------------------------------------------------
+
+    /// A fresh context reports an all-zero snapshot.
+    #[test]
+    fn metrics_snapshot_zero_on_fresh_context() {
+        let ctx = WasiCudaContext::new(InstanceId(400));
+        let snap = ctx.metrics_snapshot();
+        assert_eq!(snap, InstanceMetricsSnapshot::default());
+        assert_eq!(snap.kernels_launched, 0);
+        assert_eq!(snap.bytes_pinned, 0);
+        assert_eq!(snap.back_pressure_rejections, 0);
+        assert_eq!(snap.yield_count, 0);
+        assert_eq!(snap.device_bytes_allocated, 0);
+    }
+
+    /// The snapshot reflects recorded activity: a registered kernel bumps
+    /// `bytes_pinned`, a tracked device buffer bumps
+    /// `device_bytes_allocated`, the internal counters bump
+    /// `kernels_launched` / `back_pressure_rejections`, and folding in a
+    /// scheduler surfaces its `yield_count`.
+    #[test]
+    fn metrics_snapshot_reflects_activity() {
+        let ctx = WasiCudaContext::new(InstanceId(401));
+
+        // Register a kernel → bytes_pinned.
+        ctx.registry
+            .register(KernelEntry {
+                owner: InstanceId(401),
+                entry: "k".into(),
+                ptx_bytes_len: 2048,
+                #[cfg(feature = "cuda")]
+                module: None,
+            })
+            .expect("register");
+
+        // Track a device buffer → device_bytes_allocated.
+        ctx.device_mem()
+            .insert(crate::device_mem::DeviceMemEntry {
+                owner: InstanceId(401),
+                size: 65536,
+            })
+            .expect("insert");
+
+        // Bump the lifetime counters directly (the launch path does this
+        // through the private helpers; here we exercise the read surface).
+        ctx.record_kernel_launched();
+        ctx.record_kernel_launched();
+        ctx.record_back_pressure_rejection();
+
+        let snap = ctx.metrics_snapshot();
+        assert_eq!(snap.kernels_launched, 2);
+        assert_eq!(snap.bytes_pinned, 2048);
+        assert_eq!(snap.back_pressure_rejections, 1);
+        assert_eq!(snap.device_bytes_allocated, 65536);
+        assert_eq!(snap.yield_count, 0, "no scheduler folded in yet");
+
+        // Fold in a scheduler whose yield counter has advanced.
+        let sched = SchedulerContext::unbounded();
+        sched.yield_now();
+        sched.yield_now();
+        sched.yield_now();
+        let snap = ctx.metrics_snapshot_with_scheduler(&sched);
+        assert_eq!(snap.yield_count, 3);
+        // The other fields are unchanged by folding in the scheduler.
+        assert_eq!(snap.kernels_launched, 2);
+        assert_eq!(snap.device_bytes_allocated, 65536);
     }
 }

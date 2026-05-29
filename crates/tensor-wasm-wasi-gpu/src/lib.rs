@@ -23,12 +23,14 @@
 
 pub mod abi;
 pub mod async_dispatch;
+pub mod device_mem;
 pub mod host;
 pub mod kernel_args;
 pub mod registry;
 pub mod scheduler;
 pub mod streaming;
 
+pub use host::InstanceMetricsSnapshot;
 pub use streaming::{
     add_input_to_linker, add_streaming_to_linker, HasInput, HasStreaming, InputContext,
     StreamingContext, FN_EMIT_CHUNK, FN_FLUSH, FN_INPUT_LEN, FN_READ_INPUT, MAX_CHUNK_BYTES,
