@@ -51,6 +51,35 @@ pub struct InstanceState {
     /// epoch deadline) at the start of each call. `None` for instances
     /// spawned without a deadline.
     pub deadline_duration: Option<Duration>,
+    /// Absolute wall-clock instant past which the cooperative epoch
+    /// callback must **trap** (terminate the guest) rather than yield.
+    ///
+    /// This is the source of truth for the HARD deadline guarantee under
+    /// the cooperative-yield scheme (see
+    /// [`crate::executor::TensorWasmExecutor`]'s epoch callback). The
+    /// store's epoch deadline is configured with
+    /// [`wasmtime::Store::epoch_deadline_callback`] in async-yield mode:
+    /// every time the epoch deadline trips, the callback compares
+    /// `Instant::now()` against this instant. If the instant has NOT
+    /// passed, the callback returns [`wasmtime::UpdateDeadline::Yield`],
+    /// so the guest yields `Pending` to the async runtime (making a
+    /// compute-bound guest cancellable on future-drop) and the epoch
+    /// re-arms for another cooperative window. Once this instant HAS
+    /// passed, the callback returns an error, which wasmtime turns into
+    /// a trap — preserving the exact trap-on-deadline behaviour the
+    /// executor relied on under the old `set_epoch_deadline`-trap scheme.
+    ///
+    /// Distinct from [`Self::deadline`]: `deadline` is the per-call soft
+    /// budget consulted by the scheduler/back-pressure surface and by the
+    /// timeout *classification* in `call_export_with_args`, whereas
+    /// `hard_deadline` is what the epoch callback enforces. The executor
+    /// keeps them aligned — for a call with a configured deadline both are
+    /// `now + d`; during instantiation `hard_deadline` is additionally
+    /// clamped by [`crate::executor::MAX_START_FN_DURATION`] so a runaway
+    /// `start` function still traps even on a deadline-less spawn.
+    /// `None` means "no hard cap" — the callback yields cooperatively
+    /// forever (used only if no cap of any kind applies).
+    pub hard_deadline: Option<Instant>,
     /// Total kernel dispatches issued by this instance (cumulative).
     pub kernel_dispatches: AtomicU64,
     /// Total bytes of GPU memory this instance has allocated.
@@ -120,6 +149,7 @@ impl InstanceState {
             created_at: Instant::now(),
             deadline: None,
             deadline_duration: None,
+            hard_deadline: None,
             kernel_dispatches: AtomicU64::new(0),
             gpu_bytes_allocated: AtomicU64::new(0),
             limiter: TensorWasmResourceLimiter::new(usize::MAX),
@@ -198,6 +228,24 @@ impl InstanceState {
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// Set the absolute instant at which the cooperative epoch callback
+    /// must trap (the HARD deadline). Returns `self` for builder-style use.
+    /// See [`Self::hard_deadline`].
+    pub(crate) fn with_hard_deadline(mut self, at: Instant) -> Self {
+        self.hard_deadline = Some(at);
+        self
+    }
+
+    /// True iff a hard deadline is configured and `Instant::now()` has
+    /// reached or passed it. Consulted by the executor's epoch-deadline
+    /// callback to decide between a cooperative yield and a hard trap.
+    pub(crate) fn hard_deadline_elapsed(&self) -> bool {
+        match self.hard_deadline {
+            Some(at) => Instant::now() >= at,
+            None => false,
+        }
     }
 
     /// Record the per-call deadline duration so subsequent calls can re-arm

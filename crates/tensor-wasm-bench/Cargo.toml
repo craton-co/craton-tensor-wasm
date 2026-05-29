@@ -10,6 +10,8 @@ description = "Benchmark harness for Craton TensorWasm (Criterion + custom suite
 homepage = "https://github.com/craton-co/craton-tensor-wasm"
 documentation = "https://docs.rs/tensor-wasm-bench"
 readme = "README.md"
+keywords = ["wasm", "benchmark", "criterion", "latency", "gpu"]
+categories = ["development-tools::profiling", "wasm"]
 publish = false
 
 [lib]
@@ -88,12 +90,14 @@ name = "call_export_args"
 harness = false
 
 [[bench]]
-# B7.1 streaming-invoke harness. Bodies are `todo!()` placeholders until
-# the streaming spawn path lands; registered so `cargo bench --workspace`
-# compiles cleanly (the criterion_main! harness would otherwise clash with
-# auto-discovery). Running this bench panics until B7.1 — see the module
-# docs. Converting the todo!()s to clean skip lines is tracked for the
-# bench-cleanup pass.
+# B7.1 streaming-invoke harness. The three bench functions emit clean
+# `"status":"skipped"` JSON lines (mirroring the dispatch_future_backends
+# skip pattern) and return without measuring until the streaming spawn path
+# lands; registered so `cargo bench --workspace` compiles cleanly (the
+# criterion_main! harness would otherwise clash with auto-discovery).
+# Running this bench completes cleanly today — it does NOT panic. The
+# per-function TODO(B7.1) markers in the source track the real wiring; see
+# the module docs.
 name = "streaming_invoke"
 harness = false
 

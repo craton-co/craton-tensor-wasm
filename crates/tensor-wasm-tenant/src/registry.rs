@@ -286,12 +286,22 @@ impl TenantRegistry {
         // longer upgrade because the inner allocation has been dropped — a
         // `Weak::upgrade` on a fully-dropped Arc returns `None`).
         //
-        // H1: stamp the context with this registry's token *before*
-        // wrapping in `Arc` so `check_capability` can compare token
-        // identity on every quota-mutation call. Unconditional — the
-        // binding is enforced regardless of the `strict-cap-binding`
-        // feature.
-        ctx.registry_token = Some(Arc::clone(&self.registry_token));
+        // H1: the context must be stamped with this registry's token so
+        // `check_capability` can compare token identity on every
+        // quota-mutation call. Unconditional — the binding is enforced
+        // regardless of the `strict-cap-binding` feature.
+        //
+        // Latent-footgun fix: the stamp is applied ONLY on the success
+        // (`Vacant`/insert) arm below, *after* the fallible `entry()` match
+        // has resolved and we know registration will commit — never before.
+        // On the `Occupied`/`OrphanStillAlive` rejection arms the `ctx` is
+        // dropped, but stamping it before resolving fallibility would leave
+        // it carrying a token for a registry it was never inserted into; a
+        // future refactor that returned the rejected `ctx` to the caller
+        // would then let `check_capability` accept a foreign cap. We derive
+        // the token here (it is just an `Arc::clone` of this registry's
+        // identity allocation) but defer the assignment to the success arm.
+        let registry_token = Arc::clone(&self.registry_token);
         let outcome = match self.inner.entry(id) {
             dashmap::mapref::entry::Entry::Occupied(_) => Err(RegistryError::AlreadyRegistered(id)),
             dashmap::mapref::entry::Entry::Vacant(slot) => {
@@ -324,10 +334,17 @@ impl TenantRegistry {
                         // before we proceed to insert into `inner`.
                     }
                 }
+                // Success-only stamp: now that the slot is known Vacant and
+                // the insert is about to commit, bind the context to this
+                // registry's identity token *before* wrapping in `Arc`.
+                // Placing the assignment here (rather than before the
+                // `entry()` match) guarantees a rejected `ctx` never carries
+                // a token for a registry it was not inserted into.
+                ctx.registry_token = Some(Arc::clone(&registry_token));
                 let arc = Arc::new(ctx);
                 slot.insert(Arc::clone(&arc));
                 // H1: cap is always bound to this registry's token.
-                let cap = TenantCapability::mint(id, Arc::clone(&self.registry_token));
+                let cap = TenantCapability::mint(id, registry_token);
                 Ok((arc, cap))
             }
         };
@@ -546,13 +563,21 @@ impl TenantRegistry {
 
     /// Number of tombstones currently held by this registry.
     ///
-    /// Crate-private accessor exposed for the T27 prune tests. Operators
-    /// who want a public surface should call [`Self::collect_tombstones`]
-    /// (which returns the *prune count* and is admin-gated); the raw
-    /// tombstone count is an internal implementation detail that should
-    /// not bleed into stable API.
-    #[cfg(test)]
-    pub(crate) fn tombstone_count(&self) -> usize {
+    /// A tombstone is recorded for every tenant that has been
+    /// [`unregister`](Self::unregister)ed while at least one
+    /// `Arc<TenantContext>` from its registration was still alive (an
+    /// "orphan"). Tombstones are reclaimed by the opportunistic prune and by
+    /// [`Self::collect_tombstones`], so a count that grows without bound is
+    /// an operator-visible signal of leaked/churned tenant Arcs (orphans
+    /// that never drop, or churn outpacing the amortized prune).
+    ///
+    /// Exposed as an unauthenticated read-only gauge for the metrics layer:
+    /// unlike [`Self::collect_tombstones`] (which mutates the map and is
+    /// admin-cap-gated), this only observes the current size and leaks no
+    /// per-tenant identity, so it is safe to surface without a capability.
+    /// Pair it with [`Self::collect_tombstones`] to both observe growth and
+    /// reclaim the dead entries.
+    pub fn tombstone_count(&self) -> usize {
         self.tombstones.len()
     }
 

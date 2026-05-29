@@ -197,24 +197,46 @@ impl std::error::Error for RateLimited {}
 /// atomic *as a unit*. The lock is held only for the duration of that
 /// arithmetic (no I/O, no syscalls beyond `Instant::now`), so contention is
 /// negligible next to the work an admitted operation actually goes on to do.
+/// Scale factor for the fixed-point token accounting: tokens are tracked
+/// internally in *micro-tokens* (1 whole token == `MICRO_PER_TOKEN`
+/// micro-tokens). All refill / consume / cap arithmetic is therefore exact
+/// integer arithmetic on `u64`, with no `f64` rounding or epsilon fudge.
+///
+/// At micro-token granularity, sub-token refill credit (a 100 ops/s bucket
+/// accruing 1 token every 10 ms) is preserved between calls exactly as the
+/// old `f64` `tokens` field intended, but an exactly-full bucket compares
+/// *exactly* equal to its capacity — so a full bucket always admits, and
+/// accumulated rounding can no longer spuriously reject it.
+///
+/// `1_000_000` gives microsecond-equivalent resolution: even a 1 ops/s rate
+/// credits 1 micro-token per microsecond of elapsed time, far finer than any
+/// realistic scheduler cares about, while keeping the `u64` headroom huge
+/// (`u64::MAX / 1_000_000` ≈ 1.8e13 whole tokens of burst capacity).
+const MICRO_PER_TOKEN: u64 = 1_000_000;
+
 #[derive(Debug)]
 struct TokenBucket {
-    /// Steady-state refill rate, tokens per second. The fractional-token
-    /// accounting (a 100 ops/s bucket refills 1 token every 10 ms) is carried
-    /// on `TokenBucketState::tokens` (an `f64`), so sub-token credit is not
-    /// lost between calls even though the rate itself is a whole number.
+    /// Steady-state refill rate, tokens per second. Refill credit is computed
+    /// as exact integer micro-tokens from the elapsed `Duration` (see
+    /// [`TokenBucket::refilled_micros`]), so sub-token credit is carried on
+    /// `TokenBucketState::micro_tokens` without any floating-point rounding.
     ops_per_sec: u64,
-    /// Maximum tokens the bucket can hold (the burst depth).
+    /// Maximum *whole* tokens the bucket can hold (the burst depth). The
+    /// public [`RateLimited::burst`] reports this value unchanged.
     burst: u64,
+    /// Bucket capacity in micro-tokens (`burst * MICRO_PER_TOKEN`, saturating
+    /// so an absurdly large burst cannot overflow `u64`). Precomputed once so
+    /// the hot path is a plain `min`.
+    capacity_micros: u64,
     /// Mutable bucket state, guarded as a unit.
     state: Mutex<TokenBucketState>,
 }
 
 #[derive(Debug)]
 struct TokenBucketState {
-    /// Current token count, carried as `f64` to preserve fractional refill
-    /// credit between observations.
-    tokens: f64,
+    /// Current token count in micro-tokens, preserving fractional refill
+    /// credit between observations as an exact integer (no `f64` rounding).
+    micro_tokens: u64,
     /// Last instant the bucket was refilled. Advanced on every
     /// `try_acquire`, so the next call only credits time since this point.
     last_refill: Instant,
@@ -230,20 +252,46 @@ impl TokenBucket {
     fn new(ops_per_sec: u64, burst: u64) -> Self {
         let burst = burst.max(1);
         let ops_per_sec = ops_per_sec.max(1);
+        // Saturating so a pathologically large burst (> u64::MAX / MICRO)
+        // cannot overflow the micro-token capacity. Realistic bursts are far
+        // below this ceiling, so the saturation is a safety net, not a
+        // behavioural change.
+        let capacity_micros = burst.saturating_mul(MICRO_PER_TOKEN);
         Self {
             ops_per_sec,
             burst,
+            capacity_micros,
             state: Mutex::new(TokenBucketState {
-                tokens: burst as f64,
+                // Starts full: `burst` whole tokens == `capacity_micros`.
+                micro_tokens: capacity_micros,
                 last_refill: Instant::now(),
             }),
         }
     }
 
-    /// Refill credit accrued over `elapsed`, capped at `burst`.
-    fn refilled(&self, tokens: f64, elapsed: Duration) -> f64 {
-        let credit = elapsed.as_secs_f64() * self.ops_per_sec as f64;
-        (tokens + credit).min(self.burst as f64)
+    /// Micro-token balance after crediting `elapsed` of refill onto `current`,
+    /// capped at the bucket capacity.
+    ///
+    /// Refill credit in micro-tokens is
+    /// `elapsed_nanos * ops_per_sec * MICRO_PER_TOKEN / 1_000_000_000`. The
+    /// intermediate product is computed in `u128` so even a multi-year
+    /// `elapsed` cannot overflow before the per-nanosecond divide; the result
+    /// is then saturated back into `u64` and capped at `capacity_micros`, so
+    /// a long idle period simply tops the bucket off at its burst depth (and
+    /// never wraps). The division truncates toward zero, which only ever
+    /// *under*-credits by at most one micro-token — it can never manufacture
+    /// tokens that would let an over-budget request slip through.
+    fn refilled_micros(&self, current: u64, elapsed: Duration) -> u64 {
+        let nanos = elapsed.as_nanos();
+        // credit_micros = nanos * ops_per_sec * MICRO_PER_TOKEN / 1e9
+        let credit_micros = nanos
+            .saturating_mul(self.ops_per_sec as u128)
+            .saturating_mul(MICRO_PER_TOKEN as u128)
+            / 1_000_000_000u128;
+        let credit_micros = u64::try_from(credit_micros).unwrap_or(u64::MAX);
+        current
+            .saturating_add(credit_micros)
+            .min(self.capacity_micros)
     }
 
     /// Attempt to remove `n` tokens, refilling for elapsed wall-clock time
@@ -254,6 +302,13 @@ impl TokenBucket {
     /// `now` is injected rather than read internally so tests can drive the
     /// refill deterministically without sleeping; the public
     /// [`TenantContext::try_acquire_op`] passes `Instant::now()`.
+    ///
+    /// All accounting is exact integer arithmetic in micro-tokens, so the
+    /// admission test is a plain `available_micros >= need_micros`: an
+    /// exactly-full bucket has `available_micros == capacity_micros` and a
+    /// request for exactly the full burst has `need_micros == capacity_micros`,
+    /// which compares equal and therefore admits (no `f64::EPSILON` nudge, no
+    /// magnitude-dependent rounding that could spuriously reject it).
     fn try_acquire_at(&self, n: u64, now: Instant) -> Result<(), RateLimited> {
         let mut state = self
             .state
@@ -265,17 +320,28 @@ impl TokenBucket {
         let elapsed = now
             .checked_duration_since(state.last_refill)
             .unwrap_or(Duration::ZERO);
-        let available = self.refilled(state.tokens, elapsed);
-        let need = n as f64;
-        if available + f64::EPSILON < need {
+        let available_micros = self.refilled_micros(state.micro_tokens, elapsed);
+        // `need` in micro-tokens. Saturating so a colossal `n` cannot overflow;
+        // such a request necessarily exceeds the bucket and is rejected below.
+        let need_micros = n.saturating_mul(MICRO_PER_TOKEN);
+        if available_micros < need_micros {
             return Err(RateLimited {
                 requested: n,
-                available: available as u64,
+                // Report the whole tokens that are actually acquirable right
+                // now (floor of the micro-token balance). This is consistent
+                // with the admission decision: the request was rejected
+                // precisely because `available_micros < need_micros`, so the
+                // floored whole-token count is strictly less than `n` and the
+                // documented `available < requested` invariant holds. Floor —
+                // not the old `f64 as u64` truncation of a possibly-rounded
+                // value — is exact, so we never under-report a token the
+                // caller could in fact have acquired.
+                available: available_micros / MICRO_PER_TOKEN,
                 ops_per_sec: self.ops_per_sec,
                 burst: self.burst,
             });
         }
-        state.tokens = available - need;
+        state.micro_tokens = available_micros - need_micros;
         state.last_refill = now;
         Ok(())
     }

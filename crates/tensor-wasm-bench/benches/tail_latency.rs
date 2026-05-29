@@ -100,6 +100,7 @@ use axum::http::{header, Request, StatusCode};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use http_body_util::BodyExt;
 use tensor_wasm_api::{build_router, AppState};
+use tensor_wasm_bench::{percentile_nearest_rank, TailResult};
 use tensor_wasm_wasi_gpu::async_dispatch::{BackPressure, DispatchFuture};
 use tower::ServiceExt;
 
@@ -143,55 +144,11 @@ const BACKEND_LABEL: &str = "cudarc";
 #[cfg(all(not(feature = "cudarc-backend"), not(feature = "cuda-oxide-backend")))]
 const BACKEND_LABEL: &str = "unified-memory";
 
-/// One line of the structured JSON output. Field names match the format
-/// documented in `bench-results/README.md` so downstream parsers (Grafana
-/// import scripts, the v0.3 observability dashboards) can consume it
-/// without translation. The `backend` field was added in W4.4 (RFC 0001
-/// Unresolved questions extension) and is the compile-time
-/// [`BACKEND_LABEL`] of the run; it is always present today even though the
-/// schema is still flagged "schemaless" upstream (wave-4 ops work
-/// formalises the schema). Downstream parsers that pre-date W4.4 should
-/// treat `backend` as optional and fall back to `"unified-memory"` when it
-/// is missing — that matches the W4.6 historical default.
-#[derive(Debug, Clone)]
-struct TailResult {
-    metric: String,
-    backend: &'static str,
-    samples: usize,
-    p50_ns: u128,
-    p95_ns: u128,
-    p99_ns: u128,
-    p99_9_ns: u128,
-    max_ns: u128,
-}
-
-impl TailResult {
-    fn to_json(&self) -> String {
-        format!(
-            "{{\"metric\":\"{}\",\"backend\":\"{}\",\"samples\":{},\"p50_ns\":{},\"p95_ns\":{},\"p99_ns\":{},\"p99_9_ns\":{},\"max_ns\":{}}}",
-            self.metric,
-            self.backend,
-            self.samples,
-            self.p50_ns,
-            self.p95_ns,
-            self.p99_ns,
-            self.p99_9_ns,
-            self.max_ns,
-        )
-    }
-}
-
-/// Nearest-rank percentile (`samples[ceil(p * n) - 1]`). `samples` must be
-/// pre-sorted ascending; the function panics on an empty slice to surface
-/// bench misconfiguration loudly rather than silently emitting 0 ns.
-fn percentile_nearest_rank(sorted: &[Duration], p: f64) -> u128 {
-    assert!(!sorted.is_empty(), "percentile of empty sample set");
-    assert!((0.0..=1.0).contains(&p), "percentile p out of range");
-    let n = sorted.len();
-    let rank = ((p * n as f64).ceil() as usize).max(1);
-    let idx = rank.min(n) - 1;
-    sorted[idx].as_nanos()
-}
+// `TailResult` and `percentile_nearest_rank` now live in the crate's
+// `src/lib.rs` (imported above) so the percentile math and the JSON schema
+// have a single source of truth, plus real `cargo test`-visible unit tests.
+// `harness = false` bench targets are compiled with `cfg(test)` UNSET, so any
+// `#[cfg(test)] mod tests` here would never compile or run.
 
 /// Collect `SAMPLES` raw durations from `f`, sort once, and compute P50/P95/
 /// P99/P99.9/max via `percentile_nearest_rank`. `metric` is the label that
@@ -455,66 +412,11 @@ fn tail_latency_bench(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn nearest_rank_known_distribution() {
-        // 1..=100 sorted: P50 = 50, P95 = 95, P99 = 99, P99.9 = 100, max = 100.
-        // Nearest-rank: rank(0.50, 100) = ceil(50) = 50 → samples[49] = 50.
-        let samples: Vec<Duration> = (1u128..=100)
-            .map(|n| Duration::from_nanos(n as u64))
-            .collect();
-        assert_eq!(percentile_nearest_rank(&samples, 0.50), 50);
-        assert_eq!(percentile_nearest_rank(&samples, 0.95), 95);
-        assert_eq!(percentile_nearest_rank(&samples, 0.99), 99);
-        // P99.9 of 100 samples: ceil(99.9) = 100 → samples[99] = 100.
-        assert_eq!(percentile_nearest_rank(&samples, 0.999), 100);
-    }
-
-    #[test]
-    fn nearest_rank_p0_returns_min() {
-        let samples = vec![Duration::from_nanos(7), Duration::from_nanos(13)];
-        // p=0.0 clamps the rank to 1 → samples[0].
-        assert_eq!(percentile_nearest_rank(&samples, 0.0), 7);
-    }
-
-    /// W4.4 sanity: the compile-time backend label must be one of the three
-    /// slots RFC 0001 enumerates. Catches typos in any future feature-flag
-    /// rename (e.g. if `cuda-oxide-backend` is shortened to `cuoxide`).
-    #[test]
-    fn backend_label_is_one_of_three_known_values() {
-        assert!(
-            matches!(BACKEND_LABEL, "unified-memory" | "cudarc" | "cuda-oxide"),
-            "unexpected BACKEND_LABEL={BACKEND_LABEL:?}; expected one of unified-memory/cudarc/cuda-oxide per RFC 0001",
-        );
-    }
-
-    /// W4.4 JSON-serialisation contract: `to_json` must emit the backend
-    /// field so downstream parsers can demultiplex by backend. Guards
-    /// against a future refactor accidentally dropping the field.
-    #[test]
-    fn tail_result_json_carries_backend_field() {
-        let r = TailResult {
-            metric: "test/metric".to_string(),
-            backend: "unified-memory",
-            samples: 10,
-            p50_ns: 1,
-            p95_ns: 2,
-            p99_ns: 3,
-            p99_9_ns: 4,
-            max_ns: 5,
-        };
-        let s = r.to_json();
-        assert!(
-            s.contains("\"backend\":\"unified-memory\""),
-            "missing backend field: {s}"
-        );
-        assert!(
-            s.contains("\"metric\":\"test/metric\""),
-            "missing metric field: {s}"
-        );
-    }
-}
+// NOTE: percentile-math, JSON-serialisation, and backend-label tests now live
+// in `crates/tensor-wasm-bench/src/lib.rs`'s `#[cfg(test)] mod tests`, which
+// `cargo test` actually compiles and runs. A `#[cfg(test)] mod tests` here
+// would be dead code: `harness = false` bench targets are built in the bench
+// profile with `cfg(test)` UNSET.
 
 criterion_group!(benches, tail_latency_bench);
 criterion_main!(benches);

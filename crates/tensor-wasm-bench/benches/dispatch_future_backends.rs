@@ -71,6 +71,7 @@ mod bench {
     use std::time::{Duration, Instant};
 
     use criterion::black_box;
+    use tensor_wasm_bench::{percentile_nearest_rank, TailStats};
     use tensor_wasm_wasi_gpu::async_dispatch::{BackPressure, DispatchFuture};
 
     /// Raw observations per backend. Matches the W4.6 floor in
@@ -149,47 +150,19 @@ mod bench {
         }
     }
 
-    /// Tail-percentile summary. JSON fields mirror the W4.6 `TailResult`
-    /// schema plus a `backend` discriminator and a `status` field so the
-    /// same parser handles measured + skip lines.
-    #[derive(Debug, Clone)]
-    struct TailStats {
-        backend: String,
-        samples: usize,
-        p50_ns: u128,
-        p95_ns: u128,
-        p99_ns: u128,
-        p99_9_ns: u128,
-        max_ns: u128,
-    }
-
-    impl TailStats {
-        fn to_json(&self) -> String {
-            format!(
-            "{{\"backend\":\"{}\",\"status\":\"measured\",\"samples\":{},\"p50_ns\":{},\"p95_ns\":{},\"p99_ns\":{},\"p99_9_ns\":{},\"max_ns\":{}}}",
-            self.backend, self.samples,
-            self.p50_ns, self.p95_ns, self.p99_ns, self.p99_9_ns, self.max_ns,
-        )
-        }
-    }
+    // `TailStats` and `percentile_nearest_rank` now live in the crate's
+    // `src/lib.rs` (imported above) so the percentile math and JSON schema are
+    // shared with `tail_latency.rs` via a single source of truth, with real
+    // `cargo test`-visible unit tests. `skip_json` and `render_file` stay local
+    // because they are specific to this bench's output document.
 
     /// Skip line for stub backends.
     fn skip_json(backend: &str, reason: &str) -> String {
         format!(
             "{{\"backend\":\"{}\",\"status\":\"skipped\",\"reason\":\"{}\"}}",
-            backend, reason,
+            tensor_wasm_bench::json_escape(backend),
+            tensor_wasm_bench::json_escape(reason),
         )
-    }
-
-    /// Nearest-rank percentile (`samples[ceil(p * n) - 1]`). Same algorithm
-    /// as `tail_latency.rs` — see its module docs for the rationale.
-    fn percentile_nearest_rank(sorted: &[Duration], p: f64) -> u128 {
-        assert!(!sorted.is_empty(), "percentile of empty sample set");
-        assert!((0.0..=1.0).contains(&p), "percentile p out of range");
-        let n = sorted.len();
-        let rank = ((p * n as f64).ceil() as usize).max(1);
-        let idx = rank.min(n) - 1;
-        sorted[idx].as_nanos()
     }
 
     /// Run `iters` samples through `backend`. Returns `None` for stub
@@ -324,63 +297,12 @@ mod bench {
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn cuda_async_returns_sentinel() {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let err = rt
-                .block_on(CudaAsyncBackend.dispatch_once())
-                .expect_err("CudaAsync must be a stub today");
-            assert_eq!(err, CUDA_ASYNC_NOT_YET_WIRED);
-        }
-
-        #[test]
-        fn bench_one_returns_some_for_busy_poll_and_none_for_stub() {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap();
-            let stats = bench_one(&rt, &BusyPollBackend::new(), 64).expect("BusyPoll yields stats");
-            assert_eq!(stats.backend, "busy-poll");
-            assert_eq!(stats.samples, 64);
-            // Percentiles monotonic non-decreasing on a sorted slice.
-            assert!(stats.p50_ns <= stats.p95_ns);
-            assert!(stats.p95_ns <= stats.p99_ns);
-            assert!(stats.p99_ns <= stats.p99_9_ns);
-            assert!(stats.p99_9_ns <= stats.max_ns);
-            assert!(
-                bench_one(&rt, &CudaAsyncBackend, 64).is_none(),
-                "stub backend must short-circuit to None"
-            );
-        }
-
-        #[test]
-        fn percentile_nearest_rank_matches_w46() {
-            // Same fixture as `tail_latency.rs::nearest_rank_known_distribution`
-            // so drift between the two impls is caught at both sites.
-            let samples: Vec<Duration> = (1u128..=100)
-                .map(|n| Duration::from_nanos(n as u64))
-                .collect();
-            assert_eq!(percentile_nearest_rank(&samples, 0.50), 50);
-            assert_eq!(percentile_nearest_rank(&samples, 0.95), 95);
-            assert_eq!(percentile_nearest_rank(&samples, 0.99), 99);
-            assert_eq!(percentile_nearest_rank(&samples, 0.999), 100);
-        }
-
-        #[test]
-        fn skip_json_carries_reason() {
-            let line = skip_json("cuda-async", CUDA_ASYNC_NOT_YET_WIRED);
-            assert!(line.contains("\"status\":\"skipped\""));
-            assert!(line.contains("RFC 0001"));
-        }
-    }
+    // NOTE: percentile-math and JSON-serialisation tests now live in
+    // `crates/tensor-wasm-bench/src/lib.rs`'s `#[cfg(test)] mod tests`, which
+    // `cargo test` actually compiles and runs. A `#[cfg(test)] mod tests` here
+    // would be dead code: this is a `harness = false` bench target built in the
+    // bench profile with `cfg(test)` UNSET, and the module additionally sits
+    // behind `#[cfg(feature = "cuda")]`, so it never compiled or ran.
 } // end of `mod bench` (gated on `#[cfg(feature = "cuda")]`)
 
 #[cfg(feature = "cuda")]

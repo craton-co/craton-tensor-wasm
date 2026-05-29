@@ -23,7 +23,7 @@ use tensor_wasm_jit::rewrite::{rewrite_wasm, RewriteOptions};
 use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, instrument, warn};
-use wasmtime::{ExternType, Module, ResourceLimiter, Store, Val};
+use wasmtime::{ExternType, Module, ResourceLimiter, Store, UpdateDeadline, Val};
 
 use crate::engine::TensorWasmEngine;
 use crate::instance::{InstanceState, TensorWasmInstance};
@@ -67,6 +67,66 @@ fn duration_to_epoch_ticks(d: Duration, tick: Duration) -> u64 {
         .min(MAX_EPOCH_DEADLINE_TICKS)
 }
 
+/// Install the COOPERATIVE epoch-deadline scheme on `store`, arming the first
+/// deadline `first_ticks` ticks out.
+///
+/// This replaces the historical trap-only configuration (`set_epoch_deadline`
+/// alone, which leaves the store in wasmtime's default
+/// [`Store::epoch_deadline_trap`](wasmtime::Store::epoch_deadline_trap) mode).
+/// Under trap mode a compute-bound guest never returns `Pending`: the
+/// `call_async` poll blocks the worker until the epoch traps, so an outer
+/// `timeout` / future-drop cannot cancel it cooperatively and a single-thread
+/// runtime can be wedged by a spinning guest. Cooperative yielding fixes both.
+///
+/// The scheme is two-level:
+///
+///   * **Cooperative yield (between yields the guest is cancellable).** The
+///     store is configured via
+///     [`Store::epoch_deadline_callback`](wasmtime::Store::epoch_deadline_callback).
+///     Each time the epoch deadline trips, the callback returns
+///     [`UpdateDeadline::Yield`] with [`COOPERATIVE_YIELD_TICKS`], so the guest
+///     yields `Pending` to the async executor and the deadline re-arms for
+///     another window. While parked at that yield, the surrounding
+///     `call_async` future can be dropped — which terminates the guest fiber
+///     promptly (wasmtime turns a cancel-while-yielded into a trap on the
+///     unwinding fiber). This is exactly the property the
+///     `orphan_cleanup_on_drop` test needs.
+///
+///   * **Hard deadline (still TRAPs a runaway guest).** Before yielding, the
+///     callback consults the per-store
+///     [`InstanceState::hard_deadline`](crate::instance::InstanceState::hard_deadline).
+///     Once that absolute wall-clock instant has elapsed the callback returns
+///     `Err(..)` instead of yielding, which wasmtime converts into a trap —
+///     bit-for-bit the same termination the old `set_epoch_deadline` trap
+///     produced. The executor sets `hard_deadline` to the per-call deadline
+///     (and, during instantiation, to a value additionally clamped by
+///     [`MAX_START_FN_DURATION`]), so the public timeout contract is preserved:
+///     `call_export_with_args` still classifies the resulting error as
+///     [`ExecError::Timeout`] because the wall clock has crossed `deadline`.
+///
+/// The error message intentionally matches the spirit of a wasmtime epoch
+/// trap ("epoch deadline reached"); the executor never surfaces this string
+/// to callers — it is reclassified into the typed [`ExecError::Timeout`] (or,
+/// for the no-deadline start-fn cap, propagated as `ExecError::Wasmtime`,
+/// exactly as a trap did before).
+fn arm_cooperative_epoch(store: &mut Store<InstanceState>, first_ticks: u64) {
+    // Arm the FIRST deadline relative to the current epoch. Subsequent
+    // re-arms are driven by the value the callback returns.
+    store.set_epoch_deadline(first_ticks);
+    store.epoch_deadline_callback(|ctx| {
+        if ctx.data().hard_deadline_elapsed() {
+            // HARD deadline crossed: trap, terminating the guest. Mirrors the
+            // historical `epoch_deadline_trap` behaviour. The executor's
+            // timeout classification keys off the wall clock, not this string.
+            Err(wasmtime::Error::msg("epoch deadline reached"))
+        } else {
+            // Within the hard deadline: yield `Pending` so the guest is
+            // cancellable, then re-arm for another cooperative window.
+            Ok(UpdateDeadline::Yield(COOPERATIVE_YIELD_TICKS))
+        }
+    });
+}
+
 /// Overflow-safe sentinel for "effectively no deadline", in epoch ticks.
 ///
 /// [`wasmtime::Store::set_epoch_deadline`] takes a deadline **relative** to
@@ -80,6 +140,33 @@ fn duration_to_epoch_ticks(d: Duration, tick: Duration) -> u64 {
 /// `current_epoch + MAX_EPOCH_DEADLINE_TICKS` cannot overflow for the life of
 /// the process.
 const MAX_EPOCH_DEADLINE_TICKS: u64 = u64::MAX / 2;
+
+/// Number of epoch ticks between cooperative yields under the async-yield
+/// epoch scheme.
+///
+/// The executor configures every store with
+/// [`wasmtime::Store::epoch_deadline_callback`] (see
+/// [`TensorWasmExecutor::arm_cooperative_epoch`]) so that — instead of trapping
+/// the instant the epoch deadline trips — a compute-bound guest *yields*
+/// `Pending` back to the async runtime and the deadline is re-armed for
+/// another `COOPERATIVE_YIELD_TICKS` window. Yielding is what makes a
+/// runaway guest *cancellable*: while it is parked at a yield point the
+/// surrounding `call_async` future can be dropped (by an outer `timeout`
+/// or task cancellation), which terminates the guest promptly instead of
+/// blocking the worker until a trap fires. The HARD deadline is still
+/// enforced — on each yield the callback first checks the per-store
+/// [`InstanceState::hard_deadline`](crate::instance::InstanceState::hard_deadline)
+/// and traps once it has elapsed (see `arm_cooperative_epoch`).
+///
+/// One tick (the engine's `epoch_tick`, 10 ms by default) keeps yields
+/// frequent enough that future-drop cancellation is observed within a
+/// single tick of cadence, while staying coarse enough that a well-behaved
+/// guest doing real work is not penalised with excessive yield churn. The
+/// background epoch ticker ([`crate::engine::TensorWasmEngine::spawn_epoch_ticker`])
+/// must be running for the deadline to advance at all — the same
+/// pre-existing requirement as the trap scheme, enforced by the
+/// [`ExecError::EpochTickerNotRunning`] admission check.
+const COOPERATIVE_YIELD_TICKS: u64 = 1;
 
 /// Hard upper bound on how long a Wasm module's `start` function (and any
 /// other code that runs inside [`wasmtime::Instance::new_async`]) is allowed
@@ -1448,6 +1535,21 @@ impl TensorWasmExecutor {
                 .with_deadline(Instant::now() + d)
                 .with_deadline_duration(d);
         }
+        // HARD-deadline instant the cooperative epoch callback traps at while
+        // `start` (and anything else running inside `instantiate_async`)
+        // executes. Bounded by BOTH the per-call deadline (if any) and the
+        // implicit [`MAX_START_FN_DURATION`] cap, mirroring the old
+        // `start_deadline_ticks = min(epoch_deadline_ticks, max_start_ticks)`
+        // trap point — except now expressed as a wall-clock instant the
+        // callback consults on each yield rather than a one-shot trap count.
+        // Until the callback observes this instant has passed it yields
+        // cooperatively, so even a runaway `start` function is interruptible
+        // by the epoch ticker AND traps no later than this instant.
+        let start_phase_budget = match cfg.deadline {
+            Some(d) => d.min(MAX_START_FN_DURATION),
+            None => MAX_START_FN_DURATION,
+        };
+        state = state.with_hard_deadline(Instant::now() + start_phase_budget);
         let tick = self.engine.config().epoch_tick;
         let epoch_deadline_ticks = match cfg.deadline {
             Some(d) => duration_to_epoch_ticks(d, tick),
@@ -1478,7 +1580,19 @@ impl TensorWasmExecutor {
         check_module_memory_within_cap(module, max_memory_bytes)?;
         let mut store = Store::new(self.engine.inner(), state);
         store.limiter(|state| &mut state.limiter as &mut dyn ResourceLimiter);
-        store.set_epoch_deadline(start_deadline_ticks);
+        // Arm the COOPERATIVE epoch scheme for the start phase. The first
+        // deadline is armed at the cooperative cadence (never beyond
+        // `start_deadline_ticks`, which is the latest the hard deadline could
+        // possibly fall) so the callback gets a chance to run — and yield —
+        // long before the start-phase budget elapses. At each epoch trip the
+        // guest yields `Pending` (so an in-flight `instantiate_async` is
+        // cancellable on future-drop) and the callback traps only once the
+        // per-store `hard_deadline` (set just above to the start-phase budget)
+        // has elapsed — preserving the `MAX_START_FN_DURATION` guarantee that
+        // a runaway `start` cannot burn forever. The relative tick counts now
+        // govern only the YIELD cadence; the trap point is the wall-clock
+        // `hard_deadline` instant the callback consults.
+        arm_cooperative_epoch(&mut store, start_deadline_ticks.min(COOPERATIVE_YIELD_TICKS));
         // HIGH finding fix: build a single `Linker<InstanceState>` and
         // register every host surface whose backing machinery is actually
         // present, then instantiate against it. Previously only the
@@ -1558,7 +1672,34 @@ impl TensorWasmExecutor {
                 return Err(classify_instantiation_error(err, max_memory_bytes));
             }
         };
-        store.set_epoch_deadline(epoch_deadline_ticks);
+        // Start phase complete: re-arm the cooperative epoch deadline for the
+        // post-instantiation window and swap the hard-deadline instant from
+        // the start-phase budget over to the per-call deadline.
+        //
+        //   * Deadline spawn: trap at the configured per-call `deadline`
+        //     instant (`now + d`, seeded above). A later `call_export`
+        //     re-arms both this instant and the ticks for that call's window.
+        //   * Deadline-less spawn: clear the hard deadline so the callback
+        //     yields cooperatively FOREVER (matching the old
+        //     `MAX_EPOCH_DEADLINE_TICKS` "effectively no deadline" semantics) —
+        //     but now the guest is CANCELLABLE on future-drop between yields,
+        //     which the old trap-at-`u64::MAX/2` scheme could not offer.
+        //
+        // The relative tick count armed here is only the YIELD cadence (never
+        // beyond `epoch_deadline_ticks`, the latest a configured deadline
+        // could fall); the trap decision is driven entirely by the wall-clock
+        // `hard_deadline` the callback consults. Arming at the cooperative
+        // cadence — rather than the old `epoch_deadline_ticks` (which for a
+        // deadline-less spawn was the near-infinite `MAX_EPOCH_DEADLINE_TICKS`
+        // sentinel) — is what makes even a deadline-less compute-bound guest
+        // yield, and therefore stay cancellable, instead of running an entire
+        // epoch sentinel's worth of ticks before its first yield point.
+        store.set_epoch_deadline(epoch_deadline_ticks.min(COOPERATIVE_YIELD_TICKS));
+        let post_start_hard_deadline = match cfg.deadline {
+            Some(_) => store.data().deadline,
+            None => None,
+        };
+        store.data_mut().hard_deadline = post_start_hard_deadline;
         Ok(TensorWasmInstance::new(store, instance))
     }
 
@@ -1986,10 +2127,24 @@ impl TensorWasmExecutor {
         if let Some(d) = configured_deadline {
             let new_deadline = call_start + d;
             guard.store.data_mut().deadline = Some(new_deadline);
+            // Re-arm the HARD-deadline instant the cooperative epoch callback
+            // traps at, in lockstep with `deadline`, so THIS call's window
+            // (not a previous call's, nor the spawn-time start-phase budget)
+            // governs when a runaway guest traps. The callback installed at
+            // spawn (`arm_cooperative_epoch`) persists across calls; only the
+            // instant it consults and the relative tick count are re-armed.
+            guard.store.data_mut().hard_deadline = Some(new_deadline);
             let tick = self.engine.config().epoch_tick;
-            guard
-                .store
-                .set_epoch_deadline(duration_to_epoch_ticks(d, tick));
+            // Re-arm at the cooperative cadence (never beyond this call's
+            // deadline window). The cooperative epoch callback installed at
+            // spawn yields `Pending` at each trip and traps only once
+            // `hard_deadline` (re-armed to `new_deadline` above) elapses — so
+            // the relative ticks here govern only the yield cadence, while the
+            // wall-clock `hard_deadline` governs the trap. Arming at the
+            // cooperative cadence keeps a compute-bound guest yielding (hence
+            // cancellable on future-drop) throughout the call.
+            let call_ticks = duration_to_epoch_ticks(d, tick).min(COOPERATIVE_YIELD_TICKS);
+            guard.store.set_epoch_deadline(call_ticks);
         }
         // Re-arm the cooperative-scheduler context's wall-clock origin
         // in lockstep with the deadline above. Without this, a guest

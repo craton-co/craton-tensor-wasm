@@ -209,12 +209,20 @@ pub trait HasStreaming {
     fn streaming(&self) -> &StreamingContext;
 }
 
-/// Module name used to register the wasi-tensor host functions.
+/// Module name used to register the wasi-tensor host functions:
+/// `wasi:tensor/host@0.1.0`.
 ///
-/// The on-the-wire string matches the WIT package name in
-/// `wit/wasi-tensor.wit` so wit-bindgen-generated guest bindings resolve
-/// the imports against this module.
-pub const STREAMING_MODULE: &str = "wasi:tensor/host";
+/// The on-the-wire string carries the `@x.y.z` version segment so it
+/// matches the `package wasi:tensor@0.1.0;` declaration in
+/// `wit/wasi-tensor.wit`. wit-bindgen-generated guests for
+/// `wasi:tensor@0.1.0` emit imports named `wasi:tensor/host@0.1.0`, so the
+/// version segment is required for those bindings to resolve against this
+/// host module. The version is kept in lockstep with the WIT package
+/// declaration — bumping one without the other will cause guests generated
+/// from the WIT to fail to link, mirroring the `wasi:cuda/host@0.2.0`
+/// ([`crate::abi::MODULE`]) and `wasi:scheduler/host@0.1.0`
+/// ([`crate::scheduler::SCHEDULER_MODULE`]) conventions.
+pub const STREAMING_MODULE: &str = "wasi:tensor/host@0.1.0";
 
 /// Host-function name for `emit-chunk`.
 pub const FN_EMIT_CHUNK: &str = "emit-chunk";
@@ -407,8 +415,8 @@ pub trait HasInput {
 ///
 /// `T` is the store data type and must implement [`HasInput`]. Mirrors
 /// [`add_streaming_to_linker`]: both register host functions on the same
-/// [`STREAMING_MODULE`] (`wasi:tensor/host`) so a guest importing either
-/// surface links against one host module. They are split into two
+/// [`STREAMING_MODULE`] (`wasi:tensor/host@0.1.0`) so a guest importing
+/// either surface links against one host module. They are split into two
 /// registration functions because the input surface needs only
 /// [`HasInput`] while the streaming surface needs [`HasStreaming`]; the
 /// executor's `InstanceState` implements both and calls both.
@@ -522,5 +530,54 @@ mod tests {
         // Cheap clone shares the same backing buffer.
         let cloned = ctx.clone();
         assert_eq!(cloned.bytes(), ctx.bytes());
+    }
+
+    #[test]
+    fn streaming_module_is_versioned() {
+        assert!(STREAMING_MODULE.contains("wasi:tensor"));
+        assert!(STREAMING_MODULE.ends_with("@0.1.0"));
+    }
+
+    /// Pin the host [`STREAMING_MODULE`] string against drift from
+    /// `wit/wasi-tensor.wit`.
+    ///
+    /// Mirrors `abi.rs::module_version_matches_wit_package_decl`. The WIT
+    /// file is the authoritative spec; the host's import-module name has to
+    /// carry the same `@x.y.z` segment so wit-bindgen-generated guests for
+    /// `wasi:tensor@x.y.z` (which emit imports named
+    /// `wasi:tensor/host@x.y.z`) can link against this host. Parse the
+    /// version out of the WIT `package wasi:tensor@x.y.z;` line and compare
+    /// it to the suffix of [`STREAMING_MODULE`]. If somebody bumps one
+    /// without the other, this trips before the linker error reaches
+    /// downstream users.
+    #[test]
+    fn streaming_module_version_matches_wit_package_decl() {
+        // Path is relative to this source file
+        // (`crates/tensor-wasm-wasi-gpu/src/streaming.rs`):
+        //   ../ -> crates/tensor-wasm-wasi-gpu/, where the in-crate
+        //          `wit/wasi-tensor.wit` copy lives. Kept in-crate so the
+        //          published tarball is self-contained (`cargo publish`
+        //          rejects paths that escape the crate root).
+        const WIT: &str = include_str!("../wit/wasi-tensor.wit");
+        let pkg_line = WIT
+            .lines()
+            .find(|l| l.trim_start().starts_with("package wasi:tensor@"))
+            .expect("wit/wasi-tensor.wit must declare `package wasi:tensor@x.y.z;`");
+        let version = pkg_line
+            .trim()
+            .trim_start_matches("package wasi:tensor@")
+            .trim_end_matches(';')
+            .trim();
+        assert!(
+            !version.is_empty(),
+            "could not parse a version out of: {pkg_line:?}"
+        );
+        let expected_suffix = format!("@{version}");
+        assert!(
+            STREAMING_MODULE.ends_with(&expected_suffix),
+            "STREAMING_MODULE ({STREAMING_MODULE:?}) drifted from \
+             wit/wasi-tensor.wit package version ({version:?}); update \
+             src/streaming.rs::STREAMING_MODULE or the WIT file so they agree."
+        );
     }
 }

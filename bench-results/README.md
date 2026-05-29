@@ -275,9 +275,11 @@ RUSTUP_TOOLCHAIN=nightly-2026-04-03 \
     --features cuda,cuda-oxide-backend
 ```
 
-Without `--features cuda` the bench compiles and runs, but both backends
-emit skip lines so the file is regenerated as two skips. That mode is
-useful only to verify the bench builds on a non-CUDA host.
+Without `--features cuda` the bench compiles and runs, but its `main` only
+prints the two skip lines to stdout (prefixed `DISPATCH_BACKEND`) and does
+**not** write or regenerate this JSON file — the file-sink path lives only in
+the `cuda`-gated body. That mode is useful only to verify the bench builds and
+runs on a non-CUDA host; to refresh this file you must pass `--features cuda`.
 
 Like `tail-latency.json`, this file is **not** read by the regression
 gate — it is a diagnostic snapshot, refreshed when either the busy-poll

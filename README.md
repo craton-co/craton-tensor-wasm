@@ -21,8 +21,8 @@ cold-starts, and OpenTelemetry tracing wired end-to-end.
 ## Status
 
 **v0.3.7** — auth, observability, ops, and supply-chain hardening shipped.
-The host-only execution path is solid (≈ 150 tests across 10 crates, all
-green on a CUDA-free developer laptop). CUDA-bound paths (real
+The host-only execution path is solid (a broad unit + integration suite
+across all 11 crates, all green on a CUDA-free developer laptop). CUDA-bound paths (real
 `cudaMallocManaged`, real PTX `ptxas` validation, real kernel launches)
 are gated behind `--features unified-memory` and exercised by the CUDA
 self-hosted runner once it lands (see `docs/CUDARC-SPIKE.md` for the
@@ -57,19 +57,20 @@ What 0.3.7 ships on top of 0.1.0:
 
 ### Prerequisites
 - Rust toolchain via `rustup` (the repo pins `nightly-2026-04-03`).
+- `wabt` (provides `wat2wasm`, used by the sample below to compile `.wat` fixtures).
 - (Optional) CUDA 12.0+ for the GPU-accelerated path — see [`docs/CUDA-SETUP.md`](docs/CUDA-SETUP.md).
 
 ### Build & test
 
 ```sh
 git clone https://github.com/craton-co/craton-tensor-wasm
-cd tensor-wasm
+cd craton-tensor-wasm
 cargo build --workspace
 cargo test --workspace
 ```
 
-This runs ~150 unit + integration tests across all 10 crates, all green
-on a no-CUDA developer laptop.
+This runs the full unit + integration suite across all 11 crates, all
+green on a no-CUDA developer laptop.
 
 ### Run a sample Wasm function
 
@@ -124,27 +125,28 @@ Operational capabilities that ship on by default (no feature flag):
 | Per-token rate limit | `TENSOR_WASM_API_RATE_LIMIT_QPS`, `_BURST` | W1.4. Retires the global concurrency cap. |
 | HTTP request metrics | always on | W2.3. `tensor_wasm_http_requests_total`, duration histogram, in-flight gauge. |
 | `build_info` metric | always on | W4.9. Version, git commit, enabled features as labels. |
-| OpenAI-compatible inference gateway shim (`/v1/completions`, `/v1/chat/completions`) | always on | B4.9 scaffold returning 501; v0.4 wires translation. See [`docs/OPENAI-COMPAT.md`](docs/OPENAI-COMPAT.md). |
+| OpenAI-compatible inference gateway (`/v1/completions`, `/v1/chat/completions`) | always on | Wired to internal invoke as of 0.3.7 (T41); the 501 scaffold shell is gone. Resolves `model` → function via `TENSOR_WASM_API_OPENAI_MODEL_MAP`, buffered or SSE. See [`docs/OPENAI-COMPAT.md`](docs/OPENAI-COMPAT.md). |
 
-### v0.3.7 scaffolds
+### v0.3.7 strategic features
 
-Eight of the thirteen post-v0.3.6 strategic features landed as v0.3.7
-scaffolds — surface-area-stable Rust types + tests + design docs, with
-the production wire deferred to v0.4. Operators can build against the
-Rust + CLI surface today; the HTTP route / on-disk store / scheduler
-integration ships in v0.4. Each row links to the spec doc with the
-v0.4 deliverable.
+Eight of the thirteen post-v0.3.6 strategic features were scoped into
+v0.3.7. A late-cycle wire-up wave (T30, T33–T41) closed most of them
+in-place — they are wired through the invoke / HTTP / store paths
+today, not deferred. The remaining items ship a stable Rust + CLI
+surface with parts of the production wire still landing. Each row
+links to its spec doc; see [`CHANGELOG.md`](CHANGELOG.md#037---2026-05-28)
+for the exact per-task status.
 
-| Scaffold | Owning crate | Spec doc |
-|---|---|---|
-| Typed multi-value guest args | `tensor-wasm-exec` | [`docs/PATH-TO-V1.md#1-typed-multi-value-guest-export-abi`](docs/PATH-TO-V1.md#post-v036-strategic-features) |
-| Streaming `/invoke-stream` (SSE / chunked) | `tensor-wasm-wasi-gpu` + `tensor-wasm-api` | [`docs/STREAMING.md`](docs/STREAMING.md) |
-| Signed kernel registry (`KernelManifest`) | `tensor-wasm-jit` | [`docs/KERNEL-REGISTRY.md`](docs/KERNEL-REGISTRY.md) |
-| Cooperative WASI yield (`wasi:scheduler/host@0.1.0`) | `tensor-wasm-wasi-gpu` | [`docs/COOPERATIVE-YIELD.md`](docs/COOPERATIVE-YIELD.md) |
-| Pre-instantiated instance pool | `tensor-wasm-exec` | [`docs/INSTANCE-POOL.md`](docs/INSTANCE-POOL.md) |
-| Differential JIT correctness oracle | `tensor-wasm-jit` | [`docs/DIFFERENTIAL-ORACLE.md`](docs/DIFFERENTIAL-ORACLE.md) |
-| Per-tenant GPU memory quotas | `tensor-wasm-tenant` | [`docs/GPU-QUOTAS.md`](docs/GPU-QUOTAS.md) |
-| Unified content-addressed artifact store | `tensor-wasm-artifacts` | [`docs/ARTIFACT-STORE.md`](docs/ARTIFACT-STORE.md) |
+| Feature | Owning crate | Status | Spec doc |
+|---|---|---|---|
+| Typed multi-value guest args | `tensor-wasm-exec` | Wired (T33) — `--args <JSON>` end-to-end through CLI / HTTP / `SpawnConfig`. | [`docs/PATH-TO-V1.md#post-v036-strategic-features`](docs/PATH-TO-V1.md#post-v036-strategic-features) |
+| Streaming `/invoke-stream` (SSE / chunked) | `tensor-wasm-wasi-gpu` + `tensor-wasm-api` | Wired (T34) — real SSE frames via `StreamingContext`. | [`docs/STREAMING.md`](docs/STREAMING.md) |
+| Signed kernel registry (`KernelManifest`) | `tensor-wasm-jit` | Wired (T35) — disk-persisted `DiskRegistry` over the artifact store (`GET /kernels` paginated). | [`docs/KERNEL-REGISTRY.md`](docs/KERNEL-REGISTRY.md) |
+| Cooperative WASI yield (`wasi:scheduler/host@0.1.0`) | `tensor-wasm-wasi-gpu` | Wired (T36) — deadlines drive scheduler verdicts + back-pressure. | [`docs/COOPERATIVE-YIELD.md`](docs/COOPERATIVE-YIELD.md) |
+| Pre-instantiated instance pool | `tensor-wasm-exec` | Wired (T37) — `InstancePool` through the invoke path with reset-on-return. | [`docs/INSTANCE-POOL.md`](docs/INSTANCE-POOL.md) |
+| Differential JIT correctness oracle | `tensor-wasm-jit` | Landed (T38) — proptest harness; host verdicts run today, GPU verdicts `#[ignore]` pending the S22 runner. | [`docs/DIFFERENTIAL-ORACLE.md`](docs/DIFFERENTIAL-ORACLE.md) |
+| Per-tenant GPU memory quotas | `tensor-wasm-tenant` | In-process accounting landed; driver-level `cuMemPool` pin added (T39) behind `--features gpu-mem-pool`. | [`docs/GPU-QUOTAS.md`](docs/GPU-QUOTAS.md) |
+| Unified content-addressed artifact store | `tensor-wasm-artifacts` | Landed — `DiskArtifactStore` fully implemented and now backs snapshots (T40) and the JIT disk cache (T30). | [`docs/ARTIFACT-STORE.md`](docs/ARTIFACT-STORE.md) |
 
 The full v0.3.7 landings list is in
 [`CHANGELOG.md`](CHANGELOG.md#037---2026-05-28); v0.4 deliverables are
@@ -155,7 +157,10 @@ Full taxonomy: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## GPU requirements
 
-- Driver: CUDA 12.0+ (Linux ≥ 525.60.13 / Windows ≥ 527.41).
+- Toolkit: CUDA 12.0+ (minimum); builds verified through CUDA 13.2.
+  Driver minimum for 12.0: Linux ≥ 525.60.13 / Windows ≥ 527.41 (for
+  13.2: Linux ≥ 590.42.01 / Windows ≥ 591.86). See
+  [`docs/CUDA-SETUP.md`](docs/CUDA-SETUP.md) for the full matrix.
 - Architecture: sm_80+ (Ampere) for PTX wmma kernels emitted by S12.
 - Optional: NVIDIA MPS for multi-tenant context isolation — see
   [`docs/MPS-SETUP.md`](docs/MPS-SETUP.md).
@@ -257,6 +262,9 @@ For the complete sitemap (every Markdown doc in this repo, grouped by purpose wi
                      ┌────▼─────────────┐
                      │   tensor-wasm-core      │ (errors, metrics, telemetry)
                      └──────────────────┘
+
+  tensor-wasm-artifacts (content-addressed signed store) backs
+  tensor-wasm-snapshot and the tensor-wasm-jit disk cache.
 ```
 
 Full diagram in [ARCHITECTURE.md](ARCHITECTURE.md).

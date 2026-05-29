@@ -4,7 +4,7 @@ Craton TensorWasm is a GPU-accelerated serverless Wasm runtime. It runs untruste
 
 ## Workspace layout
 
-The workspace is composed of ten crates:
+The workspace is composed of eleven crates:
 
 - `tensor-wasm-core` — Foundational types, errors, metrics, telemetry.
 - `tensor-wasm-mem` — CUDA Unified Memory allocator and Wasmtime `MemoryCreator`.
@@ -12,6 +12,7 @@ The workspace is composed of ten crates:
 - `tensor-wasm-wasi-gpu` — `wasi-cuda` host bridge for explicit GPU kernel launch.
 - `tensor-wasm-jit` — JIT pipeline: detector, IR, PTX codegen, kernel cache, deopt.
 - `tensor-wasm-snapshot` — Wasm + GPU memory snapshot and restore.
+- `tensor-wasm-artifacts` — Content-addressed, HMAC-signed, zstd-compressed on-disk blob store (BLAKE3-keyed) backing artifact-backed snapshots and the JIT kernel registry/cache.
 - `tensor-wasm-tenant` — Multi-tenant CUDA context management.
 - `tensor-wasm-api` — HTTP serverless API gateway (axum).
 - `tensor-wasm-cli` — Developer CLI (`tensor-wasm` binary).
@@ -39,7 +40,7 @@ The crates are layered top-down — higher layers depend on lower layers, never 
               tensor-wasm-exec
                   │
                   ▼
-              tensor-wasm-mem
+              tensor-wasm-mem      tensor-wasm-artifacts ◄── (snapshot [opt], jit)
                   │
                   ▼
               tensor-wasm-core
@@ -66,6 +67,8 @@ graph TD
   snap --> core
   tenant --> core
   api --> core
+  jit --> art[tensor-wasm-artifacts]
+  snap -.artifact-backing.-> art
   bench[tensor-wasm-bench] -.dev-dep.-> core
 ```
 

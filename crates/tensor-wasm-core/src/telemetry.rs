@@ -134,16 +134,28 @@ pub fn init(level: LogLevel, json: bool) -> bool {
 /// fall back to `info` for malformed directives.
 fn build_filter(level: LogLevel) -> EnvFilter {
     match level.as_directive() {
-        Some(directive) => EnvFilter::try_new(directive).unwrap_or_else(|_| EnvFilter::new("info")),
+        Some(directive) => filter_from_directive(directive),
         None => {
             // Prefer TENSOR_WASM_LOG, then RUST_LOG, then info.
             if let Ok(v) = std::env::var("TENSOR_WASM_LOG") {
-                EnvFilter::try_new(&v).unwrap_or_else(|_| EnvFilter::new("info"))
+                filter_from_directive(&v)
             } else {
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
             }
         }
     }
+}
+
+/// Parse a single filter `directive` into an [`EnvFilter`], falling back to the
+/// shared `info` default when the directive is malformed.
+///
+/// Extracted from [`build_filter`] so the malformed-directive fallback is
+/// reachable from a unit test for *any* directive string — including the ones
+/// produced by an explicit [`LogLevel`] variant (`Some(_)` arm), not just the
+/// `Auto` env-var path. The behaviour is identical to the inline
+/// `try_new(..).unwrap_or_else(..)` it replaces.
+fn filter_from_directive(directive: &str) -> EnvFilter {
+    EnvFilter::try_new(directive).unwrap_or_else(|_| EnvFilter::new("info"))
 }
 
 #[cfg(test)]
@@ -251,6 +263,54 @@ mod tests {
             },
         );
     }
+
+    // --- explicit-`LogLevel` malformed-directive fallback ----------------
+    //
+    // The existing B5.1 tests only drive the `Auto` (env-var) arm of
+    // `build_filter`. The `Some(directive)` arm — taken when a caller pins
+    // an explicit level — routes through the same `filter_from_directive`
+    // helper, whose malformed-input fallback to `info` was previously
+    // unasserted. These tests pin both the malformed and well-formed paths
+    // of that helper directly, with no env-var dependency.
+
+    #[test]
+    fn filter_from_directive_falls_back_to_info_on_malformed() {
+        // `twasm=notalevel` has a valid target but an invalid level, so
+        // `EnvFilter::try_new` rejects it and the helper must fall back to
+        // the shared `info` default rather than panic.
+        let filter = filter_from_directive("twasm=notalevel");
+        let rendered = format!("{filter}");
+        assert!(
+            rendered.contains("info"),
+            "expected `info` fallback for malformed explicit directive, got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn filter_from_directive_preserves_valid_directive() {
+        // A well-formed directive must be honoured verbatim, not silently
+        // collapsed to the `info` fallback. This guards against a fallback
+        // that swallows every input.
+        let filter = filter_from_directive("debug");
+        let rendered = format!("{filter}");
+        assert!(
+            rendered.contains("debug"),
+            "expected valid `debug` directive to be preserved, got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn build_filter_explicit_level_is_honoured() {
+        // The `Some(_)` arm of `build_filter` (explicit `LogLevel`) must
+        // produce the corresponding directive. This exercises the explicit
+        // path end-to-end, complementing the helper-level tests above.
+        let filter = build_filter(LogLevel::Warn);
+        let rendered = format!("{filter}");
+        assert!(
+            rendered.contains("warn"),
+            "expected explicit `Warn` level to yield a `warn` filter, got: {rendered}",
+        );
+    }
 }
 
 /// Initialise the global tracing subscriber with an additional OTLP exporter.
@@ -328,6 +388,37 @@ pub fn init_with_otlp(
     }
 }
 
+/// Resolve the OTLP collector endpoint from the environment.
+///
+/// Resolution order, mirroring the contract documented on [`init_with_otlp`]:
+/// the caller-supplied `primary` variable, then the standard
+/// `OTEL_EXPORTER_OTLP_ENDPOINT`, then the built-in `http://localhost:4317`
+/// default.
+///
+/// `lookup` abstracts the environment read so this pure function can be unit
+/// tested without mutating process-global env state. Production callers pass
+/// `|name| std::env::var(name).ok()`.
+#[cfg(feature = "otlp")]
+fn resolve_otlp_endpoint(
+    primary: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> String {
+    lookup(primary)
+        .or_else(|| lookup("OTEL_EXPORTER_OTLP_ENDPOINT"))
+        .unwrap_or_else(|| "http://localhost:4317".to_string())
+}
+
+/// Map an OTLP exporter-build error into [`OtlpInitError::Exporter`].
+///
+/// Factored out of [`run_otlp_init`] so the `Exporter(_)` mapping branch is
+/// assertable from a unit test driven with a synthetic error, rather than only
+/// reachable when a live exporter build genuinely fails. The formatting
+/// (`{e:?}`) is identical to the inline `map_err` it replaces.
+#[cfg(feature = "otlp")]
+fn map_exporter_error<E: std::fmt::Debug>(e: E) -> OtlpInitError {
+    OtlpInitError::Exporter(format!("{e:?}"))
+}
+
 /// Body of [`init_with_otlp`], lifted out so the `call_once` closure can
 /// short-circuit via `?` and so the ordering between
 /// `tracing_subscriber::try_init` and the OpenTelemetry global mutations is
@@ -352,16 +443,14 @@ fn run_otlp_init(level: LogLevel, json: bool, otlp_env_var: &str) -> Result<(), 
     use opentelemetry_otlp::WithExportConfig;
     use tracing_subscriber::{fmt, prelude::*};
 
-    let endpoint = std::env::var(otlp_env_var)
-        .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
-        .unwrap_or_else(|_| "http://localhost:4317".to_string());
+    let endpoint = resolve_otlp_endpoint(otlp_env_var, |name| std::env::var(name).ok());
 
     // Build OTLP exporter (tonic-grpc).
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(&endpoint)
         .build()
-        .map_err(|e| OtlpInitError::Exporter(format!("{e:?}")))?;
+        .map_err(map_exporter_error)?;
 
     // Build the provider and derive a tracer. Crucially, neither
     // `SdkTracerProvider::builder().build()` nor `provider.tracer(...)`
@@ -487,5 +576,79 @@ mod otlp_tests {
         let err = init_with_otlp(LogLevel::Info, false, "TENSOR_WASM_TEST_OTLP_ENDPOINT_2")
             .expect_err("init_with_otlp must fail once plain init has run");
         assert!(matches!(err, OtlpInitError::AlreadyInitialized));
+    }
+
+    // --- endpoint resolution seam ----------------------------------------
+    //
+    // `resolve_otlp_endpoint` takes an injected `lookup` closure so the
+    // three-tier precedence (primary var → OTEL_EXPORTER_OTLP_ENDPOINT →
+    // hardcoded default) is testable without touching process-global env
+    // state. Each test drives the closure with an in-memory map.
+
+    #[test]
+    fn resolve_endpoint_prefers_primary_var() {
+        let endpoint = resolve_otlp_endpoint("PRIMARY", |name| match name {
+            "PRIMARY" => Some("http://primary:4317".to_string()),
+            "OTEL_EXPORTER_OTLP_ENDPOINT" => Some("http://standard:4317".to_string()),
+            _ => None,
+        });
+        assert_eq!(endpoint, "http://primary:4317");
+    }
+
+    #[test]
+    fn resolve_endpoint_falls_back_to_standard_var() {
+        // Primary unset → the standard OTEL var wins over the default.
+        let endpoint = resolve_otlp_endpoint("PRIMARY", |name| match name {
+            "OTEL_EXPORTER_OTLP_ENDPOINT" => Some("http://standard:4317".to_string()),
+            _ => None,
+        });
+        assert_eq!(endpoint, "http://standard:4317");
+    }
+
+    #[test]
+    fn resolve_endpoint_falls_back_to_default() {
+        // Neither var set → the hardcoded localhost default applies.
+        let endpoint = resolve_otlp_endpoint("PRIMARY", |_| None);
+        assert_eq!(endpoint, "http://localhost:4317");
+    }
+
+    // --- exporter error-mapping seam -------------------------------------
+    //
+    // `map_exporter_error` is the `map_err` target on the exporter-build
+    // step in `run_otlp_init`. Driving it with a synthetic error makes the
+    // `Exporter(_)` branch assertable without a genuine exporter-build
+    // failure (which is hard to provoke deterministically in CI).
+
+    #[test]
+    fn map_exporter_error_produces_exporter_variant() {
+        #[derive(Debug)]
+        struct SyntheticErr;
+        let mapped = map_exporter_error(SyntheticErr);
+        match mapped {
+            OtlpInitError::Exporter(msg) => {
+                assert!(
+                    msg.contains("SyntheticErr"),
+                    "expected the Debug rendering of the source error, got: {msg}",
+                );
+            }
+            other => panic!("expected OtlpInitError::Exporter, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_exporter_error_preserves_debug_rendering() {
+        // The mapping uses `{e:?}`, so structured Debug fields must survive
+        // into the cached error message operators read in logs.
+        #[derive(Debug)]
+        struct DetailedErr {
+            #[allow(dead_code)]
+            code: u32,
+        }
+        let mapped = map_exporter_error(DetailedErr { code: 7 });
+        let rendered = format!("{mapped}");
+        assert!(
+            rendered.contains("code: 7"),
+            "expected Debug fields preserved through the mapping, got: {rendered}",
+        );
     }
 }
