@@ -1272,7 +1272,9 @@ mod tests {
             b,
             tensor_wasm_core::error::TensorWasmError::Serialization(_)
         ));
-        assert!(b.to_string().contains("zero-byte"));
+        // `TensorWasmError`'s Display is sanitised and omits the inner detail;
+        // the forwarded context is reachable via `inner()`.
+        assert!(b.inner().unwrap_or("").contains("zero-byte"));
     }
 
     #[test]
@@ -1406,6 +1408,7 @@ mod tests {
             b,
             tensor_wasm_core::error::TensorWasmError::Serialization(_)
         ));
-        assert!(b.to_string().contains("minimum 1024"));
+        // Display is sanitised; the forwarded detail is in `inner()`.
+        assert!(b.inner().unwrap_or("").contains("minimum 1024"));
     }
 }
