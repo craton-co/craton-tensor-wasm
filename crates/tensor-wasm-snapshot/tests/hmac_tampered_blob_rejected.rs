@@ -19,6 +19,7 @@
 
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::types::{InstanceId, TenantId};
+use tensor_wasm_snapshot::format::V3_TRAILER_MAGIC_LEN;
 use tensor_wasm_snapshot::payload_crc32;
 use tensor_wasm_snapshot::reader::SnapshotReader;
 use tensor_wasm_snapshot::writer::{InstanceState, Snapshot, SnapshotWriter, DEFAULT_ZSTD_LEVEL};
@@ -30,8 +31,10 @@ use tensor_wasm_snapshot::writer::{InstanceState, Snapshot, SnapshotWriter, DEFA
 /// confidentiality-of-the-key property.
 const KEY: [u8; 32] = [0xAB; 32];
 
-/// Size of the v3 signature trailer: 1-byte `SignatureKind` + 32-byte HMAC-SHA256.
-const SIG_TRAILER_LEN: usize = 1 + 32;
+/// Size of the v3 signature trailer. The T8 format change grew this from the
+/// original `[kind][sig]` (33 bytes) to `[V3_TRAILER_MAGIC][kind][sig]`:
+/// 4-byte magic + 1-byte `SignatureKind` + 32-byte HMAC-SHA256 = 37 bytes.
+const SIG_TRAILER_LEN: usize = V3_TRAILER_MAGIC_LEN + 1 + 32;
 
 #[test]
 fn tampered_wasm_memory_with_refixed_crc_is_rejected() {
