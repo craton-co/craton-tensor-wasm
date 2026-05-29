@@ -504,26 +504,34 @@ pub fn reference_eval(
                 }
             }
             TensorWasmOp::VecAdd { lanes } => {
-                for _ in 0..*lanes {
-                    let b = stack.pop().ok_or(ReferenceEvalError::StackUnderflow)?;
-                    let a = stack.pop().ok_or(ReferenceEvalError::StackUnderflow)?;
-                    stack.push(a + b);
+                // Element-wise (lane-aligned) add. Two prior `LoadUnified`
+                // ops push operand vectors contiguously, so the stack is
+                // `[a0..a_{n-1}, b0..b_{n-1}]` with `b` on top. Pair lane `i`
+                // of `a` with lane `i` of `b` — NOT a scalar pop-top-two,
+                // which would cross-pair lanes and feed results back in.
+                let lanes = *lanes as usize;
+                let (a, b) = pop_two_lane_vectors(&mut stack, lanes)?;
+                for i in 0..lanes {
+                    stack.push(a[i] + b[i]);
                 }
             }
             TensorWasmOp::VecMul { lanes } => {
-                for _ in 0..*lanes {
-                    let b = stack.pop().ok_or(ReferenceEvalError::StackUnderflow)?;
-                    let a = stack.pop().ok_or(ReferenceEvalError::StackUnderflow)?;
-                    stack.push(a * b);
+                let lanes = *lanes as usize;
+                let (a, b) = pop_two_lane_vectors(&mut stack, lanes)?;
+                for i in 0..lanes {
+                    stack.push(a[i] * b[i]);
                 }
             }
             TensorWasmOp::VecFma { lanes } => {
-                for _ in 0..*lanes {
-                    let c = stack.pop().ok_or(ReferenceEvalError::StackUnderflow)?;
-                    let b = stack.pop().ok_or(ReferenceEvalError::StackUnderflow)?;
-                    let a = stack.pop().ok_or(ReferenceEvalError::StackUnderflow)?;
-                    // Single-rounding contract — mirrors `fma.rn.f32`.
-                    stack.push(a.mul_add(b, c));
+                // Lane-aligned `a*b + c` over three operand vectors
+                // (`[a.., b.., c..]`, `c` on top). Single-rounding contract —
+                // mirrors `fma.rn.f32`.
+                let lanes = *lanes as usize;
+                let c = pop_lane_vector(&mut stack, lanes)?;
+                let b = pop_lane_vector(&mut stack, lanes)?;
+                let a = pop_lane_vector(&mut stack, lanes)?;
+                for i in 0..lanes {
+                    stack.push(a[i].mul_add(b[i], c[i]));
                 }
             }
             TensorWasmOp::Barrier => {
@@ -544,6 +552,29 @@ pub fn reference_eval(
     }
 
     Ok(output)
+}
+
+/// Pop the top `lanes` values off the operand stack, preserving their
+/// pushed (lane) order: the returned vec is `[v0, v1, .., v_{lanes-1}]`
+/// where `v_{lanes-1}` was on top. Errors on underflow.
+fn pop_lane_vector(stack: &mut Vec<f32>, lanes: usize) -> Result<Vec<f32>, ReferenceEvalError> {
+    if stack.len() < lanes {
+        return Err(ReferenceEvalError::StackUnderflow);
+    }
+    Ok(stack.split_off(stack.len() - lanes))
+}
+
+/// Pop two lane-aligned operand vectors. The stack layout after two
+/// `LoadUnified` ops is `[a.., b..]` with `b` on top, so the first pop
+/// yields `b` and the second yields `a`; both are returned in lane order
+/// as `(a, b)`.
+fn pop_two_lane_vectors(
+    stack: &mut Vec<f32>,
+    lanes: usize,
+) -> Result<(Vec<f32>, Vec<f32>), ReferenceEvalError> {
+    let b = pop_lane_vector(stack, lanes)?;
+    let a = pop_lane_vector(stack, lanes)?;
+    Ok((a, b))
 }
 
 /// Standalone matmul reference (M x K) * (K x N) -> (M x N), all f32
