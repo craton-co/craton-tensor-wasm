@@ -207,7 +207,13 @@ mod tests {
         // default `info` filter.
         temp_env::with_vars(
             [
-                ("TENSOR_WASM_LOG", Some("not-a-valid-filter")),
+                // A directive with a valid target but an INVALID level
+                // (`notalevel`) is genuinely rejected by `EnvFilter::try_new`,
+                // forcing the `info` fallback. (A bare token like
+                // `"not-a-valid-filter"` is NOT malformed to tracing-subscriber
+                // — it parses as a target directive at the default level — so
+                // it would never exercise the fallback this test pins.)
+                ("TENSOR_WASM_LOG", Some("twasm=notalevel")),
                 // Also clear RUST_LOG so the local developer env (which
                 // may set it to `debug`) does not perturb the assertion.
                 // Explicit `None::<&str>` annotation keeps the array

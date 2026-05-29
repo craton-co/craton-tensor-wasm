@@ -1848,6 +1848,11 @@ mod tests {
         let key = [0x11u8; 32];
         let bytes = SnapshotWriter::new()
             .with_hmac_sha256_key(key)
+            // Pin to the legacy inline v3 envelope: this test asserts the
+            // HMAC-SHA256 v3 trailer wire format, which the default v0.4
+            // `capture` path replaces with the artifact-store envelope when
+            // an HMAC key is configured (T40). See `with_legacy_envelope`.
+            .with_legacy_envelope()
             .capture(InstanceState {
                 tenant_id: TenantId(2),
                 instance_id: InstanceId(2),
@@ -1877,6 +1882,8 @@ mod tests {
         let key = [0xA5u8; 32];
         let mut bytes = SnapshotWriter::new()
             .with_hmac_sha256_key(key)
+            // Inline v3 trailer required (see `v3_without_key_is_rejected`).
+            .with_legacy_envelope()
             .capture(InstanceState {
                 tenant_id: TenantId(3),
                 instance_id: InstanceId(3),
@@ -1912,6 +1919,8 @@ mod tests {
         let key_b = [0x02u8; 32];
         let bytes = SnapshotWriter::new()
             .with_hmac_sha256_key(key_a)
+            // Inline v3 trailer required (see `v3_without_key_is_rejected`).
+            .with_legacy_envelope()
             .capture(InstanceState {
                 tenant_id: TenantId(4),
                 instance_id: InstanceId(4),
@@ -1947,6 +1956,8 @@ mod tests {
         let key = [0x77u8; 32];
         let mut bytes = SnapshotWriter::new()
             .with_hmac_sha256_key(key)
+            // Inline v3 trailer required (see `v3_without_key_is_rejected`).
+            .with_legacy_envelope()
             .capture(InstanceState {
                 tenant_id: TenantId(5),
                 instance_id: InstanceId(5),
@@ -1987,6 +1998,8 @@ mod tests {
         let key = [0x77u8; 32];
         let mut bytes = SnapshotWriter::new()
             .with_hmac_sha256_key(key)
+            // Inline v3 trailer required (see `v3_without_key_is_rejected`).
+            .with_legacy_envelope()
             .capture(InstanceState {
                 tenant_id: TenantId(6),
                 instance_id: InstanceId(6),
@@ -2184,6 +2197,8 @@ mod tests {
         let regs = vec![0xCCu8; 32];
         let bytes = SnapshotWriter::new()
             .with_hmac_sha256_key(key)
+            // Inline v3 trailer required (see `v3_without_key_is_rejected`).
+            .with_legacy_envelope()
             .capture(InstanceState {
                 tenant_id: TenantId(7),
                 instance_id: InstanceId(7),
