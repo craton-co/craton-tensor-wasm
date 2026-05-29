@@ -3,7 +3,7 @@ SPDX-License-Identifier: Apache-2.0
 Copyright 2026 Craton Software Company
 -->
 
-# `cuda-oxide-backend` — v0.3.1 scaffold
+# `cuda-oxide-backend` — v0.3.7 scaffold
 
 This crate's `cuda-oxide-backend` Cargo feature is the **opt-in scaffold** for
 the v0.5 `cust` successor adopted in [RFC

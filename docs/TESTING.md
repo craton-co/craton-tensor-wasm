@@ -22,4 +22,9 @@
 ## Coverage target
 85% line coverage on stable crates by 1.0 (measured via `cargo llvm-cov`).
 
-TODO: link to dashboard once coverage.yml uploads to a service.
+Coverage is measured in CI by the
+[`coverage.yml`](../.github/workflows/coverage.yml) workflow
+(`cargo llvm-cov`), which uploads the `lcov.info` report to Codecov on
+pushes to `main` and on pull requests. A direct link to the coverage
+dashboard is planned and will be added here once the Codecov project
+page is public.
