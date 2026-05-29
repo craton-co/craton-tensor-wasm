@@ -836,14 +836,25 @@ impl KernelCache {
         let entry = registry.get(&name, &version).ok()?;
         // Promote into L1 via the standard put path (which re-checks
         // integrity) so subsequent calls hit fast.
-        let (manifest, ptx_text) = (&entry.0, &entry.1);
-        let emitted = crate::ptx_emit::EmittedPtx {
-            text: ptx_text.clone(),
+        //
+        // Perf: `entry` is an `Arc<(KernelManifest, String)>` owned by the
+        // registry, so the PTX `String` cannot be moved out — exactly one
+        // owned copy into `EmittedPtx` is the irreducible minimum on this
+        // path. That copy is wrapped in an `Arc<EmittedPtx>` once; the L1
+        // promotion and the handle returned to the caller then share it via
+        // refcount bump, so the PTX bytes are never re-copied. The single
+        // `CachedKernel::new` below also hashes the PTX exactly once (its
+        // BLAKE3 integrity tag); the cheap wrapper `clone()` we hand to `put`
+        // copies only the 32-byte hash + fingerprint + an `Arc` refcount
+        // bump, not the PTX text.
+        let manifest = &entry.0;
+        let emitted = Arc::new(crate::ptx_emit::EmittedPtx {
+            text: entry.1.clone(),
             launch_geometry: (0, 0), // v0.4: extend KernelManifest to carry geometry
-        };
+        });
         let cached = CachedKernel::new(
             manifest.digest_as_u64(), // see Step 4 — add helper
-            Arc::new(emitted),
+            emitted,
             CompiledHandle::default(),
         );
         // Best-effort L1 promote; `put` is infallible-by-design (any
@@ -853,12 +864,9 @@ impl KernelCache {
         // caller still gets the verified `Arc<CachedKernel>` from this
         // call, the next call simply pays another L3 round-trip.
         //
-        // T20 perf: `put` wraps the kernel in an `Arc` internally; we
-        // hand it a clone of the value rather than threading the Arc
-        // through to keep `put`'s public signature stable. The returned
-        // `Arc<CachedKernel>` to the caller is a separate allocation
-        // from the L1 copy — both share the inner `Arc<EmittedPtx>`,
-        // so PTX text is not duplicated.
+        // `put` keeps its by-value `CachedKernel` signature, so we hand it a
+        // wrapper clone (cheap — see above); the returned `Arc<CachedKernel>`
+        // shares the same inner `Arc<EmittedPtx>` as the L1 copy.
         self.put(*key, cached.clone());
         Some(Arc::new(cached))
     }
@@ -1217,13 +1225,35 @@ impl std::fmt::Display for KeyFingerprint {
 ///
 /// ```text
 /// [0..16)   magic = "TWJIT-KRNL-v2\0\0"
-/// [16..24)  blueprint fingerprint (u64 LE)
-/// [24..28)  sm_version (u32 LE)
-/// [28..32)  launch_geometry.grid_x (u32 LE)
-/// [32..36)  launch_geometry.block_x (u32 LE)
-/// [36..44)  ptx length (u64 LE)
-/// [44..44+ptx_len)  PTX text (UTF-8, NOT null-terminated)
+/// [16..24)  tenant_id (u64 LE)            <- tenant-binding defence-in-depth
+/// [24..32)  blueprint fingerprint (u64 LE)
+/// [32..36)  sm_version (u32 LE)
+/// [36..40)  launch_geometry.grid_x (u32 LE)
+/// [40..44)  launch_geometry.block_x (u32 LE)
+/// [44..52)  ptx length (u64 LE)
+/// [52..52+ptx_len)  PTX text (UTF-8, NOT null-terminated)
 /// ```
+///
+/// ## Tenant binding (defence-in-depth)
+///
+/// The `tenant_id` word at `[16..24)` was added so the *persisted*
+/// envelope binds the owning tenant, not merely the filename path
+/// (`path_for` already folds `tenant_id` into the path hash, but the
+/// path alone is the only thing scoping a blob to a tenant). Without
+/// this, an attacker who can drop a well-formed, HMAC-valid sidecar +
+/// blob at *another* tenant's `path_for` location would have it served
+/// to that tenant on `get`. The reader now cross-checks
+/// `tenant_on_disk == key.tenant_id` alongside the existing
+/// fingerprint / sm_version defence-in-depth check and rejects a
+/// mismatch as a miss.
+///
+/// The 16-byte magic stays `TWJIT-KRNL-v2\0\0\0` (the cross-version
+/// compat invariant pinned by the artifact-store round-trip test); the
+/// tenant word is an in-place, length-extending revision of the V2 body.
+/// A genuinely pre-tenant V2 blob fed to this reader misaligns every
+/// field and is rejected cleanly by the tenant / fingerprint / sm_version
+/// cross-check (worst case a clean miss + rewrite on the next `put`) —
+/// the L2 cache is regenerable, so no migration step is required.
 ///
 /// The HMAC trailer that pre-T30 V2 sat at the end of the file is gone
 /// from this layer — the artifact store provides streaming HMAC over
@@ -1255,6 +1285,18 @@ struct DiskCache {
     /// per-blob path-prefix fingerprint agree byte-for-byte without
     /// either side reaching into the other's private field.
     hmac_key: Zeroizing<[u8; 32]>,
+    /// Cached 16-hex-char fingerprint of `hmac_key` — the `{key_prefix}`
+    /// segment every `path_for` filename leads with.
+    ///
+    /// Perf: the HMAC-key fingerprint is `blake3(hmac_key)` truncated, which
+    /// is constant for the cache's lifetime (the key never changes after
+    /// construction). `path_for` used to recompute it via
+    /// `blake3::hash(&self.hmac_key[..])` on *every* disk op; hoisting it
+    /// here computes the digest exactly once in `new`. The per-cache-key
+    /// digest in `path_for` genuinely varies per call and stays inline.
+    /// This is *not* secret (it is already in every filename), so caching
+    /// the rendered hex rather than the key bytes leaks nothing.
+    key_prefix_hex: String,
     /// Underlying streaming content-addressed signed blob store.
     /// Holds the v2-envelope-wrapped kernel payloads. Wrapped in an
     /// `Arc` so the disk cache is cheaply clonable — `KernelCache`
@@ -1276,8 +1318,11 @@ struct DiskCache {
 /// version compat is preserved: an older reader extracting this body
 /// from any future archive can still parse it.
 const DISK_CACHE_MAGIC_V2: &[u8; 16] = b"TWJIT-KRNL-v2\0\0\0";
-/// V2 header: magic + fingerprint + sm_version + grid_x + block_x + ptx_len.
-const DISK_CACHE_HEADER_LEN_V2: usize = 16 + 8 + 4 + 4 + 4 + 8;
+/// V2 header: magic + tenant_id + fingerprint + sm_version + grid_x +
+/// block_x + ptx_len. The `tenant_id` word is the tenant-binding
+/// defence-in-depth field — see the [`DiskCache`] type-level "Tenant
+/// binding" note.
+const DISK_CACHE_HEADER_LEN_V2: usize = 16 + 8 + 8 + 4 + 4 + 4 + 8;
 
 /// 16-byte sidecar magic. Stamped at the head of every `*.ptxbin`
 /// sidecar so the reader can tell a T30 sidecar apart from any legacy
@@ -1312,9 +1357,21 @@ impl DiskCache {
         // construction-time bytes linger after drop. `*key_bytes` derefs the
         // `Zeroizing` to hand the store its by-value `[u8; 32]`.
         let store = Arc::new(DiskArtifactStore::new(dir.clone(), *key_bytes));
+        // Perf: the HMAC-key fingerprint (`blake3(hmac_key)` truncated to 8
+        // bytes → 16 hex chars) is constant for the cache's lifetime, so
+        // compute it once here rather than on every `path_for` call. See the
+        // `key_prefix_hex` field doc.
+        let key_fp = blake3::hash(&key_bytes[..]);
+        let mut key_prefix_buf = [0u8; 16];
+        hex::encode_to_slice(&key_fp.as_bytes()[..8], &mut key_prefix_buf)
+            .expect("16 byte buf for 8 byte input");
+        let key_prefix_hex = std::str::from_utf8(&key_prefix_buf)
+            .expect("hex is utf8")
+            .to_string();
         Self {
             dir,
             hmac_key: key_bytes,
+            key_prefix_hex,
             store,
             integrity_reject_total,
         }
@@ -1369,17 +1426,12 @@ impl DiskCache {
         hex::encode_to_slice(&digest[..16], &mut cache_key_hex_buf)
             .expect("32 byte buf for 16 byte input");
         let cache_key_hex = std::str::from_utf8(&cache_key_hex_buf).expect("hex is utf8");
-        // First 8 bytes of blake3(hmac_key), packed LE → u64 → 16 hex chars.
-        // `&self.hmac_key[..]` Deref-borrows the underlying `[u8; 32]` and
-        // takes the full slice; `Zeroizing` is `Deref<Target=[u8; 32]>`.
-        //
-        // T20 perf: same encode-to-slice treatment as the cache-key digest —
-        // 8 bytes of HMAC-key fingerprint → 16 hex chars into a stack buf.
-        let key_fp = blake3::hash(&self.hmac_key[..]);
-        let mut key_prefix_buf = [0u8; 16];
-        hex::encode_to_slice(&key_fp.as_bytes()[..8], &mut key_prefix_buf)
-            .expect("16 byte buf for 8 byte input");
-        let key_prefix_hex = std::str::from_utf8(&key_prefix_buf).expect("hex is utf8");
+        // Perf: the HMAC-key fingerprint prefix is constant for the cache's
+        // lifetime, so it was hoisted to a `key_prefix_hex` field computed
+        // once in `DiskCache::new` rather than re-hashing `blake3(hmac_key)`
+        // on every disk op. The per-cache-key digest above genuinely varies
+        // per call and stays inline. See the `key_prefix_hex` field doc.
+        let key_prefix_hex = &self.key_prefix_hex;
         self.dir
             .join(format!("{key_prefix_hex}-{cache_key_hex}.ptxbin"))
     }
@@ -1394,6 +1446,12 @@ impl DiskCache {
         let (grid_x, block_x) = kernel.ptx.launch_geometry;
         let mut buf = Vec::with_capacity(DISK_CACHE_HEADER_LEN_V2 + ptx_bytes.len());
         buf.extend_from_slice(DISK_CACHE_MAGIC_V2);
+        // jit L (tenant-isolation defence-in-depth): bind the owning tenant
+        // into the persisted envelope, not just the filename path. The reader
+        // asserts this matches the requesting key so a sidecar+blob planted at
+        // another tenant's `path_for` location is rejected. See the `DiskCache`
+        // "Tenant binding" doc.
+        buf.extend_from_slice(&key.tenant_id.to_le_bytes());
         buf.extend_from_slice(&key.blueprint.to_le_bytes());
         buf.extend_from_slice(&key.sm_version.to_le_bytes());
         // jit S-3 follow-up: persist `launch_geometry` so L2 hits round-trip
@@ -1555,36 +1613,53 @@ impl DiskCache {
             return Ok(None);
         }
         // Header integrity is implied by the artifact store's HMAC, but
-        // cross-check fingerprint and sm_version against the requested
-        // key as defence-in-depth — a sidecar that points at a foreign
-        // blob (e.g. someone hand-edited the sidecar's content hash)
+        // cross-check tenant_id, fingerprint and sm_version against the
+        // requested key as defence-in-depth — a sidecar that points at a
+        // foreign blob (e.g. someone hand-edited the sidecar's content hash)
         // would still survive the store's MAC because each blob carries
         // its own self-consistent envelope; only this final check
         // refuses the mismatch.
+        let mut tenant_bytes = [0u8; 8];
+        tenant_bytes.copy_from_slice(&envelope[16..24]);
         let mut bp_bytes = [0u8; 8];
-        bp_bytes.copy_from_slice(&envelope[16..24]);
+        bp_bytes.copy_from_slice(&envelope[24..32]);
         let mut sm_bytes = [0u8; 4];
-        sm_bytes.copy_from_slice(&envelope[24..28]);
+        sm_bytes.copy_from_slice(&envelope[32..36]);
         let mut grid_x_bytes = [0u8; 4];
-        grid_x_bytes.copy_from_slice(&envelope[28..32]);
+        grid_x_bytes.copy_from_slice(&envelope[36..40]);
         let mut block_x_bytes = [0u8; 4];
-        block_x_bytes.copy_from_slice(&envelope[32..36]);
+        block_x_bytes.copy_from_slice(&envelope[40..44]);
         let mut len_bytes = [0u8; 8];
-        len_bytes.copy_from_slice(&envelope[36..44]);
+        len_bytes.copy_from_slice(&envelope[44..52]);
+        let tenant_on_disk = u64::from_le_bytes(tenant_bytes);
         let fingerprint_on_disk = u64::from_le_bytes(bp_bytes);
         let sm_version_on_disk = u32::from_le_bytes(sm_bytes);
         let grid_x_on_disk = u32::from_le_bytes(grid_x_bytes);
         let block_x_on_disk = u32::from_le_bytes(block_x_bytes);
         let ptx_len_on_disk = u64::from_le_bytes(len_bytes) as usize;
-        if fingerprint_on_disk != key.blueprint || sm_version_on_disk != key.sm_version {
+        // jit L (tenant-isolation defence-in-depth): the persisted tenant_id
+        // MUST match the requesting key. The filename path already partitions
+        // by tenant (path_for folds tenant_id into the hash), but binding the
+        // tenant *inside* the signed envelope closes the gap where a planted
+        // sidecar+blob at another tenant's path would otherwise be served to
+        // that tenant. A genuine pre-tenant V2 blob also lands here (its
+        // misaligned fields will not satisfy this check) and is rejected as a
+        // clean miss to be rewritten on the next put.
+        if tenant_on_disk != key.tenant_id
+            || fingerprint_on_disk != key.blueprint
+            || sm_version_on_disk != key.sm_version
+        {
             // Fires only on a HMAC-verified blob whose header does not match
             // the requested key — a hand-edited sidecar pointing at a
-            // foreign blob. Integrity rejection.
+            // foreign blob, or a blob planted under a foreign tenant's path.
+            // Integrity rejection.
             self.integrity_reject_total.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 target: "tensor_wasm_jit::cache",
                 file = %sidecar_path.display(),
-                "disk-cache V2 envelope header key mismatch; treating as miss"
+                tenant = key.tenant_id,
+                tenant_on_disk,
+                "disk-cache V2 envelope header key mismatch (tenant/fingerprint/sm); treating as miss"
             );
             return Ok(None);
         }
@@ -2061,6 +2136,72 @@ mod tests {
         assert!(cache.get(&key).is_some());
         assert_eq!(cache.cache_hits_total(), 2);
         assert_eq!(cache.cache_misses_total(), 1);
+    }
+
+    /// jit L (tenant-isolation defence-in-depth): the V2 disk envelope now
+    /// binds `tenant_id`, and the L2 reader cross-checks it against the
+    /// requesting key. A sidecar+blob planted at another tenant's
+    /// `path_for` location (simulated here by writing under tenant A's key,
+    /// then reading the *exact same path* with a key that differs only in
+    /// `tenant_id`) must be rejected as a miss and bump the
+    /// integrity-rejection counter, rather than being served cross-tenant.
+    #[test]
+    fn disk_envelope_binds_tenant_and_rejects_cross_tenant_blob() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let hmac_key = [0x5Au8; 32];
+
+        let cache = KernelCache::new().with_disk_persistence(DiskCacheConfig {
+            dir: dir.clone(),
+            hmac_key,
+        });
+        let disk = cache.disk.as_ref().expect("disk configured");
+
+        // Same blueprint/sm/emit_config for two tenants; the only difference
+        // is `tenant_id`. `path_for` already folds tenant_id into the hash,
+        // so a real put lands tenant A and tenant B at different paths — to
+        // simulate a *planted* blob we deliberately write A's envelope to B's
+        // path and confirm the in-envelope tenant check still rejects it.
+        let key_a = CacheKey::for_tenant(TenantId(100), 0xAA, 80);
+        let key_b = CacheKey::for_tenant(TenantId(200), 0xAA, 80);
+
+        let kernel = CachedKernel::new(
+            0xAA,
+            Arc::new(EmittedPtx {
+                text: ".visible .entry tenant_bound(){}".into(),
+                launch_geometry: (4, 8),
+            }),
+            CompiledHandle::default(),
+        );
+
+        // Honest round-trip for tenant A succeeds and round-trips geometry.
+        disk.put(&key_a, &kernel).expect("put A");
+        let hit_a = disk.get(&key_a).expect("get A ok").expect("A present");
+        assert_eq!(hit_a.fingerprint, 0xAA);
+        assert_eq!(hit_a.ptx.launch_geometry, (4, 8));
+
+        // Plant A's blob at B's sidecar path: write A's envelope through the
+        // artifact store, then stamp a sidecar at B's `path_for` pointing at
+        // it. This mimics an attacker who can drop files at B's path.
+        let envelope = DiskCache::encode_v2_envelope(&key_a, &kernel);
+        let hash = disk.store.put(&envelope).expect("store put");
+        let mut sidecar = Vec::with_capacity(SIDECAR_LEN_V1);
+        sidecar.extend_from_slice(SIDECAR_MAGIC_V1);
+        sidecar.extend_from_slice(hash.as_bytes());
+        std::fs::write(disk.path_for(&key_b), &sidecar).expect("plant sidecar");
+
+        let before = cache.integrity_reject_total();
+        // Reading as tenant B must reject: the envelope's bound tenant (A)
+        // does not match B's key, so the cross-check fires.
+        assert!(
+            disk.get(&key_b).expect("get B ok").is_none(),
+            "a blob bound to tenant A must not be served to tenant B"
+        );
+        assert_eq!(
+            cache.integrity_reject_total(),
+            before + 1,
+            "cross-tenant blob must count as an integrity rejection"
+        );
     }
 
     /// jit S-3 T13 regression: `DiskCacheConfig`'s `Debug` impl MUST NOT

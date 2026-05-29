@@ -49,13 +49,15 @@ fn independent_constructions_yield_independent_caps() {
     // DashMap shards, so admin operations against one are visible only
     // when invoked with that registry's own cap.
     //
-    // The cap-interchangeability assertion (cap_a used against reg_b)
-    // describes the default-feature behaviour: caps are an opaque
-    // "you-hold-*some*-cap" token, not a tag tied to a specific
-    // registry. Under `--features strict-cap-binding` the cap is bound
-    // to its minting registry by `Arc::ptr_eq`, and cross-registry use
-    // is refused with [`RegistryError::CapabilityFromForeignRegistry`];
-    // that flavour is exercised by `tests/cap_binding_strict.rs`.
+    // H1: capability-registry binding is now UNCONDITIONAL (no longer
+    // gated on `strict-cap-binding`). A cap minted by registry A is bound
+    // to A by `Arc::ptr_eq` and is refused by registry B in every feature
+    // config. The legacy `Option`/`usize`-returning admin methods collapse
+    // that refusal to `None` / `0` / empty Vec; the typed
+    // `RegistryError::CapabilityFromForeignRegistry` is surfaced by the
+    // `*_strict` variants exercised in `tests/cap_binding_strict.rs`. The
+    // old "caps are interchangeable across registries" assertion (the H1
+    // vulnerability) has been removed.
     let (reg_a, cap_a) = TenantRegistry::new();
     let (reg_b, cap_b) = TenantRegistry::new();
     assert!(reg_a.is_empty());
@@ -73,18 +75,21 @@ fn independent_constructions_yield_independent_caps() {
     assert!(reg_a.get(TenantId(200), &cap_a).is_none());
     assert!(reg_b.get(TenantId(100), &cap_b).is_none());
 
-    // Non-strict mode: a cap from registry A is also accepted by
-    // registry B (the security boundary is "*some* cap" rather than
-    // "this exact registry's cap"). Strict mode flips this to a hard
-    // refusal — see `tests/cap_binding_strict.rs`.
-    #[cfg(not(feature = "strict-cap-binding"))]
-    {
-        // `cap_a` works against `reg_b` (opaque-token contract).
-        assert_eq!(reg_b.len(&cap_a), 1);
-        let snap_via_a = reg_b.tenants(&cap_a);
-        assert_eq!(snap_via_a.len(), 1);
-        assert_eq!(snap_via_a[0].id(), TenantId(200));
-    }
+    // H1: a cap from registry A is REJECTED by registry B in every
+    // feature config (binding is unconditional). Through the legacy
+    // admin methods the refusal collapses to `0` / empty Vec — registry
+    // B does not enumerate its tenants for a foreign cap. (The typed
+    // `CapabilityFromForeignRegistry` error is asserted via the `*_strict`
+    // APIs in `tests/cap_binding_strict.rs`.)
+    assert_eq!(
+        reg_b.len(&cap_a),
+        0,
+        "foreign cap must not unlock registry B's len (H1 binding)"
+    );
+    assert!(
+        reg_b.tenants(&cap_a).is_empty(),
+        "foreign cap must not enumerate registry B's tenants (H1 binding)"
+    );
 
     // And the caps are independently usable — one going out of scope
     // does not invalidate the other (they share no allocation).

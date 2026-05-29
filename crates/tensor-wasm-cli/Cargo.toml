@@ -73,6 +73,16 @@ tempfile.workspace = true
 # upload paths can feed `reqwest::Body::wrap_stream` instead of buffering
 # whole archives in RAM (cli fix 1: streaming restore body).
 tokio-util = { workspace = true }
+# percent-encoding: used by `invoke` and `snapshot save` to percent-encode
+# user-supplied identifiers before splicing them into request paths, so a
+# value containing `/`, `?`, `#`, `..`, or `%` cannot reshape the request
+# target (URL/path injection fix). No workspace pin exists, so declare a
+# direct version against the 2.x line.
+percent-encoding = "2"
+# zeroize: `load_hmac_key` returns `zeroize::Zeroizing<[u8; 32]>` so the
+# 32-byte signing secret is scrubbed when the binding drops; the hex form
+# is also wrapped at the call sites. Pinned against the workspace version.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 wat.workspace = true

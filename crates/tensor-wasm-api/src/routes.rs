@@ -1333,10 +1333,23 @@ async fn run_invoke(
     // call (see `SpawnConfig::args` doc) — wiring it here keeps the API surface
     // honest even though the historical explicit-pass path remains for
     // back-compat with embedders that drive multi-call flows.
-    let cfg = SpawnConfig::for_tenant(tenant)
-        .with_deadline(INVOKE_DEFAULT_DEADLINE)
-        .with_args(args.to_vec());
-    let instance_id = executor.spawn_instance(cfg, wasm_bytes).await?;
+    //
+    // PERF (run_invoke arg copies): the `args` slice is already threaded
+    // explicitly into every `call_export_with_args_then_terminate` below, so
+    // the SpawnConfig copy is purely the canonical-carrier mirror. On the
+    // dominant zero-arg `_start`/`main` path that copy is a pointless empty
+    // allocation, so skip `with_args` entirely when there are no args. The
+    // small helper centralises the build so the retry branch does not
+    // open-code (and re-audit) the same allocation decision.
+    let build_cfg = || {
+        let cfg = SpawnConfig::for_tenant(tenant).with_deadline(INVOKE_DEFAULT_DEADLINE);
+        if args.is_empty() {
+            cfg
+        } else {
+            cfg.with_args(args.to_vec())
+        }
+    };
+    let instance_id = executor.spawn_instance(build_cfg(), wasm_bytes).await?;
 
     // api S-20 / exec orphan-instance: use `call_export_with_args_then_terminate`
     // so the instance is cleaned up even if our future is dropped mid-await
@@ -1365,11 +1378,9 @@ async fn run_invoke(
                 // by the first guard. Re-spawn to try `main` — slightly more
                 // expensive than the old "reuse the instance" flow but only
                 // when `_start` is genuinely absent, and keeps the auto-
-                // terminate invariant intact.
-                let cfg = SpawnConfig::for_tenant(tenant)
-                    .with_deadline(INVOKE_DEFAULT_DEADLINE)
-                    .with_args(args.to_vec());
-                let retry_id = executor.spawn_instance(cfg, wasm_bytes).await?;
+                // terminate invariant intact. Reuses `build_cfg` so the
+                // empty-args allocation skip applies here too.
+                let retry_id = executor.spawn_instance(build_cfg(), wasm_bytes).await?;
                 executor
                     .call_export_with_args_then_terminate(retry_id, "main", args)
                     .await?
@@ -1899,6 +1910,29 @@ pub async fn invoke_function_stream(
     let args = parse_invoke_args(&req.args)?;
     let export_override = req.export;
 
+    // SECURITY (async-invoke resource amplification, MEDIUM): the streaming
+    // executor call runs in a detached `tokio::spawn` below that outlives the
+    // request future (the response streams chunks long after the handler
+    // returns the body). Bound it against the same outstanding-job ceiling
+    // the `invoke-async` path uses so streaming dispatch cannot amplify the
+    // live executor-instance / task count without limit. Reject with the
+    // shared `503 capacity_exhausted` shape; acquire the gauge guard before
+    // the spawn and move it into the task so the slot is held for the whole
+    // streaming lifetime and released (via `release` / `Drop`) on completion.
+    if state.metrics.jobs_active().get() as usize >= MAX_OUTSTANDING_ASYNC_JOBS {
+        tracing::warn!(
+            target: "tensor_wasm_api::routes",
+            active = state.metrics.jobs_active().get(),
+            limit = MAX_OUTSTANDING_ASYNC_JOBS,
+            "rejected invoke-stream: outstanding async-job ceiling reached",
+        );
+        return Err(ApiError::service_unavailable(
+            "capacity_exhausted",
+            "outstanding async-job capacity exhausted; retry later",
+        ));
+    }
+    let jobs_active_guard = JobsActiveGuard::new(Arc::clone(&state.metrics));
+
     let wants_sse = accept_wants_sse(&headers);
     tracing::Span::current().record("sse", tracing::field::display(wants_sse));
 
@@ -1921,6 +1955,12 @@ pub async fn invoke_function_stream(
     // spawn's terminal status lands on `done_rx`.
     let executor = state.executor.clone();
     tokio::spawn(async move {
+        // Hold the admission slot for the whole streaming invocation. Moved
+        // into the task so its `Drop`/`release` (the matching `dec()` for the
+        // pre-spawn `inc()`) runs when the executor work concludes — keeping
+        // the `jobs_active` gauge an accurate outstanding-work count for the
+        // ceiling check on the next request.
+        let guard = jobs_active_guard;
         let cfg = SpawnConfig::for_tenant(tenant)
             .with_deadline(INVOKE_DEFAULT_DEADLINE)
             .with_streaming(streaming);
@@ -1992,6 +2032,10 @@ pub async fn invoke_function_stream(
         // we have nothing to deliver — the response future already
         // dropped.
         let _ = done_tx.send(terminal);
+        // Release the admission slot now the streaming work is done. Paired
+        // with the `JobsActiveGuard::new` before the spawn; on a panic before
+        // this point the guard's `Drop` decrements instead.
+        guard.release();
     });
 
     // Build the body stream. The shape is the same for both SSE and
@@ -2229,19 +2273,31 @@ pub async fn get_job(
     if let Some(Extension(ctx)) = auth.as_ref() {
         ctx.authorize_tenant(tenant)?;
     }
+    // PERF (get_job deep clone under guard): the previous code cloned the
+    // whole `JobRecord` — including the potentially large `result`
+    // `serde_json::Value` — while still holding the DashMap shard guard,
+    // serialising every concurrent reader/writer of that shard for the
+    // duration of the deep clone. We now do only the cheap owner-check copy
+    // (a `u64` tenant id) under the guard, drop it, and clone the record
+    // outside the lock so the shard is contended for the minimum window.
+    let owner = match state.jobs.get(&id) {
+        Some(rec) => rec.value().tenant_id,
+        None => return Err(ApiError::not_found(format!("job {id} not found"))),
+    };
+    // Per-resource owner check: reject before serialising the record so a
+    // cross-tenant caller never observes the job's status / result /
+    // function_id.
+    if owner != tenant {
+        return Err(ApiError::forbidden(
+            "tenant_scope_denied",
+            "job belongs to a different tenant",
+        ));
+    }
+    // Re-fetch and clone outside the owner-check guard above. A concurrent
+    // eviction between the two lookups is benign: it can only turn a hit into
+    // a 404, which is a legitimate response for a since-evicted job.
     match state.jobs.get(&id) {
-        Some(rec) => {
-            // Per-resource owner check: reject before serialising the
-            // record so a cross-tenant caller never observes the job's
-            // status / result / function_id.
-            if rec.value().tenant_id != tenant {
-                return Err(ApiError::forbidden(
-                    "tenant_scope_denied",
-                    "job belongs to a different tenant",
-                ));
-            }
-            Ok(Json(rec.clone()))
-        }
+        Some(rec) => Ok(Json(rec.clone())),
         None => Err(ApiError::not_found(format!("job {id} not found"))),
     }
 }
@@ -2833,6 +2889,103 @@ mod tests {
             "leaked size figures: {}",
             api.message,
         );
+    }
+
+    /// Helper: build a `JobRecord` with the given status + creation stamp.
+    /// `function_id` / `tenant` are irrelevant to the eviction policy so they
+    /// are fixed.
+    fn job_with(status: JobStatus, created_unix_ms: u64) -> (Uuid, JobRecord) {
+        let id = Uuid::new_v4();
+        (
+            id,
+            JobRecord {
+                id,
+                function_id: Uuid::nil(),
+                tenant_id: TenantId(0),
+                status,
+                result: None,
+                created_unix_ms,
+            },
+        )
+    }
+
+    #[test]
+    fn evict_jobs_noop_when_under_cap() {
+        // Under the cap: the map is left untouched.
+        let jobs: DashMap<Uuid, JobRecord> = DashMap::new();
+        for i in 0..10u64 {
+            let (id, rec) = job_with(JobStatus::Completed, i);
+            jobs.insert(id, rec);
+        }
+        evict_jobs_if_over_cap(&jobs);
+        assert_eq!(jobs.len(), 10, "no eviction expected under the cap");
+    }
+
+    #[test]
+    fn evict_jobs_prefers_terminal_oldest_first() {
+        // Force the cap down to a tiny value via a local map populated past
+        // MAX_JOB_RECORDS would be wasteful, so exercise the policy directly
+        // by inserting MAX_JOB_RECORDS + N records and asserting the survivors.
+        let jobs: DashMap<Uuid, JobRecord> = DashMap::new();
+
+        // One Pending job (must survive — it is in flight) plus enough
+        // Completed jobs to push two over the cap. Timestamps ascending so we
+        // can assert the oldest terminal records are the ones dropped.
+        let (pending_id, pending) = job_with(JobStatus::Pending, 0);
+        jobs.insert(pending_id, pending);
+
+        let mut completed_ids_by_age: Vec<Uuid> = Vec::new();
+        // total terminal = MAX_JOB_RECORDS + 1 (so map = cap + 2 with the
+        // pending one), forcing exactly 2 evictions.
+        for i in 0..(MAX_JOB_RECORDS as u64 + 1) {
+            let (id, rec) = job_with(JobStatus::Completed, i + 1);
+            completed_ids_by_age.push(id);
+            jobs.insert(id, rec);
+        }
+        assert_eq!(jobs.len(), MAX_JOB_RECORDS + 2);
+
+        evict_jobs_if_over_cap(&jobs);
+        assert_eq!(jobs.len(), MAX_JOB_RECORDS);
+
+        // The Pending job must survive — terminal records are evicted first.
+        assert!(
+            jobs.contains_key(&pending_id),
+            "in-flight Pending job must not be evicted while terminal records exist",
+        );
+        // The two oldest Completed records (smallest created_unix_ms) are gone.
+        assert!(
+            !jobs.contains_key(&completed_ids_by_age[0]),
+            "oldest terminal record should be evicted",
+        );
+        assert!(
+            !jobs.contains_key(&completed_ids_by_age[1]),
+            "second-oldest terminal record should be evicted",
+        );
+        // A newer terminal record survives.
+        assert!(
+            jobs.contains_key(&completed_ids_by_age[completed_ids_by_age.len() - 1]),
+            "newest terminal record should survive",
+        );
+    }
+
+    #[test]
+    fn evict_jobs_falls_back_to_oldest_when_all_pending() {
+        // Pathological all-Pending flood: no terminal records to evict, so the
+        // policy falls back to dropping the oldest records of any status to
+        // keep the map bounded.
+        let jobs: DashMap<Uuid, JobRecord> = DashMap::new();
+        let mut ids_by_age: Vec<Uuid> = Vec::new();
+        for i in 0..(MAX_JOB_RECORDS as u64 + 3) {
+            let (id, rec) = job_with(JobStatus::Pending, i);
+            ids_by_age.push(id);
+            jobs.insert(id, rec);
+        }
+        evict_jobs_if_over_cap(&jobs);
+        assert_eq!(jobs.len(), MAX_JOB_RECORDS);
+        // The three oldest were dropped.
+        for old in ids_by_age.iter().take(3) {
+            assert!(!jobs.contains_key(old), "oldest Pending record should be evicted");
+        }
     }
 
     #[test]

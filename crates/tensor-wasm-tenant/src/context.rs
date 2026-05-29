@@ -367,8 +367,15 @@ pub struct TenantContext {
     bytes_in_use: AtomicU64,
 
     /// Maximum GPU memory in bytes this tenant may allocate concurrently.
-    /// `None` = no GPU memory cap (operator trust). v0.3.7 records and
-    /// reports usage; v0.4 enforces via cuMemPool's
+    /// `None` = no GPU memory cap (operator trust).
+    ///
+    /// ADVISORY / IN-PROCESS-ONLY: unless a [`DriverMemPool`] is wired in
+    /// via [`TenantContextBuilder::with_driver_enforced_gpu_cap`], this
+    /// cap is enforced ONLY by the in-process [`Self::gpu_bytes_in_use`]
+    /// counter on the [`Self::consume_gpu_bytes`] path. The CUDA driver
+    /// itself sees no cap, so any tenant that obtains a raw CUDA handle
+    /// and allocates outside `consume_gpu_bytes` is NOT capped. v0.3.7
+    /// records and reports usage; v0.4 enforces via cuMemPool's
     /// `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`.
     ///
     /// Distinct from [`Self::memory_quota_bytes`]: that one is the
@@ -393,11 +400,15 @@ pub struct TenantContext {
 
     /// Recorded-only CUDA memory-pool release-threshold value. `None`
     /// means "use the driver default" (typically unbounded retention).
-    /// The cust 0.3.x crate does not expose the `cuMemPool*` API, so
-    /// this field is **not** wired through to
-    /// `cudaMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)` —
-    /// the in-process [`TenantContext::bytes_in_use`] counter is the
-    /// only enforcement of this crate's quota. See
+    ///
+    /// ADVISORY / RECORD-ONLY: this value is NEVER enforced. The cust
+    /// 0.3.x crate does not expose the `cuMemPool*` API, so this field is
+    /// **not** wired through to
+    /// `cudaMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)` — it
+    /// is stored purely for inspection / metrics / forward-compat and the
+    /// CUDA driver never sees it. The in-process
+    /// [`TenantContext::bytes_in_use`] counter is the only enforcement of
+    /// this crate's quota. See
     /// [`TenantContextBuilder::with_recorded_cuda_mem_pool_quota`] for
     /// the honest naming and the upgrade path.
     #[allow(dead_code)]
@@ -511,12 +522,16 @@ impl TenantContext {
     /// Per-tenant GPU memory cap in bytes, or `None` for "no cap"
     /// (operator-trust deployment).
     ///
-    /// Set via [`TenantContextBuilder::with_gpu_memory_bytes_cap`]. The
-    /// in-process allocator path
+    /// ADVISORY / IN-PROCESS-ONLY unless a [`DriverMemPool`] is wired in
+    /// via [`TenantContextBuilder::with_driver_enforced_gpu_cap`]. Set via
+    /// [`TenantContextBuilder::with_gpu_memory_bytes_cap`]. The in-process
+    /// allocator path
     /// (`tensor-wasm-mem::TensorWasmMemoryCreator::with_tenant_context`)
     /// reads this on every allocation and refuses to allocate when the
-    /// would-be new total of [`Self::gpu_bytes_in_use`] would exceed it.
-    /// The CUDA driver itself does NOT see this cap until v0.4 wires
+    /// would-be new total of [`Self::gpu_bytes_in_use`] would exceed it —
+    /// but this is purely a process-local bookkeeping refusal. The CUDA
+    /// driver itself does NOT see this cap (so a tenant allocating through
+    /// a raw CUDA handle is uncapped) until v0.4 wires
     /// `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`
     /// (CUDA 11.2+). See `docs/GPU-QUOTAS.md` for the v0.4 plan.
     pub fn gpu_memory_bytes_cap(&self) -> Option<u64> {
@@ -561,14 +576,34 @@ impl TenantContext {
         let limit = self.gpu_memory_bytes_cap;
         let mut current = self.gpu_bytes_in_use.load(Ordering::Acquire);
         loop {
+            // MEDIUM fix (uncapped overflow): the counter contract is
+            // "never refused when there is no cap". A `checked_add`
+            // overflow on the uncapped path used to surface as a
+            // non-retryable `GpuMemoryExhausted { limit: u64::MAX }`,
+            // violating that contract. When `limit` is `None` we instead
+            // saturate at `u64::MAX` and `warn!` — the request is always
+            // admitted. The overflow-as-error behaviour is retained only
+            // for the capped path (a saturating add there could mask an
+            // over-cap allocation), where `next > cap` already rejects it.
             let next = match current.checked_add(n) {
                 Some(v) => v,
                 None => {
-                    return Err(TensorWasmError::GpuMemoryExhausted {
-                        requested: n,
-                        limit: limit.unwrap_or(u64::MAX),
-                        current,
-                    });
+                    if limit.is_none() {
+                        tracing::warn!(
+                            target: "tensor_wasm_tenant::context",
+                            tenant = %self.tenant_id,
+                            current,
+                            requested = n,
+                            "consume_gpu_bytes overflow on uncapped tenant; saturating at u64::MAX",
+                        );
+                        u64::MAX
+                    } else {
+                        return Err(TensorWasmError::GpuMemoryExhausted {
+                            requested: n,
+                            limit: limit.unwrap_or(u64::MAX),
+                            current,
+                        });
+                    }
                 }
             };
             if let Some(cap) = limit {
@@ -826,9 +861,9 @@ impl TenantContext {
     /// the offended tenant id is implicit in which context the call
     /// landed on and is recorded by the surrounding span.
     ///
-    /// Under the `strict-cap-binding` feature, an additional check
-    /// rejects caps minted by a *different* registry (by `Arc::ptr_eq` on
-    /// the per-registry token allocations). The check is **fail-closed**:
+    /// H1 (unconditional registry binding): an additional check rejects
+    /// caps minted by a *different* registry (by `Arc::ptr_eq` on the
+    /// per-registry token allocations). The check is **fail-closed**:
     /// a context that was never registered (no `registry_token` recorded)
     /// cannot prove which registry — if any — vouches for the cap, so the
     /// capability check is rejected outright rather than waved through.
@@ -838,6 +873,11 @@ impl TenantContext {
     /// carry a token (stamped by
     /// [`crate::TenantRegistry::register_with_capability`]) and continue
     /// to pass against caps from the same registry.
+    ///
+    /// H1: this binding is enforced regardless of the `strict-cap-binding`
+    /// feature, so a release build without that feature still rejects
+    /// cross-registry capabilities and fails closed on unregistered
+    /// contexts.
     fn check_capability(
         &self,
         cap: &TenantCapability,
@@ -849,25 +889,22 @@ impl TenantContext {
                 resource: resource.into(),
             });
         }
-        #[cfg(feature = "strict-cap-binding")]
-        {
-            match self.registry_token.as_ref() {
-                // Registered context: the cap must come from the same
-                // registry. Report the cap's tenant id as the offender —
-                // the audit-flagged threat is a holder of one registry's
-                // cap using it against a namesake tenant in another
-                // registry.
-                Some(ctx_token) if std::sync::Arc::ptr_eq(ctx_token, &cap.registry_token) => {}
-                // Either the cap was minted by a different registry, or
-                // this context carries no registry provenance at all
-                // (builder-constructed, never registered). Fail closed in
-                // both cases.
-                _ => {
-                    return Err(TensorWasmError::TenantIsolationViolation {
-                        tenant_id: cap.tenant_id,
-                        resource: resource.into(),
-                    });
-                }
+        match self.registry_token.as_ref() {
+            // Registered context: the cap must come from the same
+            // registry. Report the cap's tenant id as the offender —
+            // the audit-flagged threat is a holder of one registry's
+            // cap using it against a namesake tenant in another
+            // registry.
+            Some(ctx_token) if std::sync::Arc::ptr_eq(ctx_token, &cap.registry_token) => {}
+            // Either the cap was minted by a different registry, or
+            // this context carries no registry provenance at all
+            // (builder-constructed, never registered). Fail closed in
+            // both cases.
+            _ => {
+                return Err(TensorWasmError::TenantIsolationViolation {
+                    tenant_id: cap.tenant_id,
+                    resource: resource.into(),
+                });
             }
         }
         Ok(())
@@ -917,12 +954,13 @@ impl TenantContext {
     ///
     /// Returns `None` when the builder was not given an explicit value
     /// (the driver default applies), or `Some(bytes)` when set via
-    /// [`TenantContextBuilder::with_recorded_cuda_mem_pool_quota`]. As
-    /// the builder method's name indicates, the value is informational
-    /// only — the cust 0.3.x crate does not expose
-    /// `cuMemPoolSetAttribute`, so the CUDA driver never sees this
-    /// number. Enforcement of this crate's per-tenant quota lives
-    /// entirely in [`Self::bytes_in_use`].
+    /// [`TenantContextBuilder::with_recorded_cuda_mem_pool_quota`].
+    ///
+    /// ADVISORY / RECORD-ONLY: as the builder method's name indicates,
+    /// the value is informational only and is NEVER enforced — the cust
+    /// 0.3.x crate does not expose `cuMemPoolSetAttribute`, so the CUDA
+    /// driver never sees this number. Enforcement of this crate's
+    /// per-tenant quota lives entirely in [`Self::bytes_in_use`].
     pub fn cuda_mem_pool_quota_bytes(&self) -> Option<u64> {
         self.cuda_mem_pool_quota_bytes
     }
@@ -1413,8 +1451,8 @@ impl TenantContextBuilder {
             // Stamped by `TenantRegistry::register_with_capability` after
             // the context is moved into the registry but before it is
             // Arc-wrapped; remains `None` for contexts the test harness
-            // constructs without going through the registry.
-            #[cfg(feature = "strict-cap-binding")]
+            // constructs without going through the registry. H1: always
+            // present so registry binding is enforced unconditionally.
             registry_token: None,
         }
     }

@@ -90,7 +90,11 @@ fn thirty_two_threads_register_disjoint_ids_concurrently() {
                          no tombstone should exist before any unregister",
                     );
                 }
-                #[cfg(feature = "strict-cap-binding")]
+                // H1: `CapabilityFromForeignRegistry` is now compiled
+                // unconditionally (no longer gated on `strict-cap-binding`),
+                // so this arm must always be present for the match to be
+                // exhaustive in every feature config. `register` never mints
+                // or compares an admin cap, so this variant can never occur.
                 Err(RegistryError::CapabilityFromForeignRegistry) => {
                     panic!(
                         "unexpected CapabilityFromForeignRegistry for id {id:?} — \

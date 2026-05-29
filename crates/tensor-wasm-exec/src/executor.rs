@@ -2533,4 +2533,103 @@ mod tests {
         let mut lim = TensorWasmResourceLimiter::new(usize::MAX);
         assert!(!lim.table_growing(0, 4096, Some(2048)).unwrap());
     }
+
+    /// exec H2 regression: a cancelled/dropped invoke future must release the
+    /// per-tenant slot, not just the engine-wide one. Before the fix,
+    /// `AutoTerminateGuard::drop` decremented `instance_count` but left
+    /// `tenant_counts` untouched, so a tenant that accumulated cancelled
+    /// invokes would hit `max_instances_per_tenant` with zero live instances
+    /// and be locked out permanently.
+    ///
+    /// We exercise the guard directly (the struct + its `Drop` are the unit
+    /// the fix lives in) rather than racing a real future-cancellation, which
+    /// is non-deterministic: we charge a per-tenant slot exactly the way
+    /// `spawn_instance` does, build an *armed* guard with the per-tenant
+    /// rollback populated the way `call_export_with_args_then_terminate` now
+    /// does, drop it, and assert BOTH counters returned to zero.
+    #[tokio::test]
+    async fn dropped_invoke_releases_per_tenant_slot() {
+        use crate::engine::EngineConfig;
+        let cfg = EngineConfig {
+            max_instances_per_tenant: Some(1),
+            ..EngineConfig::default()
+        };
+        let engine = Arc::new(TensorWasmEngine::with_config(cfg).unwrap());
+        let exec = TensorWasmExecutor::new(engine);
+        let tenant = TenantId(7);
+
+        // Spawn one instance: charges engine-wide + per-tenant to 1, and (with
+        // the cap == 1) the tenant is now at its ceiling.
+        let id = exec
+            .spawn_instance(SpawnConfig::for_tenant(tenant), &trivial_wasm())
+            .await
+            .unwrap();
+        assert_eq!(exec.tenant_instance_count(tenant), 1);
+        assert_eq!(exec.instances_len(), 1);
+
+        // Build the guard exactly as `call_export_with_args_then_terminate`
+        // does: armed, with the per-tenant rollback captured up front. Then
+        // drop it to simulate the cancelled-future path (the guard stays
+        // armed because the normal disarm-then-terminate sequence never ran).
+        {
+            let _guard = AutoTerminateGuard {
+                instances: Arc::clone(&exec.instances),
+                instance_count: Arc::clone(&exec.instance_count),
+                metrics: exec.metrics.clone(),
+                id,
+                tenant_rollback: Some((Arc::clone(&exec.tenant_counts), tenant)),
+                armed: true,
+            };
+            // dropped here
+        }
+
+        // Both counters must be back to zero — the tenant is no longer locked
+        // out and the engine-wide slot was freed.
+        assert_eq!(
+            exec.tenant_instance_count(tenant),
+            0,
+            "per-tenant slot leaked on dropped invoke (exec H2)"
+        );
+        assert_eq!(exec.instances_len(), 0, "engine-wide slot leaked");
+        assert_eq!(exec.live_count(), 0, "registry entry leaked");
+
+        // The tenant must be able to spawn again (proves no lockout).
+        let id2 = exec
+            .spawn_instance(SpawnConfig::for_tenant(tenant), &trivial_wasm())
+            .await
+            .expect("tenant should not be locked out after a cancelled invoke");
+        exec.terminate(id2).await.unwrap();
+        assert_eq!(exec.tenant_instance_count(tenant), 0);
+    }
+
+    /// exec H2 companion: with NO per-tenant cap configured, the guard's
+    /// `tenant_rollback` is `None` and the drop path must not touch
+    /// `tenant_counts` (it is never populated) — only the engine-wide slot is
+    /// released, matching the async `terminate` path which also skips the
+    /// per-tenant decrement when the cap is unset.
+    #[tokio::test]
+    async fn dropped_invoke_no_tenant_cap_releases_engine_slot_only() {
+        let engine = Arc::new(TensorWasmEngine::new().unwrap());
+        let exec = TensorWasmExecutor::new(engine);
+        let tenant = TenantId(3);
+        let id = exec
+            .spawn_instance(SpawnConfig::for_tenant(tenant), &trivial_wasm())
+            .await
+            .unwrap();
+        assert_eq!(exec.instances_len(), 1);
+        // No per-tenant cap => tenant_counts never charged.
+        assert_eq!(exec.tenant_instance_count(tenant), 0);
+        {
+            let _guard = AutoTerminateGuard {
+                instances: Arc::clone(&exec.instances),
+                instance_count: Arc::clone(&exec.instance_count),
+                metrics: exec.metrics.clone(),
+                id,
+                tenant_rollback: None,
+                armed: true,
+            };
+        }
+        assert_eq!(exec.instances_len(), 0, "engine-wide slot leaked");
+        assert_eq!(exec.tenant_instance_count(tenant), 0);
+    }
 }

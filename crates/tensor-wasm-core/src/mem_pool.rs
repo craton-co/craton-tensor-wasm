@@ -34,16 +34,28 @@ use std::sync::Arc;
 /// the other. The `String` payloads carry the `Debug`-formatted
 /// underlying CUDA result so the operator alert path keeps the same
 /// context it had when these variants lived in `mem`.
+///
+/// SECURITY (finding: `MemPoolError` Display leaks raw CUDA detail): the
+/// raw CUDA `Debug` payload can contain host pointer addresses and paths,
+/// so — mirroring [`crate::error::TensorWasmError`]'s opaque-`Display` +
+/// [`inner()`](Self::inner) pattern — the `Create`/`SetAttribute`/`Device`
+/// variants render an OPAQUE label via `Display` (no `{0}`) and surface
+/// the inner string only via [`Debug`](std::fmt::Debug) or the explicit
+/// [`inner()`](Self::inner) accessor. **Never expose [`inner()`] to a
+/// tenant-facing surface** — it is for server-side operator logs only.
 #[derive(Debug, thiserror::Error)]
 pub enum MemPoolError {
     /// `cuMemPoolCreate` returned a non-`CUDA_SUCCESS` code. The wrapped
-    /// string is the `Debug`-formatted CUDA result.
-    #[error("cuMemPoolCreate failed: {0}")]
+    /// string is the `Debug`-formatted CUDA result; it is omitted from
+    /// `Display` and only surfaced via `Debug` / [`inner()`](Self::inner).
+    #[error("cuMemPoolCreate failed")]
     Create(String),
     /// `cuMemPoolSetAttribute` returned a non-`CUDA_SUCCESS` code. The
     /// half-built pool is destroyed before this error is returned, so
-    /// callers do not need to do anything to clean up.
-    #[error("cuMemPoolSetAttribute failed: {0}")]
+    /// callers do not need to do anything to clean up. The wrapped string
+    /// is omitted from `Display` and only surfaced via `Debug` /
+    /// [`inner()`](Self::inner).
+    #[error("cuMemPoolSetAttribute failed")]
     SetAttribute(String),
     /// CUDA was not initialised by the time the pool operation ran.
     /// Reserved for callers that need to distinguish "driver not primed"
@@ -54,9 +66,32 @@ pub enum MemPoolError {
     /// The per-ordinal device cache could not retain a primary context
     /// for the requested device ordinal. Wraps the underlying CUDA
     /// description. A non-CUDA host or a missing GPU surfaces here, NOT
-    /// through [`Self::Create`].
-    #[error("device retain failed: {0}")]
+    /// through [`Self::Create`]. The wrapped string is omitted from
+    /// `Display` and only surfaced via `Debug` / [`inner()`](Self::inner).
+    #[error("device retain failed")]
     Device(String),
+}
+
+impl MemPoolError {
+    /// Returns the inner diagnostic string for the three variants that wrap
+    /// a raw CUDA message (`Create`, `SetAttribute`, `Device`). For
+    /// `NotInitialized` — which carries no payload — this returns `None`.
+    ///
+    /// SECURITY (finding: `MemPoolError` Display leaks raw CUDA detail):
+    /// this accessor exists so server-side operator logs can record the
+    /// full CUDA detail even though `Display` deliberately omits it,
+    /// mirroring [`crate::error::TensorWasmError::inner`]. **Never expose
+    /// the returned string to end-users / response bodies** — that is
+    /// precisely the leak surface the opaque `Display` impls protect
+    /// against.
+    pub fn inner(&self) -> Option<&str> {
+        match self {
+            MemPoolError::Create(s)
+            | MemPoolError::SetAttribute(s)
+            | MemPoolError::Device(s) => Some(s),
+            MemPoolError::NotInitialized => None,
+        }
+    }
 }
 
 /// A driver-level memory pool whose release threshold can be pinned to a
@@ -108,19 +143,36 @@ impl DriverMemPool for Arc<dyn DriverMemPool> {
 mod tests {
     use super::*;
 
-    /// `MemPoolError` Display impls produce non-empty, distinguishable
-    /// messages. The operator alert path keys on the message string, so
-    /// an accidental `#[error("")]` would silently swallow context.
+    /// `MemPoolError` Display impls produce non-empty, distinguishable —
+    /// and OPAQUE — messages: the operator alert path keys on the label,
+    /// while the raw CUDA detail is sanitised out of `Display` and reaches
+    /// server-side logs only via [`MemPoolError::inner`]. An accidental
+    /// `#[error("...{0}")]` would re-leak the vendor string to any
+    /// tenant-facing surface that renders `Display`.
     #[test]
     fn mem_pool_error_display_non_empty() {
+        // Create: opaque label in Display, raw detail only via `inner()`.
         let e = MemPoolError::Create("CUDA_ERROR_OUT_OF_MEMORY".into());
-        assert!(format!("{e}").contains("cuMemPoolCreate failed"));
+        assert_eq!(format!("{e}"), "cuMemPoolCreate failed");
+        assert!(!format!("{e}").contains("CUDA_ERROR_OUT_OF_MEMORY"));
+        assert_eq!(e.inner(), Some("CUDA_ERROR_OUT_OF_MEMORY"));
+
+        // SetAttribute: same opaque-Display + inner()-detail split.
         let e = MemPoolError::SetAttribute("CUDA_ERROR_INVALID_VALUE".into());
-        assert!(format!("{e}").contains("cuMemPoolSetAttribute failed"));
+        assert_eq!(format!("{e}"), "cuMemPoolSetAttribute failed");
+        assert!(!format!("{e}").contains("CUDA_ERROR_INVALID_VALUE"));
+        assert_eq!(e.inner(), Some("CUDA_ERROR_INVALID_VALUE"));
+
+        // NotInitialized carries no payload — opaque label, no inner detail.
         let e = MemPoolError::NotInitialized;
-        assert!(format!("{e}").contains("not initialized"));
+        assert_eq!(format!("{e}"), "cuda not initialized");
+        assert_eq!(e.inner(), None);
+
+        // Device: same opaque-Display + inner()-detail split.
         let e = MemPoolError::Device("device_for(7): ...".into());
-        assert!(format!("{e}").contains("device retain failed"));
+        assert_eq!(format!("{e}"), "device retain failed");
+        assert!(!format!("{e}").contains("device_for(7)"));
+        assert_eq!(e.inner(), Some("device_for(7): ..."));
     }
 
     /// The `Arc<dyn DriverMemPool>` blanket impl forwards to the inner

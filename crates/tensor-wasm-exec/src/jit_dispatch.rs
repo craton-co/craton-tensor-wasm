@@ -16,14 +16,18 @@
 //! ```
 //!
 //! - Looks up the cached kernel by `(fp_lo|fp_hi as u64, sm_version)`.
-//! - On a cache hit (no-CUDA path): reads the args region, runs the
-//!   host-side reference implementation (a simple element-wise add of the
-//!   two halves of `args` — enough for the end-to-end test to validate
-//!   the marshalling round-trip), writes the result back into the results
-//!   region, and returns `0`.
-//! - On a cache miss: emits a `tracing::warn!` and returns `-1`. The
-//!   trampoline drops the error code; for v0.1.0 the guest still sees
-//!   zero-filled results.
+//! - On a cache hit under `--features cuda`: launches the real compiled
+//!   kernel against the guest scratch region and returns `0`
+//!   ([`DISPATCH_OK`]).
+//! - On a cache hit WITHOUT CUDA: there is no kernel to run, so the dispatch
+//!   deliberately deopts — it emits a `tracing::warn!` and returns
+//!   [`DISPATCH_CACHE_MISS`] (the same code the genuine miss path uses)
+//!   rather than echoing the guest's own input back as if it were a real
+//!   result. The rewrite trampoline turns any nonzero code into a wasm trap
+//!   (after freeing the scratch slot), so a no-CUDA deployment fails loudly
+//!   instead of silently returning wrong data.
+//! - On a cache miss: emits a `tracing::warn!` and returns
+//!   [`DISPATCH_CACHE_MISS`]; the trampoline traps the guest as above.
 //!
 //! ## `alloc` / `free`
 //!
@@ -405,8 +409,7 @@ where
                 // behind `--features cuda`; the marshalling contract — args at
                 // `scratch`, results at `scratch + alen` — is identical to the
                 // no-CUDA reference path that the e2e test substitutes.)
-                let mem = mem; // silence unused on this path if launch is stubbed
-                let _ = (mem, scratch, alen, rlen, &cached);
+                let _ = (&mut *mem, scratch, alen, rlen, &cached);
                 DISPATCH_OK
             }
 
@@ -646,7 +649,7 @@ mod tests {
         let lo = (fp & 0xFFFF_FFFF) as i64;
         let hi = (fp >> 32) as i64;
         let ret = call.call(&mut store, (lo, hi)).expect("call");
-        assert_eq!(ret, DISPATCH_OK);
+        assert_eq!(ret, HIT_CODE);
     }
 
     /// End-to-end test: drive a Wasm function `add(2, 3)` through the

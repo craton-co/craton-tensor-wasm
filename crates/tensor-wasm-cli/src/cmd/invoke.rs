@@ -75,10 +75,22 @@ pub async fn run(args: InvokeArgs, ctx: &HttpContext) -> Result<()> {
         "args": parsed_args,
     });
 
+    // sec MEDIUM (URL/path injection): the function id is user-supplied and
+    // was previously spliced into the path verbatim, so a value containing
+    // `/`, `?`, `#`, `..`, or `%` could reshape the request target (escape
+    // the `/functions/{id}/invoke` segment entirely). Percent-encode it as a
+    // single path segment so it can only ever land where we intend. We encode
+    // with `NON_ALPHANUMERIC`, which covers every reserved/sub-delim and dot
+    // character, so `.`/`..` traversal and query/fragment smuggling are all
+    // neutralised.
+    let encoded_id = percent_encoding::utf8_percent_encode(
+        &args.id,
+        percent_encoding::NON_ALPHANUMERIC,
+    );
     let url = format!(
         "{}/functions/{}/invoke",
         super::server_base(&args.server),
-        args.id
+        encoded_id
     );
 
     let client = ctx.build_client(Duration::from_secs(60))?;

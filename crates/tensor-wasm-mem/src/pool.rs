@@ -271,11 +271,33 @@ impl UnifiedMemoryPool {
         // thread may hold a different `&mut [u8]` slice into a disjoint
         // region of the same slab.
         //
+        // Finding (PERF, allocate whole-region memset defeats the
+        // sub-microsecond pool goal for large slabs):
+        // -------------------------------------------------------------------
         // Cost: O(size) per allocation. For a 256 MiB Wasm linear memory this
         // is on the order of tens of milliseconds — large enough that callers
         // doing many small allocations should batch where possible, but
         // unavoidable for correctness given the recycle discipline. Skipping
         // it would re-open the H1 cross-tenant disclosure window.
+        //
+        // DECISION: the memset is REQUIRED and is kept at full `size`; the
+        // "zero only the visible window" narrowing CANNOT be applied at this
+        // layer. `allocate` takes a single `size` and has no `minimum` /
+        // visible-window parameter, and the `PoolAllocation` it returns hands
+        // the caller the FULL `[0, size)` range immediately via
+        // `as_slice()` / `as_mut_slice()` (see the public accessors below).
+        // There is no `grow_to` step at the pool layer that would zero a tail
+        // before first read, and several callers — including the H1 regression
+        // tests `recycled_allocation_reads_as_zero` and
+        // `first_allocation_reads_as_zero`, plus the cross-tenant
+        // `tests/cudarc_visible_window_only.rs` — rely on every byte of the
+        // carved region reading zero on hand-out. Narrowing the zero-fill to a
+        // prefix here would leave the recycled tail observable and re-open the
+        // H1 cross-tenant disclosure window: a soundness regression, not a
+        // safe optimization. (The wasm path's tail IS additionally re-zeroed
+        // by `PooledLinearMemory::grow_to`, but the pool API contract is wider
+        // than that single consumer, so the conservative full memset is the
+        // only sound choice at this layer.)
         //
         // PERF note (considered, intentionally NOT applied here): the
         // `UnifiedBuffer` visible-window path can zero only `[0, minimum)` and

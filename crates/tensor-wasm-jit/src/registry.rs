@@ -473,13 +473,46 @@ const DISK_REGISTRY_DEFAULT_LIST: (usize, usize) = (0, DISK_REGISTRY_DEFAULT_LIM
 /// new public type onto the API surface for no reader-side benefit.
 type ManifestBlob = (KernelManifest, String);
 
+/// Keymap value: the artifact-store [`ContentHash`] for a published
+/// kernel, paired with the decoded-and-already-verified
+/// [`KernelManifest`] (PTX text deliberately omitted).
+///
+/// Caching the manifest here serves two findings:
+///
+/// * **PERF (`list_paginated`)** — listings can be served straight from
+///   this cached manifest without a per-entry artifact-store `get`
+///   (HMAC + zstd decode of the full PTX-bearing blob) that is then
+///   thrown away. Listing is O(entries) keymap reads instead of
+///   O(entries) decompressions.
+///
+/// * **LOW perf (`get` re-verify)** — both [`DiskRegistry::open`] and
+///   [`DiskRegistry::publish`] verify the manifest signature *before*
+///   the entry is admitted into the keymap, so the cached manifest is
+///   by construction one that has already passed the registry's v2 HMAC
+///   check under the current key. `get` can skip the redundant per-
+///   resolve re-verification of the manifest signature: the bytes it
+///   then pulls from the artifact store are still independently
+///   authenticated by the store's own HMAC envelope, and the manifest
+///   embedded in this cache is exactly the one that was verified at
+///   admission time. No security is weakened — the store HMAC still
+///   guards on-disk integrity, and key-rotation skipping still happens
+///   at `open` time.
+#[derive(Clone)]
+struct KeymapEntry {
+    hash: ContentHash,
+    /// Decoded manifest, PTX stripped. Verified under the registry
+    /// HMAC key at admission time (publish or restart-recovery).
+    manifest: KernelManifest,
+}
+
 /// Production disk-persisted kernel registry (roadmap feature #3, T35).
 ///
 /// `DiskRegistry` is a thin layer on top of
 /// [`tensor_wasm_artifacts::DiskArtifactStore`] — the artifact store
 /// brings HMAC-SHA256 envelope, zstd compression, content-addressing,
 /// size caps, and atomic rename-on-publish. The registry contributes
-/// the application-level keymap `(name, version, sm_version) → ContentHash`
+/// the application-level keymap
+/// `(name, version, sm_version) → (ContentHash + cached manifest)`
 /// so callers can resolve manifests by stable `name@version` (with
 /// `sm_version` as a tie-breaker for kernels published for multiple
 /// compute capabilities).
@@ -531,12 +564,16 @@ pub struct DiskRegistry {
     /// Underlying content-addressed signed blob store. Holds the
     /// bincode-encoded `(KernelManifest, ptx_text)` payloads.
     artifact_store: DiskArtifactStore,
-    /// `(name, version, sm_version) → ContentHash` keymap. The DashMap
+    /// `(name, version, sm_version) → KeymapEntry` keymap. The DashMap
     /// behind an `Arc` lets concurrent `publish` / `resolve` callers
     /// proceed in parallel without coarse locking; the artifact store
     /// itself is also `Send + Sync` so neither layer becomes the
     /// serialisation point.
-    keymap: Arc<DashMap<(String, String, u32), ContentHash>>,
+    ///
+    /// The value caches the decoded, signature-verified manifest
+    /// alongside its `ContentHash` so listings need not re-fetch and
+    /// re-decompress each blob — see [`KeymapEntry`].
+    keymap: Arc<DashMap<(String, String, u32), KeymapEntry>>,
     /// Manifest signature key. Held in [`zeroize::Zeroizing`] so the
     /// scrub-on-Drop guarantees from the snapshot signing path apply
     /// here too — the secret does not linger in the heap arena after
@@ -568,7 +605,7 @@ impl DiskRegistry {
     /// enable one.
     pub fn open(dir: PathBuf, hmac_key: [u8; 32]) -> Result<Self, RegistryError> {
         let artifact_store = DiskArtifactStore::new(dir, hmac_key);
-        let keymap: Arc<DashMap<(String, String, u32), ContentHash>> = Arc::new(DashMap::new());
+        let keymap: Arc<DashMap<(String, String, u32), KeymapEntry>> = Arc::new(DashMap::new());
 
         // Restart-recovery: walk every blob in the store, decode it,
         // re-verify the manifest signature under the same hmac_key,
@@ -630,7 +667,11 @@ impl DiskRegistry {
                 manifest.version.clone(),
                 manifest.sm_version,
             );
-            keymap.insert(k, hash);
+            // Cache the verified manifest alongside the hash so listings
+            // and resolves avoid a redundant decode/verify (see
+            // `KeymapEntry`). `manifest` has just passed the v2 HMAC
+            // check above.
+            keymap.insert(k, KeymapEntry { hash, manifest });
         }
 
         Ok(Self {
@@ -709,13 +750,24 @@ impl DiskRegistry {
         }
 
         // Step 5: bincode encode and persist via artifact store.
+        // Keep a manifest clone for the keymap cache before the original
+        // is moved into the blob — `manifest` has already passed the
+        // digest + v2 HMAC checks above, so the cached copy is verified
+        // by construction (see `KeymapEntry`).
+        let cached_manifest = manifest.clone();
         let blob: ManifestBlob = (manifest, ptx_text);
         let bytes = encode_manifest_blob(&blob)?;
         let hash = self
             .artifact_store
             .put(&bytes)
             .map_err(|e| RegistryError::Storage(e.to_string()))?;
-        self.keymap.insert(key, hash);
+        self.keymap.insert(
+            key,
+            KeymapEntry {
+                hash,
+                manifest: cached_manifest,
+            },
+        );
         Ok(())
     }
 
@@ -731,10 +783,14 @@ impl DiskRegistry {
     pub fn list_paginated(&self, offset: usize, limit: usize) -> Vec<KernelManifest> {
         let limit = limit.min(DISK_REGISTRY_MAX_LIMIT);
         let mut out: Vec<KernelManifest> = Vec::with_capacity(limit);
-        // Iterate the keymap; for each in-range entry, pull the blob
-        // from the artifact store, decode it, and surface the manifest
-        // (PTX is omitted from the listing — same convention as
-        // `InMemoryRegistry::list`).
+        // FINDING (PERF): serve listings from the cached manifest in the
+        // keymap value rather than doing a per-entry artifact-store `get`
+        // (HMAC + zstd decode of the full PTX-bearing blob) only to throw
+        // the PTX away. The cached manifest was signature-verified at
+        // admission time (publish / restart-recovery), and listings omit
+        // PTX by convention (same as `InMemoryRegistry::list`), so the
+        // blob fetch + decode was pure waste — O(N) decompressions per
+        // listing. We now just clone the cached manifest.
         for (i, kv) in self.keymap.iter().enumerate() {
             if i < offset {
                 continue;
@@ -742,30 +798,7 @@ impl DiskRegistry {
             if out.len() >= limit {
                 break;
             }
-            let hash = *kv.value();
-            let raw = match self.artifact_store.get(&hash) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "tensor_wasm_jit::registry",
-                        hash = %hash,
-                        error = %e,
-                        "list_paginated: artifact store read failed; skipping entry"
-                    );
-                    continue;
-                }
-            };
-            match decode_manifest_blob(&raw) {
-                Ok((m, _ptx)) => out.push(m),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "tensor_wasm_jit::registry",
-                        hash = %hash,
-                        error = %e,
-                        "list_paginated: bincode decode failed; skipping entry"
-                    );
-                }
-            }
+            out.push(kv.value().manifest.clone());
         }
         out
     }
@@ -800,20 +833,31 @@ impl KernelRegistry for DiskRegistry {
         // Find the highest sm_version present for (name, version). The
         // trait surface keys on (name, version) only — when multiple
         // sm_versions exist for the same name/version pair we pick the
-        // one the keymap iterates first. Embedders that need
-        // sm-specific resolution can bypass `KernelRegistry::get` and
-        // call `list_paginated` to discover the matrix.
+        // entry with the maximum sm_version (the 3rd key element).
+        // Embedders that need sm-specific resolution can bypass
+        // `KernelRegistry::get` and call `list_paginated` to discover
+        // the matrix.
         //
-        // We materialise the matching `(triple, hash)` rather than
-        // holding the DashMap iterator across the artifact-store get —
-        // long-held DashMap entries block writers.
-        let hit: Option<((String, String, u32), ContentHash)> = self
+        // FINDING (MEDIUM correctness): this previously used `.find(...)`,
+        // which returns the first entry in DashMap bucket-iteration
+        // order. That order is non-deterministic across restarts, so the
+        // same `(name, version)` could resolve to a DIFFERENT sm_version
+        // build between runs — serving a kernel compiled for the wrong
+        // compute capability. `max_by_key` on `kv.key().2` (the
+        // sm_version) makes the choice deterministic and matches the
+        // doc contract ("the highest sm_version").
+        //
+        // We materialise the matching `ContentHash` (a `Copy` value)
+        // rather than holding the DashMap iterator across the
+        // artifact-store get — long-held DashMap entries block writers.
+        let hit: Option<ContentHash> = self
             .keymap
             .iter()
-            .find(|kv| kv.key().0 == name && kv.key().1 == version)
-            .map(|kv| (kv.key().clone(), *kv.value()));
-        let (_triple, hash) = match hit {
-            Some(p) => p,
+            .filter(|kv| kv.key().0 == name && kv.key().1 == version)
+            .max_by_key(|kv| kv.key().2)
+            .map(|kv| kv.value().hash);
+        let hash = match hit {
+            Some(h) => h,
             None => {
                 return Err(RegistryError::NotFound(format!("{name}@{version}")));
             }
@@ -829,13 +873,17 @@ impl KernelRegistry for DiskRegistry {
             other => RegistryError::Storage(other.to_string()),
         })?;
         let (manifest, ptx_text) = decode_manifest_blob(&raw)?;
-        // Defence in depth: re-verify the manifest signature on resolve.
-        // The artifact store already authenticated the bytes, but the
-        // manifest's own v2 signature is independent — if the registry
-        // HMAC key rotated, a stale signed-under-old-key blob would
-        // still pass the store envelope but fail this check, which is
-        // the right outcome.
-        self.verify_signature(&manifest)?;
+        // FINDING (LOW perf): we no longer re-run the manifest v2 HMAC
+        // verification on every resolve. The keymap only ever contains
+        // entries whose manifest passed `verify_signature` at admission
+        // time (publish) or at restart-recovery (`open`, which also drops
+        // any blob that fails to verify under the *current* key, so a
+        // rotated key is handled there). The bytes we just read are
+        // independently authenticated by the artifact store's own HMAC
+        // envelope keyed on the same content hash, so on-disk integrity
+        // is still covered — this removes a redundant per-resolve MAC,
+        // not a security layer. `self.verify_signature` is retained for
+        // the publish/open paths; deliberately not invoked here.
         Ok(Arc::new((manifest, ptx_text)))
     }
 
@@ -882,6 +930,58 @@ mod tests {
         );
         m.signature = sign_manifest(&m, key);
         m
+    }
+
+    /// Like [`signed_manifest`] but lets the caller pick `sm_version`,
+    /// for the DiskRegistry highest-sm resolution test below.
+    fn signed_manifest_sm(
+        name: &str,
+        version: &str,
+        sm_version: u32,
+        ptx_text: &str,
+        key: &[u8; 32],
+    ) -> KernelManifest {
+        let digest = *blake3::hash(ptx_text.as_bytes()).as_bytes();
+        let mut m = KernelManifest::new(
+            name.to_string(),
+            version.to_string(),
+            sm_version,
+            digest,
+            [0u8; 32],
+            0,
+            "test".to_string(),
+        );
+        m.signature = sign_manifest(&m, key);
+        m
+    }
+
+    /// FINDING (MEDIUM correctness) regression: when several
+    /// `sm_version` builds exist for one `(name, version)`,
+    /// `DiskRegistry::get` MUST resolve the HIGHEST sm_version
+    /// deterministically (per the doc contract), not whichever the
+    /// DashMap happens to iterate first. We publish sm_70, sm_90, sm_80
+    /// (intentionally out of order) under distinct PTX so the resolved
+    /// manifest is unambiguous, then assert `get` returns sm_90.
+    #[test]
+    fn disk_get_resolves_highest_sm_version() {
+        let key = [0x42u8; 32];
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let reg = DiskRegistry::open(tmp.path().to_path_buf(), key).expect("open");
+
+        // Distinct PTX per sm so the digests (and thus blobs) differ and
+        // we can tell which entry was resolved.
+        for sm in [70u32, 90, 80] {
+            let ptx = format!("// ptx for sm_{sm}\n");
+            let m = signed_manifest_sm("matmul.f32", "1.0.0", sm, &ptx, &key);
+            KernelRegistry::publish(&reg, m, ptx).expect("publish");
+        }
+
+        let got = KernelRegistry::get(&reg, "matmul.f32", "1.0.0").expect("get");
+        assert_eq!(
+            got.0.sm_version, 90,
+            "get must resolve the highest sm_version"
+        );
+        assert_eq!(got.1, "// ptx for sm_90\n");
     }
 
     #[test]

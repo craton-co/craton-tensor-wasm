@@ -307,6 +307,31 @@ impl SnapshotReader {
     /// Enable the T9 freshness check with `max_age` as the maximum
     /// accepted age of a captured snapshot.
     ///
+    /// # ⚠️ NOT A STANDALONE REPLAY / SECURITY BOUNDARY ⚠️
+    ///
+    /// SECURITY (freshness accepts future-dated / unreadable-clock
+    /// snapshots): this knob is a **best-effort liveness signal only**, not
+    /// a replay or rollback boundary. It deliberately *accepts* in two
+    /// directions an attacker can exploit:
+    /// - a **future-dated** snapshot (writer clock ahead of, or forged ahead
+    ///   of, the reader clock) is treated as age `0` and always passes; and
+    /// - if the reader's own clock is unreadable (before `UNIX_EPOCH`, or out
+    ///   of `u64` millis range) the check is **skipped entirely** and the
+    ///   snapshot is accepted.
+    ///
+    /// Consequently `max_age` alone does **not** stop replay of a once-valid
+    /// capture inside its window, and cannot stop a blob whose timestamp has
+    /// been pushed into the future. For an actual replay/rollback boundary
+    /// you **must** pair it with the authenticated monotonic checks —
+    /// [`SnapshotReader::with_min_sequence_no`] (per-signing-key high-water
+    /// mark) and/or [`SnapshotReader::with_expected_nonce`] (single-use
+    /// challenge) — and with [`SnapshotReader::require_signature`] +
+    /// [`SnapshotReader::with_hmac_sha256_key`] /
+    /// [`SnapshotReader::with_ed25519_verifying_key`] so the timestamp,
+    /// `sequence_no`, and `nonce` are all signature-certified. Used by
+    /// itself, treat this purely as a "is this snapshot suspiciously stale"
+    /// hint, never as the thing that keeps an attacker out.
+    ///
     /// When enabled, the reader compares the snapshot's
     /// `metadata.created_unix_ms` against the host's wall clock at the
     /// moment of `restore` and rejects the blob with
@@ -844,6 +869,20 @@ impl SnapshotReader {
     /// reader hosts is typically transient and operators prefer accept
     /// over reject in that direction — see [`SnapshotReader::with_max_age`]
     /// docs).
+    ///
+    /// SECURITY (best-effort liveness, NOT a replay boundary): the
+    /// accept-on-skew behaviour is intentional and is **not** a security
+    /// boundary on its own. This function *accepts* a future-dated snapshot
+    /// (saturating subtraction makes `age == 0`) and *accepts* when the
+    /// reader's clock is unreadable — so an attacker who forges a future
+    /// timestamp, or replays a capture while it is still inside the
+    /// `max_age` window, sails straight through here. Treat the result as a
+    /// staleness hint only; a real replay/rollback boundary requires the
+    /// authenticated [`SnapshotReader::with_min_sequence_no`] /
+    /// [`SnapshotReader::with_expected_nonce`] checks (run separately in
+    /// [`SnapshotReader::check_replay`]) under a signature-verifying reader.
+    /// Do not change the accept-on-skew direction without revisiting that
+    /// contract — callers are documented to depend on it.
     fn check_freshness(&self, created_unix_ms: u64) -> Result<()> {
         let max_age = match self.max_age {
             Some(d) => d,
@@ -1670,13 +1709,29 @@ pub struct RestoredOnGpu {
 /// Restore `bytes` and stage the `gpu_memory` payload onto the GPU at
 /// `device_index` via `cuMemPrefetchAsync` on a fresh non-blocking stream.
 ///
-/// **M2:** this convenience wrapper restores through a *default*
-/// [`SnapshotReader::new`], so it applies the default decompressed-size cap
-/// and accepts unsigned v2 blobs. Callers that need to apply hardening —
-/// [`SnapshotReader::with_max_decompressed`], [`SnapshotReader::require_signature`],
-/// [`SnapshotReader::with_hmac_sha256_key`], [`SnapshotReader::with_max_age`] —
-/// must use [`restore_to_gpu_with`] and pass their own configured reader.
-/// This wrapper is retained for backward compatibility and delegates to it.
+/// # ⚠️ SECURITY — INSECURE BY DEFAULT, DEPRECATED ⚠️
+///
+/// This convenience wrapper restores through a *default*
+/// [`SnapshotReader::new`]: **no HMAC/Ed25519 key, `require_signature =
+/// false`**. It will therefore accept an unsigned, unauthenticated v2 blob
+/// from an arbitrary source and copy its attacker-controlled `gpu_memory`
+/// straight into a `UnifiedBuffer` that is prefetched onto the device — a
+/// direct path for hostile bytes to reach the GPU with no signature, no
+/// freshness, and no replay check. Do **not** call this on any blob whose
+/// origin you do not fully trust.
+///
+/// Use [`restore_to_gpu_with`] instead and pass a reader hardened with
+/// [`SnapshotReader::with_hmac_sha256_key`] /
+/// [`SnapshotReader::with_ed25519_verifying_key`],
+/// [`SnapshotReader::require_signature`], and (as appropriate)
+/// [`SnapshotReader::with_max_age`] / [`SnapshotReader::with_min_sequence_no`] /
+/// [`SnapshotReader::with_expected_nonce`]. Those knobs are simply
+/// unreachable through this entry point.
+///
+/// Retained only for backward compatibility (deleting it would break existing
+/// callers); it is `#[deprecated]` to steer all new code to the `_with`
+/// variant. Behaviour is otherwise unchanged: it delegates verbatim to
+/// [`restore_to_gpu_with`] with a default reader.
 ///
 /// On success the returned [`RestoredOnGpu`] owns a populated
 /// `UnifiedBuffer<u8>` whose pages have been requested to migrate to the
@@ -1686,8 +1741,19 @@ pub struct RestoredOnGpu {
 /// Requires the `cuda` feature; on no-CUDA builds this symbol does not
 /// exist, and callers should fall back to [`SnapshotReader::restore`]
 /// followed by a manual host-to-device copy.
+// SECURITY (insecure-by-default convenience entry point): mark deprecated so
+// the compiler nudges every call site toward the authenticated `_with`
+// variant. We intentionally do NOT change behaviour here (that would break
+// callers) — the fix is the deprecation attribute plus the elevated warning
+// above.
 #[cfg(feature = "cuda")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cuda")))]
+#[deprecated(
+    note = "insecure by default: restores via a default reader with no signature/HMAC key and \
+            require_signature=false, staging attacker-controlled bytes to the GPU. Use \
+            restore_to_gpu_with for authenticated restore (pass a reader configured with \
+            with_hmac_sha256_key/with_ed25519_verifying_key and require_signature)."
+)]
 #[instrument(skip(bytes), fields(input_len = bytes.len(), device_index = device_index))]
 pub fn restore_to_gpu(bytes: &[u8], device_index: u32) -> Result<RestoredOnGpu> {
     restore_to_gpu_with(&SnapshotReader::new(), bytes, device_index)
@@ -2397,6 +2463,79 @@ mod tests {
             matches!(err, TensorWasmError::Serialization(_)),
             "expected Serialization",
         );
+    }
+
+    /// SECURITY regression (Ed25519 signature malleability): a malleated
+    /// signature must be rejected by `verify_strict`.
+    ///
+    /// We take a *valid* signature `(R, S)` and replace `S` with the
+    /// non-canonical `S + L`, where `L` is the prime order of the Ed25519
+    /// scalar subgroup. Because `[L]B == identity`, the cofactored
+    /// verification equation that the permissive `Verifier::verify` uses
+    /// still holds for `S + L`, so the *old* code path would have accepted
+    /// this forged-from-valid signature — the classic malleability. The new
+    /// `verify_strict` path rejects any `S >= L` as non-canonical, so the
+    /// reader must now reject this blob.
+    ///
+    /// No external test vectors are needed: we derive the malleated
+    /// signature from one this crate's writer just produced.
+    #[cfg(feature = "signed-snapshots")]
+    #[test]
+    fn ed25519_malleated_signature_is_rejected() {
+        use ed25519_dalek::SigningKey;
+        let signing_key = SigningKey::from_bytes(&[0x66u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let mut bytes = SnapshotWriter::new()
+            .with_ed25519_signing_key(signing_key)
+            .capture(InstanceState {
+                tenant_id: TenantId(9),
+                instance_id: InstanceId(9),
+                wasm_memory: &[3; 48],
+                gpu_memory: &[],
+                registers: &[],
+            })
+            .expect("capture");
+
+        // Sanity: a pristine blob verifies.
+        SnapshotReader::new()
+            .with_ed25519_verifying_key(verifying_key)
+            .restore(&bytes)
+            .expect("pristine ed25519 blob must verify");
+
+        // The Ed25519 trailer is `[magic:4][kind:1][sig:64]`; the 64-byte
+        // signature is `R(32) || S(32)` with `S` little-endian. Locate the
+        // `S` scalar (the final 32 bytes of the whole blob).
+        let sig_start = bytes.len() - crate::format::ED25519_SIG_LEN;
+        let s_start = sig_start + 32; // skip the 32-byte R component
+        debug_assert_eq!(bytes.len() - s_start, 32);
+
+        // L = 2^252 + 27742317777372353535851937790883648493, little-endian.
+        // Adding L to the canonical S (which is < L) yields a non-canonical
+        // S that `verify` would still accept but `verify_strict` rejects.
+        const L_LE: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x10,
+        ];
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = u16::from(bytes[s_start + i]) + u16::from(L_LE[i]) + carry;
+            bytes[s_start + i] = (sum & 0xff) as u8;
+            carry = sum >> 8;
+        }
+        // S < L < 2^253 and L < 2^253, so S + L < 2^254 — no 256-bit overflow.
+        assert_eq!(carry, 0, "S + L unexpectedly overflowed 256 bits");
+
+        let err = SnapshotReader::new()
+            .with_ed25519_verifying_key(verifying_key)
+            .restore(&bytes)
+            .expect_err("malleated (non-canonical S) signature must be rejected");
+        match err {
+            TensorWasmError::Serialization(m) => {
+                assert!(m.contains("Ed25519"), "unexpected message: {m}");
+            }
+            other => panic!("expected Serialization, got {other:?}"),
+        }
     }
 
     // ----- Replay protection: nonce -----

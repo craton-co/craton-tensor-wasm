@@ -246,8 +246,12 @@ async fn save(
 
     // Load and validate the HMAC key before any network I/O so a malformed
     // key file fails fast with a LOCAL_VALIDATION_FAILED exit code.
-    let hmac_key_hex = match hmac_key_file {
-        Some(path) => Some(load_hmac_key(path).map(hex::encode)?),
+    // sec LOW: `load_hmac_key` now returns a `Zeroizing<[u8; 32]>` (scrubbed on
+    // drop) and we wrap the derived hex String in `Zeroizing` too so the
+    // hex-encoded secret is scrubbed when it goes out of scope rather than
+    // lingering on the heap.
+    let hmac_key_hex: Option<zeroize::Zeroizing<String>> = match hmac_key_file {
+        Some(path) => Some(zeroize::Zeroizing::new(hex::encode(&*load_hmac_key(path)?))),
         None => None,
     };
 
@@ -261,16 +265,24 @@ async fn save(
         refuse_hmac_key_on_plaintext(server)?;
     }
 
+    // sec MEDIUM (URL/path injection): `instance_id` is user-supplied and was
+    // previously spliced into the path verbatim, so a value containing `/`,
+    // `?`, `#`, `..`, or `%` could reshape the request target (escape the
+    // `/instances/{id}/snapshot` segment). Percent-encode it as a single path
+    // segment using `NON_ALPHANUMERIC` so traversal and query/fragment
+    // smuggling are neutralised. Mirrors the `invoke` fix.
+    let encoded_instance =
+        percent_encoding::utf8_percent_encode(instance_id, percent_encoding::NON_ALPHANUMERIC);
     let url = format!(
         "{}/instances/{}/snapshot",
         super::server_base(server),
-        instance_id
+        encoded_instance
     );
     let client = ctx.build_client(Duration::from_secs(120))?;
 
     let mut req = client.post(&url);
     if let Some(hex_key) = &hmac_key_hex {
-        req = req.header(HMAC_KEY_HEADER, hex_key);
+        req = req.header(HMAC_KEY_HEADER, hex_key.as_str());
     }
     let resp = ctx
         .apply(req)
@@ -386,6 +398,14 @@ async fn restore(
     if as_instance.trim().is_empty() {
         return Err(local_err("--as-instance must be non-empty"));
     }
+    // sec MEDIUM (header injection): `as_instance` is forwarded verbatim in
+    // the `X-TensorWasm-As-Instance` header. A value containing CR/LF or other
+    // control bytes could smuggle additional headers or split the request, and
+    // non-token bytes can yield an opaque reqwest error at send time. Validate
+    // it against a strict identifier charset up front so we fail closed with a
+    // clear local error instead. The same charset is applied to the path-bound
+    // ids elsewhere (those are additionally percent-encoded for the URL case).
+    validate_identifier_charset(as_instance, "--as-instance")?;
 
     let meta = std::fs::metadata(input)
         .with_context(|| format!("locating snapshot file {}", input.display()))?;
@@ -408,8 +428,10 @@ async fn restore(
 
     // Load and validate the HMAC key before any network I/O so a malformed
     // key file fails fast with a LOCAL_VALIDATION_FAILED exit code.
-    let hmac_key_hex = match hmac_key_file {
-        Some(path) => Some(load_hmac_key(path).map(hex::encode)?),
+    // sec LOW: same Zeroizing treatment as `save` — the key bytes and their
+    // hex encoding are both scrubbed on drop.
+    let hmac_key_hex: Option<zeroize::Zeroizing<String>> = match hmac_key_file {
+        Some(path) => Some(zeroize::Zeroizing::new(hex::encode(&*load_hmac_key(path)?))),
         None => None,
     };
 
@@ -448,7 +470,7 @@ async fn restore(
         .header(reqwest::header::CONTENT_LENGTH, meta.len().to_string())
         .header("X-TensorWasm-As-Instance", as_instance);
     if let Some(hex_key) = &hmac_key_hex {
-        req = req.header(HMAC_KEY_HEADER, hex_key);
+        req = req.header(HMAC_KEY_HEADER, hex_key.as_str());
     }
     if require_signature {
         req = req.header(REQUIRE_SIGNATURE_HEADER, "true");
@@ -534,6 +556,34 @@ fn looks_like_tensor_wasm_envelope(body: &str) -> bool {
     serde_json::from_str::<Envelope>(body).is_ok()
 }
 
+/// sec MEDIUM (URL/path/header injection): validate a user-supplied identifier
+/// against a strict charset before it is used in a request path or header
+/// value. Accepts only `[A-Za-z0-9._-]`, rejects the empty string and the
+/// traversal tokens `.` / `..`. This neutralises CR/LF/control-byte header
+/// smuggling on the `X-TensorWasm-As-Instance` header value and keeps the
+/// identifier free of any byte that could reshape a request target. Path-bound
+/// ids are *additionally* percent-encoded at their `format!` site.
+fn validate_identifier_charset(id: &str, flag: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(local_err(format!("{flag} must be non-empty")));
+    }
+    if id == "." || id == ".." {
+        return Err(local_err(format!(
+            "{flag} must not be `.` or `..` (path traversal)"
+        )));
+    }
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    {
+        return Err(local_err(format!(
+            "{flag} contains an invalid character {bad:?}; only ASCII letters, \
+             digits, `.`, `_`, and `-` are allowed"
+        )));
+    }
+    Ok(())
+}
+
 /// Build an [`anyhow::Error`] tagged with the LOCAL_VALIDATION_FAILED exit code.
 fn local_err(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(SnapshotExit {
@@ -585,36 +635,58 @@ pub fn refuse_hmac_key_on_plaintext(server: &str) -> Result<()> {
 /// error so an operator who accidentally points the flag at, say, a
 /// passphrase or PEM file gets a clear message instead of a silently
 /// truncated key.
-pub(crate) fn load_hmac_key(path: &Path) -> Result<[u8; 32]> {
-    // cli 1.1.a: warn if the keyfile is readable by group/other on Unix.
-    // The file holds a 32-byte signing secret; world-readable means anyone
-    // on the host can forge snapshots that look authentic. We warn rather
-    // than refuse because (a) `umask 0` developer setups exist and (b) the
-    // operator may genuinely want the file group-readable for a service
-    // account. Loud warning, not hard failure.
+pub(crate) fn load_hmac_key(path: &Path) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+    // cli 1.1.a / sec LOW: by default WARN if the keyfile is readable by
+    // group/other on Unix. The file holds a 32-byte signing secret;
+    // group/world-readable means anyone on the host can forge snapshots that
+    // look authentic. We default to warn (not refuse) because (a) `umask 0`
+    // developer setups exist and (b) the operator may genuinely want the file
+    // group-readable for a service account.
+    //
+    // sec LOW (opt-in strict mode): when `TENSOR_WASM_REQUIRE_KEY_PERMS=1` is
+    // set, REFUSE (hard error) on a group/other-accessible key file instead of
+    // merely warning, so security-conscious deployments can fail closed.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = std::fs::metadata(path) {
             let mode = meta.permissions().mode();
             if mode & 0o077 != 0 {
+                let strict = std::env::var("TENSOR_WASM_REQUIRE_KEY_PERMS")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                if strict {
+                    return Err(local_err(format!(
+                        "HMAC key file {} is readable by group/other (mode {:o}); \
+                         TENSOR_WASM_REQUIRE_KEY_PERMS=1 is set, so refusing to use \
+                         it — tighten to 0600 (chmod 600 {})",
+                        path.display(),
+                        mode & 0o777,
+                        path.display()
+                    )));
+                }
                 tracing::warn!(
                     target: "tensor_wasm_cli::snapshot",
                     file = %path.display(),
                     mode = format!("{:o}", mode & 0o777),
                     "HMAC key file is readable by group/other; tighten to 0600 \
                      (chmod 600 <file>) — the file holds a 32-byte signing \
-                     secret and any reader can forge snapshots"
+                     secret and any reader can forge snapshots (set \
+                     TENSOR_WASM_REQUIRE_KEY_PERMS=1 to make this a hard error)"
                 );
             }
         }
     }
     // cli 1.1.c: wrap the file read in a Zeroized RAII so the heap-resident
     // copy of the key material is scrubbed on every return path, success
-    // or error. The returned `[u8; 32]` is the caller's responsibility.
+    // or error.
     let raw = Zeroized(
         std::fs::read(path).with_context(|| format!("reading HMAC key file {}", path.display()))?,
     );
+
+    // sec LOW: return the key inside `zeroize::Zeroizing` so the 32-byte
+    // secret is scrubbed when the caller's binding drops, rather than handing
+    // back a bare `[u8; 32]` that lingers in memory.
 
     // Try the hex path first: a file that's pure ASCII hex (after trimming
     // surrounding whitespace) is the documented happy path. Mixed binary
@@ -629,14 +701,14 @@ pub(crate) fn load_hmac_key(path: &Path) -> Result<[u8; 32]> {
                     path.display()
                 ))
             })?);
-            let mut out = [0u8; 32];
+            let mut out = zeroize::Zeroizing::new([0u8; 32]);
             out.copy_from_slice(&bytes.0);
             return Ok(out);
         }
     }
 
     if raw.0.len() == 32 {
-        let mut out = [0u8; 32];
+        let mut out = zeroize::Zeroizing::new([0u8; 32]);
         out.copy_from_slice(&raw.0);
         return Ok(out);
     }
@@ -653,11 +725,10 @@ pub(crate) fn load_hmac_key(path: &Path) -> Result<[u8; 32]> {
 ///
 /// Uses `std::ptr::write_volatile` per byte so a future-optimising compiler
 /// cannot elide the store as a dead write. This is the same pattern the
-/// `zeroize` crate's `volatile_write_bytes` uses; pulling the dep in just
-/// for this one call site is overkill, and the cli crate's heap-key
-/// lifetime is short enough (single subcommand) that a per-call
-/// implementation suffices. If the cli ever grows a long-running daemon
-/// path, switch to `zeroize::Zeroizing`.
+/// `zeroize` crate's `volatile_write_bytes` uses. The crate now depends on
+/// `zeroize` (the returned key is a `zeroize::Zeroizing<[u8; 32]>`), so this
+/// could be replaced by `zeroize::Zeroizing<Vec<u8>>`; it's kept as a tiny
+/// local wrapper to avoid churning the surrounding read/decode flow.
 struct Zeroized(Vec<u8>);
 
 impl Drop for Zeroized {
@@ -743,8 +814,10 @@ mod tests {
         // 64 hex chars = 32 bytes of 0x42.
         let hex_key = "42".repeat(32);
         std::fs::write(&path, &hex_key).unwrap();
+        // `load_hmac_key` now returns `Zeroizing<[u8; 32]>`; deref to compare
+        // the inner array (sec LOW zeroize wrapper).
         let k = load_hmac_key(&path).unwrap();
-        assert_eq!(k, [0x42u8; 32]);
+        assert_eq!(*k, [0x42u8; 32]);
     }
 
     #[test]
@@ -755,7 +828,7 @@ mod tests {
         content.push('\n');
         std::fs::write(&path, &content).unwrap();
         let k = load_hmac_key(&path).unwrap();
-        assert_eq!(k, [0xabu8; 32]);
+        assert_eq!(*k, [0xabu8; 32]);
     }
 
     #[test]
@@ -765,7 +838,7 @@ mod tests {
         let raw = [0x99u8; 32];
         std::fs::write(&path, raw).unwrap();
         let k = load_hmac_key(&path).unwrap();
-        assert_eq!(k, raw);
+        assert_eq!(*k, raw);
     }
 
     #[test]

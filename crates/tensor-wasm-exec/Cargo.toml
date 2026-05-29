@@ -38,6 +38,11 @@ tracing-subscriber.workspace = true
 wat.workspace = true
 
 [features]
+# `cuda` enables the real GPU kernel-launch path in `jit_dispatch` (a cache hit
+# launches a compiled kernel instead of signalling deopt). It pulls the CUDA
+# host bridge in `tensor-wasm-wasi-gpu`; requires a CUDA toolkit at build time,
+# so it is opt-in and off by default (plain `cargo build` stays CUDA-free).
+cuda = ["tensor-wasm-wasi-gpu/cuda"]
 
 [package.metadata.docs.rs]
 all-features = true

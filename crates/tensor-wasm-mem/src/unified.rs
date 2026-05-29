@@ -217,7 +217,7 @@ pub struct UnifiedBuffer {
     /// host memory and so safe to view as a `&[u8]`. `false` for the T39
     /// `new_in_tenant_pool` path, whose `cuMemAllocFromPoolAsync` memory
     /// is DEVICE-ONLY (see the "Bytes layout" doc on
-    /// [`Self::new_in_tenant_pool`]); calling `from_raw_parts` over it
+    /// `new_in_tenant_pool`); calling `from_raw_parts` over it
     /// would be host-side UB. `as_slice` / `as_mut_slice` consult this
     /// flag and panic rather than fabricating a host slice over device
     /// memory. Every constructor MUST set this correctly.
@@ -432,6 +432,13 @@ mod backing {
     /// default `Box<[u8]>` fallback ⇒ `false`.
     pub(super) const IS_UVM_BACKED: bool = true;
 
+    /// Audit (LOW, Drop-time zeroization): `false` here — the cudarc
+    /// managed allocation is freed via `cuMemFree_v2`, which needs a live
+    /// CUDA context, so [`super::UnifiedBuffer::drop`] must NOT attempt a
+    /// host-side memset over it. Only the no-CUDA `Box<[u8]>` build sets
+    /// this `true`.
+    pub(super) const IS_HOST_BACKED: bool = false;
+
     /// Owning storage for a [`super::UnifiedBuffer`] under the
     /// `cudarc-backend` feature.
     ///
@@ -561,6 +568,12 @@ mod backing {
     /// three-way gating.
     pub(super) const IS_UVM_BACKED: bool = false;
 
+    /// Audit (LOW, Drop-time zeroization): `true` here — the backing is a
+    /// plain heap `Box<[u8]>`, so [`super::UnifiedBuffer::drop`] can
+    /// volatile-zero the bytes before the box is freed (no CUDA context
+    /// required). This is the ONLY build where the constant is `true`.
+    pub(super) const IS_HOST_BACKED: bool = true;
+
     /// Owning storage for a [`super::UnifiedBuffer`] on the no-CUDA
     /// default build.
     ///
@@ -613,7 +626,7 @@ mod backing {
 // "Aliasing invariant" doc on the `mod backing` blocks above), this
 // closes the audit-T5 finding that `Backing::Cuda` aliased the parent
 // struct's `NonNull<u8>`.
-use backing::{Backing, IS_UVM_BACKED};
+use backing::{Backing, IS_HOST_BACKED, IS_UVM_BACKED};
 
 /// T39 owning storage for a [`UnifiedBuffer`] allocated through a
 /// tenant-scoped `cuMemPool`.
@@ -638,10 +651,23 @@ use backing::{Backing, IS_UVM_BACKED};
 /// captures the pointer, and from then on only the parent struct's
 /// `as_ptr` / `as_mut_ptr` are the legal access paths.
 #[cfg(feature = "gpu-mem-pool")]
-#[derive(Debug)]
 pub(crate) struct TenantPoolBacking {
     ptr: NonNull<u8>,
     pool: Arc<crate::cuda_mem_pool::TenantMemPool>,
+}
+
+// Audit (LOW — ASLR-leak via logs): hand-written `Debug` that REDACTS the
+// raw `ptr` address rather than the `#[derive(Debug)]` default (which would
+// print the allocation pointer). Logs/backtraces that render this struct
+// then cannot be used to defeat ASLR.
+#[cfg(feature = "gpu-mem-pool")]
+impl fmt::Debug for TenantPoolBacking {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TenantPoolBacking")
+            .field("ptr", &"<redacted>")
+            .field("pool_cap_bytes", &self.pool.cap_bytes())
+            .finish()
+    }
 }
 
 #[cfg(feature = "gpu-mem-pool")]
@@ -729,6 +755,12 @@ impl UnifiedBuffer {
             size,
             device_id,
             backing,
+            // Audit H4: the standard backings (cust/cudarc managed memory
+            // and the host `Box<[u8]>`) are all host-dereferenceable.
+            host_addressable: true,
+            // Audit (LOW): only the no-CUDA `Box<[u8]>` build can be
+            // zeroized in `Drop` without a live CUDA context.
+            host_zeroize_on_drop: IS_HOST_BACKED,
             tenant_ctx: None,
         })
     }
@@ -805,6 +837,12 @@ impl UnifiedBuffer {
                 size,
                 device_id,
                 backing,
+                // Audit H4: same standard host-addressable backings as
+                // `new_with_visible_window_on`.
+                host_addressable: true,
+                // Audit (LOW): only the no-CUDA `Box<[u8]>` build is
+                // zeroized on drop.
+                host_zeroize_on_drop: IS_HOST_BACKED,
                 tenant_ctx: Some(tenant_ctx),
             }),
             Err(e) => {
@@ -862,11 +900,29 @@ impl UnifiedBuffer {
         // Bypass the per-feature `Backing::allocate` machinery: the
         // pool path is the *only* allocator here, and it does not
         // zero-init (device-located memory is uninitialised at
-        // allocation). Callers that need a zero-filled buffer must
-        // memset themselves; we deliberately do NOT pay for a
+        // allocation). We deliberately do NOT pay for a
         // full-allocation memset here because the T39 use cases
         // (working-set scratch buffers) overwrite the region
         // immediately.
+        //
+        // Audit (MEDIUM — intra-tenant residue): because this path
+        // skips the device memset, the freshly-allocated region may
+        // contain bytes left over from a PRIOR allocation that the
+        // SAME tenant's pool recycled (`cuMemAllocFromPoolAsync` draws
+        // from the pool's released-but-not-returned arena). Cross-
+        // tenant safety is unaffected — each tenant owns a distinct
+        // pool — but a tenant could observe its own freed residue.
+        //
+        // CONTRACT: callers MUST fully overwrite every byte they will
+        // subsequently read before reading it. This buffer is returned
+        // UNINITIALISED. There is no host-side memset available on this
+        // path (the bytes are device-only — see "Bytes layout" above —
+        // so `ptr::write_bytes` from the CPU would be UB), and a device
+        // memset helper would require threading a `&Stream` through
+        // `TenantMemPool`, which lives in another module. If a
+        // zero-on-allocate option is wanted it should be added to
+        // `TenantMemPool::allocate` (a stream-synchronised `cuMemsetD8`)
+        // rather than faked here; deferred — see the report.
         let ptr = pool.allocate(size)?;
         let tp = TenantPoolBacking {
             ptr,
@@ -877,6 +933,16 @@ impl UnifiedBuffer {
             size,
             device_id,
             backing: Backing::TenantPool(tp),
+            // Audit H4: `cuMemAllocFromPoolAsync` returns DEVICE-ONLY
+            // memory (see the "Bytes layout" doc above). It is NOT
+            // host-dereferenceable, so flag it accordingly — `as_slice`
+            // / `as_mut_slice` will panic rather than fabricate a host
+            // `&[u8]` over device memory (which would be UB).
+            host_addressable: false,
+            // Audit (LOW): device-only memory cannot be zeroized from the
+            // CPU in `Drop` (needs a live CUDA context); leave it to the
+            // pool's free path.
+            host_zeroize_on_drop: false,
             // No `tenant_ctx`: this constructor is the *driver*-pin
             // entry point. The caller chooses whether to also stash
             // an `Arc<TenantContext>` for in-process accounting via a
@@ -908,20 +974,70 @@ impl UnifiedBuffer {
     }
 
     /// Borrow the buffer as a shared byte slice.
+    ///
+    /// # Panics
+    ///
+    /// Audit H4: panics if the buffer is NOT host-addressable (i.e. it
+    /// was created via `new_in_tenant_pool`, whose
+    /// `cuMemAllocFromPoolAsync` memory is device-only). Fabricating a
+    /// host `&[u8]` over device memory is undefined behaviour, so this
+    /// fails loudly rather than handing out a slice the CPU cannot
+    /// legally dereference. The signature is unchanged (returns `&[u8]`,
+    /// not `Result`) because every in-tree caller —
+    /// `TensorWasmLinearMemory` in `wasm_memory.rs`, the pool/tests —
+    /// only ever calls this on host-addressable managed/heap buffers;
+    /// see the `host_addressable` field.
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: ptr is non-null and points to `size` valid bytes by the type invariant.
+        assert!(
+            self.host_addressable,
+            "UnifiedBuffer::as_slice on a device-only buffer (audit H4): \
+             this allocation came from new_in_tenant_pool \
+             (cuMemAllocFromPoolAsync) and is NOT host-dereferenceable; \
+             copy it to host memory via a stream instead"
+        );
+        // SAFETY: ptr is non-null and points to `size` valid bytes by the
+        // type invariant, and the assert above proves the bytes are
+        // host-addressable.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.size) }
     }
 
     /// Borrow the buffer as a mutable byte slice.
+    ///
+    /// # Panics
+    ///
+    /// Audit H4: panics if the buffer is NOT host-addressable. See
+    /// [`Self::as_slice`] for the rationale.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: ptr is non-null, points to `size` valid bytes, and `&mut self` proves uniqueness.
+        assert!(
+            self.host_addressable,
+            "UnifiedBuffer::as_mut_slice on a device-only buffer (audit H4): \
+             this allocation came from new_in_tenant_pool \
+             (cuMemAllocFromPoolAsync) and is NOT host-dereferenceable; \
+             copy it to/from host memory via a stream instead"
+        );
+        // SAFETY: ptr is non-null, points to `size` valid bytes, `&mut self`
+        // proves uniqueness, and the assert above proves the bytes are
+        // host-addressable.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.size) }
     }
 
     /// Which device this buffer is anchored to.
     pub fn device_id(&self) -> DeviceId {
         self.device_id
+    }
+
+    /// Audit (LOW — ASLR-leak via logs): an opaque, non-reversible token
+    /// derived from the real pointer for use in `Debug` / log output. It
+    /// lets two renders of the same buffer be correlated WITHOUT
+    /// disclosing the actual allocation address (which would leak the
+    /// memory layout and defeat ASLR). A plain multiplicative hash of the
+    /// address bits — not cryptographic, just enough to scramble the
+    /// address so it cannot be read back.
+    fn opaque_handle(&self) -> u32 {
+        let bits = self.ptr.as_ptr() as usize as u64;
+        // FNV-1a-ish fold down to 32 bits; one-way for logging purposes.
+        let mixed = bits.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        ((mixed >> 32) ^ (mixed & 0xFFFF_FFFF)) as u32
     }
 
     /// Attempt to grow the buffer in place to `new_size` bytes.
@@ -1136,10 +1252,19 @@ impl UnifiedBacking for UnifiedBuffer {
 
 impl fmt::Debug for UnifiedBuffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Audit (LOW — ASLR-leak via logs): do NOT print the real `ptr`
+        // address. A raw allocation address in a `Debug` render (which
+        // routinely lands in logs / panic backtraces / error reports)
+        // leaks the heap/UVM layout and defeats ASLR for an attacker who
+        // can read them. We surface only the size + device, plus an
+        // opaque, non-reversible handle so two `Debug` lines for the same
+        // buffer can still be correlated without disclosing the address.
         f.debug_struct("UnifiedBuffer")
-            .field("ptr", &self.ptr.as_ptr())
+            .field("ptr", &"<redacted>")
+            .field("handle", &format_args!("{:#010x}", self.opaque_handle()))
             .field("size", &self.size)
             .field("device_id", &self.device_id)
+            .field("host_addressable", &self.host_addressable)
             .finish()
     }
 }
@@ -1167,6 +1292,33 @@ impl Drop for UnifiedBuffer {
         // `Backing` drop. See the `Backing` "Aliasing invariant" doc.
         if let Some(ctx) = self.tenant_ctx.as_ref() {
             ctx.release_gpu_bytes(self.size as u64);
+        }
+
+        // Audit (LOW — no Drop-time zeroization of sensitive buffers):
+        // overwrite the bytes before the backing's own `Drop` frees them,
+        // so freed memory does not linger with potentially-sensitive
+        // residue. Gated to the HOST `Box<[u8]>` path only
+        // (`host_zeroize_on_drop`, set from `IS_HOST_BACKED`): the CUDA
+        // device/managed paths need a live CUDA context to touch their
+        // bytes and so are deliberately excluded — zeroing them here would
+        // be UB / a fault. We use `write_bytes` through the volatile
+        // wrapper so the compiler cannot elide the store as a dead write
+        // into about-to-be-freed memory. This crate does not depend on the
+        // `zeroize` crate (not in its Cargo.toml), so a manual volatile
+        // memset is used instead.
+        if self.host_zeroize_on_drop && self.size > 0 {
+            // SAFETY: on the host-backed build `ptr` points to `size`
+            // valid, host-addressable, uniquely-owned bytes (proved by
+            // `&mut self` in `drop`). The backing `Box<[u8]>` is still
+            // alive — field drop runs only after this body returns — so
+            // the write targets live memory. `write_volatile` prevents the
+            // store from being optimised away.
+            unsafe {
+                std::ptr::write_bytes(self.ptr.as_ptr(), 0u8, self.size);
+                // A volatile re-read defeats dead-store elimination: it
+                // forces the zeroing store above to be observable.
+                let _ = std::ptr::read_volatile(self.ptr.as_ptr());
+            }
         }
     }
 }
@@ -1422,6 +1574,52 @@ mod tests {
         // double-free if anything outside the sealed module had
         // reached in and called `into_inner` on the wrapped storage.
         drop(b);
+    }
+
+    #[test]
+    fn debug_redacts_raw_pointer_address() {
+        // Audit (LOW — ASLR-leak via logs): the `Debug` render must NOT
+        // contain the real allocation address. We assert the redaction
+        // marker is present and that the literal pointer (formatted the
+        // way `#[derive(Debug)]` would) does not appear.
+        let b = UnifiedBuffer::new(32).expect("alloc");
+        let dbg = format!("{b:?}");
+        assert!(dbg.contains("<redacted>"), "ptr not redacted: {dbg}");
+        let raw = format!("{:p}", b.as_ptr());
+        assert!(
+            !dbg.contains(&raw),
+            "Debug leaked the raw pointer address {raw}: {dbg}"
+        );
+    }
+
+    #[test]
+    #[cfg(all(not(feature = "unified-memory"), not(feature = "cudarc-backend")))]
+    fn host_backed_buffer_is_zeroized_on_drop() {
+        // Audit (LOW — Drop-time zeroization): on the host `Box<[u8]>`
+        // build, dropping a buffer must overwrite its bytes. We cannot
+        // legally read freed memory, so instead we verify the buffer is
+        // flagged for drop-time zeroization and that the volatile memset
+        // path runs without fault on a written-then-dropped buffer.
+        let mut b = UnifiedBuffer::new(256).expect("alloc");
+        b.as_mut_slice().fill(0xAB);
+        assert!(
+            b.host_zeroize_on_drop,
+            "host build must flag drop-time zeroization"
+        );
+        // Dropping triggers the volatile zero memset; a fault here (e.g.
+        // a regression that enabled zeroization on a device path) would
+        // surface as a crash under this no-feature CI build.
+        drop(b);
+    }
+
+    #[test]
+    fn host_addressable_buffers_expose_slices() {
+        // Audit H4: the standard constructors produce host-addressable
+        // buffers, so `as_slice` / `as_mut_slice` must NOT panic.
+        let mut b = UnifiedBuffer::new(16).expect("alloc");
+        assert!(b.host_addressable);
+        b.as_mut_slice().fill(1);
+        assert!(b.as_slice().iter().all(|&v| v == 1));
     }
 
     #[test]

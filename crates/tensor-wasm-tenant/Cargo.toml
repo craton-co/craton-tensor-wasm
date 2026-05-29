@@ -55,10 +55,12 @@ required-features = ["strict-cap-binding"]
 default = ["strict-cap-binding"]
 cuda = ["dep:cust"]
 loom = ["dep:loom"]
-# When enabled, `TenantCapability` is bound to the `TenantRegistry` that
-# minted it: a cap from registry A is rejected by registry B even if both
-# caps name the same `TenantId`. ON by default — strict cap binding is the
-# recommended posture for multi-tenant deployments. Disable
-# (`default-features = false`) only for legacy call sites that intentionally
-# mix caps across registries (e.g. some test harnesses).
+# H1 fix: capability-to-registry binding (a cap from registry A is rejected
+# by registry B even if both name the same `TenantId`, and forged/foreign
+# admin caps are refused) is now UNCONDITIONAL — it is enforced whether or
+# not this feature is enabled, including in a release build with
+# `default-features = false`. This feature flag is retained only to gate the
+# typed `*_strict` admin APIs and the `cap_binding_strict` integration test
+# (it no longer toggles any security behaviour). Kept in `default` so the
+# `*_strict` surface is available out of the box.
 strict-cap-binding = []

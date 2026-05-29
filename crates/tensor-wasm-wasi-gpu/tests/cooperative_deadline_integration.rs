@@ -19,6 +19,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tensor_wasm_wasi_gpu::async_dispatch::DEADLINE_NEAR_WINDOW;
 use tensor_wasm_wasi_gpu::scheduler::{
     add_scheduler_to_linker, SchedulerContext, YIELD_CODE_CONTINUE,
     YIELD_CODE_DEADLINE_APPROACHING, YIELD_CODE_STOP,
@@ -72,42 +73,58 @@ async fn make_probe_instance(
 
 #[tokio::test]
 async fn yield_verdict_progresses_continue_near_elapsed() {
-    // 100 ms deadline window. We probe at three points:
-    //   t≈0 ms   → CONTINUE  (remaining > DEADLINE_NEAR_WINDOW)
-    //   t≈60 ms  → APPROACHING (within the 50 ms NEAR window)
-    //   t≈110 ms → STOP (past the deadline)
+    // Walk the three verdict bands CONTINUE -> APPROACHING -> STOP.
     //
-    // The DEADLINE_NEAR_WINDOW const lives in `async_dispatch`; we
-    // use 50 ms here as the contract the scheduler upholds. If the
-    // const changes the timing in this test would need to track it.
-    let deadline = Instant::now() + Duration::from_millis(100);
-    let (mut store, instance) = make_probe_instance(Some(deadline)).await;
+    // We deliberately do NOT sleep real time into each band. On a loaded host,
+    // module instantiation and host-call scheduling can themselves consume more
+    // than the 50 ms NEAR window, so an elapsed-time-based probe is racy (the
+    // very first probe could already observe APPROACHING). Instead we reset the
+    // absolute deadline on the *live* store immediately before each probe via
+    // `set_bp_deadline_instant`. Only the single sub-millisecond host call sits
+    // between setting the deadline and reading the verdict, so the band each
+    // probe lands in is deterministic regardless of host load. Offsets are
+    // derived from `DEADLINE_NEAR_WINDOW` so the test tracks the const.
+    let near = DEADLINE_NEAR_WINDOW;
+    let (mut store, instance) = make_probe_instance(None).await;
     let probe = instance
         .get_typed_func::<(), i32>(&mut store, "probe")
         .expect("probe");
 
-    // t≈0 ms — must be CONTINUE.
+    // CONTINUE: a deadline far beyond the NEAR window.
+    store
+        .data_mut()
+        .scheduler
+        .set_bp_deadline_instant(Some(Instant::now() + near + Duration::from_secs(10)));
     let code = probe.call_async(&mut store, ()).await.expect("call");
     assert_eq!(
         code as u32, YIELD_CODE_CONTINUE,
-        "at t≈0 (>= 50 ms remaining) must observe CONTINUE, got {code}"
+        "remaining far beyond the {near:?} NEAR window must observe CONTINUE, got {code}"
     );
 
-    // Sleep into the NEAR window. 60 ms total elapsed → ~40 ms
-    // remaining, which is inside the 50 ms threshold.
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    // APPROACHING: a deadline comfortably inside the NEAR window. `near - 10ms`
+    // keeps remaining strictly below `near` even if the probe call resolves
+    // instantly (so it is never mistaken for CONTINUE), while leaving ~40 ms of
+    // slack before the budget would cross zero into STOP — far more than a
+    // single inline host call needs.
+    store
+        .data_mut()
+        .scheduler
+        .set_bp_deadline_instant(Some(Instant::now() + near - Duration::from_millis(10)));
     let code = probe.call_async(&mut store, ()).await.expect("call");
     assert_eq!(
         code as u32, YIELD_CODE_DEADLINE_APPROACHING,
-        "at t≈60 ms (~40 ms remaining, inside 50 ms window) must observe APPROACHING, got {code}"
+        "remaining inside the {near:?} NEAR window must observe APPROACHING, got {code}"
     );
 
-    // Sleep past the deadline. 110 ms total elapsed → 10 ms past.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // STOP: a deadline already in the past.
+    store
+        .data_mut()
+        .scheduler
+        .set_bp_deadline_instant(Some(Instant::now() - Duration::from_millis(1)));
     let code = probe.call_async(&mut store, ()).await.expect("call");
     assert_eq!(
         code as u32, YIELD_CODE_STOP,
-        "at t≈110 ms (past deadline) must observe STOP, got {code}"
+        "a deadline in the past must observe STOP, got {code}"
     );
 }
 

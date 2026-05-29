@@ -123,30 +123,31 @@ fn no_cap_allows_unbounded() {
     let total = (1024u64 * 1024 * 1024) + (8u64 * 1024 * 1024 * 1024);
     assert_eq!(ctx.gpu_bytes_in_use(), total);
 
-    // u64::MAX overflow is still rejected — the counter must not
-    // wrap silently even under "no cap". This is the same
-    // `checked_add` guard the CPU path has on `consume_bytes_inner`.
-    let err = ctx
-        .consume_gpu_bytes(u64::MAX)
-        .expect_err("checked_add overflow must always refuse, even with no cap");
-    assert!(matches!(err, TensorWasmError::GpuMemoryExhausted { .. }));
+    // MEDIUM fix (uncapped overflow): under "no cap", an add that would
+    // overflow `u64` no longer errors. The contract is "never refused
+    // when there is no cap", so the counter SATURATES at `u64::MAX`
+    // (and the implementation logs a warning) and the call succeeds.
+    // The counter must still never wrap.
+    ctx.consume_gpu_bytes(u64::MAX)
+        .expect("uncapped overflow must saturate and succeed, not refuse");
     assert_eq!(
         ctx.gpu_bytes_in_use(),
-        total,
-        "rejected u64::MAX add must not move the counter"
+        u64::MAX,
+        "uncapped overflow must saturate the counter at u64::MAX, not wrap"
     );
 }
 
 #[test]
-fn consume_to_u64_max_minus_one_then_overflow_rejected() {
-    // GPU sibling of `quota_overflow_saturating::consume_u64_max_then_one_more_byte`.
+fn consume_to_u64_max_minus_one_then_overflow_saturates() {
+    // MEDIUM fix (uncapped overflow): the uncapped `consume_gpu_bytes`
+    // contract is "never refused when there is no cap". An add that would
+    // overflow `u64` no longer surfaces as a non-retryable
+    // `GpuMemoryExhausted { limit: u64::MAX }`; instead it SATURATES the
+    // counter at `u64::MAX`, logs a warning, and succeeds.
     //
-    // The CPU overflow test jumps straight to `u64::MAX`; here we instead
-    // walk the GPU counter up to exactly `u64::MAX - 1` and then ask for
-    // `2` more, so the rejection is unambiguously the `checked_add`
-    // overflow guard (`(u64::MAX - 1) + 2` wraps), NOT a cap comparison.
-    // We run with no cap (`None`) precisely so the only thing that can
-    // refuse the add is the overflow guard.
+    // We walk the GPU counter up to exactly `u64::MAX - 1` and then ask
+    // for `2` more, which would push past `u64::MAX`. We run with no cap
+    // (`None`) precisely so the overflow path is the only thing in play.
     let ctx = TenantContext::builder(TenantId(5)).build();
     assert_eq!(ctx.gpu_memory_bytes_cap(), None, "test wants the no-cap path");
 
@@ -156,36 +157,21 @@ fn consume_to_u64_max_minus_one_then_overflow_rejected() {
         .expect("reserving u64::MAX - 1 under no-cap must succeed");
     assert_eq!(ctx.gpu_bytes_in_use(), u64::MAX - 1);
 
-    // `+2` would push the counter to `u64::MAX + 1`, which `checked_add`
-    // detects as overflow and refuses with `GpuMemoryExhausted`. The
-    // reported `limit` is `u64::MAX` (the sentinel for "no cap") and
-    // `current` is the pre-rejection value.
-    let err = ctx
-        .consume_gpu_bytes(2)
-        .expect_err("(u64::MAX - 1) + 2 overflows and must be refused");
-    match err {
-        TensorWasmError::GpuMemoryExhausted {
-            requested,
-            limit,
-            current,
-        } => {
-            assert_eq!(requested, 2, "wrong requested in error: {err:?}");
-            assert_eq!(limit, u64::MAX, "no-cap overflow reports u64::MAX limit: {err:?}");
-            assert_eq!(current, u64::MAX - 1, "current must be pre-rejection: {err:?}");
-        }
-        other => panic!("expected GpuMemoryExhausted from checked_add overflow, got {other:?}"),
-    }
-
-    // The rejected add must not move (or wrap) the counter.
+    // `+2` would push the counter to `u64::MAX + 1`. Under the no-cap
+    // saturate-and-succeed contract this must NOT error — it saturates the
+    // counter at `u64::MAX` (no wrap) and returns Ok.
+    ctx.consume_gpu_bytes(2)
+        .expect("(u64::MAX - 1) + 2 overflow under no-cap must saturate and succeed");
     assert_eq!(
         ctx.gpu_bytes_in_use(),
-        u64::MAX - 1,
-        "rejected overflow add must leave the GPU counter untouched (no wrap)",
+        u64::MAX,
+        "uncapped overflow must saturate the GPU counter at u64::MAX, not wrap",
     );
 
-    // A `+1` is still legitimate: it lands exactly on `u64::MAX`.
+    // A further add is still admitted and the counter stays pinned at the
+    // saturation point.
     ctx.consume_gpu_bytes(1)
-        .expect("the final byte up to exactly u64::MAX must still be reservable");
+        .expect("uncapped add at the saturation point must still succeed");
     assert_eq!(ctx.gpu_bytes_in_use(), u64::MAX);
 }
 

@@ -82,11 +82,21 @@ pub const MAX_PAYLOAD_LEN: usize = 256 * 1024 * 1024;
 /// to gigabytes). The decoder is driven through
 /// [`std::io::Read::take`] with a probe of `MAX_DECOMPRESSED_LEN + 1`
 /// so we can distinguish "exactly cap" (allowed) from ">cap" (rejected)
-/// without ever allocating past the cap. Sized larger than
-/// [`MAX_PAYLOAD_LEN`] so a legitimate round-trip can still expand
-/// slightly past the put-side cap due to compression accounting; the
-/// snapshot reader uses a tighter 256 MiB cap for its own scenario.
-pub const MAX_DECOMPRESSED_LEN: usize = 1024 * 1024 * 1024;
+/// without ever allocating past the cap.
+///
+/// SECURITY (memory-amplification fix): this MUST stay tied to
+/// [`MAX_PAYLOAD_LEN`]. Every blob the store can hold was put-capped at
+/// `MAX_PAYLOAD_LEN` *uncompressed* bytes, so a legitimate decode never
+/// needs to yield more than that. Sizing the read cap larger (the old
+/// 1 GiB = 4x value) handed an attacker holding a valid/leaked key a
+/// 4x memory-amplification primitive: a blob that put refused at
+/// 256 MiB could still be hand-crafted to decompress to ~1 GiB on the
+/// read path. We therefore pin the read cap to the put cap plus a small
+/// fixed framing slack (a few KiB) so no legitimately-`put` blob — which
+/// is at most `MAX_PAYLOAD_LEN` uncompressed — is ever rejected, while
+/// the read path can no longer be coerced into a larger allocation than
+/// the write path would have admitted.
+pub const MAX_DECOMPRESSED_LEN: usize = MAX_PAYLOAD_LEN + 8 * 1024;
 
 /// Errors returned by [`ArtifactStore`] implementations.
 ///
@@ -195,7 +205,8 @@ pub trait ArtifactStore: Send + Sync {
     /// Stream the verified-then-decoded body of `hash` into `out`,
     /// returning the number of bytes written. This completes the
     /// streaming story [`Self::put`] already has on the write side: where
-    /// [`Self::get`] returns an owned `Vec<u8>` (up to ~1 GiB resident),
+    /// [`Self::get`] returns an owned `Vec<u8>` (up to
+    /// [`MAX_DECOMPRESSED_LEN`] resident),
     /// `get_to` lets a caller pipe a large artifact straight into a file,
     /// socket, or hashing sink without first materialising the whole
     /// decoded payload as a return value.
@@ -658,10 +669,19 @@ impl DiskArtifactStore {
             warn!(target: "tensor_wasm_artifacts", error = %e, "metadata write failed");
             ArtifactError::Io
         })?;
+        // Durability (crash-consistency fix): flush the sidecar's data
+        // before the atomic rename, mirroring the blob publish above.
+        tmp.as_file().sync_all().map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "metadata fsync (pre-persist) failed");
+            ArtifactError::Io
+        })?;
         tmp.persist(&meta_path).map_err(|e| {
             warn!(target: "tensor_wasm_artifacts", error = %e, "metadata persist failed");
             ArtifactError::Io
         })?;
+        // Durability: best-effort directory fsync to persist the rename
+        // (tolerant of Windows, where directory sync is unsupported).
+        self.sync_dir_best_effort();
         Ok(hash)
     }
 
@@ -910,6 +930,36 @@ impl DiskArtifactStore {
         }
         Ok(None)
     }
+
+    /// Best-effort fsync of the store's containing directory after an
+    /// atomic rename, so the rename (a directory-entry mutation) is
+    /// persisted and not just the file data.
+    ///
+    /// Durability fix (LOW): a crash between `persist` and the OS
+    /// flushing the directory metadata could otherwise resurrect the old
+    /// directory state even though the file data is already on stable
+    /// storage. fsyncing the directory closes that window on POSIX.
+    ///
+    /// This is deliberately best-effort: on Windows you cannot open a
+    /// directory as a syncable `File` (the open or the `sync_all` errors
+    /// with e.g. `PermissionDenied`/`InvalidInput`), so a failure here is
+    /// logged at debug level and swallowed rather than failing the
+    /// otherwise-successful `put`. The file's own `sync_all` (issued
+    /// before the rename) is the load-bearing durability step on every
+    /// platform; the directory sync is the extra POSIX guarantee.
+    fn sync_dir_best_effort(&self) {
+        match File::open(&self.dir).and_then(|d| d.sync_all()) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::debug!(
+                    target: "tensor_wasm_artifacts",
+                    dir = %self.dir.display(),
+                    error = %e,
+                    "directory fsync skipped (best-effort; unsupported on this platform?)"
+                );
+            }
+        }
+    }
 }
 
 /// Result of [`DiskArtifactStore::verify_blob`]: the authenticated header
@@ -1083,6 +1133,17 @@ impl ArtifactStore for DiskArtifactStore {
             ArtifactError::Io
         })?;
 
+        // Durability (crash-consistency fix): flush the temp file's data
+        // to stable storage BEFORE the atomic rename. Without this
+        // `sync_all`, a crash after `persist` could leave the renamed
+        // file's directory entry pointing at data still sitting in the
+        // page cache, so the blob the doc comments promise is durable
+        // could come back truncated or zero-length on the next boot.
+        tmp.as_file().sync_all().map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "blob fsync (pre-persist) failed");
+            ArtifactError::Io
+        })?;
+
         // Atomic publish: temp-then-rename in the same directory,
         // mirroring the JIT L2 disk-cache pattern so a partial write
         // can never leave a half-formed entry that a concurrent reader
@@ -1094,6 +1155,14 @@ impl ArtifactStore for DiskArtifactStore {
             warn!(target: "tensor_wasm_artifacts", error = %e, "tempfile persist failed");
             ArtifactError::Io
         })?;
+
+        // Durability: fsync the containing directory so the rename itself
+        // is persisted, not just the file data. On Windows a directory
+        // `sync_all` typically fails (you cannot open a directory as a
+        // syncable file handle); that is tolerated as best-effort — the
+        // file data is already durable from the `sync_all` above, which
+        // is the part that matters most for crash consistency.
+        self.sync_dir_best_effort();
         Ok(hash)
     }
 
@@ -1224,11 +1293,16 @@ impl ArtifactStore for DiskArtifactStore {
         // That preserves the "BadHmac wins over Decompression on
         // tampered input" invariant the tamper-rejection tests assert.
         // Size the initial allocation from the compressed body length
-        // (a 4:1 decompression estimate) clamped to the cap, rather than
-        // a fixed 1 MiB regardless of payload size.
+        // clamped to the cap, then let the Vec grow on demand. PERF/
+        // security: the old 4x multiplier reserved 256 MiB up front for a
+        // 64 MiB compressed body — a large speculative allocation driven
+        // by attacker-controlled body length. Use a conservative 2x
+        // estimate (most tensor-memory payloads compress better than 2:1,
+        // so this rarely under-reserves much) and rely on `Vec`'s
+        // amortised growth for the incompressible tail.
         let initial_capacity = usize::try_from(body_len)
             .unwrap_or(cap)
-            .saturating_mul(4)
+            .saturating_mul(2)
             .min(cap);
         let mut payload: Vec<u8> = Vec::with_capacity(initial_capacity);
         let mut decode_result: Result<(), ArtifactError> = Ok(());
@@ -1777,11 +1851,13 @@ pub fn decode_envelope_from_bytes_with_cap(
         .ok()
         .and_then(|c| c.checked_add(1))
         .unwrap_or(u64::MAX);
-    // Size the initial allocation from the compressed body length rather
-    // than a fixed 1 MiB: a 4:1 decompression estimate covers typical
-    // tensor-memory payloads, clamped to the cap so a tiny envelope
-    // never reserves more than its ceiling allows.
-    let initial_capacity = body.len().saturating_mul(4).min(cap);
+    // Size the initial allocation from the compressed body length,
+    // clamped to the cap, and let the Vec grow on demand. PERF/security:
+    // the old 4x multiplier reserved up to 4x the compressed body up
+    // front (256 MiB for a 64 MiB body) on an attacker-controlled
+    // length. A conservative 2x estimate covers typical tensor-memory
+    // payloads while `Vec`'s amortised growth handles the rest.
+    let initial_capacity = body.len().saturating_mul(2).min(cap);
     let mut payload: Vec<u8> = Vec::with_capacity(initial_capacity);
     let decoder = zstd::stream::read::Decoder::new(body).map_err(|e| {
         warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed (decode_envelope_from_bytes)");
@@ -1820,15 +1896,33 @@ pub fn decode_envelope_from_bytes_with_cap(
 // =====================================================================
 
 /// In-memory artifact store. Intended for tests, fuzzers, and ephemeral
-/// caches. The HMAC key is still held (and zeroized on drop) so
-/// behaviour matches the disk store, but no signing is exercised — the
-/// in-memory map already guarantees integrity.
+/// caches.
+///
+/// # SECURITY WARNING: NO integrity or signature verification
+///
+/// Unlike [`DiskArtifactStore`], this store performs **NO HMAC signing
+/// and NO HMAC/content-hash verification** on `put` / `get`. It stores
+/// the plaintext payload in a `HashMap` and hands it straight back. The
+/// `hmac_key` below is accepted only so the constructor signature
+/// matches the disk store's; it is never used to sign or verify anything
+/// (hence `#[allow(dead_code)]`).
+///
+/// This is safe **only** because the in-memory map is the trust boundary:
+/// the bytes returned are exactly the bytes a (trusted) caller inserted
+/// in the same process, so there is no untrusted on-the-wire/on-disk
+/// envelope to authenticate. Do **NOT** use this type to back any data
+/// path that crosses a trust boundary (untrusted input, persistence,
+/// IPC, network). For anything that must detect tampering or forged
+/// blobs, use [`DiskArtifactStore`], which signs and constant-time
+/// verifies every record. Treat this store as test/ephemeral-only.
 pub struct InMemoryArtifactStore {
     entries: parking_lot::Mutex<HashMap<ContentHash, Vec<u8>>>,
-    // Held for parity with `DiskArtifactStore::hmac_key`; not read on
-    // any hot path. Future migrations (snapshot replay-protection
-    // matrix, signed-kernel-registry) may want to surface the key
-    // fingerprint from an in-memory store too.
+    // Held for parity with `DiskArtifactStore::hmac_key` (and zeroized on
+    // drop), but DELIBERATELY never read: this store does no signing or
+    // verification (see the type-level SECURITY WARNING). Not read on any
+    // path. Future migrations (snapshot replay-protection matrix,
+    // signed-kernel-registry) may want to surface the key fingerprint
+    // from an in-memory store too.
     #[allow(dead_code)]
     hmac_key: Zeroizing<[u8; 32]>,
 }

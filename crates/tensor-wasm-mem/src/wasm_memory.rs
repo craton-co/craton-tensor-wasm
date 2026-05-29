@@ -314,6 +314,41 @@ unsafe impl LinearMemory for TensorWasmLinearMemory {
     }
 
     fn wasm_accessible(&self) -> Range<usize> {
+        // Finding (MEDIUM, wasm_accessible reports full cap, not visible size):
+        // ------------------------------------------------------------------
+        // DECISION: keep the FULL reservation `[base, base + maximum_size)`;
+        // do NOT narrow to `current_size`.
+        //
+        // Rationale (verified against wasmtime 25.0.3):
+        //   * The `LinearMemory::wasm_accessible` contract is "the range of
+        //     native addresses that WebAssembly can natively access from this
+        //     linear memory, INCLUDING guard pages" — i.e. the whole backing
+        //     reservation, not the currently-grown window. Wasmtime's own
+        //     `MmapMemory`/`StaticMemory` impls return the entire mapping
+        //     (`mmap.len()` / `memory_and_guard_size`), which is strictly
+        //     larger than `byte_size()`; the asymmetry with `byte_size()` is
+        //     by design.
+        //   * The ONLY consumer in wasmtime 25 is `Instance::wasm_fault()`
+        //     (runtime/vm/instance.rs), the SIGSEGV/trap classifier that maps
+        //     a faulting host address back to a wasm offset for diagnostics.
+        //     It is NOT used in Cranelift bounds-check codegen, nor in any
+        //     pooling/static-memory reservation logic (those read
+        //     `byte_size()` / `maximum_byte_size()` and the
+        //     `VMMemoryDefinition.current_length`). The premise that this
+        //     value feeds bounds reasoning does not hold for this version.
+        //   * Reporting the full cap is therefore the CORRECT classification
+        //     window: an OOB store landing in the reserved-but-not-yet-grown
+        //     tail `[current_size, maximum_size)` is a genuine wasm trap that
+        //     belongs to THIS memory, and narrowing to `current_size` would
+        //     mis-attribute it (worse diagnostics), not improve safety.
+        //   * No UB / unmapped-address hazard: the entire `cap` is physically
+        //     allocated up front (`new_with_visible_window_on`); only ZEROING
+        //     is lazy. The `[current_size, maximum_size)` bytes are mapped and
+        //     addressable — the fault handler only reads the address range, it
+        //     never dereferences these bytes. They are guaranteed zero before
+        //     ever becoming guest-visible by the grow-time zero-fill in
+        //     `grow_to` above (audit H2), so the cross-tenant guarantee is
+        //     unaffected by what this method reports.
         let base = self.buffer.as_ptr() as usize;
         base..(base + self.maximum_size)
     }
@@ -464,6 +499,19 @@ unsafe impl LinearMemory for PooledLinearMemory {
     }
 
     fn wasm_accessible(&self) -> Range<usize> {
+        // Finding (MEDIUM, wasm_accessible reports full cap, not visible size):
+        // mirror the decision documented on
+        // `TensorWasmLinearMemory::wasm_accessible`. We keep the FULL carved
+        // reservation `[base_ptr, base_ptr + max_size)` rather than narrowing
+        // to `current_size`. In wasmtime 25 the sole consumer is the
+        // `Instance::wasm_fault()` trap classifier, whose contract wants the
+        // entire backing window (matching the runtime's own
+        // `Mmap`/`StaticMemory` impls); the carved tail
+        // `[current_size, max_size)` is physically present in the slab and is
+        // zero-filled before becoming guest-visible (audit H1 carve-time
+        // zero-fill + audit H2 grow-time zero-fill), so reporting it is both
+        // correct for fault attribution and free of any cross-tenant or UB
+        // hazard.
         let base = self.base_ptr as usize;
         base..(base + self.max_size)
     }

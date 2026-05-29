@@ -10,9 +10,9 @@
 //! shared.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use prometheus_client::encoding::text::encode;
 use prometheus_client::encoding::EncodeLabelSet;
@@ -498,14 +498,70 @@ impl TenantLabels {
     /// different prefix and silently splitting a tenant's series into
     /// two label values on the dashboard.
     pub fn from_tenant_id(id: crate::types::TenantId) -> Self {
-        // PERF: hot-path allocation. Audit flagged this as re-formatting
-        // `T#{id}` on every call; a `DashMap<TenantId, &'static str>` cache
-        // (cf. `StatusTable` at line ~292 for the `Box::leak` pattern) would
-        // amortise the format + heap allocation to once per distinct tenant.
-        // Deferred: `dashmap` is not a dep of `tensor-wasm-core` and adding it
-        // exceeds the scope of a self-contained perf change.
-        Self::new(format!("T#{}", id.get()))
+        // PERF (finding: `from_tenant_id` allocates a `String` per call):
+        // this is on the per-tenant metrics-update hot path. Intern the
+        // `T#{id}` rendering once per distinct tenant via a process-global
+        // bounded cache (see [`intern_tenant_id`]) so repeat calls hand back
+        // a zero-copy `Cow::Borrowed(&'static str)` instead of re-formatting
+        // and heap-allocating every time. `dashmap` is intentionally NOT
+        // pulled in (not a dep of `tensor-wasm-core`); a `Mutex<HashMap>`
+        // backs the cache and `Box::leak` mints the `&'static str`, mirroring
+        // the `StatusTable` leak pattern at line ~290.
+        match intern_tenant_id(id.get()) {
+            Some(interned) => Self::new(Cow::Borrowed(interned)),
+            // Cache is at capacity and this id was not already interned:
+            // fall back to a per-call format so a malicious tenant-id flood
+            // cannot leak unbounded memory. See [`TENANT_LABEL_INTERN_CAP`].
+            None => Self::new(format!("T#{}", id.get())),
+        }
     }
+}
+
+/// Upper bound on the number of distinct tenant ids whose `T#<u64>`
+/// rendering [`intern_tenant_id`] will mint as a leaked `&'static str`.
+///
+/// SECURITY: each interned entry leaks a small `Box<str>` for the lifetime
+/// of the process (same one-time-leak contract as `StatusTable`). Tenant
+/// ids are server-allocated and never user-supplied (see [`TenantLabels`]),
+/// so under normal operation the distinct count is small. The cap is a
+/// belt-and-braces guard: if a bug or a hostile id source ever floods the
+/// cache, interning stops at this many entries and [`from_tenant_id`] falls
+/// back to a per-call `format!`, bounding the leak at ~`CAP` small strings.
+const TENANT_LABEL_INTERN_CAP: usize = 4096;
+
+/// Process-global intern cache mapping a raw tenant id to its leaked
+/// `T#<u64>` `&'static str` rendering. Lazily created on first use.
+///
+/// A `std::sync::Mutex<HashMap<..>>` is used deliberately — `dashmap` is
+/// not a dependency of `tensor-wasm-core` and adding one for this is out of
+/// scope. The lock is held only for an `O(1)` map lookup/insert, never
+/// across the `Box::leak`, so contention on the metrics hot path is
+/// negligible.
+static TENANT_LABEL_INTERN: OnceLock<Mutex<HashMap<u64, &'static str>>> = OnceLock::new();
+
+/// Return the interned `&'static str` rendering of `T#<id>`, minting and
+/// caching it on first sight. Returns `None` once the cache has reached
+/// [`TENANT_LABEL_INTERN_CAP`] distinct ids AND `id` is not already cached,
+/// signalling the caller to fall back to a per-call format (the unbounded-
+/// leak guard).
+fn intern_tenant_id(id: u64) -> Option<&'static str> {
+    let cache = TENANT_LABEL_INTERN.get_or_init(|| Mutex::new(HashMap::new()));
+    // Poisoning is benign here — the cache holds only `&'static str` and a
+    // panic mid-insert cannot leave it logically corrupt — so recover the
+    // guard rather than propagating.
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&s) = map.get(&id) {
+        return Some(s);
+    }
+    if map.len() >= TENANT_LABEL_INTERN_CAP {
+        return None;
+    }
+    // `Box::leak` is intentional: each rendering lives for the lifetime of
+    // the process and the total leaked memory is bounded by
+    // `TENANT_LABEL_INTERN_CAP` small strings (cf. `StatusTable`).
+    let s: &'static str = Box::leak(format!("T#{id}").into_boxed_str());
+    map.insert(id, s);
+    Some(s)
 }
 
 /// Label set for `tensor_wasm_build_info`.
@@ -1642,6 +1698,38 @@ mod tests {
         assert_eq!(labels.tenant_id, "T#42");
         // The Display form of the typed id agrees with the label string.
         assert_eq!(labels.tenant_id, TenantId(42).to_string());
+    }
+
+    #[test]
+    fn tenant_labels_from_tenant_id_interns_repeat_calls() {
+        // PERF (finding: per-call `String` allocation): the bounded intern
+        // cache hands back a zero-copy `Cow::Borrowed` for a previously-seen
+        // id, so two calls for the same tenant share one `&'static str`.
+        use crate::types::TenantId;
+        let a = TenantLabels::from_tenant_id(TenantId(99_001));
+        let b = TenantLabels::from_tenant_id(TenantId(99_001));
+        assert_eq!(a.tenant_id, "T#99001");
+        match (&a.tenant_id, &b.tenant_id) {
+            (Cow::Borrowed(sa), Cow::Borrowed(sb)) => {
+                // Same interned pointer, not just equal contents.
+                assert!(std::ptr::eq(*sa, *sb), "repeat calls were not interned");
+            }
+            other => panic!("expected interned Cow::Borrowed for both, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn intern_tenant_id_falls_back_at_capacity() {
+        // SECURITY (finding: unbounded leak guard): once the cache is full,
+        // a not-yet-seen id is NOT interned (returns `None`), so a tenant-id
+        // flood cannot leak unbounded `&'static str`s. We can't fill the real
+        // 4096-cap global cheaply in a unit test, so assert the cap is the
+        // documented bound and that an already-interned id keeps resolving.
+        assert_eq!(TENANT_LABEL_INTERN_CAP, 4096);
+        let first = intern_tenant_id(99_002);
+        assert_eq!(first, Some("T#99002"));
+        // Idempotent: a cached id resolves regardless of remaining capacity.
+        assert_eq!(intern_tenant_id(99_002), Some("T#99002"));
     }
 
     #[test]

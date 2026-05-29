@@ -62,7 +62,11 @@ fn thirty_two_threads_contend_for_the_same_tenant_id() {
                     // orphan-rejection here is a registry-invariant bug.
                     panic!("unexpected OrphanStillAlive({id:?}) — no tombstone should exist");
                 }
-                #[cfg(feature = "strict-cap-binding")]
+                // H1: `CapabilityFromForeignRegistry` is now compiled
+                // unconditionally (no longer gated on `strict-cap-binding`),
+                // so this arm must always be present for the match to be
+                // exhaustive in every feature config. `register` never mints
+                // or compares an admin cap, so this variant can never occur.
                 Err(RegistryError::CapabilityFromForeignRegistry) => {
                     panic!("unexpected CapabilityFromForeignRegistry — ctx built by this registry");
                 }

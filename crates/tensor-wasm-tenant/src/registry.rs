@@ -24,6 +24,7 @@
 //! any additional authority over tenants it did not create.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use dashmap::DashMap;
@@ -52,15 +53,10 @@ pub enum RegistryError {
     OrphanStillAlive(TenantId),
     /// An admin-cap-gated method was invoked with a
     /// [`RegistryAdminCapability`] that was minted by a *different*
-    /// `TenantRegistry`. Only emitted when the `strict-cap-binding` feature
-    /// is enabled; without it, caps from independent registries are
-    /// interchangeable (the surface invariant has always been "you must
-    /// hold *some* cap" rather than "your cap must match this exact
-    /// registry"). Strict mode is the recommended posture for multi-tenant
-    /// deployments where two independent `TenantRegistry` instances live
-    /// in the same process — see the `## Cap binding` section in the crate
-    /// README for the upgrade path.
-    #[cfg(feature = "strict-cap-binding")]
+    /// `TenantRegistry`. H1: this is now emitted unconditionally (the
+    /// cross-registry binding is no longer behind the `strict-cap-binding`
+    /// feature), closing the prior hole where caps from independent
+    /// registries were interchangeable in a non-strict build.
     #[error(
         "capability was minted by a different TenantRegistry; refusing cross-registry operation"
     )]
@@ -129,46 +125,39 @@ pub const MPS_PIPE_DIRECTORY_ENV: &str = "CUDA_MPS_PIPE_DIRECTORY";
 /// admin authority to a sub-system passes a `&RegistryAdminCapability`
 /// reference rather than handing out independent copies.
 ///
-/// # Registry binding (`strict-cap-binding` feature)
+/// # Registry binding (H1 — always enforced)
 ///
-/// Under the `strict-cap-binding` feature, every admin capability also
-/// carries an `Arc<()>` token that points to its minting registry's
-/// per-instance allocation. Comparison is by `Arc::ptr_eq`, so a cap
-/// minted by registry A is rejected with
+/// Every admin capability carries an `Arc<()>` token that points to its
+/// minting registry's per-instance allocation. Comparison is by
+/// `Arc::ptr_eq`, so a cap minted by registry A is rejected with
 /// [`RegistryError::CapabilityFromForeignRegistry`] when presented
 /// against registry B even though both caps statically have the same
-/// type. Without this feature the cap is an opaque "you-hold-*some*-cap"
-/// token; the foreign-cap test at
-/// `tests/admin_cap_required.rs::independent_constructions_yield_independent_caps`
-/// asserts the legacy behaviour.
+/// type. Without this binding the cap would be an opaque
+/// "you-hold-*some*-cap" token, which the H1 audit finding flagged as a
+/// forged/confused-admin-cap vector.
+///
+/// H1 fix: this binding is now UNCONDITIONAL — it no longer depends on
+/// the `strict-cap-binding` feature, so a release build with the feature
+/// disabled still rejects foreign admin caps.
 #[derive(Debug)]
 pub struct RegistryAdminCapability {
     _seal: (),
     /// Pointer-identity stamp of the registry that minted this capability.
-    /// Only present under the `strict-cap-binding` feature; the field
-    /// disappears entirely (zero memory cost, no API surface) when the
-    /// feature is off, preserving 0.3 ABI for embedders that don't opt
-    /// into the strict mode.
-    #[cfg(feature = "strict-cap-binding")]
+    /// H1: always present so admin-cap binding is enforced unconditionally.
     pub(crate) registry_token: std::sync::Arc<()>,
 }
 
 impl RegistryAdminCapability {
-    /// Mint a fresh capability. Crate-private so external crates cannot
-    /// forge admin authority over a `TenantRegistry` they did not
-    /// construct. The non-strict-binding signature is unchanged.
-    #[cfg(not(feature = "strict-cap-binding"))]
-    pub(crate) fn mint() -> Self {
-        Self { _seal: () }
-    }
-
     /// Mint a fresh capability bound to the minting registry's
     /// `registry_token` (an `Arc::clone` of the registry's per-instance
     /// allocation). Comparison at admin-method call time is by
     /// `Arc::ptr_eq`; two registries that happen to allocate
     /// `Arc::new(())` at the same address would still be distinct
     /// allocations and `ptr_eq` would return `false`.
-    #[cfg(feature = "strict-cap-binding")]
+    ///
+    /// Crate-private so external crates cannot forge admin authority over
+    /// a `TenantRegistry` they did not construct. H1: the registry-bound
+    /// signature is now unconditional — there is no token-less variant.
     pub(crate) fn mint(registry_token: std::sync::Arc<()>) -> Self {
         Self {
             _seal: (),
@@ -199,7 +188,7 @@ pub struct TenantRegistry {
     /// re-register.
     tombstones: Arc<DashMap<TenantId, Weak<TenantContext>>>,
     /// Per-instance identity token used to bind capabilities to this
-    /// specific registry under the `strict-cap-binding` feature.
+    /// specific registry.
     ///
     /// Allocated fresh inside [`Self::new`] and cloned (cheap `Arc::clone`)
     /// into every cap minted by this registry. Cloning the registry
@@ -209,8 +198,16 @@ pub struct TenantRegistry {
     /// continue to work against the other. Two *independent*
     /// `TenantRegistry::new()` calls produce two distinct allocations,
     /// so `Arc::ptr_eq` on the tokens identifies registry provenance.
-    #[cfg(feature = "strict-cap-binding")]
+    ///
+    /// H1: always present so registry binding is enforced unconditionally,
+    /// not just under the `strict-cap-binding` feature.
     registry_token: Arc<()>,
+    /// T-perf (amortized tombstone prune): monotonically increasing count
+    /// of register/unregister operations, used to throttle the
+    /// opportunistic O(tombstones) prune so it runs roughly once every
+    /// [`Self::PRUNE_EVERY_N_OPS`] mutations instead of on every call.
+    /// Shared (`Arc`) so registry clones increment the same counter.
+    prune_op_counter: Arc<AtomicUsize>,
 }
 
 impl TenantRegistry {
@@ -223,18 +220,15 @@ impl TenantRegistry {
     /// `DashMap`, but does NOT clone the cap — admin authority stays with
     /// whoever the original constructor handed it to.
     pub fn new() -> (Self, RegistryAdminCapability) {
-        #[cfg(feature = "strict-cap-binding")]
+        // H1: registry token is always allocated and bound into the cap.
         let registry_token: Arc<()> = Arc::new(());
         let reg = Self {
             inner: Arc::new(DashMap::new()),
             tombstones: Arc::new(DashMap::new()),
-            #[cfg(feature = "strict-cap-binding")]
             registry_token: Arc::clone(&registry_token),
+            prune_op_counter: Arc::new(AtomicUsize::new(0)),
         };
-        #[cfg(feature = "strict-cap-binding")]
         let cap = RegistryAdminCapability::mint(registry_token);
-        #[cfg(not(feature = "strict-cap-binding"))]
-        let cap = RegistryAdminCapability::mint();
         (reg, cap)
     }
 
@@ -269,7 +263,7 @@ impl TenantRegistry {
     /// tenant's accounting is untouched.
     pub fn register_with_capability(
         &self,
-        #[allow(unused_mut)] mut ctx: TenantContext,
+        mut ctx: TenantContext,
     ) -> Result<(Arc<TenantContext>, TenantCapability), RegistryError> {
         let id = ctx.id();
         // T11 atomic orphan-check (tenant 1.6 #9):
@@ -292,13 +286,12 @@ impl TenantRegistry {
         // longer upgrade because the inner allocation has been dropped — a
         // `Weak::upgrade` on a fully-dropped Arc returns `None`).
         //
-        // Under `strict-cap-binding` we stamp the context with this
-        // registry's token *before* wrapping in `Arc` so `check_capability`
-        // can compare token identity on every quota-mutation call.
-        #[cfg(feature = "strict-cap-binding")]
-        {
-            ctx.registry_token = Some(Arc::clone(&self.registry_token));
-        }
+        // H1: stamp the context with this registry's token *before*
+        // wrapping in `Arc` so `check_capability` can compare token
+        // identity on every quota-mutation call. Unconditional — the
+        // binding is enforced regardless of the `strict-cap-binding`
+        // feature.
+        ctx.registry_token = Some(Arc::clone(&self.registry_token));
         let outcome = match self.inner.entry(id) {
             dashmap::mapref::entry::Entry::Occupied(_) => Err(RegistryError::AlreadyRegistered(id)),
             dashmap::mapref::entry::Entry::Vacant(slot) => {
@@ -333,10 +326,8 @@ impl TenantRegistry {
                 }
                 let arc = Arc::new(ctx);
                 slot.insert(Arc::clone(&arc));
-                #[cfg(feature = "strict-cap-binding")]
+                // H1: cap is always bound to this registry's token.
                 let cap = TenantCapability::mint(id, Arc::clone(&self.registry_token));
-                #[cfg(not(feature = "strict-cap-binding"))]
-                let cap = TenantCapability::mint(id);
                 Ok((arc, cap))
             }
         };
@@ -358,8 +349,17 @@ impl TenantRegistry {
         // we never hold an `inner` shard guard while reaching into
         // `tombstones`. The ordering remains `inner` then
         // `tombstones`; never the reverse.
+        //
+        // T-perf (amortized prune): the prune is an O(tombstones)
+        // shard-locking scan. Running it on every successful mutation was
+        // wasteful churn on a hot path. We now run it only every
+        // [`Self::PRUNE_EVERY_N_OPS`] ops (or whenever the tombstone map
+        // has grown past [`Self::PRUNE_TOMBSTONE_THRESHOLD`]); correctness
+        // is unaffected because the T11 orphan check on re-register reads
+        // the live `strong_count` directly and never relies on the prune
+        // having run — the prune is purely a space reclamation.
         if outcome.is_ok() {
-            self.prune_dead_tombstones_except(id);
+            self.maybe_prune_dead_tombstones_except(id);
         }
         outcome
     }
@@ -380,12 +380,44 @@ impl TenantRegistry {
             .retain(|id, weak| *id == skip_id || weak.strong_count() > 0);
     }
 
+    /// Amortize the O(tombstones) prune (T-perf): every register/unregister
+    /// previously ran [`Self::prune_dead_tombstones_except`] unconditionally,
+    /// taking per-shard tombstone locks on every call. Instead, run the
+    /// scan only once every [`Self::PRUNE_EVERY_N_OPS`] mutations, OR
+    /// immediately when the tombstone map has grown past
+    /// [`Self::PRUNE_TOMBSTONE_THRESHOLD`] (so a churn burst between
+    /// throttled prunes cannot let the map grow without bound).
+    ///
+    /// Correctness is preserved: the prune only ever drops tombstones whose
+    /// `Weak` can no longer upgrade (dead orphans), and the re-register
+    /// orphan check reads `strong_count` live rather than depending on the
+    /// prune having run. Skipping a prune therefore never resurrects an
+    /// orphaned tenant — it only delays reclaiming dead-tombstone space.
+    fn maybe_prune_dead_tombstones_except(&self, skip_id: TenantId) {
+        let n = self.prune_op_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % Self::PRUNE_EVERY_N_OPS == 0
+            || self.tombstones.len() > Self::PRUNE_TOMBSTONE_THRESHOLD
+        {
+            self.prune_dead_tombstones_except(skip_id);
+        }
+    }
+
+    /// Run the opportunistic tombstone prune once every this many
+    /// register/unregister ops (T-perf amortization).
+    const PRUNE_EVERY_N_OPS: usize = 64;
+
+    /// Prune immediately (ignoring the op-counter throttle) once the
+    /// tombstone map exceeds this many entries, bounding worst-case growth
+    /// between throttled prunes.
+    const PRUNE_TOMBSTONE_THRESHOLD: usize = 1024;
+
     /// Verify that `cap` was minted by *this* registry's [`Self::new`]
-    /// call. No-op when `strict-cap-binding` is disabled (the 0.3
-    /// behaviour: caps from independent registries are interchangeable);
-    /// under the feature, returns
-    /// [`RegistryError::CapabilityFromForeignRegistry`] on mismatch and
-    /// every admin method calls this before doing any work.
+    /// call. Returns [`RegistryError::CapabilityFromForeignRegistry`] on
+    /// mismatch; every admin method calls this before doing any work.
+    ///
+    /// H1: this check is now UNCONDITIONAL (no longer gated on
+    /// `strict-cap-binding`), so a release build without that feature
+    /// still rejects cross-registry / forged admin caps and fails closed.
     ///
     /// We compare with `Arc::ptr_eq` on the per-registry token allocation
     /// rather than hashing addresses: two registries that happen to
@@ -393,7 +425,6 @@ impl TenantRegistry {
     /// allocations from `Arc::clone`'s point of view (each `Arc::new(())`
     /// is its own refcount block), so `ptr_eq` is the only correct
     /// comparison.
-    #[cfg(feature = "strict-cap-binding")]
     fn check_admin_cap(&self, cap: &RegistryAdminCapability) -> Result<(), RegistryError> {
         if Arc::ptr_eq(&self.registry_token, &cap.registry_token) {
             Ok(())
@@ -408,22 +439,18 @@ impl TenantRegistry {
     /// `get` lets any holder of an `Arc<TenantRegistry>` enumerate other
     /// tenants' contexts by id and mutate their quota counters.
     ///
-    /// Under the `strict-cap-binding` feature an additional runtime check
-    /// rejects caps minted by a different registry; mismatch is observed
-    /// here as `None`. The strict-mode test
+    /// H1: a runtime check rejects caps minted by a different registry;
+    /// mismatch is observed here as `None` (unconditional — no longer
+    /// gated on `strict-cap-binding`). The test
     /// (`tests/cap_binding_strict.rs`) calls the typed [`Self::get_strict`]
     /// variant for explicit error propagation; this method preserves the
-    /// `Option`-returning signature for the 0.3 line.
+    /// `Option`-returning signature.
     pub fn get(
         &self,
         tenant_id: TenantId,
         cap: &RegistryAdminCapability,
     ) -> Option<Arc<TenantContext>> {
-        #[cfg(feature = "strict-cap-binding")]
-        {
-            self.check_admin_cap(cap).ok()?;
-        }
-        let _ = cap;
+        self.check_admin_cap(cap).ok()?;
         self.inner.get(&tenant_id).map(|r| Arc::clone(r.value()))
     }
 
@@ -431,20 +458,16 @@ impl TenantRegistry {
     ///
     /// Gated behind [`RegistryAdminCapability`]: without this, any holder
     /// of an `Arc<TenantRegistry>` could evict arbitrary tenants from the
-    /// registry, breaking their kernel pipelines. Under the
-    /// `strict-cap-binding` feature, a foreign cap is observed as `None`
-    /// here (no eviction happens). Use [`Self::unregister_strict`] when
-    /// the explicit error propagation is required.
+    /// registry, breaking their kernel pipelines. H1: a foreign cap is
+    /// observed as `None` here (no eviction happens) unconditionally — no
+    /// longer gated on `strict-cap-binding`. Use [`Self::unregister_strict`]
+    /// when explicit error propagation is required.
     pub fn unregister(
         &self,
         tenant_id: TenantId,
         cap: &RegistryAdminCapability,
     ) -> Option<Arc<TenantContext>> {
-        #[cfg(feature = "strict-cap-binding")]
-        {
-            self.check_admin_cap(cap).ok()?;
-        }
-        let _ = cap;
+        self.check_admin_cap(cap).ok()?;
         // T11 atomic tombstone-then-remove (tenant 1.6 #9):
         //
         // Take the `inner` shard write-guard FIRST via `entry(tenant_id)`.
@@ -485,8 +508,10 @@ impl TenantRegistry {
         // the registry's (we just returned it to the caller and they may
         // have already let it drop), and pruning it here would defeat the
         // T11 orphan check on a subsequent re-register racing us.
+        //
+        // T-perf: amortized — see `maybe_prune_dead_tombstones_except`.
         if removed.is_some() {
-            self.prune_dead_tombstones_except(tenant_id);
+            self.maybe_prune_dead_tombstones_except(tenant_id);
         }
         removed
     }
@@ -501,16 +526,12 @@ impl TenantRegistry {
     /// to keep the tombstone map from growing with every churned tenant.
     /// Callers do not normally need to invoke it manually — a successful
     /// re-`register` of a now-clean id implicitly clears its tombstone.
-    /// Under the `strict-cap-binding` feature, a foreign cap silently
-    /// returns `0` (no pruning happens).
+    /// H1: a foreign cap silently returns `0` (no pruning happens)
+    /// unconditionally — no longer gated on `strict-cap-binding`.
     pub fn collect_tombstones(&self, cap: &RegistryAdminCapability) -> usize {
-        #[cfg(feature = "strict-cap-binding")]
-        {
-            if self.check_admin_cap(cap).is_err() {
-                return 0;
-            }
+        if self.check_admin_cap(cap).is_err() {
+            return 0;
         }
-        let _ = cap;
         let mut pruned = 0;
         self.tombstones.retain(|_id, weak| {
             if weak.strong_count() == 0 {
@@ -540,17 +561,14 @@ impl TenantRegistry {
     /// Gated behind [`RegistryAdminCapability`] because the count is a
     /// global property of the registry that should not leak across the
     /// tenant boundary — a tenant counting its peers is itself a
-    /// side-channel. Under the `strict-cap-binding` feature, a foreign
-    /// cap is observed as `0` here (no enumeration). Use
-    /// [`Self::len_strict`] for explicit error propagation.
+    /// side-channel. H1: a foreign cap is observed as `0` here (no
+    /// enumeration) unconditionally — no longer gated on
+    /// `strict-cap-binding`. Use [`Self::len_strict`] for explicit error
+    /// propagation.
     pub fn len(&self, cap: &RegistryAdminCapability) -> usize {
-        #[cfg(feature = "strict-cap-binding")]
-        {
-            if self.check_admin_cap(cap).is_err() {
-                return 0;
-            }
+        if self.check_admin_cap(cap).is_err() {
+            return 0;
         }
-        let _ = cap;
         self.inner.len()
     }
 
@@ -588,8 +606,9 @@ impl TenantRegistry {
             }
         };
         // T27 opportunistic prune — see comment in `unregister`.
+        // T-perf: amortized — see `maybe_prune_dead_tombstones_except`.
         if removed.is_some() {
-            self.prune_dead_tombstones_except(tenant_id);
+            self.maybe_prune_dead_tombstones_except(tenant_id);
         }
         Ok(removed)
     }
@@ -625,18 +644,14 @@ impl TenantRegistry {
     ///
     /// Gated behind [`RegistryAdminCapability`] because the snapshot
     /// enumerates every registered tenant — a primitive that, in the wrong
-    /// hands, defeats the whole point of multi-tenant isolation. Under
-    /// the `strict-cap-binding` feature, a foreign cap returns an empty
-    /// `Vec` (no enumeration). Use [`Self::tenants_strict`] for explicit
-    /// error propagation.
+    /// hands, defeats the whole point of multi-tenant isolation. H1: a
+    /// foreign cap returns an empty `Vec` (no enumeration) unconditionally
+    /// — no longer gated on `strict-cap-binding`. Use
+    /// [`Self::tenants_strict`] for explicit error propagation.
     pub fn tenants(&self, cap: &RegistryAdminCapability) -> Vec<Arc<TenantContext>> {
-        #[cfg(feature = "strict-cap-binding")]
-        {
-            if self.check_admin_cap(cap).is_err() {
-                return Vec::new();
-            }
+        if self.check_admin_cap(cap).is_err() {
+            return Vec::new();
         }
-        let _ = cap;
         self.inner.iter().map(|r| Arc::clone(r.value())).collect()
     }
 
@@ -915,7 +930,9 @@ mod tests {
                         Ok(_) => local_ok += 1,
                         Err(RegistryError::OrphanStillAlive(_)) => local_orphan += 1,
                         Err(RegistryError::AlreadyRegistered(_)) => local_already += 1,
-                        #[cfg(feature = "strict-cap-binding")]
+                        // H1: this variant now exists unconditionally, so the
+                        // arm is no longer feature-gated. `register` never
+                        // mints/compares an admin cap, so it can never occur.
                         Err(RegistryError::CapabilityFromForeignRegistry) => {
                             panic!("unexpected CapabilityFromForeignRegistry from register")
                         }
@@ -995,7 +1012,7 @@ mod tests {
                 Err(RegistryError::OrphanStillAlive(_)) => {
                     panic!("no prior registration in this test — OrphanStillAlive impossible")
                 }
-                #[cfg(feature = "strict-cap-binding")]
+                // H1: variant now unconditional; arm no longer feature-gated.
                 Err(RegistryError::CapabilityFromForeignRegistry) => {
                     panic!("register cannot return CapabilityFromForeignRegistry")
                 }
@@ -1121,40 +1138,30 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // T27 perf-pass tests: opportunistic tombstone prune on
+    // T27 / T-perf tests: AMORTIZED opportunistic tombstone prune on
     // unregister and register_with_capability success paths.
+    //
+    // T-perf changed the prune from per-op to amortized (every
+    // `PRUNE_EVERY_N_OPS` ops, or when the map exceeds
+    // `PRUNE_TOMBSTONE_THRESHOLD`). These tests pin the new contract:
+    // (1) the prune does NOT run on every op, (2) it eventually
+    // reclaims dead tombstones once enough ops accrue, and (3) the
+    // orphan / same-id correctness rules still hold whenever a prune
+    // does run.
     // ----------------------------------------------------------------
 
-    /// `unregister` opportunistically prunes dead tombstones for IDs
-    /// other than its own. Setup is straightforward:
-    ///
-    ///   1. Register and unregister tenant 1 with no held Arc — its
-    ///      tombstone now has a dead `Weak`. The prune step inside
-    ///      `unregister(1)` skipped id 1 itself, so tombstone 1
-    ///      remains.
-    ///   2. Register and unregister tenant 2 with no held Arc — the
-    ///      prune step inside `unregister(2)` walks all tombstones,
-    ///      sees tombstone 1 with `strong_count() == 0` and
-    ///      `id != 2`, and drops it. Tombstone 2 itself is skipped
-    ///      (same-id rule), so it survives.
-    ///
-    /// The asserts pin down the exact post-state so a future
-    /// refactor that loses the prune (or accidentally prunes the
-    /// current id) is caught.
+    /// Drive enough register/unregister ops to force an amortized prune
+    /// boundary, then assert the prune drops dead tombstones for IDs
+    /// other than the current one while skipping the same-id tombstone.
     #[test]
-    fn unregister_prunes_dead_tombstones_opportunistically() {
+    fn unregister_prunes_dead_tombstones_when_op_boundary_reached() {
         let (reg, cap) = TenantRegistry::new();
-        // Register tenant 1, drop the returned Arc. inner still holds
-        // one strong ref.
+        // Register tenant 1, drop the returned Arc; unregister it,
+        // dropping that Arc too. Tombstone 1's Weak is now dead.
         let _ = reg.register(ctx(1)).unwrap();
-        // Unregister tenant 1. inner's strong ref is dropped via
-        // `OccupiedEntry::remove_entry`; the returned Arc here is
-        // dropped at end of statement. Tombstone 1's Weak is now dead.
         reg.unregister(TenantId(1), &cap).unwrap();
-        // Same-id skip: prune left tombstone 1 in place. (If a future
-        // refactor drops the same-id check, this assertion catches it
-        // and we lose orphan protection on a re-register race.)
-        assert_eq!(reg.tombstone_count(), 1);
+        // T-perf: the prune is amortized, so a single unregister does
+        // NOT necessarily run it. The dead tombstone may linger.
         assert!(reg.tombstones.contains_key(&TenantId(1)));
         assert_eq!(
             reg.tombstones.get(&TenantId(1)).unwrap().strong_count(),
@@ -1162,74 +1169,51 @@ mod tests {
             "tombstone 1's Weak should be dead — both Arcs were dropped"
         );
 
-        // Register tenant 2. The success path of
-        // `register_with_capability` runs its own prune, which would
-        // remove tombstone 1 (different id, dead Weak) even before we
-        // get to unregister(2). Hold the Arc so the prune doesn't
-        // matter to the *unregister* assertion below — we re-create the
-        // dead-tombstone-1 state right before unregister(2) runs.
-        //
-        // Actually simpler: don't register tenant 2 at all yet — just
-        // assert prune-via-unregister directly by running a second
-        // unregister cycle. Register tenant 2 fresh, unregister it,
-        // and verify tombstone 1 is gone.
-        let _ = reg.register(ctx(2)).unwrap();
-        // register(2)'s success-path prune already cleaned tombstone 1
-        // (id != 2, dead). To isolate the *unregister* prune, re-seed
-        // a dead tombstone for a third id and verify unregister(2)
-        // clears it.
+        // Drive enough churn on a *different* id to cross an op boundary
+        // so a prune is guaranteed to run. Each loop is a register +
+        // unregister = 2 ops; run well past PRUNE_EVERY_N_OPS.
+        for _ in 0..TenantRegistry::PRUNE_EVERY_N_OPS {
+            let _ = reg.register(ctx(2)).unwrap();
+            reg.unregister(TenantId(2), &cap).unwrap();
+        }
+        // By now a prune has run on an `id != 1` op, so dead tombstone 1
+        // must have been reclaimed. (Tombstone 2 is repeatedly re-seeded
+        // and same-id-skipped, so it may or may not linger — we assert
+        // only on the reclamation of the unrelated dead tombstone 1.)
         assert!(
             !reg.tombstones.contains_key(&TenantId(1)),
-            "register(2)'s success path prune should have removed dead tombstone 1"
+            "amortized prune must eventually drop dead tombstone 1"
         );
-
-        // Re-seed: register tenant 3, drop Arc, unregister, drop Arc.
-        // Tombstone 3 is dead; register(3)'s and unregister(3)'s prunes
-        // both skip id 3 itself.
-        let _ = reg.register(ctx(3)).unwrap();
-        reg.unregister(TenantId(3), &cap).unwrap();
-        assert!(reg.tombstones.contains_key(&TenantId(3)));
-        assert_eq!(reg.tombstones.get(&TenantId(3)).unwrap().strong_count(), 0);
-
-        // Now unregister tenant 2. Tombstone 3 is dead (and id != 2),
-        // so the unregister prune must drop it. Tombstone 2 (just
-        // inserted by this unregister) is skipped by the same-id rule.
-        reg.unregister(TenantId(2), &cap).unwrap();
-        assert!(
-            !reg.tombstones.contains_key(&TenantId(3)),
-            "unregister(2) must prune dead tombstone 3 (different id)"
-        );
-        assert!(
-            reg.tombstones.contains_key(&TenantId(2)),
-            "unregister(2)'s own freshly-inserted tombstone must survive"
-        );
-        assert_eq!(reg.tombstone_count(), 1);
     }
 
-    /// `register_with_capability`'s success-path prune drops dead
-    /// tombstones for *other* IDs. We seed a dead tombstone for id 1,
-    /// then register id 2 and assert the dead tombstone is gone after
-    /// the successful register.
+    /// The amortized prune is genuinely throttled: a single successful
+    /// register does NOT run a full prune (the per-op-prune behaviour
+    /// T-perf removed). The dead tombstone is reclaimed later via the
+    /// explicit, admin-gated `collect_tombstones`.
     #[test]
-    fn register_prunes_dead_tombstones_opportunistically() {
+    fn register_prune_is_amortized_collect_reclaims() {
         let (reg, cap) = TenantRegistry::new();
         // Seed dead tombstone 1.
         let _ = reg.register(ctx(1)).unwrap();
         reg.unregister(TenantId(1), &cap).unwrap();
         assert!(reg.tombstones.contains_key(&TenantId(1)));
-        // Register a different id. Its success path prunes tombstone 1.
+        // A single register of a different id does NOT force a prune
+        // under the amortized policy.
         let _ = reg.register_with_capability(ctx(2)).unwrap();
         assert!(
-            !reg.tombstones.contains_key(&TenantId(1)),
-            "register(2)'s success-path prune must drop dead tombstone 1"
+            reg.tombstones.contains_key(&TenantId(1)),
+            "amortized policy: a single register must not prune dead tombstone 1"
         );
-        assert_eq!(reg.tombstone_count(), 0);
+        // Explicit prune still reclaims it (id 1 dead, id 2 live → kept).
+        let pruned = reg.collect_tombstones(&cap);
+        assert_eq!(pruned, 1, "collect_tombstones must reclaim dead tombstone 1");
+        assert!(!reg.tombstones.contains_key(&TenantId(1)));
     }
 
     /// The orphan-rejected register path must NOT prune (we don't want
-    /// to do extra work on a refusal). Re-register against a live
-    /// orphan, and assert any pre-existing dead tombstones are left
-    /// untouched.
+    /// to do extra work on a refusal) AND must never resurrect a live
+    /// orphan regardless of prune throttling. Re-register against a live
+    /// orphan and assert the refusal does not touch tombstones.
     #[test]
     fn register_orphan_rejected_does_not_prune() {
         let (reg, cap) = TenantRegistry::new();
@@ -1238,50 +1222,37 @@ mod tests {
         reg.unregister(TenantId(1), &cap).unwrap();
         assert!(reg.tombstones.contains_key(&TenantId(1)));
 
-        // Set up a live orphan for id 2.
+        // Set up a live orphan for id 2 (hold its Arc alive).
         let (orphan_arc, _orphan_cap) = reg.register_with_capability(ctx(2)).unwrap();
-        // register(2) just ran its prune — tombstone 1 should be gone.
-        assert!(!reg.tombstones.contains_key(&TenantId(1)));
         reg.unregister(TenantId(2), &cap).unwrap();
         // Hold orphan_arc so tombstone 2's Weak stays live.
         assert_eq!(Arc::strong_count(&orphan_arc), 1);
-
-        // Re-seed dead tombstone 1 again.
-        let _ = reg.register(ctx(1)).unwrap();
-        // register(1) just pruned (we registered an id, prune runs on
-        // success; tombstone 2's Weak is live → not pruned). Good.
-        assert!(reg.tombstones.contains_key(&TenantId(2)));
-        reg.unregister(TenantId(1), &cap).unwrap();
-        // unregister(1) prune: tombstone 2 has live Weak → not pruned.
-        // Tombstone 1 is just-inserted → skipped by same-id rule.
-        assert!(reg.tombstones.contains_key(&TenantId(1)));
         assert!(reg.tombstones.contains_key(&TenantId(2)));
 
-        // Now attempt to re-register id 2 against the live orphan.
-        // This MUST fail with OrphanStillAlive and MUST NOT prune
-        // tombstone 1 (which has a dead Weak right now after both
-        // Arcs from the second register(1) cycle dropped).
-        // First force tombstone 1's Weak to be dead by ensuring no
-        // strong refs remain — `reg.register(ctx(1))` above returned
-        // an Arc which `let _ =` dropped; `unregister(1)` returned
-        // another Arc which the statement dropped. So tombstone 1's
-        // Weak is already dead. Confirm.
-        assert_eq!(
-            reg.tombstones.get(&TenantId(1)).unwrap().strong_count(),
-            0,
-            "expected tombstone 1's Weak to be dead at this point"
-        );
+        // Snapshot the tombstone set right before the refusal so we can
+        // assert the refusal path left it byte-for-byte unchanged
+        // (no prune work on a refusal, regardless of the op counter).
+        let before: std::collections::BTreeSet<u64> = reg
+            .tombstones
+            .iter()
+            .map(|e| e.key().get())
+            .collect();
 
+        // Re-register id 2 against the live orphan: MUST fail with
+        // OrphanStillAlive (no resurrection) and MUST NOT prune.
         let err = reg
             .register_with_capability(ctx(2))
             .expect_err("re-register against live orphan must fail");
         assert_eq!(err, RegistryError::OrphanStillAlive(TenantId(2)));
 
-        // The refusal path is supposed to skip pruning. Tombstone 1
-        // (dead Weak, id != 2) MUST still be present.
-        assert!(
-            reg.tombstones.contains_key(&TenantId(1)),
-            "refusal path must not prune dead tombstones — saw tombstone 1 disappear"
+        let after: std::collections::BTreeSet<u64> = reg
+            .tombstones
+            .iter()
+            .map(|e| e.key().get())
+            .collect();
+        assert_eq!(
+            before, after,
+            "refusal path must not prune or otherwise mutate tombstones"
         );
         // Drop orphan so the test cleans up properly.
         drop(orphan_arc);

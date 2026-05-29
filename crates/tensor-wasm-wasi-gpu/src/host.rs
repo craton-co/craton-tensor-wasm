@@ -41,8 +41,10 @@
 //!   (1024 across all current GPUs).
 //! - grid dimensions must each be in `[1, MAX_GRID_DIM]`
 //!   (2^31 - 1, the CUDA driver maximum for `grid_x`).
-//! - `shared_mem` is bounded only by the device's per-block shared-memory
-//!   limit; we leave that to the driver.
+//! - `shared_mem` must be in `[0, MAX_DYNAMIC_SHARED_MEM_BYTES]` — a
+//!   conservative host cap rejected before the driver call so an
+//!   obviously-oversize request fails actionably host-side rather than as
+//!   a generic `CUDA_ERROR_INVALID_VALUE`.
 //!
 //! Violations return [`AbiError::InvalidDimensions`] without ever calling
 //! into `cuLaunchKernel` — the failure is reported with a structured
@@ -117,6 +119,25 @@ pub const MAX_RECORDED_ERROR_BYTES: usize = 512;
 /// bounded by [`MAX_PTX_BYTES`]; this is the matching cap for the
 /// entry-name side.
 pub const MAX_ENTRY_NAME_BYTES: usize = 256;
+
+/// Conservative host cap on the dynamic shared-memory bytes a single
+/// `launch` may request (the `shared_mem` argument forwarded to
+/// `cuLaunchKernel` as `shared_mem as u32`).
+///
+/// MEDIUM finding: `validate_launch_args` historically only rejected
+/// `shared_mem < 0`, so any positive value up to `i32::MAX` (~2 GiB) was
+/// forwarded verbatim to the driver. That defers an obviously-bogus
+/// request to `cuLaunchKernel`, which reports it with a far less
+/// actionable `CUDA_ERROR_INVALID_VALUE`. We bound it host-side instead,
+/// mirroring the grid/block-dim posture (reject before any driver call
+/// with [`AbiError::InvalidDimensions`]).
+///
+/// 228 KiB is the current maximum dynamic shared memory per block on
+/// recent NVIDIA architectures (Hopper/Ada opt-in via
+/// `cudaFuncAttributeMaxDynamicSharedMemorySize`). Kernels needing more
+/// do not exist on shipping hardware, so this is a safe upper bound: a
+/// real launch never exceeds it, and a guest that does is caught early.
+pub const MAX_DYNAMIC_SHARED_MEM_BYTES: i32 = 228 * 1024;
 
 /// Per-instance host state passed to wasi-cuda calls.
 ///
@@ -1214,6 +1235,20 @@ fn load_ptx_impl<T: HasWasiCuda>(
         entry_bytes = entry_len as u64,
     )
     .entered();
+    // LOW finding: check `ptx_len < 0` BEFORE the cap comparison below.
+    // `ptx_len` is i32 from the wire; a negative value cast through
+    // `as usize` becomes a huge number that would trip the
+    // QuotaExceeded/`MAX_PTX_BYTES` branch and misreport an invalid-pointer
+    // condition as "input too large." `read_bytes` would ultimately reject
+    // the negative length with `InvalidPointer` anyway; surfacing that code
+    // here keeps parity with the `entry_len < 0` check just below.
+    if ptx_len < 0 {
+        caller
+            .data()
+            .wasi_cuda()
+            .record_error(format!("load_ptx: negative ptx_len ({ptx_len})"));
+        return Err(AbiError::InvalidPointer);
+    }
     if (ptx_len as usize) > MAX_PTX_BYTES {
         caller.data().wasi_cuda().record_error(format!(
             "load_ptx: ptx_len {ptx_len} exceeds MAX_PTX_BYTES {MAX_PTX_BYTES}"
@@ -1340,7 +1375,7 @@ fn load_ptx_impl<T: HasWasiCuda>(
 /// 3. Block dimensions fit `[1, MAX_BLOCK_DIM]` each and the thread-per-
 ///    block product is `<= MAX_THREADS_PER_BLOCK`.
 /// 4. Grid dimensions fit `[1, MAX_GRID_DIM]` each.
-/// 5. `shared_mem >= 0`.
+/// 5. `shared_mem` is in `[0, MAX_DYNAMIC_SHARED_MEM_BYTES]`.
 ///
 /// Failures return [`AbiError::InvalidDimensions`] for dimension-cap
 /// violations and [`AbiError::InvalidPointer`] for memory-region issues,
@@ -1410,6 +1445,19 @@ fn validate_launch_args<T: HasWasiCuda>(
     if shared_mem < 0 {
         caller.data().wasi_cuda().record_error(format!(
             "launch: shared_mem must be >= 0 (got {shared_mem})"
+        ));
+        return Err(AbiError::InvalidDimensions);
+    }
+    // MEDIUM finding: bound `shared_mem` host-side before it is forwarded
+    // to `cuLaunchKernel` as `shared_mem as u32` (~line 1757). Previously
+    // any positive value up to `i32::MAX` was passed through, deferring an
+    // obviously-bogus request to the driver. Cap it at
+    // [`MAX_DYNAMIC_SHARED_MEM_BYTES`] and reject above it with
+    // `InvalidDimensions`, matching the grid/block-dim posture so the
+    // failure is actionable host-side.
+    if shared_mem > MAX_DYNAMIC_SHARED_MEM_BYTES {
+        caller.data().wasi_cuda().record_error(format!(
+            "launch: shared_mem {shared_mem} exceeds MAX_DYNAMIC_SHARED_MEM_BYTES={MAX_DYNAMIC_SHARED_MEM_BYTES}"
         ));
         return Err(AbiError::InvalidDimensions);
     }
@@ -2366,6 +2414,122 @@ mod tests {
         assert!(reg.remove(id).is_some());
         // handle still readable; no UAF possible.
         assert_eq!(handle.entry, "k");
+    }
+
+    /// MEDIUM finding regression guard: a `launch` whose `shared_mem`
+    /// exceeds [`MAX_DYNAMIC_SHARED_MEM_BYTES`] must be rejected host-side
+    /// with `InvalidDimensions` — before any driver call — rather than
+    /// forwarded to `cuLaunchKernel`. We enable the capability and use a
+    /// 1x1x1 grid + block so the only validation failure is the shared-mem
+    /// cap.
+    #[tokio::test]
+    async fn launch_with_oversize_shared_mem_returns_invalid_dimensions() {
+        let mut config = wasmtime::Config::new();
+        config.async_support(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut linker: Linker<Dummy> = Linker::new(&engine);
+        add_to_linker(&mut linker).expect("add_to_linker");
+
+        let oversize = MAX_DYNAMIC_SHARED_MEM_BYTES + 1;
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "{fn_name}"
+                (func $launch (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "try_launch") (result i32)
+                (call $launch
+                  (i64.const 0)
+                  (i32.const 1) (i32.const 1) (i32.const 1)
+                  (i32.const 1) (i32.const 1) (i32.const 1)
+                  (i32.const {oversize})   ;; shared_mem — above the host cap
+                  (i32.const 0) (i32.const 0)))
+            )
+            "#,
+            m = MODULE,
+            fn_name = FN_LAUNCH,
+        );
+        let bytes = wat::parse_str(&wat).unwrap();
+        let module = wasmtime::Module::new(&engine, &bytes).expect("compile");
+        let mut ctx = WasiCudaContext::new(InstanceId(230));
+        ctx.enable_wasi_cuda();
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+        let try_launch = instance
+            .get_typed_func::<(), i32>(&mut store, "try_launch")
+            .expect("typed func");
+        let rc = try_launch.call_async(&mut store, ()).await.expect("call");
+        assert_eq!(
+            rc,
+            AbiError::InvalidDimensions.code(),
+            "shared_mem past the host cap must return InvalidDimensions, got {rc}"
+        );
+        let last = store.data().wasi_cuda().last_error().unwrap_or_default();
+        assert!(
+            last.contains("MAX_DYNAMIC_SHARED_MEM_BYTES"),
+            "expected shared-mem cap error, got: {last}"
+        );
+    }
+
+    /// LOW finding regression guard: a negative `ptx_len` must surface as
+    /// `InvalidPointer` (the memory-region error `read_bytes` would yield)
+    /// rather than `QuotaExceeded` — a negative i32 cast through `as usize`
+    /// would otherwise trip the `MAX_PTX_BYTES` branch and misreport the
+    /// failure. We invoke `load_ptx` directly through the linked host
+    /// surface with `ptx_len = -1`.
+    #[tokio::test]
+    async fn load_ptx_negative_ptx_len_returns_invalid_pointer() {
+        let mut config = wasmtime::Config::new();
+        config.async_support(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut linker: Linker<Dummy> = Linker::new(&engine);
+        add_to_linker(&mut linker).expect("add_to_linker");
+
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "{fn_name}"
+                (func $load_ptx (param i32 i32 i32 i32) (result i64)))
+              (memory (export "memory") 1)
+              (func (export "try_load") (result i64)
+                (call $load_ptx
+                  (i32.const 0)    ;; ptx_ptr
+                  (i32.const -1)   ;; ptx_len — negative
+                  (i32.const 0)    ;; entry_ptr
+                  (i32.const 4)))  ;; entry_len
+            )
+            "#,
+            m = MODULE,
+            fn_name = FN_LOAD_PTX,
+        );
+        let bytes = wat::parse_str(&wat).unwrap();
+        let module = wasmtime::Module::new(&engine, &bytes).expect("compile");
+        let mut ctx = WasiCudaContext::new(InstanceId(231));
+        ctx.enable_wasi_cuda();
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+        let try_load = instance
+            .get_typed_func::<(), i64>(&mut store, "try_load")
+            .expect("typed func");
+        let rc = try_load.call_async(&mut store, ()).await.expect("call");
+        assert_eq!(
+            rc,
+            AbiError::InvalidPointer.code() as i64,
+            "negative ptx_len must return InvalidPointer ({}), not QuotaExceeded ({})",
+            AbiError::InvalidPointer.code(),
+            AbiError::QuotaExceeded.code(),
+        );
+        let last = store.data().wasi_cuda().last_error().unwrap_or_default();
+        assert!(
+            last.contains("negative ptx_len"),
+            "expected negative-ptx_len error, got: {last}"
+        );
     }
 
     // ----------------------------------------------------------------

@@ -257,6 +257,192 @@ pub fn build_router_with_kernel_publish_tokens(
 /// rebuild the router for each case; production starts the gateway once).
 static T16_HOST_WARN_FIRED: AtomicBool = AtomicBool::new(false);
 
+/// SECURITY (H3): environment variable carrying an optional bearer token
+/// that gates `GET /metrics`. When set to a non-empty value the metrics
+/// scrape endpoint requires `Authorization: Bearer <token>` matching this
+/// value (constant-time compared); when unset or empty the endpoint stays
+/// unauthenticated (the historical Prometheus-scrape posture) and a
+/// one-shot `warn!` is emitted at startup. See [`MetricsAuth`] and
+/// [`metrics_auth_gate`].
+pub const ENV_METRICS_TOKEN: &str = "TENSOR_WASM_API_METRICS_TOKEN";
+
+/// Process-wide latch for the H3 "metrics endpoint is unauthenticated"
+/// startup warning. Like [`T16_HOST_WARN_FIRED`] this fires at most once
+/// per process so repeated `build_router*` calls in the test suite do not
+/// flood the log.
+static H3_METRICS_WARN_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// SECURITY (H3): resolved gate for the unauthenticated `/metrics` scrape
+/// endpoint.
+///
+/// `/metrics` is documented `security: []` in
+/// `openapi/tensor-wasm-api.yaml` so Prometheus scrapers and k8s tooling
+/// can hit it without a bearer token — the default (env unset) preserves
+/// that posture. Operators that expose the listener on a shared interface
+/// can opt into a bearer-token gate by setting
+/// [`ENV_METRICS_TOKEN`]; when set, `metrics_auth_gate` requires
+/// `Authorization: Bearer <token>` and returns `401` otherwise.
+#[derive(Debug, Clone, Default)]
+struct MetricsAuth {
+    /// The configured token, or `None` when the endpoint is left
+    /// unauthenticated. `Arc<str>` so cloning into every request's
+    /// extensions does not copy the secret bytes.
+    token: Option<Arc<str>>,
+}
+
+impl MetricsAuth {
+    /// Load the optional metrics token from [`ENV_METRICS_TOKEN`].
+    ///
+    /// Unset / empty (after trimming) → unauthenticated (the historical
+    /// posture); the one-shot startup warning is emitted here so operators
+    /// running an internet-facing listener without an ingress ACL notice
+    /// the open scrape target. A non-empty value enables the bearer gate.
+    fn from_env() -> Self {
+        let raw = std::env::var(ENV_METRICS_TOKEN).unwrap_or_default();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            // One-shot warning: the scrape target carries per-tenant
+            // operational data and is unauthenticated. Idempotent across
+            // router rebuilds via the CAS latch.
+            if H3_METRICS_WARN_FIRED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                tracing::warn!(
+                    target: "tensor_wasm_api::server",
+                    "GET /metrics is unauthenticated (TENSOR_WASM_API_METRICS_TOKEN \
+                     unset) — it exposes per-tenant gauges and route/error \
+                     distributions. This is the expected Prometheus-scrape \
+                     posture behind an internal interface or ingress ACL; set \
+                     TENSOR_WASM_API_METRICS_TOKEN=<token> to require \
+                     `Authorization: Bearer <token>` on the scrape path.",
+                );
+            }
+            Self { token: None }
+        } else {
+            tracing::info!(
+                target: "tensor_wasm_api::server",
+                "GET /metrics requires a bearer token (TENSOR_WASM_API_METRICS_TOKEN set)",
+            );
+            Self {
+                token: Some(Arc::from(trimmed)),
+            }
+        }
+    }
+}
+
+/// Reset the H3 metrics startup-warning latch.
+///
+/// Test-only, mirroring [`__reset_host_validation_warn_for_test`]: each
+/// scenario in an integration test that asserts on the warning needs a
+/// clean "not yet warned" state. Production code MUST NOT call this — the
+/// warning is fire-once for the life of the process by design.
+#[doc(hidden)]
+pub fn __reset_metrics_warn_for_test() {
+    H3_METRICS_WARN_FIRED.store(false, Ordering::Release);
+}
+
+/// SECURITY (H3): bearer-token gate applied ONLY to the `/metrics` route.
+///
+/// The handler in `routes.rs` is left untouched (it is owned by another
+/// agent and is `security: []` by contract); this middleware wraps the
+/// route in `server.rs` so the gate is purely additive and opt-in:
+///
+/// * No [`MetricsAuth`] in the extensions, or `token == None` → pass
+///   through unauthenticated (the default Prometheus-scrape posture).
+/// * Token configured → require `Authorization: Bearer <token>` and reject
+///   with `401 unauthorized` (standard `{ "error": { kind, message } }`
+///   envelope) otherwise. The comparison is constant-time
+///   ([`subtle::ConstantTimeEq`]) so a timing side-channel cannot be used
+///   to recover the token byte-by-byte, mirroring the bearer allowlist
+///   compare in `crate::middleware::AuthConfig::scope_for`.
+async fn metrics_auth_gate(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let configured = req
+        .extensions()
+        .get::<MetricsAuth>()
+        .and_then(|m| m.token.clone());
+
+    let Some(expected) = configured else {
+        // Unauthenticated posture (default): pass through unchanged.
+        return next.run(req).await;
+    };
+
+    // A token is required. Recover the `Authorization: Bearer <token>`
+    // header and constant-time compare against the configured value.
+    let presented = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(parse_bearer_token);
+
+    let authorized = match presented {
+        // `ct_eq` requires equal-length inputs to be meaningful; a length
+        // mismatch is an immediate non-match. We still run `ct_eq` only
+        // when lengths match so the byte loop does not early-exit on the
+        // first differing byte.
+        Some(tok) => {
+            let a = tok.as_bytes();
+            let b = expected.as_bytes();
+            a.len() == b.len() && a.ct_eq(b).into()
+        }
+        None => false,
+    };
+
+    if !authorized {
+        return metrics_unauthorized();
+    }
+    next.run(req).await
+}
+
+/// Render the `401` envelope for a rejected `/metrics` request. Mirrors the
+/// `{ "error": { "kind", "message" } }` shape produced by
+/// `crate::middleware::envelope` (which is private to that module, so this
+/// is a local copy rather than a shared import).
+fn metrics_unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": {
+                "kind": "unauthorized",
+                "message": "GET /metrics requires a valid Authorization: Bearer <token> header",
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Parse the credentials of a `Bearer` `Authorization` header value.
+///
+/// Local minimal mirror of `crate::middleware::parse_bearer_credentials`
+/// (which is private to that module and lives in a file this change must
+/// not touch). Splits on the first space/tab, matches the scheme
+/// case-insensitively, trims surrounding BWS, and rejects control bytes so
+/// a CR/LF/NUL cannot be smuggled into a downstream log line. Returns
+/// `None` for a missing/empty credential so the caller treats it as a
+/// non-match.
+fn parse_bearer_token(value: &str) -> Option<&str> {
+    if value.bytes().any(|b| b != b'\t' && (b < 0x20 || b == 0x7F)) {
+        return None;
+    }
+    let split = value
+        .as_bytes()
+        .iter()
+        .position(|&b| b == b' ' || b == b'\t')?;
+    let (scheme, rest) = value.split_at(split);
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim_matches(|c: char| c == ' ' || c == '\t');
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
 /// One-shot startup safety check: when the gateway is in production mode
 /// (`TENSOR_WASM_API_TOKENS` set to a non-empty value) but the operator
 /// has not configured a `Host` allowlist (`TENSOR_WASM_API_TRUSTED_HOSTS`
@@ -458,21 +644,36 @@ fn build_router_full(
     // share a single credential across many endpoints — protecting these
     // here would break the published contract and silently disable
     // upstream health checks.
+    // SECURITY (H3): `/metrics` is mounted in its own sub-router so the
+    // opt-in bearer gate (`metrics_auth_gate`) can be layered onto it
+    // WITHOUT touching the handler in `routes.rs` or gating `/healthz`.
+    // The endpoint stays `security: []` in
+    // `openapi/tensor-wasm-api.yaml` by default — Prometheus scrapers and
+    // k8s tooling expect an unauthenticated scrape target, and the
+    // endpoint exposes per-tenant operational data (the HTTP-metric
+    // families carry a `route` label, and the registry also surfaces
+    // per-tenant gauges). Operators MUST bind the listener to an internal
+    // interface or place `/metrics` behind an ingress ACL whenever the
+    // listener is internet-facing.
+    //
+    // When `TENSOR_WASM_API_METRICS_TOKEN` is set, `metrics_auth_gate`
+    // requires `Authorization: Bearer <token>` (constant-time compared)
+    // and returns `401` otherwise; when unset, the gate is a pass-through
+    // and `MetricsAuth::from_env` emits a one-shot startup `warn!` that
+    // the scrape target is unauthenticated. The `MetricsAuth` extension
+    // is inserted on this sub-router only, so `/healthz` and every other
+    // route are oblivious to it. NOTE: enabling the token does diverge
+    // from the published `security: []` contract — the OpenAPI spec and
+    // operator docs should grow an optional `bearerAuth` note for
+    // `/metrics` (deferred: those files are outside this change's scope).
+    let metrics_router = Router::new()
+        .route("/metrics", get(metrics))
+        .layer(axum::middleware::from_fn(metrics_auth_gate))
+        .layer(axum::Extension(MetricsAuth::from_env()));
+
     let probe_router = Router::new()
         .route("/healthz", get(healthz))
-        // SECURITY (H3): `/metrics` is mounted UNAUTHENTICATED (declared
-        // `security: []` in `openapi/tensor-wasm-api.yaml`). This is an
-        // intentional posture — Prometheus scrapers and k8s tooling
-        // expect an unauthenticated scrape target — but the endpoint
-        // exposes per-tenant operational data (the HTTP-metric families
-        // carry a `route` label, and the registry also surfaces
-        // per-tenant gauges). Operators MUST bind the listener to an
-        // internal interface or place `/metrics` behind an ingress ACL
-        // (e.g. allow only the monitoring subnet) whenever the listener
-        // is internet-facing. Do NOT add bearer auth here without also
-        // updating the OpenAPI contract and the probe-stack rationale
-        // below — the routing behaviour is load-bearing for scrapers.
-        .route("/metrics", get(metrics))
+        .merge(metrics_router)
         // api S-26: probes get their own generous budget. A k8s deployment
         // can have many replicas all scraping at once without affecting
         // invoke capacity.
@@ -675,4 +876,51 @@ pub async fn serve(state: Arc<AppState>, addr: SocketAddr) -> anyhow::Result<()>
     )
     .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // SECURITY (H3): bearer parsing for the `/metrics` gate.
+    #[test]
+    fn parse_bearer_token_accepts_canonical_scheme() {
+        assert_eq!(parse_bearer_token("Bearer abc123"), Some("abc123"));
+        assert_eq!(parse_bearer_token("bearer abc123"), Some("abc123"));
+        assert_eq!(parse_bearer_token("BEARER\tabc123"), Some("abc123"));
+        assert_eq!(parse_bearer_token("Bearer   spaced  "), Some("spaced"));
+    }
+
+    #[test]
+    fn parse_bearer_token_rejects_non_bearer_and_empty() {
+        assert_eq!(parse_bearer_token("Basic abc123"), None);
+        assert_eq!(parse_bearer_token("Bearer"), None);
+        assert_eq!(parse_bearer_token("Bearer    "), None);
+        assert_eq!(parse_bearer_token(""), None);
+    }
+
+    #[test]
+    fn parse_bearer_token_rejects_control_bytes() {
+        // CR/LF/NUL must not survive into a downstream log line.
+        assert_eq!(parse_bearer_token("Bearer ab\r\nc"), None);
+        assert_eq!(parse_bearer_token("Bearer ab\0c"), None);
+    }
+
+    // SECURITY (H3): an unconfigured `MetricsAuth` keeps the endpoint open.
+    #[test]
+    fn metrics_auth_default_is_unauthenticated() {
+        let auth = MetricsAuth::default();
+        assert!(auth.token.is_none());
+    }
+
+    // SECURITY (H3): the 401 envelope carries the standard error shape.
+    #[test]
+    fn metrics_unauthorized_envelope_shape() {
+        let resp = metrics_unauthorized();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
 }

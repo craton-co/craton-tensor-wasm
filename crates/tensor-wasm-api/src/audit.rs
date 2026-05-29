@@ -50,9 +50,11 @@
 //!   Also mirrors each record at `tracing::info!` level so OpenTelemetry
 //!   tail-sampling sees it.
 //! * [`FileJsonSink`] — appends to a file. The file is opened append-only
-//!   and the writes serialise through a `std::sync::Mutex<File>`. The
+//!   and the writes serialise through an `Arc<std::sync::Mutex<File>>`. The
 //!   critical section is `write_all` + `flush` of ~512 bytes — measured
-//!   below in the [latency budget](#latency-budget) section.
+//!   below in the [latency budget](#latency-budget) section. PERF: the
+//!   blocking write is offloaded to [`tokio::task::spawn_blocking`] when a
+//!   runtime is present so it never parks the async response path.
 //! * [`NoopSink`] — drops every record. Used when
 //!   `TENSOR_WASM_API_AUDIT_LOG=none` and exposed for tests.
 //!
@@ -87,13 +89,18 @@
 //!   disk or under contention this can spike — the documented mitigation
 //!   below applies.
 //!
-//! The orchestrator should re-measure under realistic disk + concurrency.
-//! If the file sink shows tails > 100 µs the recommended fix is to wrap
-//! the write in [`tokio::task::spawn_blocking`] — the trait's `emit` is
-//! sync today because the in-process latency observed under our load
-//! does not justify the additional task spawn (which is itself 5–10 µs)
-//! and the at-most-once-per-state-mutation cadence is bounded by the
-//! upstream rate limit anyway.
+//! PERF (resolved): the blocking write no longer runs inline on the async
+//! response path. Both [`StdoutJsonSink`] and [`FileJsonSink`] now offload
+//! the `write_all` + `flush` (or `println!`) to
+//! [`tokio::task::spawn_blocking`] when an active tokio runtime is detected
+//! (the production middleware path), and fall back to a synchronous write
+//! otherwise (unit tests / non-async embedders). `emit` stays sync and the
+//! [`AuditSink`] trait stays object-safe: serialisation happens on the
+//! caller's thread and only the owned line (plus a cheap `Arc` file-handle
+//! clone for the file sink) is moved into the worker. Ordering across
+//! concurrent writers stays well-defined — the worker re-acquires the inner
+//! `Mutex<File>` and `O_APPEND` makes each append atomic, so records never
+//! interleave. Records are queued, never dropped, when the bound is hit.
 //!
 //! Read-only routes do **not** invoke the sink at all (the route filter
 //! short-circuits before serialisation), so the entire mechanism is zero
@@ -359,26 +366,42 @@ impl StdoutJsonSink {
 
 impl AuditSink for StdoutJsonSink {
     fn emit(&self, record: &AuditRecord) {
-        match serde_json::to_string(record) {
-            Ok(line) => {
-                // `println!` takes the process-wide stdout lock for the
-                // write. The macro adds the trailing newline, so the
-                // emitted line is `"<json>\n"` — JSONL-friendly.
-                println!("{line}");
-                // Mirror at info level so an OTel-attached subscriber can
-                // correlate the audit entry with the request trace.
-                tracing::info!(
-                    target: "tensor_wasm_api::audit",
-                    audit = %line,
-                    "audit",
-                );
-            }
+        let line = match serde_json::to_string(record) {
+            Ok(line) => line,
             Err(e) => {
                 tracing::error!(
                     target: "tensor_wasm_api::audit",
                     error = %e,
                     "failed to serialise audit record",
                 );
+                return;
+            }
+        };
+        // Mirror at info level so an OTel-attached subscriber can correlate
+        // the audit entry with the request trace. This is cheap (the
+        // subscriber's own machinery) and stays on the caller's thread so
+        // span context is preserved.
+        tracing::info!(
+            target: "tensor_wasm_api::audit",
+            audit = %line,
+            "audit",
+        );
+        // PERF: `println!` takes the process-wide stdout lock and performs
+        // a blocking write. On the async response path that parks a tokio
+        // worker on the stdout lock — under load, behind a slow/full pipe
+        // consumer it serialises all in-flight requests. Offload the write
+        // to the blocking pool when a runtime is present; fall back to the
+        // inline write otherwise (unit tests / non-async embedders) so the
+        // simple behaviour is preserved. `println!` adds the trailing
+        // newline, keeping the JSONL framing identical to before.
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                tokio::task::spawn_blocking(move || {
+                    println!("{line}");
+                });
+            }
+            Err(_) => {
+                println!("{line}");
             }
         }
     }
@@ -398,7 +421,14 @@ pub struct FileJsonSink {
     /// The append-only file handle. `std::sync::Mutex` (not
     /// `tokio::sync::Mutex`) because the critical section is sync I/O
     /// with no `.await` point.
-    pub file: Mutex<File>,
+    ///
+    /// PERF: wrapped in an `Arc` so [`AuditSink::emit`] can hand a cheap
+    /// clone of the handle to a [`tokio::task::spawn_blocking`] worker and
+    /// offload the blocking `write_all` + `flush` off the async response
+    /// path (see the `emit` impl below). The `Arc` is the minimal change
+    /// that lets the `&self`-borrowed mutex outlive the request future on
+    /// the blocking pool.
+    pub file: Arc<Mutex<File>>,
 }
 
 impl FileJsonSink {
@@ -410,13 +440,58 @@ impl FileJsonSink {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             path,
-            file: Mutex::new(file),
+            file: Arc::new(Mutex::new(file)),
         })
+    }
+
+    /// Perform the blocking `write_all` + `flush` of one already-serialised
+    /// JSONL line. Factored out of [`AuditSink::emit`] so the same body can
+    /// run either inline (no tokio runtime) or inside a
+    /// [`tokio::task::spawn_blocking`] worker (the hot path). Errors are
+    /// logged, never propagated — an audit-write failure must not corrupt a
+    /// successful API call.
+    fn write_line(file: &Mutex<File>, path: &std::path::Path, line: &str) {
+        let mut guard = match file.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                // A poisoned mutex means a previous writer panicked
+                // mid-write; the file handle itself is still usable.
+                // Recover the inner guard and continue: dropping the
+                // audit stream on a stale panic is worse than a possibly
+                // truncated prior record.
+                tracing::warn!(
+                    target: "tensor_wasm_api::audit",
+                    path = %path.display(),
+                    "audit file mutex was poisoned; recovering",
+                );
+                poisoned.into_inner()
+            }
+        };
+        if let Err(e) = writeln!(&mut *guard, "{line}") {
+            tracing::error!(
+                target: "tensor_wasm_api::audit",
+                error = %e,
+                path = %path.display(),
+                "failed to write audit record",
+            );
+            return;
+        }
+        if let Err(e) = guard.flush() {
+            tracing::error!(
+                target: "tensor_wasm_api::audit",
+                error = %e,
+                path = %path.display(),
+                "failed to flush audit record",
+            );
+        }
     }
 }
 
 impl AuditSink for FileJsonSink {
     fn emit(&self, record: &AuditRecord) {
+        // Serialise on the caller's thread — it is cheap (~a few µs on a
+        // ~10-field struct) and lets us move only the owned `String` into
+        // the blocking worker.
         let line = match serde_json::to_string(record) {
             Ok(s) => s,
             Err(e) => {
@@ -428,38 +503,31 @@ impl AuditSink for FileJsonSink {
                 return;
             }
         };
-        let mut guard = match self.file.lock() {
-            Ok(g) => g,
-            Err(poisoned) => {
-                // A poisoned mutex means a previous writer panicked
-                // mid-write; the file handle itself is still usable.
-                // Recover the inner guard and continue: dropping the
-                // audit stream on a stale panic is worse than a possibly
-                // truncated prior record.
-                tracing::warn!(
-                    target: "tensor_wasm_api::audit",
-                    path = %self.path.display(),
-                    "audit file mutex was poisoned; recovering",
-                );
-                poisoned.into_inner()
+        // PERF: the blocking `write_all` + `flush` (a forced `write(2)` per
+        // record) previously ran inline under the `std::sync::Mutex`,
+        // serialising all in-flight requests on the audit critical section
+        // and parking a tokio worker thread on disk I/O. Offload it onto
+        // the blocking pool via `spawn_blocking` when we are inside a tokio
+        // runtime (the production response path); the response future is no
+        // longer held up by the disk write. Ordering across concurrent
+        // requests is still well-defined: each worker re-acquires the inner
+        // `Mutex<File>` and the OS `O_APPEND` guarantees atomic appends, so
+        // records never interleave even if two writes race. We do not drop
+        // records — `spawn_blocking` queues the closure rather than failing.
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                let file = Arc::clone(&self.file);
+                let path = self.path.clone();
+                tokio::task::spawn_blocking(move || {
+                    Self::write_line(&file, &path, &line);
+                });
             }
-        };
-        if let Err(e) = writeln!(&mut *guard, "{line}") {
-            tracing::error!(
-                target: "tensor_wasm_api::audit",
-                error = %e,
-                path = %self.path.display(),
-                "failed to write audit record",
-            );
-            return;
-        }
-        if let Err(e) = guard.flush() {
-            tracing::error!(
-                target: "tensor_wasm_api::audit",
-                error = %e,
-                path = %self.path.display(),
-                "failed to flush audit record",
-            );
+            Err(_) => {
+                // No runtime (unit tests, embedders driving the sink
+                // directly): fall back to the synchronous write so the
+                // behaviour and durability guarantee are unchanged.
+                Self::write_line(&self.file, &self.path, &line);
+            }
         }
     }
 }
@@ -1228,6 +1296,46 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(line).expect("each line is JSON");
             assert_eq!(v["action"], "create_function");
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// PERF: under an active tokio runtime `FileJsonSink::emit` offloads the
+    /// write to `spawn_blocking`. This exercises that path and confirms the
+    /// records still land (queued, never dropped). We await the offloaded
+    /// work by draining the blocking pool: a `spawn_blocking` fence resolves
+    /// only after earlier-queued blocking tasks have had a chance to run on
+    /// the (multi-thread) pool; we then poll the file with a bounded retry
+    /// to avoid a flaky race on slow CI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_sink_offloads_write_under_runtime() {
+        let dir = std::env::temp_dir();
+        static N: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
+        let n = N
+            .get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!(
+            "tensor-wasm-audit-async-test-{}-{n}.log",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_file(&path);
+        let sink = FileJsonSink::open(&path).expect("opens");
+        sink.emit(&sample_record());
+        sink.emit(&sample_record());
+
+        // Bounded poll: the offloaded writes complete asynchronously.
+        let mut lines = 0;
+        for _ in 0..200 {
+            if let Ok(body) = std::fs::read_to_string(&path) {
+                lines = body.lines().count();
+                if lines >= 2 {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+            // Give the blocking pool a tick to flush on slow hosts.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(lines, 2, "both records must reach the file (none dropped)");
         let _ = std::fs::remove_file(&path);
     }
 

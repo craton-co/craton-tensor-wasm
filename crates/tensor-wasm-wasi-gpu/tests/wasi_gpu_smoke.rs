@@ -240,10 +240,14 @@ async fn launch_over_back_pressure_cap_returns_quota_exceeded() {
     let mut ctx =
         WasiCudaContext::with_back_pressure(InstanceId(11), Arc::new(BackPressure::with_cap(0)));
     ctx.enable_wasi_cuda();
-    // Register a kernel directly in the context's registry so the launch
-    // path gets past the kernel-lookup gate and actually hits the
-    // back-pressure check. The first id handed out is 1, matching
-    // `try_launch_k1` in the WAT fixture.
+    // Register a kernel so the context has at least one live entry. Note the
+    // launch below does NOT depend on this id matching `try_launch_k1`'s
+    // hardcoded `1`: with a cap-0 back-pressure semaphore `launch_impl_async`
+    // refuses the permit (QuotaExceeded) *before* it ever consults the kernel
+    // registry, so the saturation error surfaces regardless of which id we
+    // registered. Kernel ids are also randomised (wasi-gpu 1.1 defence-in-depth
+    // against id enumeration), so the first id is NOT 1 — only guaranteed to be
+    // a positive, non-zero value.
     let kid = ctx
         .registry
         .register(KernelEntry {
@@ -254,7 +258,7 @@ async fn launch_over_back_pressure_cap_returns_quota_exceeded() {
             module: None,
         })
         .expect("register");
-    assert_eq!(kid.0, 1, "registry must hand out id 1 first");
+    assert!(kid.0 > 0, "registry must hand out a positive kernel id, got {}", kid.0);
 
     let mut store = wasmtime::Store::new(&engine, TestStore { cuda: ctx });
     let instance = linker

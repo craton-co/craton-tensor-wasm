@@ -109,6 +109,26 @@ pub enum EmitError {
     /// than launch a miscompiled kernel. Closes jit L1.
     #[error("PTX register allocation overflowed the u32 index space")]
     TooManyRegisters,
+    /// The blueprint's emission budget (per-op `lanes`, or total ops *
+    /// lanes across the stream) exceeds the emitter's DoS guardrails.
+    ///
+    /// The lane-bearing ops (`VecAdd`/`VecMul`/`VecFma`/`LoadUnified`/
+    /// `StoreUnified`) each drive a `0..lanes` emission loop. The
+    /// production auto-offload path pins `lanes` to `DEFAULT_LANES = 4`,
+    /// but the PUBLIC `TensorWasmKernelBlueprint::push` + `emit`/`emit_with`
+    /// API accepts arbitrary `lanes` (up to `u32::MAX`). An embedder
+    /// building blueprints from untrusted dimensions could request billions
+    /// of PTX lines and exhaust CPU/memory before a byte of output is
+    /// returned. We bound `lanes` by [`MAX_LANES`] and the aggregate
+    /// (ops * lanes) emission budget by [`MAX_EMITTED_OPS`] and refuse up
+    /// front rather than rely on every caller to pre-bound. Closes jit L2
+    /// (unbounded `lanes` / op-count emission DoS).
+    #[error("PTX emission budget exceeded: {what}")]
+    EmissionBudgetExceeded {
+        /// Which limit was hit (for diagnostics only — this string is
+        /// static and carries no untrusted-derived value).
+        what: &'static str,
+    },
 }
 
 /// Maximum length of a PTX identifier (NVIDIA PTX ISA §A.3).
@@ -149,6 +169,24 @@ pub const WMMA_ACC_FRAG_REGS: u32 = 8;
 /// any other dimensions fall back to [`EmitError::NotYetImplemented`] even
 /// when the experimental flag is on.
 pub const WMMA_TILE_DIM: u32 = 16;
+
+/// DoS guardrail (jit L2): maximum `lanes` any single lane-bearing op may
+/// request. Each lane-bearing op (`VecAdd`/`VecMul`/`VecFma`/`LoadUnified`/
+/// `StoreUnified`) emits one PTX instruction line per lane in a `0..lanes`
+/// loop, so an attacker-supplied `lanes` near `u32::MAX` would attempt to
+/// emit billions of lines. `1024` is a generous upper bound that still
+/// comfortably covers realistic GPU lane / vector widths (the production
+/// auto-offload path only ever uses `DEFAULT_LANES = 4`).
+pub const MAX_LANES: u32 = 1024;
+
+/// DoS guardrail (jit L2): maximum aggregate emitted-op budget, i.e. the
+/// sum of `lanes` over every lane-bearing op in the blueprint (each lane
+/// emits ~one instruction line). Bounds total emission work even when each
+/// individual op is under [`MAX_LANES`] but the op stream is long. `1 << 20`
+/// (~1M instruction lines, low tens of MiB of PTX text) is well beyond any
+/// realistic kernel yet small enough to reject adversarial blueprints
+/// before any output bytes are produced.
+pub const MAX_EMITTED_OPS: u64 = 1 << 20;
 
 /// Default PTX target architecture.
 pub const DEFAULT_TARGET: &str = "sm_80";
@@ -541,6 +579,41 @@ pub fn emit_with(
             entry: blueprint.entry.clone(),
         });
     }
+    // SECURITY (jit L2): bound the emission work BEFORE producing any output.
+    // The lane-bearing ops each drive a `0..lanes` loop in `lower_body`
+    // (see the emission loops in that fn), so a public-API caller supplying
+    // an unbounded `lanes` (e.g. `u32::MAX`) from untrusted dimensions would
+    // attempt to emit billions of PTX lines → CPU/memory DoS. The production
+    // auto-offload path pins `lanes` to `DEFAULT_LANES = 4`; this guard
+    // protects every other embedder of the public `push`/`emit_with` API.
+    // We reject (a) any single op whose `lanes` exceeds `MAX_LANES`, and
+    // (b) blueprints whose aggregate `ops * lanes` budget exceeds
+    // `MAX_EMITTED_OPS`. Computed in `u64` so the running sum cannot itself
+    // overflow before the cap fires.
+    let mut emitted_budget: u64 = 0;
+    for op in &blueprint.ops {
+        let lanes = match op {
+            TensorWasmOp::VecAdd { lanes }
+            | TensorWasmOp::VecMul { lanes }
+            | TensorWasmOp::VecFma { lanes }
+            | TensorWasmOp::LoadUnified { lanes }
+            | TensorWasmOp::StoreUnified { lanes } => *lanes,
+            // MatMul / Barrier emit a fixed, bounded number of lines and
+            // carry no attacker-scalable `lanes` field.
+            TensorWasmOp::MatMul { .. } | TensorWasmOp::Barrier => 0,
+        };
+        if lanes > MAX_LANES {
+            return Err(EmitError::EmissionBudgetExceeded {
+                what: "single op `lanes` exceeds MAX_LANES",
+            });
+        }
+        emitted_budget = emitted_budget.saturating_add(u64::from(lanes));
+        if emitted_budget > MAX_EMITTED_OPS {
+            return Err(EmitError::EmissionBudgetExceeded {
+                what: "aggregate ops * lanes exceeds MAX_EMITTED_OPS",
+            });
+        }
+    }
     // Rough estimate: ~64 B/op covers the per-op body line plus a fair share
     // of the fixed prologue/epilogue. Avoids grow-by-doubling reallocs on
     // the hot emit path.
@@ -884,6 +957,52 @@ mod tests {
         assert!(out.text.contains("[%rd0];"), "first load uses no offset");
         assert!(out.text.contains("[%rd0+4]"), "second lane at offset 4");
         assert!(out.text.contains("[%rd0+8]"), "third lane at offset 8");
+    }
+
+    /// DoS guardrail (jit L2): a single op requesting more than `MAX_LANES`
+    /// lanes is refused with the structured `EmissionBudgetExceeded` error
+    /// before any PTX is produced. The public `push` API accepts arbitrary
+    /// `lanes`, so without this the emitter would loop `0..u32::MAX`.
+    #[test]
+    fn oversized_lanes_is_rejected() {
+        let bp = TensorWasmKernelBlueprint::new("k")
+            .push(TensorWasmOp::VecAdd { lanes: u32::MAX });
+        let err = emit(&bp).expect_err("oversized lanes must be refused");
+        assert!(matches!(err, EmitError::EmissionBudgetExceeded { .. }));
+        // Just over the per-op cap is also refused.
+        let bp = TensorWasmKernelBlueprint::new("k")
+            .push(TensorWasmOp::LoadUnified { lanes: MAX_LANES + 1 });
+        assert!(matches!(
+            emit(&bp),
+            Err(EmitError::EmissionBudgetExceeded { .. })
+        ));
+    }
+
+    /// DoS guardrail (jit L2): even when each op is within `MAX_LANES`, a
+    /// long enough op stream whose aggregate `ops * lanes` exceeds
+    /// `MAX_EMITTED_OPS` is refused.
+    #[test]
+    fn aggregate_emission_budget_is_enforced() {
+        // Each op is at the per-op cap; enough of them to blow the aggregate.
+        let n_ops = (MAX_EMITTED_OPS / u64::from(MAX_LANES)) as usize + 2;
+        let mut bp = TensorWasmKernelBlueprint::new("k");
+        for _ in 0..n_ops {
+            bp = bp.push(TensorWasmOp::VecMul { lanes: MAX_LANES });
+        }
+        assert!(matches!(
+            emit(&bp),
+            Err(EmitError::EmissionBudgetExceeded { .. })
+        ));
+    }
+
+    /// A blueprint at exactly the `MAX_LANES` per-op bound (and well under
+    /// the aggregate cap) still emits successfully — the guard rejects only
+    /// what is over budget.
+    #[test]
+    fn lanes_at_max_still_emits() {
+        let bp = TensorWasmKernelBlueprint::new("k")
+            .push(TensorWasmOp::VecAdd { lanes: MAX_LANES });
+        assert!(emit(&bp).is_ok());
     }
 
     #[test]
