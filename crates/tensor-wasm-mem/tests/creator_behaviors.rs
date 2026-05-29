@@ -159,7 +159,9 @@ fn unified_error_allocation_falls_through_to_serialization() {
     let e = UnifiedError::Allocation("minimum 8 > maximum 4".into());
     let b: TensorWasmError = e.into();
     assert!(matches!(b, TensorWasmError::Serialization(_)));
-    assert!(b.to_string().contains("minimum 8"));
+    // `TensorWasmError`'s Display is sanitised and omits the inner detail; the
+    // forwarded context is reachable via `inner()`.
+    assert!(b.inner().unwrap_or("").contains("minimum 8"));
 }
 
 #[test]
