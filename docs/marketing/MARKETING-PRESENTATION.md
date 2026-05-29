@@ -39,7 +39,7 @@ Pitch points, each graded against tests/commits in the repo today.
 | Promise | Where the proof lives | Honest grade |
 |---|---|---|
 | Zero-copy Wasm linear memory in CUDA UVM | `crates/tensor-wasm-mem/` + `is_uvm_backed()` probe + 5 tests pinning the property | Proven structurally; B2 e2e correctness via real PTX |
-| Explicit GPU dispatch from Wasm guests with typed argv | `crates/tensor-wasm-wasi-gpu/` + 7/7 `kernel_args_e2e` tests pass on real RTX 2060 | Proven end-to-end including `vector_add` correctness readback |
+| Explicit GPU dispatch from Wasm guests with typed argv | `crates/tensor-wasm-wasi-gpu/` + 5/5 `kernel_args_e2e` tests + the B2 `vector_add` e2e test pass on real RTX 2060 | Proven end-to-end including `vector_add` correctness readback |
 | Async-yielding dispatch on Tokio + Wasmtime | `DispatchFuture::poll` yields via 50 µs tokio sleep (B1); cuda-async proper waker path scaffolded (F3) for v0.4 cutover | Framework works; production-scale waker is v0.4 |
 
 Anything not in this table is either out of v1.0 scope (see PATH-TO-V1.md
@@ -146,8 +146,10 @@ Plus the B2 wave's `vector_add_end_to_end_real_ptx_real_kernel`: builds a Wasm
 guest with three f32[64] arrays in linear memory, encodes typed argv
 `[Ptr(a), Ptr(b), Ptr(c), U32(64)]`, launches against the canonical
 `kernels/vector_add.ptx`, reads `c` back from linear memory, asserts
-`c[i] == 100.0 + 2*i` for all 64 elements. **7/7 pass on RTX 2060** even
-though the kernel targets SM_80 (the CUDA driver JIT'd it up to SM_75).
+`c[i] == 100.0 + 2*i` for all 64 elements. This B2 end-to-end test
+**passes on RTX 2060** — on top of the 5-test `kernel_args_e2e` suite
+quoted above — even though the kernel targets SM_80 (the CUDA driver
+JIT'd it down to SM_75).
 
 This is the test that proves the three pitch points work together on real
 silicon **for the non-wmma vector path**. Scope caveat: the RTX 2060 is
@@ -190,7 +192,7 @@ Per `docs/BENCHMARKING.md` "Where TensorWasm wins, where it won't" — honesty
 on losses is the marketing strategy.
 
 **TensorWasm wins on:**
-- GPU-aware Wasm runtime (single-source-of-truth: there is no other one)
+- GPU-aware Wasm runtime (we are not aware of another Wasm runtime with this design)
 - Multi-tenant Wasm with tenant-keyed GPU memory + per-token rate limiting
 - Production observability out of the box (the W2-W4 wave)
 - Snapshot-based cold-start when you're cycling many small Wasm functions
@@ -329,7 +331,7 @@ A: Two real ones:
 │  GPU-accelerated serverless WebAssembly runtime, in Rust         │
 │                                                                  │
 │  PROVEN ON REAL SILICON (non-wmma vector path):                 │
-│    7/7 Wasm→wasi-cuda→cuLaunchKernel→readback tests pass         │
+│    Wasm→wasi-cuda→cuLaunchKernel→readback e2e tests pass         │
 │    (RTX 2060 = SM_75; sm_80 wmma/MatMul unproven, needs SM_89)   │
 │    70 test batches, 0 failures, 0 audit problems                 │
 │    9 tagged releases (v0.1.0 → v0.3.7)                           │
@@ -342,7 +344,7 @@ A: Two real ones:
 │    CLI with completions + man pages + live observe dashboard     │
 │                                                                  │
 │  WHERE WE WIN:                                                   │
-│    GPU-aware Wasm (no peer in the ecosystem)                     │
+│    GPU-aware Wasm (no direct peer we know of)                    │
 │    Multi-tenant by construction                                  │
 │    Observability + ops out of the box                            │
 │                                                                  │

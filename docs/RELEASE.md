@@ -34,5 +34,17 @@ depends on `tensor-wasm-tenant`, and `artifacts` precedes both `jit` and
 ## Security advisory release path
 See `docs/runbooks/cve-disclosure-dry-run.md` for the embargoed-CVE flow. RC/patch releases follow the same sequence on a private fork until disclosure.
 
-TODO: cosign signing of release artifacts (currently SHA256 only).
-TODO: SBOM attachment to GitHub Release.
+## Supply-chain attestations
+
+- **SBOM (implemented).** Every published release ships a CycloneDX
+  JSON SBOM, generated from the release commit's `Cargo.lock` and
+  attached to the GitHub Release as an asset by the
+  [`.github/workflows/sbom.yml`](../.github/workflows/sbom.yml)
+  workflow. See [`docs/SBOM.md`](SBOM.md) for the contract, filename
+  convention, and verification steps.
+- **Artifact signing (planned / not yet implemented).** Release
+  artifacts currently ship with SHA256 checksums (`.sha256`) only.
+  Cosign keyless signing of binaries (and the SBOM) is planned for the
+  SLSA L3 milestone; see [`docs/REPRODUCIBLE-BUILDS.md`](REPRODUCIBLE-BUILDS.md)
+  and [`docs/PATH-TO-V1.md`](PATH-TO-V1.md) for status. It is not yet
+  wired into `release.yml`.

@@ -389,7 +389,7 @@ The runtime is single-host today. Above `count = 1` requires either:
   a single global state machine.
 
 The Nomad spec keeps `count = 1` and `max_parallel = 1` as the
-v0.1.0 contract. Multi-host scheduling is explicitly v2 scope per
+v0.3.7 contract. Multi-host scheduling is explicitly v2 scope per
 `../../docs/PATH-TO-V1.md` "Anti-goals". Revisit when the runtime
 ships shared state.
 

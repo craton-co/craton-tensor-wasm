@@ -498,7 +498,7 @@ part.
 
 ---
 
-_Status: W3.3 deliverable, v0.1.0 era. The strategy and verification
+_Status: W3.3 deliverable, v0.3.7. The strategy and verification
 shape is stable for the v0.x line; the time-budget numbers in §9 will
 re-baseline once an external design partner (see
 [`docs/PATH-TO-V1.md` §6 open decision #6](PATH-TO-V1.md#6-production-design-partners))

@@ -6,9 +6,18 @@ Copyright 2026 Craton Software Company
 # RFC 0001: cuda-oxide as the v0.5 cust successor
 
 - **Author(s):** Maintainers
-- **Status:** Draft
+- **Status:** Accepted
 - **Created:** 2026-05-25
-- **Discussion PR:** TBD
+- **Discussion:** Accepted by lazy consensus of the maintainers (no
+  open objections within the comment period) per the
+  [RFC process](README.md#decision-authority), rather than via a
+  numbered GitHub PR.
+- **Note on location:** Accepted RFCs normally move to
+  [`rfcs/accepted/`](README.md#directory-layout). This file is kept at
+  its original top-level path because it is referenced by stable
+  inbound links across the repository (`Cargo.toml` comments,
+  [`docs/CUDA-OXIDE-CUTOVER.md`](../docs/CUDA-OXIDE-CUTOVER.md),
+  `NOTICE`).
 - **Related:**
   - [`docs/PATH-TO-V1.md`](../docs/PATH-TO-V1.md) — Open Decision #1
     (`cust` successor) and Open Decision #8 (toolchain pin cadence).

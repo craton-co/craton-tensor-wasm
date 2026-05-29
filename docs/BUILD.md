@@ -15,23 +15,38 @@ Craton TensorWasm is a Cargo workspace of 10 crates implementing a GPU-accelerat
 | No-CUDA (default) | `cargo build --workspace` | none (pure-Rust path) | Quick local check — no CUDA linkage at all |
 | CUDA host | `cargo build --workspace --features tensor-wasm-mem/unified-memory` | `unified-memory` | Real hardware — `cudaMallocManaged` |
 | CUDA stub (CI) | `cargo build --workspace --features tensor-wasm-mem/unified-memory` (stub `libcuda.so` on `LD_LIBRARY_PATH`) | `unified-memory` | CI build/test — links against stub libs |
-| No-CUDA pinned host | `cargo build --workspace --features tensor-wasm-mem/pinned-host-memory` | `pinned-host-memory` | Page-locked host buffers without CUDA linkage |
 
-Note: the workspace has **no default features** enabled. `tensor-wasm-mem` ships two opt-in features for memory backing — `unified-memory` (links `cust` and uses `cudaMallocManaged`, requires `libcuda.so` to be linkable) and `pinned-host-memory` (pure-Rust page-locked host buffer). Plain `cargo build --workspace` is the no-CUDA, no-linkage path and is the recommended quick check. Opt into one of the two memory features for production builds.
+Note: the **workspace root enables no default features** for the CUDA/GPU stack; some library crates have safe default-on features (listed below — `tensor-wasm-snapshot` ships `signed-snapshots` + `artifact-backing` on, and `tensor-wasm-tenant` ships `strict-cap-binding` on). `tensor-wasm-mem` ships opt-in features for memory backing — chiefly `unified-memory` (links `cust` and uses `cudaMallocManaged`, requires `libcuda.so` to be linkable). Plain `cargo build --workspace` is the no-CUDA, no-linkage path and is the recommended quick check. Opt into a memory feature for production CUDA builds.
 
 ## Feature flag reference
 
-Cross-crate feature taxonomy:
+Cross-crate feature taxonomy (kept consistent with the feature matrix in [`../README.md`](../README.md)):
 
 | Crate | Flag | Default | Effect |
 |---|---|---|---|
-| tensor-wasm-mem | `unified-memory` | no | Links cust; uses `cudaMallocManaged`. |
-| tensor-wasm-mem | `pinned-host-memory` | no | Pure-Rust pinned host buffers (fallback). |
-| tensor-wasm-exec | `async-execution` | no | Enables Wasmtime async; epoch-based interrupt. |
-| tensor-wasm-wasi-gpu | `cuda` | no | Links cust for `wasi_cuda_*` host functions. |
-| tensor-wasm-jit | `auto-offload` | no | Enables Cranelift→PTX JIT pipeline. |
-| tensor-wasm-tenant | `mps` | no | Use NVIDIA MPS-shared context. |
+| tensor-wasm-core | `otlp` | no | OpenTelemetry OTLP exporter; trace IDs propagate end-to-end. |
+| tensor-wasm-mem | `unified-memory` | no | Links `cust`; uses `cudaMallocManaged`. |
+| tensor-wasm-mem | `mock-cuda` | no | Hardware-free CUDA test doubles (CI-runnable rollback/drop paths). |
+| tensor-wasm-mem | `cudarc-backend` | no | Opt-in `cudarc` backend spike (parallel `UnifiedBuffer`). |
+| tensor-wasm-mem | `gpu-mem-pool` | no | Driver-level per-tenant GPU memory cap via `cuMemPool*`; strict-superset alias of `cudarc-backend`. |
+| tensor-wasm-mem | `cuda-oxide-backend` | no | Dep-less v0.5 cust-successor scaffold module (RFC 0001). |
+| tensor-wasm-exec | `cuda` | no | Real GPU kernel-launch path in `jit_dispatch`; pulls the CUDA host bridge. |
+| tensor-wasm-wasi-gpu | `cuda` | no | Links `cust` for `wasi_cuda_*` host functions. |
+| tensor-wasm-jit | `auto-offload` | no | Gates extra CUDA-side wiring; the Cranelift→PTX pipeline itself is always compiled. |
+| tensor-wasm-jit | `cuda-oxide-backend` | no | `pliron_dialect` scaffold (pulls `pliron` from crates.io). |
+| tensor-wasm-jit | `pliron-llvm-backend` | no | Stage-2 `twasm.*`→`llvm.*` rewrite; strict superset of `cuda-oxide-backend` (needs system LLVM). |
+| tensor-wasm-jit | `kernel-registry` | no | Manifest verification + registry impls for the signed kernel registry. |
+| tensor-wasm-jit | `differential-oracle` | no | Differential JIT correctness oracle (proptest harness). |
+| tensor-wasm-snapshot | `signed-snapshots` | **yes** | HMAC-SHA256 snapshot signing/verification (v3 wire format). |
+| tensor-wasm-snapshot | `artifact-backing` | **yes** | Routes snapshot writes through the unified `DiskArtifactStore` envelope (T40). |
+| tensor-wasm-snapshot | `cuda` | no | GPU-side restore path into a CUDA `UnifiedBuffer`; links `cust`. |
+| tensor-wasm-snapshot | `mmap` | no | `memmap2`-backed snapshot reads. |
+| tensor-wasm-tenant | `strict-cap-binding` | **yes** | Gates the typed `*_strict` admin APIs (cap-to-registry binding is always enforced). |
 | tensor-wasm-tenant | `cuda` | no | Use real CUDA contexts (vs in-process stub). |
+| tensor-wasm-tenant | `loom` | no | Loom concurrency-model test harness. |
+| tensor-wasm-api | `kernel-registry-api` | no | Compiles the `kernels` module and wires `POST/GET /kernels` into the router (B6.4). |
+
+Note: `async-execution` is **not** a build flag — Wasmtime async + epoch interruption is always-on behaviour. NVIDIA MPS-backed shared contexts are likewise selected at runtime (env/config), not via a cargo feature; see [CUDA-SETUP.md](./CUDA-SETUP.md) and [the MPS setup guide](../docs/MPS-SETUP.md).
 
 ## Per-crate quick builds
 
@@ -119,4 +134,4 @@ make ci
 ```
 
 ---
-_Updated for tensor-wasm v0.1.0 (S2 of plan). See [ARCHITECTURE.md](../ARCHITECTURE.md) for the crate dependency graph._
+_Updated for tensor-wasm v0.3.7. See [ARCHITECTURE.md](../ARCHITECTURE.md) for the crate dependency graph._

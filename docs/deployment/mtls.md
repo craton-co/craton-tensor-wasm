@@ -117,7 +117,7 @@ the listener is a `tokio_rustls::TlsAcceptor` wrapped around
 
 ### 3.1 Status today
 
-**TODO (v0.4):** the v0.1 binary does not implement this. The
+**TODO (v0.4):** the v0.3.7 binary does not implement this. The
 listener in [`serve()`](../../crates/tensor-wasm-api/src/server.rs#L106)
 is a plain `TcpListener` and the crate exposes no `tls` feature.
 Architecture A becomes real once the following land:
@@ -690,7 +690,7 @@ in at least one of nginx, Envoy, or Caddy.
 ---
 
 _Status: v0.4 design + operator guide. Architecture B sections are
-runnable today against the v0.1.0 binary; Architecture A sections
+runnable today against the v0.3.7 binary; Architecture A sections
 are a design spec for the v0.4 binary work, marked **TODO (v0.4)**
 at each gap. When the binary work lands, walk this file end-to-end
 and convert every marker into either a finished sentence or a

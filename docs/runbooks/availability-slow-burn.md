@@ -39,7 +39,6 @@ faster alert misses.
 
 ```promql
 # 1. Confirm: is the 30-minute error rate above the alert threshold?
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}
 sum(rate(tensor_wasm_http_requests_total{status=~"5.."}[30m]))
   /
 sum(rate(tensor_wasm_http_requests_total[30m]))
@@ -51,7 +50,6 @@ incident is steady-state, not a recent spike.
 
 ```promql
 # 2. Scope: which route is failing?
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}
 topk(3,
   sum by (route) (
     rate(tensor_wasm_http_requests_total{status=~"5.."}[30m])
@@ -65,7 +63,6 @@ shared dependency (snapshot disk, GPU, auth, DB).
 
 ```promql
 # 3. Compare against the same window yesterday: is this new?
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}
 sum(rate(tensor_wasm_http_requests_total{status=~"5.."}[30m]))
   /
 sum(rate(tensor_wasm_http_requests_total[30m]))

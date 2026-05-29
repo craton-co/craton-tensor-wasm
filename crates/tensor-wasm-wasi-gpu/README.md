@@ -32,4 +32,6 @@ External crates this crate depends on (pinned at workspace root):
 - `dashmap` — concurrent kernel cache keyed by `KernelId`.
 - `cust` (optional) — CUDA driver-API bindings; only linked under `cuda`.
 
-Internal crate dependencies are wired in by later sessions (this crate currently has none).
+Internal crate dependencies:
+- `tensor-wasm-core` — shared core types/traits.
+- `tensor-wasm-mem` — memory management primitives.
