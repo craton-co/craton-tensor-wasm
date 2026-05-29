@@ -175,6 +175,22 @@ impl HttpContext {
         if let Some(path) = &self.tls.ca_cert {
             let pem = std::fs::read(path)
                 .with_context(|| format!("reading --ca-cert file {}", path.display()))?;
+            // `reqwest::Certificate::from_pem` (rustls backend) does NOT error
+            // on input that contains no PEM CERTIFICATE block — it parses zero
+            // certificates and returns Ok, so a bad `--ca-cert` would otherwise
+            // surface only as a confusing connect-time failure. Guard eagerly
+            // here so an invalid file fails fast with an actionable message.
+            const PEM_CERT_MARKER: &[u8] = b"-----BEGIN CERTIFICATE-----";
+            if !pem
+                .windows(PEM_CERT_MARKER.len())
+                .any(|w| w == PEM_CERT_MARKER)
+            {
+                anyhow::bail!(
+                    "--ca-cert {} does not contain a PEM-encoded certificate \
+                     (no `BEGIN CERTIFICATE` block found)",
+                    path.display()
+                );
+            }
             let cert = reqwest::Certificate::from_pem(&pem).with_context(|| {
                 format!(
                     "parsing --ca-cert {} as a PEM-encoded certificate",

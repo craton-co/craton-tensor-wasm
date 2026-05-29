@@ -53,12 +53,33 @@ use tensor_wasm_wasi_gpu::streaming::{
 /// ticker's cadence (10 ms by default), so sub-ms precision in the deadline
 /// would be illusory anyway. Callers needing finer-grained interruption must
 /// shorten [`crate::engine::EngineConfig::epoch_tick`], not the deadline.
+///
+/// The result is clamped to [`MAX_EPOCH_DEADLINE_TICKS`] (not `u64::MAX`)
+/// because `set_epoch_deadline` is *relative*: wasmtime computes
+/// `current_epoch + ticks`, so a `u64::MAX` result overflows once the
+/// background ticker has advanced the epoch.
 fn duration_to_epoch_ticks(d: Duration, tick: Duration) -> u64 {
     let d_ms = d.as_millis();
     let t_ms = tick.as_millis().max(1);
     let ticks_u128 = d_ms.div_ceil(t_ms).max(1);
-    u64::try_from(ticks_u128).unwrap_or(u64::MAX)
+    u64::try_from(ticks_u128)
+        .unwrap_or(MAX_EPOCH_DEADLINE_TICKS)
+        .min(MAX_EPOCH_DEADLINE_TICKS)
 }
+
+/// Overflow-safe sentinel for "effectively no deadline", in epoch ticks.
+///
+/// [`wasmtime::Store::set_epoch_deadline`] takes a deadline **relative** to
+/// the current epoch — internally `current_epoch + ticks`. A `u64::MAX`
+/// sentinel therefore overflows the moment the background epoch ticker has
+/// advanced the counter past 0: in a debug build that is an `attempt to add
+/// with overflow` panic inside wasmtime; in release (overflow checks off) it
+/// wraps to a deadline *in the past*, so the guest is interrupted
+/// immediately. `u64::MAX / 2` is effectively infinite (≈9.2e18 ticks —
+/// millions of years at any realistic cadence) while guaranteeing
+/// `current_epoch + MAX_EPOCH_DEADLINE_TICKS` cannot overflow for the life of
+/// the process.
+const MAX_EPOCH_DEADLINE_TICKS: u64 = u64::MAX / 2;
 
 /// Hard upper bound on how long a Wasm module's `start` function (and any
 /// other code that runs inside [`wasmtime::Instance::new_async`]) is allowed
@@ -1339,7 +1360,10 @@ impl TensorWasmExecutor {
         let tick = self.engine.config().epoch_tick;
         let epoch_deadline_ticks = match cfg.deadline {
             Some(d) => duration_to_epoch_ticks(d, tick),
-            None => u64::MAX,
+            // Overflow-safe "no deadline": `set_epoch_deadline` is relative
+            // (`current_epoch + ticks`), so `u64::MAX` would overflow once the
+            // ticker advances. See [`MAX_EPOCH_DEADLINE_TICKS`].
+            None => MAX_EPOCH_DEADLINE_TICKS,
         };
         let max_start_ticks = {
             let d_ms = MAX_START_FN_DURATION.as_millis();
@@ -2230,7 +2254,14 @@ mod tests {
         let e = ExecError::NotFound(InstanceId(99));
         let b: TensorWasmError = e.into();
         assert!(matches!(b, TensorWasmError::Serialization(_)));
-        assert!(b.to_string().contains("instance not found"));
+        // `TensorWasmError`'s Display is deliberately sanitised and does NOT
+        // echo the inner string (it can carry host paths / pointers from
+        // third-party crates). The raw context is reachable via `inner()`.
+        assert!(
+            b.inner().unwrap_or("").contains("instance not found"),
+            "inner: {:?}",
+            b.inner()
+        );
 
         let e = ExecError::Timeout(TimeoutContext {
             id: InstanceId(1),
