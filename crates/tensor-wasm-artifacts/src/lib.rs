@@ -124,7 +124,7 @@ pub enum ArtifactError {
 /// uncompressed payload; the `get` path recomputes it from the decoded
 /// body and rejects on mismatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ContentHash(pub [u8; 32]);
+pub struct ContentHash([u8; 32]);
 
 impl std::fmt::Display for ContentHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -139,6 +139,19 @@ impl ContentHash {
     /// Compute the content hash of `payload` (BLAKE3 of the uncompressed bytes).
     pub fn of(payload: &[u8]) -> Self {
         ContentHash(blake3::hash(payload).into())
+    }
+
+    /// Wrap 32 raw bytes as a [`ContentHash`]. The bytes are assumed to
+    /// be a BLAKE3 digest; this constructor does no hashing. Used by the
+    /// disk store when reconstructing hashes from on-disk filenames and
+    /// by callers that already hold a digest.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        ContentHash(bytes)
+    }
+
+    /// Borrow the raw 32-byte digest. Counterpart to [`Self::from_bytes`].
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 
     /// Hex representation, equivalent to `format!("{self}")`. Useful at
@@ -170,7 +183,12 @@ pub trait ArtifactStore: Send + Sync {
     /// Enumerate the content hashes currently stored. Order is
     /// implementation-defined; callers that need a deterministic order
     /// must sort the result themselves.
-    fn list(&self) -> Vec<ContentHash>;
+    ///
+    /// Returns [`ArtifactError::Io`] on an underlying enumeration
+    /// failure (e.g. a `read_dir` permissions/I/O fault). This is
+    /// deliberately distinct from an empty result so GC/audit callers
+    /// can tell "store is empty" apart from "could not read the store".
+    fn list(&self) -> Result<Vec<ContentHash>, ArtifactError>;
 }
 
 // =====================================================================
@@ -303,15 +321,22 @@ impl<R: Read> Read for MacReader<'_, R> {
 pub struct DiskArtifactStore {
     dir: PathBuf,
     hmac_key: Zeroizing<[u8; 32]>,
+    /// `blake3(hmac_key)[..8]` rendered as 16 ascii-hex chars, computed
+    /// once in [`Self::new`]. Used as the per-key filename segment by
+    /// `path_for`, `get`, `put`, and `list`; caching it here avoids
+    /// re-hashing the key on every store operation.
+    key_fp_hex: String,
 }
 
 impl DiskArtifactStore {
     /// Construct a disk store rooted at `dir`, signing with `hmac_key`.
     /// The directory is created lazily on the first `put`.
     pub fn new(dir: PathBuf, hmac_key: [u8; 32]) -> Self {
+        let key_fp_hex = key_fingerprint_hex(&hmac_key);
         Self {
             dir,
             hmac_key: Zeroizing::new(hmac_key),
+            key_fp_hex,
         }
     }
 
@@ -321,8 +346,22 @@ impl DiskArtifactStore {
     /// fingerprint segment partitions the namespace per HMAC key so
     /// two stores in the same dir under different keys never collide.
     fn path_for(&self, hash: &ContentHash) -> PathBuf {
-        let key_hex = key_fingerprint_hex(&self.hmac_key);
-        self.dir.join(format!("{}.{}.bin", hash, key_hex))
+        let hash_hex = hash.to_string();
+        // The rendered hash MUST be exactly 64 lowercase ascii-hex chars
+        // before it becomes a path component — `ContentHash`'s `Display`
+        // guarantees this (32 bytes, two hex digits each), but assert it
+        // so a future change to the digest size or formatter can never
+        // silently feed a traversal-shaped or wrong-length segment into
+        // `Path::join`.
+        debug_assert!(
+            hash_hex.len() == 64
+                && hash_hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "ContentHash rendered to an unexpected filename segment: {hash_hex:?}"
+        );
+        let key_hex = &self.key_fp_hex;
+        self.dir.join(format!("{hash_hex}.{key_hex}.bin"))
     }
 }
 
@@ -577,7 +616,13 @@ impl ArtifactStore for DiskArtifactStore {
         // verify the HMAC, and only THEN surface the decode error.
         // That preserves the "BadHmac wins over Decompression on
         // tampered input" invariant the tamper-rejection tests assert.
-        let initial_capacity = cap.min(1024 * 1024);
+        // Size the initial allocation from the compressed body length
+        // (a 4:1 decompression estimate) clamped to the cap, rather than
+        // a fixed 1 MiB regardless of payload size.
+        let initial_capacity = usize::try_from(body_len)
+            .unwrap_or(cap)
+            .saturating_mul(4)
+            .min(cap);
         let mut payload: Vec<u8> = Vec::with_capacity(initial_capacity);
         let mut decode_result: Result<(), ArtifactError> = Ok(());
         {
@@ -727,15 +772,40 @@ impl ArtifactStore for DiskArtifactStore {
         Ok(payload)
     }
 
-    fn list(&self) -> Vec<ContentHash> {
-        let key_hex = key_fingerprint_hex(&self.hmac_key);
-        let suffix = format!(".{}.bin", key_hex);
+    fn list(&self) -> Result<Vec<ContentHash>, ArtifactError> {
+        let suffix = format!(".{}.bin", self.key_fp_hex);
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(e) => e,
-            Err(_) => return Vec::new(),
+            // A missing store directory legitimately means "empty" (the
+            // dir is created lazily on the first `put`). Any other
+            // failure — permissions, I/O — is propagated so GC/audit
+            // callers don't mistake a read fault for an empty store.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                warn!(
+                    target: "tensor_wasm_artifacts",
+                    dir = %self.dir.display(),
+                    error = %e,
+                    "read_dir failed"
+                );
+                return Err(ArtifactError::Io);
+            }
         };
         let mut out = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries {
+            // A per-entry error (e.g. the directory was racing with a
+            // concurrent unlink, or an underlying I/O fault) is a real
+            // enumeration failure, not a skippable filename mismatch —
+            // propagate it rather than silently shortening the listing.
+            let entry = entry.map_err(|e| {
+                warn!(
+                    target: "tensor_wasm_artifacts",
+                    dir = %self.dir.display(),
+                    error = %e,
+                    "read_dir entry failed"
+                );
+                ArtifactError::Io
+            })?;
             let name = match entry.file_name().into_string() {
                 Ok(n) => n,
                 Err(_) => continue,
@@ -769,10 +839,10 @@ impl ArtifactStore for DiskArtifactStore {
                 }
             }
             if ok {
-                out.push(ContentHash(bytes));
+                out.push(ContentHash::from_bytes(bytes));
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -919,6 +989,30 @@ pub fn decode_envelope_from_bytes(
     bytes: &[u8],
     hmac_key: &[u8; 32],
 ) -> Result<Vec<u8>, ArtifactError> {
+    decode_envelope_from_bytes_with_cap(bytes, hmac_key, MAX_DECOMPRESSED_LEN)
+}
+
+/// Decode the unified artifact-store envelope from `bytes`, like
+/// [`decode_envelope_from_bytes`], but with a caller-supplied
+/// `max_decompressed` ceiling instead of the crate-wide
+/// [`MAX_DECOMPRESSED_LEN`].
+///
+/// This exists so a consumer with its own decompressed-size budget — the
+/// snapshot reader's `with_max_decompressed` knob is the motivating
+/// case — can enforce a tighter (or looser) zip-bomb cap than the
+/// default without round-tripping through the disk store. `decode_envelope_from_bytes`
+/// is a thin wrapper that calls this with `max_decompressed =
+/// MAX_DECOMPRESSED_LEN`.
+///
+/// Behaviour, validation order, and error surface are otherwise
+/// identical to [`decode_envelope_from_bytes`]: the only difference is
+/// which ceiling drives the `Take` probe and the post-decode
+/// [`ArtifactError::TooLarge`] check.
+pub fn decode_envelope_from_bytes_with_cap(
+    bytes: &[u8],
+    hmac_key: &[u8; 32],
+    max_decompressed: usize,
+) -> Result<Vec<u8>, ArtifactError> {
     // Minimum-length gate: header + at least one byte of zstd frame + HMAC tag.
     if bytes.len() < ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN {
         return Err(ArtifactError::BadMagic);
@@ -960,12 +1054,17 @@ pub fn decode_envelope_from_bytes(
     // rejected before the buffer grows past `MAX_DECOMPRESSED_LEN`,
     // matching the disk-store streaming reader.
     let body = &prefix[ARTIFACT_HEADER_LEN..];
-    let cap = MAX_DECOMPRESSED_LEN;
+    let cap = max_decompressed;
     let probe_limit = u64::try_from(cap)
         .ok()
         .and_then(|c| c.checked_add(1))
         .unwrap_or(u64::MAX);
-    let mut payload: Vec<u8> = Vec::with_capacity(cap.min(1024 * 1024));
+    // Size the initial allocation from the compressed body length rather
+    // than a fixed 1 MiB: a 4:1 decompression estimate covers typical
+    // tensor-memory payloads, clamped to the cap so a tiny envelope
+    // never reserves more than its ceiling allows.
+    let initial_capacity = body.len().saturating_mul(4).min(cap);
+    let mut payload: Vec<u8> = Vec::with_capacity(initial_capacity);
     let decoder = zstd::stream::read::Decoder::new(body).map_err(|e| {
         warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed (decode_envelope_from_bytes)");
         ArtifactError::Decompression(e.to_string())
@@ -1039,8 +1138,11 @@ impl ArtifactStore for InMemoryArtifactStore {
             .cloned()
             .ok_or_else(|| ArtifactError::NotFound(hash.to_string()))
     }
-    fn list(&self) -> Vec<ContentHash> {
-        self.entries.lock().keys().copied().collect()
+    fn list(&self) -> Result<Vec<ContentHash>, ArtifactError> {
+        // An in-memory map cannot fail to enumerate, so this is
+        // infallible — but the signature matches the trait so callers
+        // treat both stores uniformly.
+        Ok(self.entries.lock().keys().copied().collect())
     }
 }
 
@@ -1061,7 +1163,7 @@ mod tests {
         let store = InMemoryArtifactStore::new([7u8; 32]);
         let hash = store.put(b"payload").unwrap();
         assert_eq!(store.get(&hash).unwrap(), b"payload");
-        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.list().unwrap().len(), 1);
     }
 
     #[test]

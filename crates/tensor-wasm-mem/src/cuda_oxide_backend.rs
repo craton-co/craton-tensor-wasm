@@ -17,7 +17,7 @@
 //!   `tensor-wasm-tenant` written today need no re-typing once the host
 //!   port lands.
 //!
-//! * **`cuda-oxide-host-backend` (W4.1 host port)** — strict superset that
+//! * **`experimental-cuda-oxide-host-backend` (W4.1 host port)** — strict superset that
 //!   additionally pulls in the four cuda-oxide host-side crates
 //!   (`cuda-host`, `cuda-core`, `cuda-device`, `cuda-macros` per the
 //!   `tensor-wasm-mem` `Cargo.toml`). [`Self::allocate`] forwards to the
@@ -28,7 +28,7 @@
 //!   cudarc-backend's [`crate::cudarc_backend`] code path so the two
 //!   parallel backends remain easy to diff during the W4.x parity work.
 //!
-//! See `docs/CUDA-SETUP.md` section "Using the cuda-oxide-host-backend
+//! See `docs/CUDA-SETUP.md` section "Using the experimental-cuda-oxide-host-backend
 //! feature" for the toolchain install matrix that the host-backend
 //! requires.
 //!
@@ -85,7 +85,7 @@ fn leaked_set() -> &'static Mutex<HashSet<u64>> {
 // unreachable and the function genuinely is dead code; the gated allow
 // keeps `-D warnings` happy on contributor boxes that build without the
 // host-backend feature.
-#[cfg_attr(not(feature = "cuda-oxide-host-backend"), allow(dead_code))]
+#[cfg_attr(not(feature = "experimental-cuda-oxide-host-backend"), allow(dead_code))]
 fn record_leak(ptr: u64) {
     leaked_set().lock().insert(ptr);
 }
@@ -101,7 +101,7 @@ pub fn leaked_cuda_allocations() -> Vec<u64> {
 
 /// Sentinel error message returned by every stub call in this module when
 /// the dep-less `cuda-oxide-backend` scaffold is active (i.e. when the
-/// strict-superset `cuda-oxide-host-backend` feature is OFF).
+/// strict-superset `experimental-cuda-oxide-host-backend` feature is OFF).
 ///
 /// Exposed `pub(crate)` so the unit + integration tests can assert against
 /// the exact string without duplicating it. The W4.1 host port leaves this
@@ -111,7 +111,7 @@ pub(crate) const NOT_YET_WIRED: &str =
     "cuda-oxide-backend: allocate not yet wired -- see RFC 0001 v0.4 port";
 
 /// Memory-advice hint passed to `cuMemAdvise` when the
-/// `cuda-oxide-host-backend` feature is on.
+/// `experimental-cuda-oxide-host-backend` feature is on.
 ///
 /// Mirrors the shape of [`crate::advise::Advice`] but is declared locally so
 /// the dep-less scaffold build (without the host crates) still has a
@@ -135,10 +135,10 @@ pub enum CudaOxideAdvice {
 }
 
 // =============================================================================
-// Scaffold path — active when `cuda-oxide-host-backend` is OFF.
+// Scaffold path — active when `experimental-cuda-oxide-host-backend` is OFF.
 // =============================================================================
 
-#[cfg(not(feature = "cuda-oxide-host-backend"))]
+#[cfg(not(feature = "experimental-cuda-oxide-host-backend"))]
 mod scaffold {
     use super::*;
 
@@ -150,7 +150,7 @@ mod scaffold {
     /// [`NOT_YET_WIRED`] sentinel.
     ///
     /// The W4.1 host-backend path replaces this with a real owning
-    /// pointer; see the `cuda-oxide-host-backend`-gated `impl` block
+    /// pointer; see the `experimental-cuda-oxide-host-backend`-gated `impl` block
     /// below for the actual `cuMemAllocManaged` path.
     pub struct CudaOxideUnifiedBuffer {
         /// Size in bytes the caller asked for. Stored so [`Self::len`] is
@@ -179,7 +179,7 @@ mod scaffold {
         /// Scaffold stub. Always returns
         /// `Err(UnifiedError::Cuda(NOT_YET_WIRED.into()))`. The signature
         /// matches the host-backend variant so call sites do not need to
-        /// be re-typed once `cuda-oxide-host-backend` is enabled.
+        /// be re-typed once `experimental-cuda-oxide-host-backend` is enabled.
         pub fn allocate(size: usize) -> Result<Self, UnifiedError> {
             // Intentionally swallow the `size` argument — the host
             // variant uses it. Binding to `_size` keeps the linter quiet
@@ -302,11 +302,26 @@ mod scaffold {
 }
 
 // =============================================================================
-// Host-backend path — active when `cuda-oxide-host-backend` is ON.
+// Host-backend path — active when `experimental-cuda-oxide-host-backend` is ON.
 // =============================================================================
 
-#[cfg(feature = "cuda-oxide-host-backend")]
+#[cfg(feature = "experimental-cuda-oxide-host-backend")]
 mod host_backend {
+    // QUARANTINE: this module is ~350 LOC of `unsafe` FFI written against
+    // an INFERRED, never-compiled cuda-oxide host API (see the `// W4.1:
+    // API surface inferred ... verify` comments throughout). It has never
+    // been built against the real `cuda-bindings`-generated symbols. Until
+    // a LIBCLANG-equipped CI runner has actually compiled this against the
+    // toolkit, enabling the feature must fail LOUDLY rather than emit
+    // unverified unsafe code. The module is only compiled when the feature
+    // is on, so placing the guard at module top means turning the feature
+    // on is the trigger.
+    compile_error!(
+        "experimental-cuda-oxide-host-backend is not yet buildable: the \
+         cuda-oxide host FFI surface is inferred and unverified; see \
+         crates/tensor-wasm-mem/Cargo.toml"
+    );
+
     use super::*;
 
     use std::ptr::NonNull;
@@ -487,9 +502,26 @@ mod host_backend {
         // strong-count fall to zero.
         let fresh = CudaContext::new(ordinal as usize)
             .map_err(|e| UnifiedError::Cuda(format!("CudaContext::new({ordinal}): {e:?}")))?;
+        // L2: on the lost-race path the loser's `fresh` `Arc<CudaContext>`
+        // must be dropped OUTSIDE the cache mutex — dropping the last
+        // strong ref runs `cuDevicePrimaryCtxRelease` under the driver and
+        // we do not want that executing while the lock is held. Capture the
+        // canonical clone plus the (possibly redundant) loser handle, drop
+        // the guard explicitly, then drop the loser. Race-correctness is
+        // unchanged: the winner's `Arc` is pinned in the cache (strong-count
+        // ≥ 1) before the lock is released.
         let mut cache = context_cache().lock();
-        let canonical = cache.entry(ordinal).or_insert(fresh);
-        Ok(Arc::clone(canonical))
+        let (canonical, loser) = match cache.entry(ordinal) {
+            std::collections::hash_map::Entry::Occupied(occupied) => {
+                (Arc::clone(occupied.get()), Some(fresh))
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                (Arc::clone(vacant.insert(fresh)), None)
+            }
+        };
+        drop(cache);
+        drop(loser);
+        Ok(canonical)
     }
 
     /// A contiguous CUDA Unified Memory region allocated via cuda-oxide.
@@ -878,10 +910,10 @@ mod host_backend {
 // - `leaked_cuda_allocations()` above is the operator audit surface.
 // =============================================================================
 
-#[cfg(not(feature = "cuda-oxide-host-backend"))]
+#[cfg(not(feature = "experimental-cuda-oxide-host-backend"))]
 pub use scaffold::{apply_advice, prefetch_async, CudaOxideUnifiedBuffer};
 
-#[cfg(feature = "cuda-oxide-host-backend")]
+#[cfg(feature = "experimental-cuda-oxide-host-backend")]
 pub use host_backend::{
     apply_advice, cuda_oxide_free_failures, prefetch_async, CudaOxideUnifiedBuffer,
 };
@@ -906,7 +938,7 @@ mod tests {
     /// in that build `allocate(1024)` either succeeds (on a CUDA box)
     /// or returns a real driver error, never the `NOT_YET_WIRED`
     /// sentinel.
-    #[cfg(not(feature = "cuda-oxide-host-backend"))]
+    #[cfg(not(feature = "experimental-cuda-oxide-host-backend"))]
     #[test]
     fn allocate_returns_not_yet_wired_error() {
         let err = CudaOxideUnifiedBuffer::allocate(1024).expect_err("scaffold must error");
@@ -923,7 +955,7 @@ mod tests {
     /// cudarc-backend. This runs on host-only CI because zero-size
     /// rejection happens entirely in safe Rust before any
     /// `cuMemAllocManaged` invocation.
-    #[cfg(feature = "cuda-oxide-host-backend")]
+    #[cfg(feature = "experimental-cuda-oxide-host-backend")]
     #[test]
     fn allocate_zero_size_rejected_without_driver() {
         let err = CudaOxideUnifiedBuffer::allocate(0).expect_err("zero should be rejected");

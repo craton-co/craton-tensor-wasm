@@ -43,7 +43,7 @@ use tensor_wasm_mem::cuda_oxide_backend::CudaOxideUnifiedBuffer;
 // `UnifiedError` is only referenced by the scaffold-only negative-witness
 // test below; under `cuda-oxide-host-backend` the import would be unused
 // and would warn under `-D warnings`.
-#[cfg(not(feature = "cuda-oxide-host-backend"))]
+#[cfg(not(feature = "experimental-cuda-oxide-host-backend"))]
 use tensor_wasm_mem::unified::UnifiedError;
 
 mod common;
@@ -84,7 +84,7 @@ fn cuda_oxide_feature_does_not_perturb_snapshot_wire_format() {
 /// Skipped under `cuda-oxide-host-backend` because that build *does*
 /// have a working `allocate` (which either succeeds or returns a real
 /// driver error — never the sentinel).
-#[cfg(not(feature = "cuda-oxide-host-backend"))]
+#[cfg(not(feature = "experimental-cuda-oxide-host-backend"))]
 #[test]
 fn cuda_oxide_scaffold_allocate_blocks_snapshot_producer_path() {
     let err = CudaOxideUnifiedBuffer::allocate(CONFORMANCE_WASM_LEN)
@@ -117,7 +117,7 @@ fn cuda_oxide_scaffold_allocate_blocks_snapshot_producer_path() {
 /// W4.1 feature). Marked `#[ignore]` per the repo convention; runs on
 /// the S22 CUDA runner via `cargo test --features
 /// cuda-oxide-host-backend -- --ignored`.
-#[cfg(feature = "cuda-oxide-host-backend")]
+#[cfg(feature = "experimental-cuda-oxide-host-backend")]
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn cuda_oxide_host_backend_snapshot_round_trip_on_device() {

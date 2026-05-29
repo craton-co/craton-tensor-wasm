@@ -36,8 +36,8 @@ fn distinct_keys_produce_distinct_files() {
     );
 
     // Each store sees only its own entry.
-    let list_a = store_a.list();
-    let list_b = store_b.list();
+    let list_a = store_a.list().expect("list A");
+    let list_b = store_b.list().expect("list B");
     assert_eq!(list_a.len(), 1, "store A sees only its own file");
     assert_eq!(list_b.len(), 1, "store B sees only its own file");
 }

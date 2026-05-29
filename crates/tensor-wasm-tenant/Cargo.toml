@@ -18,8 +18,6 @@ all-features = false
 features = []
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lib]
-
 [dependencies]
 tensor-wasm-core = { workspace = true }
 tokio.workspace = true
@@ -54,20 +52,13 @@ path = "tests/cap_binding_strict.rs"
 required-features = ["strict-cap-binding"]
 
 [features]
-default = []
-mps = []
+default = ["strict-cap-binding"]
 cuda = ["dep:cust"]
 loom = ["dep:loom"]
-# No-op feature flag that gates docs/code referencing types only available
-# in downstream crates (e.g. the GPU memory pool exposed by `tensor-wasm-mem`).
-# Enabling this on the tenant crate alone adds NO new dependency — it just
-# unlocks the `#[cfg(feature = "gpu-mem-pool")]` doc paths so a workspace
-# build that also enables `tensor-wasm-mem/gpu-mem-pool` sees a consistent
-# cross-crate surface.
-gpu-mem-pool = []
 # When enabled, `TenantCapability` is bound to the `TenantRegistry` that
 # minted it: a cap from registry A is rejected by registry B even if both
-# caps name the same `TenantId`. Gated behind a feature so the v0.3 line
-# remains source-compatible with call sites that mix caps across
-# registries (e.g. test harnesses); v0.4 will flip this on by default.
+# caps name the same `TenantId`. ON by default — strict cap binding is the
+# recommended posture for multi-tenant deployments. Disable
+# (`default-features = false`) only for legacy call sites that intentionally
+# mix caps across registries (e.g. some test harnesses).
 strict-cap-binding = []

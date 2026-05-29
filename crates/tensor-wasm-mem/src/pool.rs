@@ -277,6 +277,19 @@ impl UnifiedMemoryPool {
         // unavoidable for correctness given the recycle discipline. Skipping
         // it would re-open the H1 cross-tenant disclosure window.
         //
+        // PERF note (considered, intentionally NOT applied here): the
+        // `UnifiedBuffer` visible-window path can zero only `[0, minimum)` and
+        // lean on `grow_to`'s tail zero-fill because the bytes past `minimum`
+        // are not host-visible until a later `grow_to` zeroes them on the way
+        // in. That optimization does NOT transfer to the pool layer: a
+        // `PoolAllocation` exposes the FULL carved `[0, size)` range to the
+        // caller immediately (there is no `minimum`/visible-window narrowing
+        // and no `grow_to` step that would zero a tail before first read), so
+        // every byte we hand out is reachable right away. Zeroing only a
+        // prefix here would leave the recycled tail observable and re-open the
+        // H1 cross-tenant disclosure window — a soundness regression. The
+        // whole-region `memset` is therefore the correct conservative choice.
+        //
         // SAFETY: `aligned_bump + size <= self.slab.len()` (checked above);
         // the slab's pointer is non-null and points to `len()` valid bytes
         // for the lifetime of `&self`; the bump allocator guarantees the

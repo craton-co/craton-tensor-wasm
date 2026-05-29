@@ -13,8 +13,6 @@ readme = "README.md"
 keywords = ["wasm", "cache", "content-addressed", "hmac", "artifact"]
 categories = ["caching", "encoding"]
 
-[lib]
-
 [dependencies]
 # Content addressing — payloads are keyed by BLAKE3 of the uncompressed bytes,
 # and the filename's key-fingerprint prefix is also BLAKE3 of the HMAC key.
@@ -26,12 +24,6 @@ sha2 = "0.10"
 # Constant-time signature comparison — defends the verifier against the
 # byte-by-byte timing oracle that `==` on `[u8; 32]` would expose.
 subtle = "2"
-# Envelope payload encoding — the artifact format itself frames a single
-# zstd-compressed byte string; serde+bincode are pulled in so the public
-# `ArtifactMetadata` (added in v0.4 alongside the writer/snapshot
-# migration) can ride the same envelope without a second framing layer.
-serde = { workspace = true }
-bincode = { workspace = true }
 # Streaming compression for the payload body. Level 3 matches the
 # snapshot writer's `DEFAULT_ZSTD_LEVEL`; the disk store inherits the
 # same default.

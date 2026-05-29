@@ -384,6 +384,16 @@ pub struct KernelCache {
     /// `tensor_wasm_jit_cache_misses_total`. `Arc`-shared so cache clones
     /// agree on the count.
     cache_misses_total: Arc<AtomicU64>,
+    /// Cumulative count of entries refused on `get` because their
+    /// `integrity_hash` failed verification (L1 recompute mismatch, an
+    /// all-zero hash on the verify-skip path, or an L2 disk integrity
+    /// failure). These rejections also bump `cache_misses_total`, but this
+    /// dedicated counter lets operators distinguish ordinary cache misses
+    /// from *tamper attempts* — a rising
+    /// `tensor_wasm_jit_cache_integrity_reject_total` is an alarm signal,
+    /// not just a cold cache. Exposed via [`Self::integrity_reject_total`].
+    /// `Arc`-shared so cache clones agree on the count.
+    integrity_reject_total: Arc<AtomicU64>,
 }
 
 impl KernelCache {
@@ -415,6 +425,7 @@ impl KernelCache {
             verify_skipped_total: Arc::new(AtomicU64::new(0)),
             cache_hits_total: Arc::new(AtomicU64::new(0)),
             cache_misses_total: Arc::new(AtomicU64::new(0)),
+            integrity_reject_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -457,7 +468,13 @@ impl KernelCache {
     /// code).
     #[must_use]
     pub fn with_disk_persistence(mut self, cfg: DiskCacheConfig) -> Self {
-        self.disk = Some(Arc::new(DiskCache::new(cfg)));
+        // Share the integrity-rejection counter with the disk layer so an
+        // L2 tamper rejection bumps the same
+        // `tensor_wasm_jit_cache_integrity_reject_total` as an L1 one.
+        self.disk = Some(Arc::new(DiskCache::new(
+            cfg,
+            Arc::clone(&self.integrity_reject_total),
+        )));
         self
     }
 
@@ -593,6 +610,7 @@ impl KernelCache {
                          evicting and refusing to return it"
                     );
                     self.storage.remove(key);
+                    self.integrity_reject_total.fetch_add(1, Ordering::Relaxed);
                     self.cache_misses_total.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
@@ -613,6 +631,7 @@ impl KernelCache {
                          CachedKernel::new — evicting and refusing to return it"
                     );
                     self.storage.remove(key);
+                    self.integrity_reject_total.fetch_add(1, Ordering::Relaxed);
                     self.cache_misses_total.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
@@ -767,6 +786,19 @@ impl KernelCache {
         self.cache_misses_total.load(Ordering::Relaxed)
     }
 
+    /// Cumulative count of entries refused on `get` because they failed
+    /// integrity verification — an L1 BLAKE3 recompute mismatch, an
+    /// all-zero `integrity_hash` on the verify-skip path, or an L2 disk
+    /// integrity failure (artifact-store HMAC/content-hash mismatch,
+    /// inner-envelope magic/header/length/UTF-8 corruption). These also
+    /// bump [`Self::cache_misses_total`], but this dedicated counter lets
+    /// operators alarm on *tamper attempts* specifically rather than
+    /// drown them in ordinary cold-cache misses. Surface on the
+    /// Prometheus counter `tensor_wasm_jit_cache_integrity_reject_total`.
+    pub fn integrity_reject_total(&self) -> u64 {
+        self.integrity_reject_total.load(Ordering::Relaxed)
+    }
+
     /// Test-only insert that skips the `put`-side integrity check.
     ///
     /// `put` rejects any `CachedKernel` whose stored `integrity_hash`
@@ -778,13 +810,19 @@ impl KernelCache {
     /// `get`. This entry-point exists for that test only — it is
     /// `#[doc(hidden)]` (excluded from generated docs and rustdoc search)
     /// and named with a `__test_only_` prefix to broadcast "do NOT call
-    /// this from production code". It is intentionally not behind a
-    /// `#[cfg(test)]` or feature gate because integration tests under
-    /// `crates/.../tests/` compile as external consumers of the library
-    /// and therefore cannot see `cfg(test)` items.
+    /// this from production code". Integration tests under
+    /// `crates/.../tests/` compile as external consumers of the library and
+    /// therefore cannot see `cfg(test)` items, so this cannot be gated on
+    /// `cfg(test)`. It is instead gated behind the dedicated
+    /// `__unstable-test-internals` cargo feature (jit M2): without that
+    /// feature the symbol does not exist, so a downstream crate cannot use
+    /// it to install a `CachedKernel` with a forged/zeroed integrity hash
+    /// and thereby bypass the S-3 integrity check. The double-underscore
+    /// feature name signals it is unstable and not covered by semver.
     ///
     /// Production code MUST go through [`Self::put`].
     #[doc(hidden)]
+    #[cfg(feature = "__unstable-test-internals")]
     pub fn __test_only_insert_unchecked(&self, key: CacheKey, kernel: CachedKernel) {
         // T20 perf: storage holds `Arc<CachedKernel>`; wrap on insert.
         self.storage.insert(key, Arc::new(kernel));
@@ -954,6 +992,14 @@ struct DiskCache {
     /// already holds the cache behind `Arc<DiskCache>`, this is the
     /// only field whose backend benefits from sharing.
     store: Arc<DiskArtifactStore>,
+    /// Shared clone of the owning [`KernelCache`]'s integrity-rejection
+    /// counter (backs `tensor_wasm_jit_cache_integrity_reject_total`).
+    /// Bumped on the L2 read path when an entry is refused for a genuine
+    /// integrity failure (artifact-store HMAC/content-hash mismatch or an
+    /// inner-envelope magic mismatch) — i.e. a tamper signal, distinct
+    /// from a benign miss (missing sidecar / legacy magic) which leaves
+    /// this untouched.
+    integrity_reject_total: Arc<AtomicU64>,
 }
 
 /// V2 magic for the inner kernel-manifest envelope wrapped inside each
@@ -975,7 +1021,7 @@ const SIDECAR_MAGIC_V1: &[u8; 16] = b"TWJIT-IDX-v1\0\0\0\0";
 const SIDECAR_LEN_V1: usize = 16 + 32;
 
 impl DiskCache {
-    fn new(mut cfg: DiskCacheConfig) -> Self {
+    fn new(mut cfg: DiskCacheConfig, integrity_reject_total: Arc<AtomicU64>) -> Self {
         // Move the key bytes into a `Zeroizing` newtype so the long-lived
         // copy is wiped on `DiskCache::drop`. We cannot partially move
         // fields out of `cfg` directly because `DiskCacheConfig`
@@ -985,17 +1031,23 @@ impl DiskCache {
         // state before its `Drop::drop` runs and zeroizes the (now
         // already-defaulted) `hmac_key` array a second time.
         let dir = std::mem::take(&mut cfg.dir);
-        let key_bytes = std::mem::take(&mut cfg.hmac_key);
+        // Wrap the moved-out key in `Zeroizing` *immediately* (jit L4) so the
+        // stack copy is wiped when this function returns, rather than left as
+        // a plain `[u8; 32]` lingering in the frame after both consumers have
+        // taken their own copies.
+        let key_bytes = Zeroizing::new(std::mem::take(&mut cfg.hmac_key));
         // The artifact store gets its own copy of the same key so its
         // streaming HMAC matches the one the sidecar's path-prefix
         // fingerprint will agree with. Both copies are wrapped in
         // `Zeroizing` (the artifact store wraps internally) so neither
-        // construction-time bytes linger after drop.
-        let store = Arc::new(DiskArtifactStore::new(dir.clone(), key_bytes));
+        // construction-time bytes linger after drop. `*key_bytes` derefs the
+        // `Zeroizing` to hand the store its by-value `[u8; 32]`.
+        let store = Arc::new(DiskArtifactStore::new(dir.clone(), *key_bytes));
         Self {
             dir,
-            hmac_key: Zeroizing::new(key_bytes),
+            hmac_key: key_bytes,
             store,
+            integrity_reject_total,
         }
     }
 
@@ -1172,7 +1224,7 @@ impl DiskCache {
         }
         let mut hash_bytes = [0u8; 32];
         hash_bytes.copy_from_slice(&sidecar[16..48]);
-        let content_hash = ContentHash(hash_bytes);
+        let content_hash = ContentHash::from_bytes(hash_bytes);
 
         // ---- Streaming-verified blob fetch via the artifact store. ----
         //
@@ -1194,6 +1246,12 @@ impl DiskCache {
                 return Ok(None);
             }
             Err(e) => {
+                // Anything that is not a clean NotFound — BadHmac,
+                // HashMismatch, decompression-bomb cap, … — is a genuine
+                // integrity failure (tamper signal), so bump the dedicated
+                // integrity-rejection counter in addition to the call
+                // site's miss counter.
+                self.integrity_reject_total.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     target: "tensor_wasm_jit::cache",
                     file = %sidecar_path.display(),
@@ -1215,6 +1273,11 @@ impl DiskCache {
             return Ok(None);
         }
         if &envelope[..16] != DISK_CACHE_MAGIC_V2 {
+            // The artifact store already HMAC-verified the blob, so a bad
+            // envelope magic here means the *verified* bytes are not a
+            // kernel envelope — corruption/tamper inside the signed
+            // payload. Count it as an integrity rejection.
+            self.integrity_reject_total.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 target: "tensor_wasm_jit::cache",
                 file = %sidecar_path.display(),
@@ -1245,6 +1308,10 @@ impl DiskCache {
         let block_x_on_disk = u32::from_le_bytes(block_x_bytes);
         let ptx_len_on_disk = u64::from_le_bytes(len_bytes) as usize;
         if fingerprint_on_disk != key.blueprint || sm_version_on_disk != key.sm_version {
+            // Fires only on a HMAC-verified blob whose header does not match
+            // the requested key — a hand-edited sidecar pointing at a
+            // foreign blob. Integrity rejection.
+            self.integrity_reject_total.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 target: "tensor_wasm_jit::cache",
                 file = %sidecar_path.display(),
@@ -1255,6 +1322,9 @@ impl DiskCache {
         let ptx_start = DISK_CACHE_HEADER_LEN_V2;
         let ptx_end = ptx_start.saturating_add(ptx_len_on_disk);
         if ptx_end > envelope.len() {
+            // Declared length overruns the verified envelope — structural
+            // corruption inside the signed payload. Integrity rejection.
+            self.integrity_reject_total.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 target: "tensor_wasm_jit::cache",
                 file = %sidecar_path.display(),
@@ -1265,6 +1335,8 @@ impl DiskCache {
         let ptx_text = match std::str::from_utf8(&envelope[ptx_start..ptx_end]) {
             Ok(s) => s.to_string(),
             Err(_) => {
+                // Non-UTF-8 PTX in a verified blob — corruption/tamper.
+                self.integrity_reject_total.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     target: "tensor_wasm_jit::cache",
                     file = %sidecar_path.display(),

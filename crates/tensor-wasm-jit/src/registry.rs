@@ -575,7 +575,16 @@ impl DiskRegistry {
         // and re-populate the keymap. Best-effort: a blob that fails
         // any check is logged and skipped — we'd rather come up with a
         // partially-populated keymap than refuse to boot.
-        for hash in artifact_store.list() {
+        let hashes = artifact_store.list().map_err(|e| {
+            tracing::warn!(
+                target: "tensor_wasm_jit::registry",
+                error = %e,
+                "restart-recovery: artifact store list failed; refusing to boot with an \
+                 unknown-completeness keymap"
+            );
+            RegistryError::Storage(e.to_string())
+        })?;
+        for hash in hashes {
             let raw = match artifact_store.get(&hash) {
                 Ok(bytes) => bytes,
                 Err(e) => {

@@ -254,6 +254,18 @@ impl OpenAiError {
         }
     }
 
+    /// Override the machine-readable `code` on an existing envelope.
+    ///
+    /// Used by the translator to stamp a more specific code
+    /// (e.g. `unsupported_parameter`) onto an `invalid_request` envelope
+    /// while keeping its `type` / `param` / status mapping intact — an
+    /// `invalid_request_error` with any code other than `model_not_found`
+    /// still maps to `400` in [`OpenAiError::into_response`].
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.error.code = Some(code.to_string());
+        self
+    }
+
     /// Construct a `model_not_found` envelope for an unknown model id.
     ///
     /// Mirrors the OpenAI `404 model_not_found` response shape so SDKs
@@ -533,6 +545,26 @@ async fn run_translated(
             .into_response();
         }
     };
+
+    // Honesty: the executor has no input channel for the prompt bytes in
+    // v0.4 (numeric WasmArg only; no stdin / argv / input stream), so a
+    // non-empty prompt is dropped on the floor before the guest runs.
+    // The translator already preserves the prompt + its length on
+    // `TranslatedRequest`; warn once per process so operators are not
+    // misled into thinking the prompt reached the guest. See
+    // `openai_translator.rs` § "Prompt → guest argv".
+    if !translated.prompt.is_empty() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                target: "tensor_wasm_api::openai",
+                prompt_len = translated.prompt_len_hint,
+                "OpenAI prompt is not delivered to the guest in v0.4: the executor exposes no \
+                 string/bytes input channel. The guest runs argument-less and must produce its \
+                 output via wasi:tensor/host.emit-chunk. This warning is logged once per process.",
+            );
+        });
+    }
 
     if translated.stream {
         run_streaming(
@@ -825,6 +857,22 @@ enum OpenAiStreamState {
 
 /// Build one `data: { ... }` SSE event carrying a single OpenAI
 /// `chat.completion.chunk` (or `text_completion`) delta.
+///
+/// SECURITY (control-byte / escape-sequence hazard): the guest's emitted
+/// bytes are forwarded verbatim — they are decoded with
+/// `String::from_utf8_lossy` and embedded directly in the JSON `text` /
+/// `delta.content` field without sanitisation. Per `docs/STREAMING.md`,
+/// the host does NOT strip control bytes or ANSI / terminal escape
+/// sequences from guest output; a malicious or buggy guest can therefore
+/// emit NULs, ANSI escapes, or other control characters that flow
+/// straight through to the client. JSON string-escaping (applied by
+/// `serde_json` when the payload is serialised) neutralises structural
+/// injection into the SSE frame, but does not neutralise terminal escape
+/// sequences once a client un-escapes and prints the content. Sanitising
+/// for display is the client's responsibility (mirrors the native
+/// `/invoke-stream` chunked branch in `routes.rs`, where the CLI's T18
+/// sanitisation handles received text). We deliberately do not alter the
+/// stream bytes here so byte-exact, non-text payloads survive the trip.
 fn make_chunk_event(
     id: &str,
     created: u64,

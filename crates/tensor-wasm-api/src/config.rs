@@ -20,34 +20,60 @@
 //!
 //! ## Env-var schema
 //!
-//! | Variable                                       | Format         | Default | Meaning                                                                                                            |
+//! **Both variables below are currently INERT / forward-looking.** They
+//! are parsed and validated at startup *only* by [`AppConfig::from_env`],
+//! which itself is not yet called by any production code path: the
+//! `build_router*` builders in [`crate::server`] never construct an
+//! [`AppConfig`], and no `/snapshot/*` route exists today. Setting them
+//! has NO runtime effect on the running gateway beyond a one-shot startup
+//! log line (and a hard parse error if malformed). The "Meaning" column
+//! describes the *intended* behaviour once the snapshot routes land — see
+//! the Status section.
+//!
+//! | Variable                                       | Format         | Default | Meaning (FORWARD-LOOKING — not yet consumed by any route)                                                          |
 //! |------------------------------------------------|----------------|---------|--------------------------------------------------------------------------------------------------------------------|
-//! | `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`            | hex (64 chars) | unset   | When set, snapshot routes HMAC-SHA256 sign on save and verify on restore. Malformed values are a hard parse error. |
-//! | `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE`   | `true`/`false` | `false` | When `true`, restore refuses unsigned (v2) snapshots even if a key is configured.                                  |
+//! | `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`            | hex (64 chars) | unset   | *When the routes ship:* snapshot save HMAC-SHA256-signs and restore verifies. Malformed values are a hard parse error today. |
+//! | `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE`   | `true`/`false` | `false` | *When the routes ship:* restore refuses unsigned (v2) snapshots even if a key is configured.                       |
 //!
 //! ## Status
 //!
 //! The `/snapshot/save` and `/snapshot/restore` HTTP routes are not yet
 //! wired into [`crate::server::build_router`] (see
 //! `crates/tensor-wasm-cli/src/cmd/snapshot.rs` for the CLI shim that
-//! returns `FEATURE_NOT_EXPOSED` today). Landing the env knob ahead of
-//! the routes lets operators bake the secret into their deployment
-//! manifests now, so when the routes ship in v0.4 they pick the key up
-//! automatically with no config-management churn.
+//! returns `FEATURE_NOT_EXPOSED` today), and [`AppConfig::from_env`] has
+//! no production caller, so the key is a *dead knob* at runtime right
+//! now. The parsing/validation is retained deliberately: landing the env
+//! knob ahead of the routes lets operators bake the secret into their
+//! deployment manifests now, so when the routes ship in v0.4 they pick
+//! the key up automatically with no config-management churn. Do not
+//! mistake the presence of this module for a wired feature — until a
+//! `/snapshot/*` route calls `AppConfig::from_env`, setting either
+//! variable does nothing beyond startup validation.
 
 use std::fmt;
 
-/// Environment variable carrying the hex-encoded HMAC-SHA256 key used
-/// for signing and verifying snapshot blobs.
+/// Environment variable carrying the hex-encoded HMAC-SHA256 key
+/// *intended* for signing and verifying snapshot blobs.
+///
+/// **INERT today.** No route consumes this value: the snapshot routes do
+/// not exist yet and [`AppConfig::from_env`] (the only reader) has no
+/// production caller. Setting it has no runtime effect beyond startup
+/// validation. See the module-level docs for the forward-looking
+/// rationale on why the knob is parsed ahead of the routes.
 ///
 /// 64 lowercase or uppercase hex characters (32 bytes). Any other length
 /// or non-hex character is a hard parse error from
 /// [`AppConfig::from_env`].
 pub const ENV_SNAPSHOT_HMAC_KEY: &str = "TENSOR_WASM_API_SNAPSHOT_HMAC_KEY";
 
-/// Environment variable that, when set to `true` (case-insensitive), makes
-/// snapshot restore refuse v2 (unsigned) snapshots. Defaults to `false`
-/// for backwards compatibility with existing v2 archives.
+/// Environment variable that, *once the snapshot routes land*, will make
+/// snapshot restore refuse v2 (unsigned) snapshots when set to `true`
+/// (case-insensitive). Defaults to `false` for backwards compatibility
+/// with existing v2 archives.
+///
+/// **INERT today** — like [`ENV_SNAPSHOT_HMAC_KEY`], parsed but not
+/// consumed by any route. Setting it has no runtime effect beyond startup
+/// validation and a one-shot warning when it is `true` with no key set.
 pub const ENV_SNAPSHOT_REQUIRE_SIGNATURE: &str = "TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE";
 
 /// Byte length of the HMAC-SHA256 key. Fixed by the algorithm.

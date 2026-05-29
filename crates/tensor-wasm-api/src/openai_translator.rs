@@ -33,15 +33,66 @@
 //!
 //! The translator returns a [`TranslatedRequest`] carrying the resolved
 //! function id, the assembled prompt text, the prompt's byte length
-//! (`prompt_len_hint`), and an `args` vector. For v0.4 the args vector
-//! is empty so the guest's standard WASI command `_start () -> ()`
-//! export links cleanly; the prompt length is preserved on the struct
-//! for a future revision that promotes it to a typed `i32` argument
-//! once the host-pre-fills-guest-memory plumbing lands. v0.4 guests
-//! generate their response via the T34
-//! `wasi:tensor/host.emit-chunk` host function; the handler drains
-//! the receiver and surfaces the emitted bytes as the completion
-//! text.
+//! (`prompt_len_hint`), and an `args` vector.
+//!
+//! **Executor input-channel constraint (why the prompt cannot reach the
+//! guest yet).** The shared
+//! [`tensor_wasm_exec::executor::TensorWasmExecutor`] accepts input only
+//! as a slice of numeric [`WasmArg`] values (`i32`/`i64`/`f32`/`f64` —
+//! the four core wasm value types; see
+//! [`tensor_wasm_exec::executor::WasmArg`]). There is **no string / bytes
+//! arg variant, no stdin, and no WASI argv**, and the
+//! [`StreamingContext`](tensor_wasm_wasi_gpu::streaming::StreamingContext)
+//! is output-only (guest → host emit channel). The prompt *bytes*
+//! therefore have no channel into the guest through the current
+//! executor; the host-pre-fills-guest-memory plumbing that would carry
+//! them lives in `tensor-wasm-exec` and is a future revision.
+//!
+//! Given that, the translator does **not** silently pretend the prompt
+//! was delivered. Two things happen instead:
+//!
+//! * The assembled prompt and its byte length are preserved on
+//!   [`TranslatedRequest`] (`prompt` / `prompt_len_hint`) so the handler
+//!   in `openai.rs` can log / surface them and a follow-up revision can
+//!   thread them once the input channel exists.
+//! * [`TranslatedRequest::args`] is left **empty**, deliberately, and
+//!   for a load-bearing reason: the executor's `call_export_with_args`
+//!   uses wasmtime's *dynamic* `Func::call_async` path for any non-empty
+//!   arg slice, which validates the param arity against the export's
+//!   declared signature **exactly**. The standard WASI command export is
+//!   `_start () -> ()`; handing it even a single `i32` would make
+//!   wasmtime reject the call (`ExecError::Wasmtime`) and break every
+//!   off-the-shelf guest. The empty-args path takes the typed
+//!   `func.typed::<(), ()>()` fast path that those guests rely on —
+//!   identical to how `routes.rs`'s `/invoke` runs an argument-less body.
+//!   So lowering `prompt_len_hint` into `args` is *not* a safe no-op; it
+//!   is an active regression, and we do not do it.
+//!
+//! The net honest position for v0.4: the prompt does not yet reach the
+//! guest, this is an executor limitation rather than a translator bug,
+//! and the handler emits a one-shot warning
+//! ([`crate::openai`]) when a non-empty prompt is dropped so operators
+//! are not misled. v0.4 guests generate their response via the T34
+//! `wasi:tensor/host.emit-chunk` host function; the handler drains the
+//! receiver and surfaces the emitted bytes as the completion text.
+//!
+//! ## Unsupported sampling knobs
+//!
+//! `max_tokens`, `temperature`, `n`, `echo`, and `tools` are parsed off
+//! the wire but the executor exposes no knob for any of them. Rather
+//! than silently ignore a caller's explicit setting (which would make
+//! the gateway lie about honouring it), the translator returns a clear
+//! `400 invalid_request_error` (`code: "unsupported_parameter"`,
+//! `param` naming the field) whenever one of these is set to a value the
+//! gateway cannot satisfy.
+//!
+//! A value that coincides with a no-op default is accepted so common
+//! SDK boilerplate still works: `temperature: 1.0`, `n: 1`,
+//! `echo: false`, and an empty / null / absent `tools` all translate
+//! cleanly. `max_tokens` has no honourable value — we cannot cap
+//! generation — so any explicit `max_tokens` is rejected. This is
+//! revisited once the executor grows the corresponding sampling
+//! controls.
 //!
 //! ## Chat → prompt
 //!
@@ -152,26 +203,35 @@ pub fn model_map_from_env() -> ModelMap {
 /// fully-assembled prompt text, and the synthetic [`WasmArg`] vector to
 /// pass into `call_export_with_args`.
 ///
-/// **v0.4 args policy:** the `args` vector is empty so the standard
-/// WASI command `_start () -> ()` export signature works out of the
-/// box. The prompt length is preserved in `prompt_len_hint` so a
-/// future revision that lands the host-pre-fills-guest-memory
-/// plumbing can promote it to an `i32` arg without churning the
-/// translator API surface. v0.4 guests should either be fixed-output
-/// or stream their reply via `wasi:tensor/host.emit-chunk` (T34) — the
-/// host buffers / forwards every emitted chunk.
+/// **v0.4 args policy:** the `args` vector is empty, deliberately. The
+/// standard WASI command export is `_start () -> ()`, and the executor's
+/// `call_export_with_args` switches to wasmtime's dynamic call path for
+/// any non-empty arg slice — which validates param arity against the
+/// export signature exactly and would reject a `()`-arity guest handed
+/// an argument. The prompt bytes also have no input channel into the
+/// guest today (numeric args only; no stdin / argv / input stream). So
+/// the prompt is preserved on `prompt` / `prompt_len_hint` for the
+/// handler to surface, but is **not** lowered into `args`. See the
+/// module-level "Prompt → guest argv" section for the full rationale.
+/// v0.4 guests stream their reply via `wasi:tensor/host.emit-chunk`
+/// (T34) — the host buffers / forwards every emitted chunk.
 #[derive(Debug, Clone)]
 pub struct TranslatedRequest {
     /// Resolved function id.
     pub function_id: Uuid,
     /// Fully-assembled prompt text (concatenated messages array for
-    /// `/v1/chat/completions`).
+    /// `/v1/chat/completions`). Preserved for the handler to log /
+    /// surface; the executor has no channel to deliver it to the guest
+    /// in v0.4.
     pub prompt: String,
     /// Byte length of the assembled prompt, clamped to `i32::MAX`.
-    /// Reserved for a future revision that passes the prompt length
-    /// into the guest as a typed argument; not used by v0.4.
+    /// Preserved so the handler can report how much prompt text was
+    /// dropped and a future revision can promote it once the
+    /// host-pre-fills-guest-memory plumbing lands.
     pub prompt_len_hint: i32,
-    /// Args to pass into the executor. v0.4 ships empty.
+    /// Args to pass into the executor. Empty in v0.4 so the standard
+    /// `_start () -> ()` guest links via the typed fast path; see the
+    /// struct-level note.
     pub args: Vec<WasmArg>,
     /// `true` if the original request had `stream: true`.
     pub stream: bool,
@@ -246,19 +306,26 @@ pub fn assemble_chat_prompt(messages: &[ChatMessage]) -> String {
 ///
 /// Returns `Err(OpenAiError)` with the OpenAI 404 envelope
 /// (`type: "invalid_request_error"`, `code: "model_not_found"`) when
-/// `req.model` is not present in the `model_map`.
+/// `req.model` is not present in the `model_map`, or the OpenAI 400
+/// envelope (`code: "unsupported_parameter"`) when an unsupported
+/// sampling knob (`max_tokens` / `temperature` / `n` / `echo`) is set
+/// to a non-default value — see [`reject_unsupported_knob`].
 ///
-/// Args policy (v0.4): an empty `Vec<WasmArg>` is returned because
-/// the typical `_start () -> ()` WASI command export takes no
-/// arguments. The prompt length is preserved in the
-/// [`TranslatedRequest::prompt_len_hint`] field so a future revision
-/// that lands the host-pre-fills-guest-memory plumbing can promote it
-/// to an `i32` arg without breaking existing guests.
+/// Args policy (v0.4): an empty `Vec<WasmArg>` is returned — see
+/// [`TranslatedRequest`] for why the prompt is preserved on the struct
+/// but not lowered into `args`.
 pub fn translate_completions_request(
     req: &CompletionsRequest,
     model_map: &HashMap<String, Uuid>,
 ) -> Result<TranslatedRequest, OpenAiError> {
     let function_id = lookup_model(&req.model, model_map)?;
+    // Honest-rejection policy: the executor exposes no sampling knobs,
+    // so a caller that explicitly sets one gets a 400 rather than a
+    // response that silently ignored it.
+    reject_unsupported_knob("max_tokens", req.max_tokens.map(|v| v as f64), None)?;
+    reject_unsupported_knob("temperature", req.temperature.map(|v| v as f64), Some(1.0))?;
+    reject_unsupported_knob("n", req.n.map(|v| v as f64), Some(1.0))?;
+    reject_unsupported_bool("echo", req.echo)?;
     let prompt = extract_prompt_text(&req.prompt);
     let prompt_len_hint = clamp_len_to_i32(prompt.len());
     Ok(TranslatedRequest {
@@ -280,6 +347,11 @@ pub fn translate_chat_completions_request(
     model_map: &HashMap<String, Uuid>,
 ) -> Result<TranslatedRequest, OpenAiError> {
     let function_id = lookup_model(&req.model, model_map)?;
+    // Honest-rejection policy: see translate_completions_request.
+    reject_unsupported_knob("max_tokens", req.max_tokens.map(|v| v as f64), None)?;
+    reject_unsupported_knob("temperature", req.temperature.map(|v| v as f64), Some(1.0))?;
+    reject_unsupported_knob("n", req.n.map(|v| v as f64), Some(1.0))?;
+    reject_unsupported_tools(req.tools.as_ref())?;
     let prompt = assemble_chat_prompt(&req.messages);
     let prompt_len_hint = clamp_len_to_i32(prompt.len());
     Ok(TranslatedRequest {
@@ -301,6 +373,86 @@ fn lookup_model(model: &str, model_map: &HashMap<String, Uuid>) -> Result<Uuid, 
              ask your operator to add a `{model}:<function_uuid>` entry",
         ))),
     }
+}
+
+/// Reject a numeric sampling knob the executor cannot honour, *unless*
+/// the caller's value coincides with a no-op default the gateway can
+/// satisfy without doing anything.
+///
+/// The executor exposes no sampling controls, so honouring a non-default
+/// value is impossible today. Per the module's honest-rejection policy
+/// we return a `400 invalid_request_error`
+/// (`code: "unsupported_parameter"`, `param: <field>`) whenever the
+/// caller sets a value the gateway would otherwise silently ignore.
+///
+/// `honored_default` names the one value (if any) that is a no-op for
+/// us and therefore accepted:
+/// * `temperature` → `Some(1.0)` (OpenAI's default sampling temperature
+///   is a no-op relative to "no sampling control");
+/// * `n` → `Some(1.0)` (the single-choice envelope only ever produces
+///   one completion, which is also OpenAI's default);
+/// * `max_tokens` → `None` (there is no value we can honour — we cannot
+///   cap generation at all — so any explicit `max_tokens` is rejected).
+// The honored defaults (`1.0`) are exactly representable, so the direct
+// equality check is intentional and correct here.
+#[allow(clippy::float_cmp)]
+fn reject_unsupported_knob(
+    field: &'static str,
+    value: Option<f64>,
+    honored_default: Option<f64>,
+) -> Result<(), OpenAiError> {
+    let Some(v) = value else {
+        return Ok(());
+    };
+    if Some(v) == honored_default {
+        return Ok(());
+    }
+    Err(OpenAiError::invalid_request(
+        format!(
+            "`{field}` is not supported by this gateway: the underlying executor exposes no \
+             sampling controls. Omit `{field}` and retry.",
+        ),
+        Some(field.to_string()),
+    )
+    .with_code("unsupported_parameter"))
+}
+
+/// Reject a boolean knob (`echo`) when set to a non-default `true`.
+/// `false` / absent is the default and translates cleanly.
+fn reject_unsupported_bool(field: &'static str, value: Option<bool>) -> Result<(), OpenAiError> {
+    if value == Some(true) {
+        return Err(OpenAiError::invalid_request(
+            format!(
+                "`{field}` is not supported by this gateway: the underlying executor cannot \
+                 echo the prompt. Omit `{field}` (or send `{field}: false`) and retry.",
+            ),
+            Some(field.to_string()),
+        )
+        .with_code("unsupported_parameter"));
+    }
+    Ok(())
+}
+
+/// Reject a non-empty `tools` array. The executor has no tool-calling
+/// dispatch, so a populated `tools` field would be silently ignored;
+/// an absent / null / empty-array value translates cleanly.
+fn reject_unsupported_tools(tools: Option<&serde_json::Value>) -> Result<(), OpenAiError> {
+    let populated = match tools {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Array(a)) => !a.is_empty(),
+        // Any other non-null shape counts as "the caller set it".
+        Some(_) => true,
+    };
+    if populated {
+        return Err(OpenAiError::invalid_request(
+            "`tools` is not supported by this gateway: the underlying executor has no \
+             tool-calling dispatch. Omit `tools` and retry."
+                .to_string(),
+            Some("tools".to_string()),
+        )
+        .with_code("unsupported_parameter"));
+    }
+    Ok(())
 }
 
 /// Clamp a `usize` byte length to `i32`. Prompts above `i32::MAX`
@@ -390,9 +542,98 @@ mod tests {
         assert_eq!(out.function_id, fixture_uuid_1());
         assert_eq!(out.prompt, "hello");
         assert!(!out.stream);
-        // v0.4 args policy: empty vec, prompt length preserved in hint.
+        // v0.4 args policy: empty vec (the standard `_start () -> ()`
+        // guest links via the typed fast path; the executor has no
+        // channel to deliver the prompt bytes), length preserved in hint.
         assert!(out.args.is_empty(), "args must be empty in v0.4");
         assert_eq!(out.prompt_len_hint, 5);
+    }
+
+    #[test]
+    fn translate_completions_rejects_unsupported_knobs() {
+        let mut map = HashMap::new();
+        map.insert("m1".to_owned(), fixture_uuid_1());
+        let base = CompletionsRequest {
+            model: "m1".to_owned(),
+            prompt: json!("hi"),
+            ..Default::default()
+        };
+
+        // max_tokens set → 400 unsupported_parameter, param names the field.
+        let req = CompletionsRequest {
+            max_tokens: Some(64),
+            ..base.clone()
+        };
+        let err = translate_completions_request(&req, &map).expect_err("rejects max_tokens");
+        assert_eq!(err.error.code.as_deref(), Some("unsupported_parameter"));
+        assert_eq!(err.error.param.as_deref(), Some("max_tokens"));
+
+        // temperature set → rejected.
+        let req = CompletionsRequest {
+            temperature: Some(0.7),
+            ..base.clone()
+        };
+        assert!(translate_completions_request(&req, &map).is_err());
+
+        // echo: true → rejected; echo: false is the default and passes.
+        let req = CompletionsRequest {
+            echo: Some(true),
+            ..base.clone()
+        };
+        assert!(translate_completions_request(&req, &map).is_err());
+        let req = CompletionsRequest {
+            echo: Some(false),
+            ..base.clone()
+        };
+        assert!(translate_completions_request(&req, &map).is_ok());
+
+        // n: 1 is the honoured default; n: 2 is rejected.
+        let req = CompletionsRequest {
+            n: Some(1),
+            ..base.clone()
+        };
+        assert!(translate_completions_request(&req, &map).is_ok());
+        let req = CompletionsRequest {
+            n: Some(2),
+            ..base
+        };
+        assert!(translate_completions_request(&req, &map).is_err());
+    }
+
+    #[test]
+    fn translate_chat_completions_rejects_nonempty_tools() {
+        let mut map = HashMap::new();
+        map.insert("m".to_owned(), fixture_uuid_1());
+        let base = ChatCompletionsRequest {
+            model: "m".to_owned(),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: json!("hi"),
+                name: None,
+            }],
+            ..Default::default()
+        };
+
+        // Populated tools array → 400 unsupported_parameter.
+        let req = ChatCompletionsRequest {
+            tools: Some(json!([{"type": "function"}])),
+            ..base.clone()
+        };
+        let err = translate_chat_completions_request(&req, &map).expect_err("rejects tools");
+        assert_eq!(err.error.code.as_deref(), Some("unsupported_parameter"));
+        assert_eq!(err.error.param.as_deref(), Some("tools"));
+
+        // Empty array / null / absent all translate cleanly.
+        let req = ChatCompletionsRequest {
+            tools: Some(json!([])),
+            ..base.clone()
+        };
+        assert!(translate_chat_completions_request(&req, &map).is_ok());
+        let req = ChatCompletionsRequest {
+            tools: Some(serde_json::Value::Null),
+            ..base
+        };
+        assert!(translate_chat_completions_request(&req, &map).is_ok());
     }
 
     #[test]

@@ -71,6 +71,17 @@ pub const BASE64_OFFLOAD_THRESHOLD: usize = 32 * 1024;
 /// keeping the worst-case footprint of a million records under ~256 MiB.
 pub const MAX_FUNCTION_NAME_BYTES: usize = 256;
 
+/// Maximum number of elements accepted in an [`InvokeRequest::args`] list.
+///
+/// The global body-size limit already bounds the *encoded* payload, but a
+/// caller could still pack tens of thousands of tiny scalar args into a
+/// small JSON body and force the executor to allocate / thread an
+/// oversized [`WasmArg`] vector. 256 is far above any realistic export
+/// arity while keeping the per-invocation argument footprint bounded.
+/// Exceeding it is rejected with `400 too_many_args` in
+/// [`parse_invoke_args`].
+pub const MAX_INVOKE_ARGS: usize = 256;
+
 // ---------------------------------------------------------------------------
 // State records
 // ---------------------------------------------------------------------------
@@ -85,6 +96,11 @@ pub const MAX_FUNCTION_NAME_BYTES: usize = 256;
 pub struct FunctionRecord {
     /// Server-assigned identifier.
     pub id: Uuid,
+    /// Tenant that deployed this function. Set from the request tenant at
+    /// `POST /functions` time and never mutated. The invoke / delete handlers
+    /// compare this against the request's claimed tenant so a wildcard-scoped
+    /// caller from tenant B cannot drive tenant A's record (api S-IDOR).
+    pub tenant_id: TenantId,
     /// Tenant-supplied display name.
     pub name: String,
     /// Decoded Wasm bytes, refcounted. Not serialised — see struct-level doc.
@@ -117,6 +133,12 @@ pub struct JobRecord {
     pub id: Uuid,
     /// Function this invocation was dispatched against.
     pub function_id: Uuid,
+    /// Tenant this invocation was dispatched under. Set from the request
+    /// tenant at `invoke-async` time and never mutated. `GET /jobs/{id}`
+    /// compares this against the request's claimed tenant so a
+    /// wildcard-scoped caller from another tenant cannot read this job's
+    /// result payload (api S-32).
+    pub tenant_id: TenantId,
     /// Current status.
     pub status: JobStatus,
     /// Result payload (set when `status` transitions to `completed` or `failed`).
@@ -870,12 +892,27 @@ async fn decode_wasm_b64(wasm_b64: String) -> Result<Vec<u8>, ApiError> {
     if wasm_b64.len() < BASE64_OFFLOAD_THRESHOLD {
         return BASE64
             .decode(wasm_b64.as_bytes())
-            .map_err(|e| ApiError::bad_request("invalid_base64", e.to_string()));
+            .map_err(base64_decode_error);
     }
     tokio::task::spawn_blocking(move || BASE64.decode(wasm_b64.as_bytes()))
         .await
         .map_err(|e| ApiError::internal(format!("base64 decoder panicked: {e}")))?
-        .map_err(|e| ApiError::bad_request("invalid_base64", e.to_string()))
+        .map_err(base64_decode_error)
+}
+
+/// Map a base64 decode failure to a fixed-message `400 invalid_base64`.
+///
+/// L8: the underlying `base64::DecodeError` text echoes the offending
+/// byte offset / alphabet detail of attacker-supplied input. We log the
+/// detail server-side via `tracing` for forensics and return only a
+/// stable, content-free message to the caller.
+fn base64_decode_error(e: base64::DecodeError) -> ApiError {
+    tracing::warn!(
+        target: "tensor_wasm_api::routes",
+        error = %e,
+        "rejected create_function: base64 decode failed",
+    );
+    ApiError::bad_request("invalid_base64", "invalid base64 payload")
 }
 
 /// `POST /functions` — deploy a new Wasm module.
@@ -885,13 +922,28 @@ async fn decode_wasm_b64(wasm_b64: String) -> Result<Vec<u8>, ApiError> {
 /// reallocate. Returns `400 invalid_wasm` if validation fails.
 #[tracing::instrument(
     name = "http.create_function",
-    skip(state, payload),
-    fields(function_id = tracing::field::Empty),
+    skip(state, auth, payload),
+    fields(
+        function_id = tracing::field::Empty,
+        tenant = tracing::field::Empty,
+    ),
 )]
 pub async fn create_function(
     State(state): State<Arc<AppState>>,
+    tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<crate::rate_limit::AuthContext>>,
     payload: Result<Json<CreateFunctionRequest>, JsonRejection>,
 ) -> ApiResult<Json<CreateFunctionResponse>> {
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    tracing::Span::current().record("tenant", tracing::field::display(tenant));
+    // Tenant-scope check: a tenant-scoped token must not deploy under a
+    // tenant outside its scope (api B1.9). Mirrors the invoke handlers'
+    // ordering — token-scope check before any per-tenant work. Absent
+    // AuthContext only happens in routers that bypass `bearer_auth`
+    // entirely (ad-hoc test routers); we degrade to dev-mode wildcard.
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        ctx.authorize_tenant(tenant)?;
+    }
     let Json(req) = payload?;
     validate_function_name(&req.name)?;
     let bytes = decode_wasm_b64(req.wasm_b64).await?;
@@ -921,10 +973,15 @@ pub async fn create_function(
     .map_err(|e| ApiError::internal(format!("wasm validator panicked: {e}")))?;
     let (bytes, validate_result) = bytes;
     if let Err(e) = validate_result {
-        return Err(ApiError::bad_request(
-            "invalid_wasm",
-            format!("wasm validation failed: {e}"),
-        ));
+        // L8: the wasmparser error text describes the offending section /
+        // offset of attacker-supplied bytes. Log it server-side for
+        // forensics and return only a stable, content-free message.
+        tracing::warn!(
+            target: "tensor_wasm_api::routes",
+            error = %e,
+            "rejected create_function: wasm validation failed",
+        );
+        return Err(ApiError::bad_request("invalid_wasm", "invalid wasm module"));
     }
     let id = Uuid::new_v4();
     tracing::Span::current().record("function_id", tracing::field::display(id));
@@ -932,6 +989,7 @@ pub async fn create_function(
         id,
         FunctionRecord {
             id,
+            tenant_id: tenant,
             name: req.name,
             wasm_bytes: Arc::from(bytes),
             created_unix_ms: now_unix_ms(),
@@ -944,11 +1002,43 @@ pub async fn create_function(
 ///
 /// Returns `204 No Content` on success and `404 Not Found` if the id is
 /// unknown.
-#[tracing::instrument(name = "http.delete_function", skip(state), fields(function_id = %id))]
+#[tracing::instrument(
+    name = "http.delete_function",
+    skip(state, auth),
+    fields(
+        function_id = %id,
+        tenant = tracing::field::Empty,
+    ),
+)]
 pub async fn delete_function(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
+    tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<crate::rate_limit::AuthContext>>,
 ) -> ApiResult<StatusCode> {
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    tracing::Span::current().record("tenant", tracing::field::display(tenant));
+    // Token-scope check first (api B1.9): a token outside the claimed
+    // tenant's scope must see `403 tenant_scope_denied` regardless of
+    // registry state, so it cannot probe id existence via a 403-vs-404
+    // split. The per-resource owner check runs only after.
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        ctx.authorize_tenant(tenant)?;
+    }
+    // Per-resource owner check: peek the record under the shard lock and
+    // verify ownership BEFORE removing it, so a cross-tenant 403 does not
+    // side-effect the registry.
+    match state.functions.get(&id) {
+        Some(entry) => {
+            if entry.value().tenant_id != tenant {
+                return Err(ApiError::forbidden(
+                    "tenant_scope_denied",
+                    "function belongs to a different tenant",
+                ));
+            }
+        }
+        None => return Err(ApiError::not_found(format!("function {id} not found"))),
+    }
     if state.functions.remove(&id).is_some() {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -963,6 +1053,19 @@ pub async fn delete_function(
 /// offending value so a caller debugging a malformed payload can pinpoint
 /// the problem without trial-and-error.
 fn parse_invoke_args(raw: &[serde_json::Value]) -> Result<Vec<WasmArg>, ApiError> {
+    // L9: cap the element count before any per-element conversion work. The
+    // body-size limit bounds the encoded bytes but not the element count, so
+    // an attacker could otherwise force an oversized `WasmArg` allocation
+    // with a compact payload of many tiny scalars.
+    if raw.len() > MAX_INVOKE_ARGS {
+        return Err(ApiError::bad_request(
+            "too_many_args",
+            format!(
+                "args list has {} elements (maximum {MAX_INVOKE_ARGS})",
+                raw.len()
+            ),
+        ));
+    }
     raw.iter()
         .enumerate()
         .map(|(i, v)| {
@@ -1154,11 +1257,22 @@ pub async fn invoke_function(
 
     // Snapshot the Wasm bytes under the DashMap shard lock, then drop the
     // guard before we hit any `.await`. `Arc::clone` is a single refcount
-    // bump regardless of payload size.
-    let wasm_bytes = match state.functions.get(&id) {
-        Some(entry) => Arc::clone(&entry.value().wasm_bytes),
+    // bump regardless of payload size. We also read the record's owning
+    // tenant so the per-resource check below runs against the same guard.
+    let (wasm_bytes, owner) = match state.functions.get(&id) {
+        Some(entry) => (Arc::clone(&entry.value().wasm_bytes), entry.value().tenant_id),
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
+    // Per-resource owner check (api S-IDOR): authorize_tenant above only
+    // proves the token may address the *claimed* tenant, not that the
+    // looked-up record belongs to it. A wildcard-scoped caller from
+    // tenant B must not invoke tenant A's record.
+    if owner != tenant {
+        return Err(ApiError::forbidden(
+            "tenant_scope_denied",
+            "function belongs to a different tenant",
+        ));
+    }
 
     let value = run_invoke(
         &state.executor,
@@ -1264,10 +1378,19 @@ pub async fn invoke_function_async(
     let req = read_invoke_request(payload).await?;
     let args = parse_invoke_args(&req.args)?;
     let export_override = req.export;
-    let wasm_bytes = match state.functions.get(&id) {
-        Some(entry) => Arc::clone(&entry.value().wasm_bytes),
+    let (wasm_bytes, owner) = match state.functions.get(&id) {
+        Some(entry) => (Arc::clone(&entry.value().wasm_bytes), entry.value().tenant_id),
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
+    // Per-resource owner check (api S-IDOR): see `invoke_function`. Runs
+    // before the JobRecord is inserted so a cross-tenant dispatch leaves
+    // no trace in the jobs registry.
+    if owner != tenant {
+        return Err(ApiError::forbidden(
+            "tenant_scope_denied",
+            "function belongs to a different tenant",
+        ));
+    }
 
     let job_id = Uuid::new_v4();
     tracing::Span::current().record("job_id", tracing::field::display(job_id));
@@ -1276,6 +1399,7 @@ pub async fn invoke_function_async(
         JobRecord {
             id: job_id,
             function_id: id,
+            tenant_id: tenant,
             status: JobStatus::Pending,
             result: None,
             created_unix_ms: now_unix_ms(),
@@ -1497,10 +1621,19 @@ pub async fn invoke_function_stream(
     }
 
     // 404 before any negotiation work, mirroring `/invoke`.
-    let wasm_bytes = match state.functions.get(&id) {
-        Some(entry) => Arc::clone(&entry.value().wasm_bytes),
+    let (wasm_bytes, owner) = match state.functions.get(&id) {
+        Some(entry) => (Arc::clone(&entry.value().wasm_bytes), entry.value().tenant_id),
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
+    // Per-resource owner check (api S-IDOR): see `invoke_function`. A
+    // wildcard-scoped caller from another tenant must not stream tenant
+    // A's record.
+    if owner != tenant {
+        return Err(ApiError::forbidden(
+            "tenant_scope_denied",
+            "function belongs to a different tenant",
+        ));
+    }
 
     let req = read_invoke_request(payload).await?;
     let args = parse_invoke_args(&req.args)?;
@@ -1730,6 +1863,19 @@ pub async fn invoke_function_stream(
         // headers.
         let byte_stream = body_stream.map(|item| {
             let bytes: axum::body::Bytes = match item {
+                // M6 / control-byte hazard: guest chunk bytes are
+                // forwarded verbatim here — NOT sanitised. Per the
+                // streaming contract (see the `## Security` section on
+                // this handler and `docs/STREAMING.md`) the host does
+                // not strip control characters or ANSI escape
+                // sequences, so a malicious guest can emit escape
+                // sequences that reach a non-sanitising consumer (a raw
+                // terminal, a log tail, a downstream pipe) and alter its
+                // display state or smuggle in injected output. This is a
+                // deliberate contract decision (byte-exact passthrough);
+                // sanitisation is the client's responsibility (the CLI's
+                // T18 layer handles received text). Do not change the
+                // byte stream here without revisiting that contract.
                 StreamFrame::Chunk(c) => axum::body::Bytes::from(c),
                 StreamFrame::Done(Ok(())) => axum::body::Bytes::from(format!(
                     "event: done\ndata: {}\n\n",
@@ -1791,13 +1937,51 @@ enum StreamWriterState {
 }
 
 /// `GET /jobs/{id}` — poll an async invocation.
-#[tracing::instrument(name = "http.get_job", skip(state), fields(job_id = %id))]
+///
+/// Tenant-gated (api S-32): the bearer token must address the claimed
+/// tenant AND the job's recorded `tenant_id` must equal that tenant. The
+/// token-scope check runs first so a caller whose token is outside the
+/// claimed tenant's scope sees `403 tenant_scope_denied` regardless of
+/// registry state — it cannot probe job-id existence via a 403-vs-404
+/// split. The per-resource owner check then rejects a wildcard-scoped
+/// caller reading another tenant's job (and its `result` payload) with
+/// the same `403 tenant_scope_denied` shape, returning before the
+/// `JobRecord` is serialised.
+#[tracing::instrument(
+    name = "http.get_job",
+    skip(state, auth),
+    fields(
+        job_id = %id,
+        tenant = tracing::field::Empty,
+    ),
+)]
 pub async fn get_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
+    tenant: Option<Extension<TenantId>>,
+    auth: Option<Extension<crate::rate_limit::AuthContext>>,
 ) -> ApiResult<Json<JobRecord>> {
+    let tenant = tenant.map(|Extension(t)| t).unwrap_or(TenantId(0));
+    tracing::Span::current().record("tenant", tracing::field::display(tenant));
+    // Token-scope check BEFORE the per-resource owner check (api S-32):
+    // an out-of-scope token must not be able to distinguish a 403 (job
+    // exists, wrong tenant) from a 404 (job unknown).
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        ctx.authorize_tenant(tenant)?;
+    }
     match state.jobs.get(&id) {
-        Some(rec) => Ok(Json(rec.clone())),
+        Some(rec) => {
+            // Per-resource owner check: reject before serialising the
+            // record so a cross-tenant caller never observes the job's
+            // status / result / function_id.
+            if rec.value().tenant_id != tenant {
+                return Err(ApiError::forbidden(
+                    "tenant_scope_denied",
+                    "job belongs to a different tenant",
+                ));
+            }
+            Ok(Json(rec.clone()))
+        }
         None => Err(ApiError::not_found(format!("job {id} not found"))),
     }
 }
@@ -1919,6 +2103,7 @@ mod tests {
     fn function_record_skips_wasm_bytes_on_wire() {
         let rec = FunctionRecord {
             id: Uuid::nil(),
+            tenant_id: TenantId(0),
             name: "n".to_string(),
             wasm_bytes: Arc::from(vec![1u8, 2, 3]),
             created_unix_ms: 0,

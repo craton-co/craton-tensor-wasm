@@ -411,6 +411,18 @@ fn build_router_full(
     // upstream health checks.
     let probe_router = Router::new()
         .route("/healthz", get(healthz))
+        // SECURITY (H3): `/metrics` is mounted UNAUTHENTICATED (declared
+        // `security: []` in `openapi/tensor-wasm-api.yaml`). This is an
+        // intentional posture — Prometheus scrapers and k8s tooling
+        // expect an unauthenticated scrape target — but the endpoint
+        // exposes per-tenant operational data (the HTTP-metric families
+        // carry a `route` label, and the registry also surfaces
+        // per-tenant gauges). Operators MUST bind the listener to an
+        // internal interface or place `/metrics` behind an ingress ACL
+        // (e.g. allow only the monitoring subnet) whenever the listener
+        // is internet-facing. Do NOT add bearer auth here without also
+        // updating the OpenAPI contract and the probe-stack rationale
+        // below — the routing behaviour is load-bearing for scrapers.
         .route("/metrics", get(metrics))
         // api S-26: probes get their own generous budget. A k8s deployment
         // can have many replicas all scraping at once without affecting

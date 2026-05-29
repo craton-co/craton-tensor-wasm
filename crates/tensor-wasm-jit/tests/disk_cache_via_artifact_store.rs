@@ -106,7 +106,7 @@ fn t30_put_writes_sidecar_and_artifact_blob_with_v2_magic() {
     );
     let mut hash_bytes = [0u8; 32];
     hash_bytes.copy_from_slice(&sidecar_bytes[16..]);
-    let content_hash = ContentHash(hash_bytes);
+    let content_hash = ContentHash::from_bytes(hash_bytes);
 
     // Layout assertion #3: the artifact-store blob exists under the
     // unified store's filename convention (`{hash}.{key_fp}.bin`).

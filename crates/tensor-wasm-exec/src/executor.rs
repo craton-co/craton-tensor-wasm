@@ -18,14 +18,17 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use lru::LruCache;
 use tensor_wasm_core::metrics::TensorWasmMetrics;
 use tensor_wasm_core::types::{InstanceId, TenantId};
+use tensor_wasm_jit::cache::KernelCache;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, instrument, warn};
 use wasmtime::{ExternType, Module, ResourceLimiter, Store, Val};
 
 use crate::engine::TensorWasmEngine;
 use crate::instance::{InstanceState, TensorWasmInstance};
 use crate::instance_pool::{InstancePool, ModuleHash};
+use crate::jit_dispatch::add_jit_dispatch_to_linker;
+use tensor_wasm_wasi_gpu::scheduler::add_scheduler_to_linker;
 use tensor_wasm_wasi_gpu::streaming::{add_streaming_to_linker, StreamingContext};
 
 /// Convert a wall-clock [`Duration`] into a number of epoch ticks suitable
@@ -533,6 +536,42 @@ pub struct TensorWasmExecutor {
     /// callers wiring it up today get forward-compatible plumbing for
     /// free.
     pool: Option<Arc<InstancePool>>,
+    /// Optional JIT kernel cache. When set, `instantiate_detached` registers
+    /// the `tensor-wasm:jit/host` `dispatch`/`alloc`/`free` imports
+    /// (`jit_dispatch::add_jit_dispatch_to_linker`) on every spawn's linker
+    /// so auto-offloaded guests can reach the cached kernels. `None` (the
+    /// default) leaves the JIT surface unlinked — a guest importing it then
+    /// fails to link, matching the historical behaviour for embedders that
+    /// have not opted in. The cache is intentionally per-executor and
+    /// cross-tenant (lookups are tenant-scoped inside the dispatch closure
+    /// via `CacheKey::for_tenant`); see `jit_dispatch.rs`.
+    jit_cache: Option<Arc<KernelCache>>,
+    /// Bounds the number of concurrent `Module::from_binary` compiles on the
+    /// Tokio blocking pool (MEDIUM finding). A permit is acquired around the
+    /// `spawn_blocking` compile in [`Self::compile_module_cached`]; the
+    /// permit is released as soon as the compile resolves (cache hits never
+    /// touch the semaphore). Capacity comes from
+    /// [`crate::engine::EngineConfig::max_concurrent_compiles`], defaulting
+    /// to [`std::thread::available_parallelism`] (floored at 1). Independent
+    /// of `max_instances` — that caps live instances, this caps in-flight
+    /// Cranelift work.
+    compile_semaphore: Arc<Semaphore>,
+}
+
+/// Resolve the concurrent-compile permit count from the engine config,
+/// falling back to the host parallelism (floored at 1) when the operator
+/// left [`crate::engine::EngineConfig::max_concurrent_compiles`] unset.
+/// A configured value of 0 is coerced to 1 (a 0-permit semaphore would
+/// deadlock every compile).
+fn resolve_compile_permits(requested: Option<usize>) -> usize {
+    match requested {
+        Some(0) | None => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1),
+        Some(n) => n,
+    }
+    .max(1)
 }
 
 /// Resolve a non-zero LRU cache capacity from a possibly-zero config
@@ -634,6 +673,7 @@ impl TensorWasmExecutor {
     /// Construct an executor over the given shared engine.
     pub fn new(engine: Arc<TensorWasmEngine>) -> Self {
         let cap = lru_cap(engine.config().max_module_cache_entries);
+        let permits = resolve_compile_permits(engine.config().max_concurrent_compiles);
         Self {
             engine,
             instances: Arc::new(DashMap::new()),
@@ -643,6 +683,8 @@ impl TensorWasmExecutor {
             metrics: None,
             ticker_warned: Arc::new(OnceLock::new()),
             pool: None,
+            jit_cache: None,
+            compile_semaphore: Arc::new(Semaphore::new(permits)),
         }
     }
 
@@ -651,6 +693,7 @@ impl TensorWasmExecutor {
     /// pass a clone of the process-wide registry.
     pub fn with_metrics(engine: Arc<TensorWasmEngine>, metrics: TensorWasmMetrics) -> Self {
         let cap = lru_cap(engine.config().max_module_cache_entries);
+        let permits = resolve_compile_permits(engine.config().max_concurrent_compiles);
         Self {
             engine,
             instances: Arc::new(DashMap::new()),
@@ -660,6 +703,8 @@ impl TensorWasmExecutor {
             metrics: Some(metrics),
             ticker_warned: Arc::new(OnceLock::new()),
             pool: None,
+            jit_cache: None,
+            compile_semaphore: Arc::new(Semaphore::new(permits)),
         }
     }
 
@@ -675,6 +720,27 @@ impl TensorWasmExecutor {
     pub fn with_instance_pool(mut self, pool: Arc<InstancePool>) -> Self {
         self.pool = Some(pool);
         self
+    }
+
+    /// Attach a JIT [`KernelCache`] to this executor and return the modified
+    /// executor.
+    ///
+    /// Builder method; pairs with [`Self::new`] / [`Self::with_metrics`].
+    /// When set, every instantiation registers the `tensor-wasm:jit/host`
+    /// `dispatch`/`alloc`/`free` imports (see
+    /// [`crate::jit_dispatch::add_jit_dispatch_to_linker`]) against this
+    /// cache, so auto-offloaded guests link successfully. Embedders that do
+    /// not call this leave the JIT surface unlinked — a guest importing it
+    /// then fails to link, matching the pre-wiring behaviour.
+    pub fn with_jit_cache(mut self, cache: Arc<KernelCache>) -> Self {
+        self.jit_cache = Some(cache);
+        self
+    }
+
+    /// Borrow the attached JIT [`KernelCache`], if any. Returns `None` for
+    /// executors constructed without [`Self::with_jit_cache`].
+    pub fn jit_cache(&self) -> Option<&Arc<KernelCache>> {
+        self.jit_cache.as_ref()
     }
 
     /// Borrow the attached [`InstancePool`], if any. Returns `None` for
@@ -755,7 +821,16 @@ impl TensorWasmExecutor {
     /// worker. Offloading to the blocking pool keeps the reactor responsive.
     /// The byte-length cap above runs synchronously before the offload so
     /// an oversized blob fails fast without entering the blocking pool.
-    async fn compile_module_cached(&self, wasm: &[u8]) -> Result<Module, ExecError> {
+    ///
+    /// Returns the compiled [`Module`] alongside the 32-byte BLAKE3 digest
+    /// it was keyed under, so callers (e.g. [`Self::build_pooled_instance`])
+    /// that also need the digest for the pool key do not re-hash the bytes
+    /// (PERF: the hash was previously computed here AND in
+    /// `build_pooled_instance`).
+    async fn compile_module_cached(
+        &self,
+        wasm: &[u8],
+    ) -> Result<(Module, ModuleHash), ExecError> {
         // Pre-compile size cap (exec hardening). Reject pathologically
         // large blobs *before* hashing or handing them to Cranelift —
         // a wasm with a malicious code section can otherwise force
@@ -780,7 +855,7 @@ impl TensorWasmExecutor {
         // module may both compile it — but the second one's `put` simply
         // overwrites the first, no correctness hazard.
         if let Some(m) = self.module_cache.lock().get(&key).cloned() {
-            return Ok(m);
+            return Ok((m, key));
         }
         // Cranelift compile is CPU-bound — offload to the blocking
         // pool. We clone the wasmtime `Engine` (cheap `Arc`-shaped
@@ -791,6 +866,18 @@ impl TensorWasmExecutor {
         // parse failure, and either way the spawn must be aborted.
         let engine = self.engine.inner().clone();
         let bytes = wasm.to_vec();
+        // Bound concurrent Cranelift compiles (MEDIUM finding). The permit is
+        // held only for the duration of the `spawn_blocking` compile and
+        // dropped immediately after — cache hits above never reach here, so
+        // repeat tenants do not contend for permits. `acquire_owned` cannot
+        // fail unless the semaphore is closed, which we never do; surface the
+        // (unreachable) closed case as a wasmtime error rather than panicking.
+        let _permit = self
+            .compile_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ExecError::Wasmtime(wasmtime::Error::msg("compile semaphore closed")))?;
         let module = tokio::task::spawn_blocking(move || Module::from_binary(&engine, &bytes))
             .await
             .map_err(|join_err| {
@@ -799,8 +886,9 @@ impl TensorWasmExecutor {
                 )))
             })?
             .map_err(ExecError::Wasmtime)?;
+        drop(_permit);
         self.module_cache.lock().put(key, module.clone());
-        Ok(module)
+        Ok((module, key))
     }
 
     /// Internal: charge a live-instance slot if the engine cap is configured.
@@ -862,15 +950,11 @@ impl TensorWasmExecutor {
         let slot_guard = self.charge_instance_slot()?;
         // Compile (and cache) the module first; the cap check lives
         // inside `compile_module_cached` so an oversized blob fails
-        // before the digest computation matters.
-        let module = self.compile_module_cached(wasm).await?;
-        // Compute the digest after the cap check so the pool key path
-        // stays consistent with the executor's module-cache key. BLAKE3
-        // is fast enough that doing it twice (here + cache) is
-        // negligible vs. the Cranelift compile we just elided on cache
-        // hit.
-        let digest = blake3::hash(wasm);
-        let module_hash: ModuleHash = *digest.as_bytes();
+        // before the digest computation matters. The digest is computed
+        // once inside `compile_module_cached` (as the cache key) and
+        // returned here so the pool key path reuses it rather than
+        // re-hashing the wasm bytes (PERF: previously hashed twice).
+        let (module, module_hash) = self.compile_module_cached(wasm).await?;
         let inst = self.instantiate_detached(cfg, &module).await?;
         // A wasmtime instance was successfully created — count it
         // against the monotonic spawn counter exactly once per genuine
@@ -910,10 +994,12 @@ impl TensorWasmExecutor {
     }
 
     /// Internal: shared instantiation logic. Builds the [`Store`], wires the
-    /// limiter, arms the start-function epoch deadline, and runs
-    /// `Instance::new_async` (with or without a streaming linker, matching
-    /// [`SpawnConfig::streaming`]). Does NOT touch the registry or the
-    /// admission counter — callers must pair this with
+    /// limiter, arms the start-function epoch deadline, builds a
+    /// [`wasmtime::Linker`] with every available host surface registered
+    /// (scheduler always; streaming when [`SpawnConfig::streaming`] is set;
+    /// JIT dispatch when a [`KernelCache`] is configured via
+    /// [`Self::with_jit_cache`]), and instantiates against it. Does NOT touch
+    /// the registry or the admission counter — callers must pair this with
     /// [`Self::charge_instance_slot`] / [`Self::register_pooled_instance`].
     async fn instantiate_detached(
         &self,
@@ -959,17 +1045,60 @@ impl TensorWasmExecutor {
         let mut store = Store::new(self.engine.inner(), state);
         store.limiter(|state| &mut state.limiter as &mut dyn ResourceLimiter);
         store.set_epoch_deadline(start_deadline_ticks);
-        let instance = if cfg.streaming.is_some() {
-            let mut linker: wasmtime::Linker<InstanceState> =
-                wasmtime::Linker::new(self.engine.inner());
+        // HIGH finding fix: build a single `Linker<InstanceState>` and
+        // register every host surface whose backing machinery is actually
+        // present, then instantiate against it. Previously only the
+        // streaming surface was wired (and only on the streaming path),
+        // leaving the scheduler (`instance.rs` `SchedulerContext`) and
+        // JIT-dispatch (`jit_dispatch.rs`) imports unlinkable on the real
+        // spawn path — a guest importing `wasi:scheduler/host` or
+        // `tensor-wasm:jit/host` failed to link and that machinery was dead.
+        //
+        // All three surfaces now coexist on the same linker:
+        //   - scheduler: always registered. The per-store `SchedulerContext`
+        //     is constructed unconditionally in `InstanceState::new`
+        //     (`unbounded()` default, real budget when a deadline is set), so
+        //     the surface is always safe to expose — a guest that doesn't
+        //     import it pays nothing.
+        //   - streaming: registered when `cfg.streaming.is_some()`
+        //     (preserves prior behaviour; the per-store context is
+        //     `disabled()` otherwise and the surface is only meaningful for
+        //     the `/invoke-stream` route).
+        //   - jit: registered when a `KernelCache` is configured on the
+        //     executor (`with_jit_cache`); the cache is the cross-tenant
+        //     backing store the dispatch closure consults (lookups are
+        //     tenant-scoped internally).
+        //
+        // The scheduler surface is always available (its per-store context is
+        // constructed unconditionally), so we always go through the linker
+        // path now. A guest with zero imports still instantiates fine — a
+        // linker with extra registered imports does not force the guest to
+        // import them. (Wasmtime only errors on *missing* imports, never on
+        // *unused* registered ones.) This replaces the old
+        // `Instance::new_async(.., &[])` empty-imports branch.
+        let mut linker: wasmtime::Linker<InstanceState> =
+            wasmtime::Linker::new(self.engine.inner());
+        // Scheduler host functions (`wasi:scheduler/host@0.1.0`). The getter
+        // borrows the per-store `SchedulerContext`, so two instances sharing
+        // a linker never cross-talk.
+        add_scheduler_to_linker(&mut linker, |state: &InstanceState| state.scheduler())
+            .map_err(ExecError::Wasmtime)?;
+        if cfg.streaming.is_some() {
             add_streaming_to_linker(&mut linker).map_err(ExecError::Wasmtime)?;
-            linker
-                .instantiate_async(&mut store, module)
-                .await
-                .map_err(ExecError::Wasmtime)?
-        } else {
-            wasmtime::Instance::new_async(&mut store, module, &[]).await?
-        };
+        }
+        if let Some(cache) = &self.jit_cache {
+            // `add_jit_dispatch_to_linker` is generic over the store payload
+            // via `JitArenaProvider + TenantContext`, both of which
+            // `InstanceState` implements (see `instance.rs` /
+            // `jit_dispatch.rs`). The arena lives per-store; the cache is the
+            // shared cross-tenant backing handle.
+            add_jit_dispatch_to_linker(&mut linker, cache.clone())
+                .map_err(ExecError::Wasmtime)?;
+        }
+        let instance = linker
+            .instantiate_async(&mut store, module)
+            .await
+            .map_err(ExecError::Wasmtime)?;
         store.set_epoch_deadline(epoch_deadline_ticks);
         Ok(TensorWasmInstance::new(store, instance))
     }

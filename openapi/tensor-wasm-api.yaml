@@ -48,6 +48,16 @@ tags:
     description: Async-job poll API
   - name: ops
     description: Operator-facing endpoints (health, metrics)
+  - name: kernels
+    description: |
+      Kernel registry (roadmap feature #3, B6.4). The routes under this
+      tag are only mounted when the gateway binary is built with
+      `--features kernel-registry-api`; on the default build they are
+      absent and a request to them 404s at the router. When the feature
+      is on but `TENSOR_WASM_API_KERNEL_HMAC_KEY` is unset the handlers
+      return `503 kernel_registry_not_configured`. See
+      crates/tensor-wasm-api/src/kernels.rs and
+      docs/KERNEL-REGISTRY.md.
   - name: openai-compat
     description: |
       OpenAI-compatible inference gateway (T41, v0.4). The two routes
@@ -501,6 +511,191 @@ paths:
         "429":
           $ref: "#/components/responses/RateLimited"
 
+  /kernels:
+    post:
+      tags: [kernels]
+      summary: Publish a signed kernel manifest + PTX text
+      description: |
+        FEATURE-GATED: this route is only mounted when the gateway is
+        built with `--features kernel-registry-api`; the default build
+        does not register it (request 404s at the router). When the
+        feature is on but `TENSOR_WASM_API_KERNEL_HMAC_KEY` is unset the
+        handler returns `503 kernel_registry_not_configured`.
+
+        Publishes a signed `KernelManifest` plus its PTX source. The
+        registry re-verifies that `BLAKE3(ptx_text)` matches
+        `manifest.digest` and that the manifest's HMAC-SHA256 signature
+        verifies under the server's configured key before persisting.
+
+        Authorization is stricter than the other routes: in addition to
+        `bearer_auth` + `tenant_scope`, the caller's bearer token must
+        appear in the `TENSOR_WASM_API_KERNEL_PUBLISH_TOKENS` allowlist
+        (the **kernel-publish** scope). Dev mode (empty
+        `TENSOR_WASM_API_TOKENS`) rejects every publish with
+        `403 kernel_publish_disabled_in_dev_mode`. See
+        crates/tensor-wasm-api/src/kernels.rs.
+      operationId: publishKernel
+      parameters:
+        - $ref: "#/components/parameters/TenantHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublishKernelRequest"
+      responses:
+        "201":
+          description: Kernel published; canonical name/version echoed back.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublishKernelResponse"
+        "400":
+          description: |
+            `digest_mismatch` (BLAKE3 of `ptx_text` did not match
+            `manifest.digest`) or `invalid_request` (other registry
+            rejection). Carries the native `{error:{kind,message}}`
+            envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            `kernel_publish_disabled_in_dev_mode` (gateway in dev mode),
+            `kernel_publish_scope_required` (token not in
+            `TENSOR_WASM_API_KERNEL_PUBLISH_TOKENS`), `bad_signature`
+            (HMAC verification failed), or `publisher_not_allowed`
+            (manifest publisher not in the registry allowlist).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorEnvelope"
+        "409":
+          description: |
+            `already_registered` — a manifest with the same
+            `name@version` is already present.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorEnvelope"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/KernelRegistryUnavailable"
+    get:
+      tags: [kernels]
+      summary: List registered kernel manifests (PTX omitted)
+      description: |
+        FEATURE-GATED: only mounted under `--features
+        kernel-registry-api`. Returns `503
+        kernel_registry_not_configured` when the feature is on but
+        `TENSOR_WASM_API_KERNEL_HMAC_KEY` is unset.
+
+        Lists manifests in unspecified order; PTX text is omitted (use
+        `GET /kernels/{name}/{version}` to fetch source). Any
+        authenticated tenant may list. `limit` is clamped to 1000
+        server-side; the response echoes the effective `offset` /
+        `limit`.
+      operationId: listKernels
+      parameters:
+        - $ref: "#/components/parameters/TenantHeader"
+        - name: offset
+          in: query
+          required: false
+          description: Index of the first manifest to return; defaults to 0.
+          schema:
+            type: integer
+            minimum: 0
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Maximum manifests in the returned page; defaults to 100,
+            clamped to 1000 server-side.
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Page of manifests with the effective pagination echoed.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListKernelsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/KernelRegistryUnavailable"
+
+  /kernels/{name}/{version}:
+    get:
+      tags: [kernels]
+      summary: Resolve a kernel manifest + PTX text
+      description: |
+        FEATURE-GATED: only mounted under `--features
+        kernel-registry-api`. Returns `503
+        kernel_registry_not_configured` when the feature is on but
+        `TENSOR_WASM_API_KERNEL_HMAC_KEY` is unset.
+
+        Resolves a single manifest plus its PTX source by
+        `name`/`version`. Any authenticated tenant may resolve. Path
+        segments are accepted verbatim; clients must percent-encode any
+        reserved characters in `name` or `version`.
+      operationId: resolveKernel
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Kernel name segment.
+          schema:
+            type: string
+        - name: version
+          in: path
+          required: true
+          description: Kernel version segment.
+          schema:
+            type: string
+        - $ref: "#/components/parameters/TenantHeader"
+      responses:
+        "200":
+          description: Resolved manifest and its PTX text.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            X-Trace-Id:
+              $ref: "#/components/headers/XTraceId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResolveKernelResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/KernelRegistryUnavailable"
+
 components:
   securitySchemes:
     BearerAuth:
@@ -639,6 +834,22 @@ components:
             $ref: "#/components/schemas/ApiErrorEnvelope"
     InvokeTimeout:
       description: Invocation exceeded its per-call deadline
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        X-Trace-Id:
+          $ref: "#/components/headers/XTraceId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorEnvelope"
+    KernelRegistryUnavailable:
+      description: |
+        Kernel registry routes are mounted but the backing registry is
+        not configured: `TENSOR_WASM_API_KERNEL_HMAC_KEY` is unset, so
+        the handler returns `503 kernel_registry_not_configured`. (The
+        publish path can also surface `kernel_registry_storage_error`
+        here on a backend I/O failure.)
       headers:
         X-Request-Id:
           $ref: "#/components/headers/XRequestId"
@@ -799,6 +1010,16 @@ components:
             - invoke_timeout
             - wasmtime
             - internal
+            # Kernel registry (feature kernel-registry-api).
+            - kernel_registry_not_configured
+            - kernel_registry_storage_error
+            - kernel_publish_disabled_in_dev_mode
+            - kernel_publish_scope_required
+            - publisher_not_allowed
+            - bad_signature
+            - digest_mismatch
+            - already_registered
+            - invalid_request
         message:
           type: string
           description: Human-readable description (not part of the contract).
@@ -810,6 +1031,127 @@ components:
         error:
           $ref: "#/components/schemas/ApiErrorBody"
       required: [error]
+      additionalProperties: false
+
+    # ---- Kernel registry shapes (B6.4, feature kernel-registry-api) -------
+    KernelManifest:
+      type: object
+      description: |
+        Signed kernel manifest. Mirrors the
+        `tensor_wasm_jit::registry::KernelManifest` Rust struct
+        (`#[non_exhaustive]`, so additional fields may appear in future
+        revisions). `digest` and `signature` are fixed 32-byte arrays
+        serialized by serde as JSON arrays of 32 integers (0-255); the
+        HMAC `signature` tag is public by design (it authenticates
+        authorship, the signing key is the secret).
+      properties:
+        name:
+          type: string
+          description: Stable kernel name (e.g. `matmul.f32`).
+        version:
+          type: string
+          description: SemVer-style version (e.g. `1.0.0`).
+        sm_version:
+          type: integer
+          minimum: 0
+          description: CUDA compute capability the PTX targets (e.g. 80 for sm_80).
+        digest:
+          type: array
+          description: BLAKE3 hash of the PTX text (32 bytes).
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+          minItems: 32
+          maxItems: 32
+        signature:
+          type: array
+          description: HMAC-SHA256 tag over the canonical signed bytes (32 bytes).
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+          minItems: 32
+          maxItems: 32
+        published_unix_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Wall-clock publish timestamp (Unix millis).
+        publisher:
+          type: string
+          description: Publisher identifier (typically a tenant id or signing-key id).
+      required:
+        - name
+        - version
+        - sm_version
+        - digest
+        - signature
+        - published_unix_ms
+        - publisher
+    PublishKernelRequest:
+      type: object
+      description: |
+        Body of `POST /kernels`. Mirrors the
+        `tensor_wasm_api::kernels::PublishKernelRequest` Rust struct.
+      properties:
+        manifest:
+          $ref: "#/components/schemas/KernelManifest"
+        ptx_text:
+          type: string
+          description: |
+            PTX source. The server computes BLAKE3 over the UTF-8 bytes
+            and requires a match with `manifest.digest` before the HMAC
+            signature check.
+      required: [manifest, ptx_text]
+      additionalProperties: false
+    PublishKernelResponse:
+      type: object
+      description: |
+        Body of a successful `201 Created` from `POST /kernels`. Echoes
+        the canonical key so the client can confirm what was stored.
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+      required: [name, version]
+      additionalProperties: false
+    ListKernelsResponse:
+      type: object
+      description: |
+        Body of `GET /kernels`. Mirrors
+        `tensor_wasm_api::kernels::ListKernelsResponse`. PTX text is
+        omitted from listed manifests.
+      properties:
+        manifests:
+          type: array
+          items:
+            $ref: "#/components/schemas/KernelManifest"
+        offset:
+          type: integer
+          minimum: 0
+          description: Effective offset the handler used (echoes the query param).
+        limit:
+          type: integer
+          minimum: 0
+          description: |
+            Effective limit the handler used after server-side clamping
+            (max 1000).
+      required: [manifests, offset, limit]
+      additionalProperties: false
+    ResolveKernelResponse:
+      type: object
+      description: |
+        Body of `GET /kernels/{name}/{version}`. Mirrors
+        `tensor_wasm_api::kernels::ResolveKernelResponse`.
+      properties:
+        manifest:
+          $ref: "#/components/schemas/KernelManifest"
+        ptx_text:
+          type: string
+          description: PTX text whose BLAKE3 matches `manifest.digest`.
+      required: [manifest, ptx_text]
       additionalProperties: false
 
     # ---- OpenAI-compatible request / response shapes (T41) ---------------

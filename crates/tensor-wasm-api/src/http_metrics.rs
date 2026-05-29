@@ -109,6 +109,16 @@ pub const DEFAULT_ROUTE_ALLOWLIST: &[&str] = &[
     // `docs/OPENAI-COMPAT.md` for the rollout plan.
     "/v1/completions",
     "/v1/chat/completions",
+    // Kernel registry routes (B6.4). Only mounted under
+    // `--features kernel-registry-api`; listed unconditionally here so
+    // the route label resolves on that build axis instead of collapsing
+    // to `"unknown"`. Listing them on the default build is harmless —
+    // the allow-list is a label-cardinality guard, not a router, so a
+    // template that never matches simply never appears as a `route`
+    // value. See `crates/tensor-wasm-api/src/kernels.rs` for the
+    // handlers and `build_router_full` for the mount.
+    "/kernels",
+    "/kernels/:name/:version",
 ];
 
 /// Set of route templates that the metrics middleware is willing to emit as

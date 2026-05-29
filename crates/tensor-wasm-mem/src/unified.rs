@@ -1084,11 +1084,21 @@ impl UnifiedBacking for UnifiedBuffer {
         // The legacy method signature on `UnifiedBuffer` takes no
         // ordinal (the cust path infers it from the buffer's owning
         // device). The trait surface accepts an ordinal so future
-        // backings can target a non-owning device; on the cust path we
-        // silently discard the argument to preserve v0.3 semantics
-        // (cust 0.3's safe surface cannot retarget mid-flight anyway).
-        let _ = device_ord;
-        UnifiedBuffer::prefetch_to_device(self)
+        // backings can target a non-owning device. cust 0.3's safe
+        // surface cannot retarget mid-flight, so we can only honor a
+        // prefetch aimed at the owning device; for any other ordinal we
+        // surface `NotSupported` rather than silently servicing it
+        // against the wrong device (matching the cudarc path — see
+        // `cudarc_backend.rs`). The owning-device case stays an advisory
+        // no-op `Ok(())` per `UnifiedBuffer::prefetch_to_device`.
+        if device_ord == self.device_id().0 {
+            UnifiedBuffer::prefetch_to_device(self)
+        } else {
+            Err(UnifiedError::NotSupported {
+                feature: "prefetch_to_device(non-owning-ordinal)",
+                backing: "cust",
+            })
+        }
     }
 
     fn prefetch_to_host(&self) -> Result<(), UnifiedError> {

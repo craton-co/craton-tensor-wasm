@@ -721,12 +721,25 @@ fn build_trampoline(
     //   i32.const 0
     //   i32.ne
     //   if
-    //     unreachable
+    //     local.get $scratch     ;; free the arena slot on the trap path too —
+    //     i32.const scratch_size ;; the `unreachable` below aborts the guest
+    //     call $free             ;; but the host arena must still reclaim it,
+    //     unreachable            ;; otherwise a deopt-storm leaks scratch.
     //   end
+    //
+    // The `if` body is stack-neutral: the `i32.ne` result was consumed by
+    // `if`, so the block opens with an empty operand stack. `free` pushes
+    // its two args, `call $free` consumes them and returns nothing, leaving
+    // the stack empty again before `unreachable`. (The `unreachable` makes
+    // the rest of the block dead, but the encoder still requires the body
+    // to type-check up to that point.)
     func.instruction(&I::LocalTee(rc_local_idx));
     func.instruction(&I::I32Const(0));
     func.instruction(&I::I32Ne);
     func.instruction(&I::If(wasm_encoder::BlockType::Empty));
+    func.instruction(&I::LocalGet(scratch_local_idx));
+    func.instruction(&I::I32Const(scratch_size as i32));
+    func.instruction(&I::Call(imports.free));
     func.instruction(&I::Unreachable);
     func.instruction(&I::End);
 
@@ -1356,12 +1369,15 @@ mod tests {
     }
 
     /// The rewritten trampoline must trap on a nonzero dispatch return code
-    /// rather than silently feed zero-filled results back to the caller.
-    /// We can't run the rewritten module without a host harness from inside
-    /// this unit test, so assert structurally: the emitted function bytes
-    /// must contain the exact `local.tee $rc; i32.const 0; i32.ne; if;
-    /// unreachable; end` opcode sequence we wired in after the dispatch
-    /// call. This catches regressions back to the old silent-drop pattern.
+    /// rather than silently feed zero-filled results back to the caller, AND
+    /// it must free the scratch arena on the trap path (otherwise a deopt
+    /// storm leaks scratch slots — see M1). We can't run the rewritten module
+    /// without a host harness from inside this unit test, so assert
+    /// structurally: the emitted function bytes must contain the
+    /// `local.tee $rc; i32.const 0; i32.ne; if { local.get $scratch;
+    /// i32.const <size>; call $free; unreachable } end` opcode sequence we
+    /// wired in after the dispatch call. This catches regressions back to
+    /// both the old silent-drop pattern and the leak-on-trap pattern.
     #[test]
     fn trampoline_traps_on_nonzero_dispatch() {
         let imports = DispatchImports {
@@ -1370,7 +1386,8 @@ mod tests {
             free: 2,
         };
         // One param so the rc local lands at index 2 (params.len() + 1 = 2)
-        // which encodes as a single 0x02 byte in unsigned LEB128.
+        // which encodes as a single 0x02 byte in unsigned LEB128. The
+        // scratch_ptr local is index 1 (params.len() = 1).
         let func = build_trampoline(
             0xDEAD_BEEF,
             &imports,
@@ -1382,18 +1399,39 @@ mod tests {
         code.function(&func);
         let mut out = Vec::new();
         wasm_encoder::Encode::encode(&code, &mut out);
-        // Expected sequence after the dispatch `call` instruction:
+        // Prefix of the trap branch, up to and including the `if` opener:
         //   0x22 0x02 — local.tee 2 (the rc local)
         //   0x41 0x00 — i32.const 0
         //   0x47      — i32.ne
         //   0x04 0x40 — if (block type = empty)
+        //   0x20 0x01 — local.get 1 (scratch_ptr) — first instr of the body
+        const PREFIX: &[u8] = &[0x22, 0x02, 0x41, 0x00, 0x47, 0x04, 0x40, 0x20, 0x01];
+        // The scratch_size `i32.const` in between is variable-length LEB128,
+        // so we don't pin its bytes. The tail of the trap branch must be:
+        //   0x10 0x02 — call 2 (the free import) — MUST precede `unreachable`
         //   0x00      — unreachable
         //   0x0B      — end (closes the if)
-        const EXPECTED: &[u8] = &[0x22, 0x02, 0x41, 0x00, 0x47, 0x04, 0x40, 0x00, 0x0B];
-        let found = out.windows(EXPECTED.len()).any(|w| w == EXPECTED);
+        const SUFFIX: &[u8] = &[0x10, 0x02, 0x00, 0x0B];
+        let prefix_at = out
+            .windows(PREFIX.len())
+            .position(|w| w == PREFIX)
+            .unwrap_or_else(|| {
+                panic!(
+                    "trampoline missing the trap-branch prefix \
+                     (local.tee rc; i32.const 0; i32.ne; if; local.get scratch); \
+                     body bytes: {out:02x?}"
+                )
+            });
+        // The `call $free; unreachable; end` suffix must appear AFTER the
+        // prefix — i.e. the free call sits inside the trap branch and
+        // precedes the `unreachable`, reclaiming scratch on the trap path.
+        let found_free_before_trap = out[prefix_at..]
+            .windows(SUFFIX.len())
+            .any(|w| w == SUFFIX);
         assert!(
-            found,
-            "trampoline missing the trap-on-nonzero-dispatch opcode sequence; \
+            found_free_before_trap,
+            "trampoline missing `call $free; unreachable; end` in the trap \
+             branch — scratch leaks on the dispatch-failure trap path; \
              body bytes: {out:02x?}"
         );
     }

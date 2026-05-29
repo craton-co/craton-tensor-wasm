@@ -58,7 +58,7 @@ fn cuda_oxide_buffer_type_has_nonzero_size() {
 /// documented sentinel error string. On the host-backend build this test
 /// is skipped — the real impl returns either `Ok` or a real driver
 /// error, never the `NOT_YET_WIRED` sentinel.
-#[cfg(not(feature = "cuda-oxide-host-backend"))]
+#[cfg(not(feature = "experimental-cuda-oxide-host-backend"))]
 #[test]
 fn cuda_oxide_allocate_returns_not_yet_wired() {
     let err = CudaOxideUnifiedBuffer::allocate(1024)
@@ -99,7 +99,7 @@ fn cuda_oxide_prefetch_async_is_exported() {
 /// host-backend feature is on and the build host can compile the
 /// cuda-oxide crates (LIBCLANG + CUDA Toolkit). The cudarc-backend has
 /// the same test under the matching name.
-#[cfg(feature = "cuda-oxide-host-backend")]
+#[cfg(feature = "experimental-cuda-oxide-host-backend")]
 #[test]
 fn cuda_oxide_zero_size_rejected_without_driver() {
     let err = CudaOxideUnifiedBuffer::allocate(0).expect_err("zero should be rejected");
@@ -113,7 +113,7 @@ fn cuda_oxide_zero_size_rejected_without_driver() {
 /// when the host-backend feature is on. Requires a CUDA driver and at
 /// least one visible GPU; marked `#[ignore]` per the repo convention so
 /// host-only CI does not try to dlopen `libcuda`.
-#[cfg(feature = "cuda-oxide-host-backend")]
+#[cfg(feature = "experimental-cuda-oxide-host-backend")]
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn cuda_oxide_round_trip_on_device() {
@@ -126,7 +126,7 @@ fn cuda_oxide_round_trip_on_device() {
 
 /// Hardware-gated advice round trip: allocate then apply
 /// `CU_MEM_ADVISE_SET_READ_MOSTLY`. Compute capability ≥ 6.0 required.
-#[cfg(feature = "cuda-oxide-host-backend")]
+#[cfg(feature = "experimental-cuda-oxide-host-backend")]
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn cuda_oxide_apply_advice_read_mostly_on_device() {
@@ -137,7 +137,7 @@ fn cuda_oxide_apply_advice_read_mostly_on_device() {
 
 /// Hardware-gated prefetch round trip: prefetch to device 0, then back
 /// to the host (`DeviceId(u32::MAX)` sentinel for `CU_DEVICE_CPU`).
-#[cfg(feature = "cuda-oxide-host-backend")]
+#[cfg(feature = "experimental-cuda-oxide-host-backend")]
 #[test]
 #[ignore = "requires CUDA hardware"]
 fn cuda_oxide_prefetch_round_trip_on_device() {

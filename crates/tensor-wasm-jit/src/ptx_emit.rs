@@ -59,6 +59,14 @@ pub enum EmitError {
         /// callers MUST NOT include the value in untrusted-facing errors).
         entry: String,
     },
+    /// The blueprint demands more SSA registers than the `%fN` index space
+    /// (`u32`) can address. Previously the allocator saturated at
+    /// `u32::MAX`, which silently aliased two distinct SSA values onto the
+    /// same physical register and corrupted results. We now refuse the
+    /// blueprint so the caller (rewrite.rs) deopts to the CPU path rather
+    /// than launch a miscompiled kernel. Closes jit L1.
+    #[error("PTX register allocation overflowed the u32 index space")]
+    TooManyRegisters,
 }
 
 /// Maximum length of a PTX identifier (NVIDIA PTX ISA §A.3).
@@ -177,10 +185,22 @@ fn lower_body(
     let mut in_off: u32 = 0;
     let mut out_off: u32 = 0;
 
-    let alloc_f = |next_f: &mut u32| -> u32 {
+    // Allocate a fresh `%fN` register. Returns `EmitError::TooManyRegisters`
+    // rather than saturating at `u32::MAX` — saturation would alias two
+    // distinct SSA values onto the same physical register (jit L1).
+    let alloc_f = |next_f: &mut u32| -> Result<u32, EmitError> {
         let r = *next_f;
-        *next_f = next_f.checked_add(1).unwrap_or(u32::MAX);
-        r
+        *next_f = next_f.checked_add(1).ok_or(EmitError::TooManyRegisters)?;
+        Ok(r)
+    };
+    // Pop an operand register off the value stack, or allocate a fresh one
+    // if the stack underflows (an op consuming more than the abstract stack
+    // holds). Threads the fallible allocator through the underflow path.
+    let pop_or_alloc = |value_stack: &mut Vec<u32>, next_f: &mut u32| -> Result<u32, EmitError> {
+        match value_stack.pop() {
+            Some(r) => Ok(r),
+            None => alloc_f(next_f),
+        }
     };
 
     for op in &blueprint.ops {
@@ -188,9 +208,9 @@ fn lower_body(
             TensorWasmOp::VecAdd { lanes } => {
                 let _ = writeln!(body, "    // vec_add[{}] lanes", lanes);
                 for _ in 0..*lanes {
-                    let b = value_stack.pop().unwrap_or_else(|| alloc_f(&mut next_f));
-                    let a = value_stack.pop().unwrap_or_else(|| alloc_f(&mut next_f));
-                    let dst = alloc_f(&mut next_f);
+                    let b = pop_or_alloc(&mut value_stack, &mut next_f)?;
+                    let a = pop_or_alloc(&mut value_stack, &mut next_f)?;
+                    let dst = alloc_f(&mut next_f)?;
                     let _ = writeln!(body, "    add.f32 %f{dst}, %f{a}, %f{b};");
                     value_stack.push(dst);
                 }
@@ -198,9 +218,9 @@ fn lower_body(
             TensorWasmOp::VecMul { lanes } => {
                 let _ = writeln!(body, "    // vec_mul[{}] lanes", lanes);
                 for _ in 0..*lanes {
-                    let b = value_stack.pop().unwrap_or_else(|| alloc_f(&mut next_f));
-                    let a = value_stack.pop().unwrap_or_else(|| alloc_f(&mut next_f));
-                    let dst = alloc_f(&mut next_f);
+                    let b = pop_or_alloc(&mut value_stack, &mut next_f)?;
+                    let a = pop_or_alloc(&mut value_stack, &mut next_f)?;
+                    let dst = alloc_f(&mut next_f)?;
                     let _ = writeln!(body, "    mul.f32 %f{dst}, %f{a}, %f{b};");
                     value_stack.push(dst);
                 }
@@ -208,10 +228,10 @@ fn lower_body(
             TensorWasmOp::VecFma { lanes } => {
                 let _ = writeln!(body, "    // vec_fma[{}] lanes", lanes);
                 for _ in 0..*lanes {
-                    let c = value_stack.pop().unwrap_or_else(|| alloc_f(&mut next_f));
-                    let b = value_stack.pop().unwrap_or_else(|| alloc_f(&mut next_f));
-                    let a = value_stack.pop().unwrap_or_else(|| alloc_f(&mut next_f));
-                    let dst = alloc_f(&mut next_f);
+                    let c = pop_or_alloc(&mut value_stack, &mut next_f)?;
+                    let b = pop_or_alloc(&mut value_stack, &mut next_f)?;
+                    let a = pop_or_alloc(&mut value_stack, &mut next_f)?;
+                    let dst = alloc_f(&mut next_f)?;
                     let _ = writeln!(body, "    fma.rn.f32 %f{dst}, %f{a}, %f{b}, %f{c};");
                     value_stack.push(dst);
                 }
@@ -238,7 +258,7 @@ fn lower_body(
                     lanes
                 );
                 for _ in 0..*lanes {
-                    let dst = alloc_f(&mut next_f);
+                    let dst = alloc_f(&mut next_f)?;
                     if in_off == 0 {
                         let _ = writeln!(body, "    ld.global.lu.f32 %f{dst}, [%rd0];");
                     } else {
@@ -255,7 +275,7 @@ fn lower_body(
                     lanes
                 );
                 for _ in 0..*lanes {
-                    let src = value_stack.pop().unwrap_or_else(|| alloc_f(&mut next_f));
+                    let src = pop_or_alloc(&mut value_stack, &mut next_f)?;
                     if out_off == 0 {
                         let _ = writeln!(body, "    st.global.cs.f32 [%rd1], %f{src};");
                     } else {

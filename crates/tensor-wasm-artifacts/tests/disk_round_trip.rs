@@ -14,12 +14,12 @@ fn disk_round_trip() {
                     some opaque artifact bytes that compress nicely\
                     some opaque artifact bytes that compress nicely";
     let hash = store.put(payload).expect("put");
-    assert_eq!(hash, ContentHash(blake3::hash(payload).into()));
+    assert_eq!(hash, ContentHash::from_bytes(blake3::hash(payload).into()));
 
     let got = store.get(&hash).expect("get");
     assert_eq!(got, payload);
 
-    let listed = store.list();
+    let listed = store.list().expect("list");
     assert_eq!(listed.len(), 1, "list must surface the single put");
     assert_eq!(listed[0], hash);
 }
@@ -43,8 +43,8 @@ fn disk_multiple_payloads_round_trip() {
         assert_eq!(&got, p);
     }
 
-    let mut listed = store.list();
-    listed.sort_by_key(|h| h.0);
+    let mut listed = store.list().expect("list");
+    listed.sort_by_key(|h| *h.as_bytes());
     assert_eq!(listed.len(), 8);
 }
 
@@ -52,7 +52,7 @@ fn disk_multiple_payloads_round_trip() {
 fn disk_get_missing_is_not_found() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = DiskArtifactStore::new(tmp.path().to_path_buf(), [0x77; 32]);
-    let hash = ContentHash([0xAA; 32]);
+    let hash = ContentHash::from_bytes([0xAA; 32]);
     let err = store.get(&hash).expect_err("must miss");
     assert!(matches!(
         err,
@@ -68,6 +68,10 @@ fn disk_put_is_idempotent_on_same_payload() {
     let h1 = store.put(p).unwrap();
     let h2 = store.put(p).unwrap();
     assert_eq!(h1, h2);
-    assert_eq!(store.list().len(), 1, "second put overwrites in place");
+    assert_eq!(
+        store.list().expect("list").len(),
+        1,
+        "second put overwrites in place"
+    );
     assert_eq!(store.get(&h1).unwrap(), p);
 }

@@ -168,9 +168,36 @@ pub(crate) fn device_for(ordinal: u32) -> Result<Arc<CudaDevice>, UnifiedError> 
     // Re-lock and insert-if-absent. Returning the *cached* value (which
     // may be ours OR a winner's) ensures the caller always sees the
     // single canonical handle for this ordinal.
+    //
+    // L2: if a winner already installed an `Arc` for this ordinal we are
+    // the loser of the race and must drop our freshly-built `fresh`. We
+    // must NOT let that drop run while `cache` is locked: dropping the
+    // last strong ref to a `CudaDevice` triggers `cuDevicePrimaryCtxRelease`
+    // under the driver, and we do not want a driver call executing under
+    // the cache mutex. So we capture the canonical clone, hold onto the
+    // loser `Arc` in a binding (`fresh` is moved into the entry on the
+    // winning path, otherwise stays here), drop the guard explicitly, and
+    // only then let the loser `Arc` fall out of scope. Race-correctness is
+    // unchanged: the winner's `Arc` is pinned in the cache (strong-count
+    // ≥ 1) before we release the lock.
     let mut cache = device_cache().lock();
-    let canonical = cache.entry(ordinal).or_insert(fresh);
-    Ok(Arc::clone(canonical))
+    let (canonical, loser) = match cache.entry(ordinal) {
+        std::collections::hash_map::Entry::Occupied(occupied) => {
+            // We lost the race: clone the winner's pinned handle and keep
+            // our now-redundant `fresh` to drop after unlocking.
+            (Arc::clone(occupied.get()), Some(fresh))
+        }
+        std::collections::hash_map::Entry::Vacant(vacant) => {
+            // We won: install `fresh` (pinning strong-count ≥ 1) and hand
+            // out a clone. Nothing to drop.
+            (Arc::clone(vacant.insert(fresh)), None)
+        }
+    };
+    // Release the lock BEFORE the loser `Arc` is dropped so any
+    // `cuDevicePrimaryCtxRelease` runs outside the cache mutex.
+    drop(cache);
+    drop(loser);
+    Ok(canonical)
 }
 
 /// Bind the device's primary context to the calling thread (mem M4).

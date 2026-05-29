@@ -430,6 +430,14 @@ struct BucketState {
     tokens: f64,
     /// Monotonic instant of the most recent refill calculation.
     last_refill: Instant,
+    /// Monotonic instant of the most recent admit attempt against this
+    /// bucket. Drives LRU eviction of the per-`(token, tenant)` map (L10):
+    /// `last_refill` is updated on every refill regardless of layer, but we
+    /// keep a separate field so the eviction policy reads intent ("last
+    /// touched by a request") rather than refill bookkeeping. In practice the
+    /// two move together; the distinct name keeps the eviction call site
+    /// self-documenting.
+    last_access: Instant,
 }
 
 /// Outcome of an attempt to claim a permit from the bucket.
@@ -467,6 +475,17 @@ pub struct RateLimiter {
     /// single shared token still gets per-tenant isolation. With the dev
     /// sentinel token, this also separates internal-cron tenants from
     /// external traffic that lands on `TokenId::DEV`.
+    ///
+    /// **L10 — bounded growth.** A wildcard-scope token can spray arbitrarily
+    /// many distinct `X-TensorWasm-Tenant` header values, each minting a fresh
+    /// `(token, tenant)` key. Left unchecked this map grows without bound (a
+    /// memory-exhaustion DoS). We cap the number of distinct tenants tracked
+    /// per token at [`MAX_TENANTS_PER_TOKEN`](RateLimiter::MAX_TENANTS_PER_TOKEN)
+    /// and evict the least-recently-used `(token, tenant)` bucket for that
+    /// token when a brand-new tenant would push it over the cap. Eviction runs
+    /// opportunistically — only on the insert of a previously-unseen
+    /// `(token, tenant)` pair — so the steady-state hot path (an existing
+    /// bucket) pays nothing.
     per_tenant_buckets: Arc<DashMap<(TokenId, TenantId), Mutex<BucketState>>>,
 }
 
@@ -481,6 +500,18 @@ impl std::fmt::Debug for RateLimiter {
 }
 
 impl RateLimiter {
+    /// Maximum number of distinct tenants tracked per token in the
+    /// per-`(token, tenant)` bucket map before LRU eviction kicks in (L10).
+    ///
+    /// Sized generously relative to any realistic legitimate fan-out: a
+    /// single token addressing more than a few thousand tenants is either a
+    /// misconfiguration or an attack, and in both cases bounding the memory
+    /// is the right call. The eviction only ever discards rate-limiter
+    /// bookkeeping (a `f64` balance + two `Instant`s); a subsequently-evicted
+    /// tenant simply starts from a full burst on its next request, which is
+    /// strictly more permissive — never a correctness or security regression.
+    pub const MAX_TENANTS_PER_TOKEN: usize = 4096;
+
     /// Construct a limiter with the production [`RealClock`].
     pub fn new(cfg: RateLimitConfig) -> Self {
         Self::with_clock(cfg, Arc::new(RealClock))
@@ -538,6 +569,18 @@ impl RateLimiter {
         let per_tenant_entry = if self.cfg.per_tenant_default.is_disabled() {
             None
         } else {
+            // L10: before minting a bucket for a previously-unseen
+            // (token, tenant) pair, make room by evicting this token's
+            // least-recently-used tenant if it is already at the cap. We
+            // gate the (relatively expensive) eviction scan behind a cheap
+            // `contains_key` so the steady-state path — an existing bucket —
+            // never touches it. The check/evict/insert sequence is not atomic
+            // across shards, but a benign race only briefly overshoots the
+            // cap by the number of concurrent first-touches and self-corrects
+            // on the next new-tenant insert.
+            if !self.per_tenant_buckets.contains_key(&(token, tenant)) {
+                self.evict_lru_tenant_if_at_cap(token);
+            }
             Some(
                 self.per_tenant_buckets
                     .entry((token, tenant))
@@ -545,6 +588,7 @@ impl RateLimiter {
                         Mutex::new(BucketState {
                             tokens: per_tenant_burst,
                             last_refill: now,
+                            last_access: now,
                         })
                     }),
             )
@@ -556,6 +600,7 @@ impl RateLimiter {
                 Mutex::new(BucketState {
                     tokens: token_burst,
                     last_refill: now,
+                    last_access: now,
                 })
             }))
         };
@@ -620,6 +665,57 @@ impl RateLimiter {
             retry_after_secs: secs.max(1),
         }
     }
+
+    /// L10 eviction: if `token` already owns
+    /// [`MAX_TENANTS_PER_TOKEN`](Self::MAX_TENANTS_PER_TOKEN) (or more)
+    /// distinct per-tenant buckets, drop the single least-recently-accessed
+    /// one to make room for the caller's pending insert. Bounds the
+    /// `per_tenant_buckets` map at `MAX_TENANTS_PER_TOKEN` entries per token,
+    /// so a wildcard token spraying distinct `X-TensorWasm-Tenant` values
+    /// cannot grow it without limit.
+    ///
+    /// Called only on the cold path (first request for a `(token, tenant)`
+    /// pair), so the per-token scan over the map does not touch the
+    /// steady-state hot path. Evicting a bucket merely resets that tenant's
+    /// rate-limit bookkeeping; the next request for it rebuilds the bucket at
+    /// full burst, which is strictly more permissive and never a security
+    /// regression (the per-token backstop layer still caps aggregate usage).
+    fn evict_lru_tenant_if_at_cap(&self, token: TokenId) {
+        // Single pass: count this token's buckets and remember the coldest.
+        let mut count = 0usize;
+        let mut lru_key: Option<(TokenId, TenantId)> = None;
+        let mut lru_access: Option<Instant> = None;
+        for entry in self.per_tenant_buckets.iter() {
+            let key = *entry.key();
+            if key.0 != token {
+                continue;
+            }
+            count += 1;
+            let access = entry
+                .value()
+                .lock()
+                .map(|s| s.last_access)
+                .unwrap_or_else(|p| p.into_inner().last_access);
+            // `is_none_or` is MSRV 1.82; workspace MSRV is 1.78, so keep the
+            // explicit match formulation (mirrors the `map_or` note in
+            // `try_admit`).
+            let colder = match lru_access {
+                None => true,
+                Some(cur) => access < cur,
+            };
+            if colder {
+                lru_access = Some(access);
+                lru_key = Some(key);
+            }
+        }
+        if count < Self::MAX_TENANTS_PER_TOKEN {
+            return;
+        }
+        if let Some(key) = lru_key {
+            // `remove` is a no-op if a concurrent caller already evicted it.
+            self.per_tenant_buckets.remove(&key);
+        }
+    }
 }
 
 /// Per-layer decision returned by `refill_and_decide`.
@@ -646,6 +742,10 @@ fn refill_and_decide(
         state.tokens = state.tokens.min(burst);
     }
     state.last_refill = now;
+    // L10: record the access so LRU eviction (see
+    // `RateLimiter::evict_lru_tenant_if_at_cap`) can identify the coldest
+    // per-tenant bucket for a token under fan-out pressure.
+    state.last_access = now;
     if state.tokens >= 1.0 {
         BucketDecision {
             admittable: true,
@@ -930,6 +1030,97 @@ mod tests {
         assert_eq!(results[3].0, StatusCode::TOO_MANY_REQUESTS);
         assert!(results[3].1.is_some(), "Retry-After header missing");
         assert_eq!(results[4].0, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// L10 regression guard: a single token addressing far more distinct
+    /// tenants than the per-token cap must NOT grow `per_tenant_buckets`
+    /// without bound. The map size for that token is held at
+    /// [`RateLimiter::MAX_TENANTS_PER_TOKEN`] via LRU eviction.
+    #[test]
+    fn per_tenant_buckets_are_bounded_under_distinct_tenant_fan_out() {
+        let clock = Arc::new(ManualClock::new());
+        // Per-tenant layer ACTIVE (non-zero burst) so the per-tenant map is
+        // actually populated; token layer disabled so we isolate the L10
+        // path. `cfg(..)` disables per-tenant, so build the config directly.
+        let limiter = RateLimiter::with_clock(
+            RateLimitConfig {
+                qps: 0,
+                burst: 0,
+                per_tenant_default: PerTenantRateLimitConfig {
+                    burst: 5,
+                    qps: 1.0,
+                },
+            },
+            clock.clone(),
+        );
+        let tok = TokenId::from_bearer("wildcard-sprayer");
+
+        // Spray far more distinct tenants than the cap. Advance the clock a
+        // touch between requests so `last_access` strictly orders the
+        // buckets, making the LRU victim deterministic.
+        let cap = RateLimiter::MAX_TENANTS_PER_TOKEN;
+        let total = cap + 500;
+        for t in 0..total {
+            clock.advance(Duration::from_micros(1));
+            // Cast is safe: TenantId wraps a u64 and `total` fits easily.
+            let _ = limiter.try_admit(tok, TenantId(t as u64));
+        }
+
+        // The map must be bounded by the per-token cap, NOT by `total`.
+        assert!(
+            limiter.per_tenant_buckets.len() <= cap,
+            "per_tenant_buckets grew to {} (cap {cap}); eviction did not bound it",
+            limiter.per_tenant_buckets.len(),
+        );
+        // And it should be at the cap (we inserted well past it), proving we
+        // evict rather than refuse to track.
+        assert_eq!(
+            limiter.per_tenant_buckets.len(),
+            cap,
+            "expected exactly the cap to remain after fan-out",
+        );
+    }
+
+    /// A second token's buckets are unaffected by another token hitting the
+    /// cap: eviction is scoped per token, not global.
+    #[test]
+    fn per_token_eviction_does_not_disturb_other_tokens() {
+        let clock = Arc::new(ManualClock::new());
+        let limiter = RateLimiter::with_clock(
+            RateLimitConfig {
+                qps: 0,
+                burst: 0,
+                per_tenant_default: PerTenantRateLimitConfig {
+                    burst: 5,
+                    qps: 1.0,
+                },
+            },
+            clock.clone(),
+        );
+        let noisy = TokenId::from_bearer("noisy");
+        let quiet = TokenId::from_bearer("quiet");
+
+        // `quiet` registers a single tenant up front.
+        let _ = limiter.try_admit(quiet, TenantId(1));
+
+        // `noisy` blows past the cap.
+        let cap = RateLimiter::MAX_TENANTS_PER_TOKEN;
+        for t in 0..(cap + 100) {
+            clock.advance(Duration::from_micros(1));
+            let _ = limiter.try_admit(noisy, TenantId(t as u64));
+        }
+
+        // `quiet`'s lone bucket survived; only `noisy` was capped.
+        assert!(
+            limiter.per_tenant_buckets.contains_key(&(quiet, TenantId(1))),
+            "quiet token's bucket must not be evicted by noisy token's fan-out",
+        );
+        let noisy_count = limiter
+            .per_tenant_buckets
+            .iter()
+            .filter(|e| e.key().0 == noisy)
+            .count();
+        assert_eq!(noisy_count, cap, "noisy token must be capped");
     }
 
     #[tokio::test]

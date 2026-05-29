@@ -68,8 +68,31 @@ pub const WRITE_CONCURRENCY_LIMIT: usize = 16;
 pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Environment variable carrying a comma-separated allowlist of bearer
-/// tokens accepted by [`bearer_auth`]. Empty / unset = dev mode pass-through.
+/// tokens accepted by [`bearer_auth`]. Empty / unset = dev mode pass-through
+/// (but only when [`ENV_ALLOW_DEV_MODE`] explicitly opts in — see below).
 pub const ENV_API_TOKENS: &str = "TENSOR_WASM_API_TOKENS";
+
+/// Environment variable that explicitly opts the gateway into dev mode
+/// (auth disabled, every request passes through with [`AuthContext::dev`]).
+///
+/// Accepted truthy values are `"1"` and `"true"` (case-insensitive, trimmed).
+/// Any other value — including unset — leaves dev mode *disabled*.
+///
+/// Closes the M4 finding: an empty / unset [`ENV_API_TOKENS`] used to make
+/// [`bearer_auth`] fail *open* (wildcard pass-through), so a deployment that
+/// merely forgot to populate the allowlist silently accepted every request.
+/// We now fail *closed*: when no tokens are configured AND this opt-in is not
+/// set, [`bearer_auth`] rejects every request with `401 Unauthorized`. The
+/// startup `warn!` in [`AuthConfig::from_env`] is preserved so an operator who
+/// genuinely wants dev mode still sees the loud signal — they just have to
+/// acknowledge it by setting this variable.
+///
+/// Only [`AuthConfig::from_env`] consults this variable. Configs built
+/// programmatically via [`AuthConfig::from_tokens`] / [`AuthConfig::from_scopes`]
+/// / [`AuthConfig::default`] are treated as an explicit in-process opt-in
+/// (they cannot be poisoned by hostile ambient environment), so they preserve
+/// the historical pass-through behaviour for tests and embedders.
+pub const ENV_ALLOW_DEV_MODE: &str = "TENSOR_WASM_API_ALLOW_DEV_MODE";
 
 /// Environment variable carrying a comma-separated allowlist of bearer
 /// tokens that are additionally permitted to call `POST /kernels` (the
@@ -543,7 +566,7 @@ pub fn cors_layer(cfg: &CorsConfig) -> CorsLayer {
 /// empty), in which case [`bearer_auth`] passes every request through
 /// unchecked. Otherwise each allowlisted bearer token maps to the
 /// [`TokenScope`] that came out of [`parse_tokens_env`] at startup.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AuthConfig {
     /// Allowlisted bearer tokens → tenant scope. Empty = dev mode
     /// (pass-through with startup warning).
@@ -551,6 +574,29 @@ pub struct AuthConfig {
     /// Count of entries that used the legacy bare-token shape. The server
     /// emits a single deprecation warning at startup if this is nonzero.
     pub deprecated_count: usize,
+    /// Whether dev-mode pass-through is permitted when `scopes` is empty.
+    ///
+    /// Only meaningful in dev mode (`scopes.is_empty()`). When `false`,
+    /// [`bearer_auth`] fails *closed* and rejects every request with
+    /// `401 Unauthorized` rather than passing it through with
+    /// [`AuthContext::dev`]. Set from [`ENV_ALLOW_DEV_MODE`] by
+    /// [`AuthConfig::from_env`]; defaults to `true` for programmatic
+    /// constructors (see [`ENV_ALLOW_DEV_MODE`] for the rationale).
+    pub dev_mode_allowed: bool,
+}
+
+impl Default for AuthConfig {
+    /// An empty allowlist with dev mode *allowed*. Programmatic construction
+    /// is an explicit in-process opt-in, so it preserves the historical
+    /// pass-through behaviour (the [`ENV_ALLOW_DEV_MODE`] gate applies only to
+    /// the env-driven [`AuthConfig::from_env`] path).
+    fn default() -> Self {
+        Self {
+            scopes: Arc::new(HashMap::new()),
+            deprecated_count: 0,
+            dev_mode_allowed: true,
+        }
+    }
 }
 
 impl AuthConfig {
@@ -561,12 +607,33 @@ impl AuthConfig {
     pub fn from_env() -> Self {
         let raw = std::env::var(ENV_API_TOKENS).unwrap_or_default();
         let parsed = parse_tokens_env(&raw);
+        // M4: empty allowlist is only honoured as dev-mode pass-through when
+        // the operator explicitly opts in via ENV_ALLOW_DEV_MODE. Otherwise we
+        // fail closed (bearer_auth 401s every request). Accept `1` / `true`
+        // (case-insensitive, trimmed) as the truthy set; anything else (incl.
+        // unset) leaves dev mode disabled.
+        let dev_mode_allowed = std::env::var(ENV_ALLOW_DEV_MODE).is_ok_and(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        });
         if parsed.token_scopes.is_empty() {
             tracing::warn!(
                 target: "tensor_wasm_api::middleware",
                 env = ENV_API_TOKENS,
                 "TENSOR_WASM_API_TOKENS empty; API accepts all requests (dev mode)",
             );
+            if !dev_mode_allowed {
+                tracing::warn!(
+                    target: "tensor_wasm_api::middleware",
+                    env = ENV_ALLOW_DEV_MODE,
+                    "{} not set; refusing dev-mode pass-through — every request \
+                     will be rejected with 401. Configure {} to enable bearer \
+                     auth, or set {}=1 to explicitly acknowledge an open gateway",
+                    ENV_ALLOW_DEV_MODE,
+                    ENV_API_TOKENS,
+                    ENV_ALLOW_DEV_MODE,
+                );
+            }
         }
         if parsed.deprecated_count > 0 {
             tracing::warn!(
@@ -583,6 +650,7 @@ impl AuthConfig {
         Self {
             scopes: Arc::new(parsed.token_scopes),
             deprecated_count: parsed.deprecated_count,
+            dev_mode_allowed,
         }
     }
 
@@ -602,6 +670,7 @@ impl AuthConfig {
         Self {
             scopes: Arc::new(scopes),
             deprecated_count: 0,
+            dev_mode_allowed: true,
         }
     }
 
@@ -619,6 +688,7 @@ impl AuthConfig {
         Self {
             scopes: Arc::new(scopes),
             deprecated_count: 0,
+            dev_mode_allowed: true,
         }
     }
 
@@ -764,6 +834,19 @@ pub async fn bearer_auth(mut req: Request, next: Next) -> Response {
         .unwrap_or_default();
 
     if cfg.is_dev_mode() {
+        // M4: fail closed unless dev mode was explicitly opted into. An empty
+        // allowlist that nobody acknowledged is treated as a misconfiguration,
+        // not as "auth disabled" — every request is rejected rather than
+        // silently granted the wildcard `AuthContext::dev` scope.
+        if !cfg.dev_mode_allowed {
+            return envelope(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "no bearer tokens configured and dev mode is not enabled; set \
+                 TENSOR_WASM_API_TOKENS to enable bearer auth, or set \
+                 TENSOR_WASM_API_ALLOW_DEV_MODE=1 to allow unauthenticated access",
+            );
+        }
         req.extensions_mut()
             .insert(crate::rate_limit::AuthContext::dev());
         return next.run(req).await;
@@ -1341,6 +1424,156 @@ mod tests {
         // dev-mode `accepts` is irrelevant, but should return `false` —
         // the dev gate runs in `bearer_auth`, not here.
         assert!(!cfg.accepts("anything"));
+    }
+
+    // ---- M4: dev-mode opt-in gate -------------------------------------
+
+    /// Programmatic constructors are an explicit in-process opt-in, so they
+    /// keep the historical pass-through behaviour (`dev_mode_allowed == true`).
+    /// This preserves every test/embedder that builds a dev `AuthConfig`
+    /// directly without touching the process environment.
+    #[test]
+    fn auth_config_programmatic_constructors_allow_dev_mode() {
+        assert!(AuthConfig::default().dev_mode_allowed);
+        assert!(AuthConfig::from_tokens(Vec::<String>::new()).dev_mode_allowed);
+        assert!(AuthConfig::from_scopes(Vec::<(String, TokenScope)>::new()).dev_mode_allowed);
+    }
+
+    /// `from_env` with an empty allowlist and no opt-in must produce a config
+    /// that forbids dev mode (M4 fail-closed). The env mutation is scoped by
+    /// `temp_env` so it cannot race other tests.
+    #[test]
+    fn auth_config_from_env_empty_without_opt_in_forbids_dev_mode() {
+        temp_env::with_vars(
+            [
+                (ENV_API_TOKENS, None::<&str>),
+                (ENV_ALLOW_DEV_MODE, None::<&str>),
+            ],
+            || {
+                let cfg = AuthConfig::from_env();
+                assert!(cfg.is_dev_mode());
+                assert!(
+                    !cfg.dev_mode_allowed,
+                    "empty allowlist + no opt-in must fail closed",
+                );
+            },
+        );
+    }
+
+    /// The opt-in honours both `1` and (case-insensitive) `true`.
+    #[test]
+    fn auth_config_from_env_opt_in_values_enable_dev_mode() {
+        for val in ["1", "true", "TRUE", " true "] {
+            temp_env::with_vars(
+                [
+                    (ENV_API_TOKENS, None::<&str>),
+                    (ENV_ALLOW_DEV_MODE, Some(val)),
+                ],
+                || {
+                    let cfg = AuthConfig::from_env();
+                    assert!(cfg.is_dev_mode());
+                    assert!(
+                        cfg.dev_mode_allowed,
+                        "ENV_ALLOW_DEV_MODE={val:?} must enable dev mode",
+                    );
+                },
+            );
+        }
+    }
+
+    /// A non-truthy opt-in value leaves dev mode disabled.
+    #[test]
+    fn auth_config_from_env_non_truthy_opt_in_forbids_dev_mode() {
+        for val in ["0", "false", "yes", ""] {
+            temp_env::with_vars(
+                [
+                    (ENV_API_TOKENS, None::<&str>),
+                    (ENV_ALLOW_DEV_MODE, Some(val)),
+                ],
+                || {
+                    assert!(
+                        !AuthConfig::from_env().dev_mode_allowed,
+                        "ENV_ALLOW_DEV_MODE={val:?} must NOT enable dev mode",
+                    );
+                },
+            );
+        }
+    }
+
+    /// When tokens ARE configured the opt-in is irrelevant — the config is
+    /// not in dev mode and `bearer_auth` enforces the allowlist as before.
+    #[test]
+    fn auth_config_from_env_with_tokens_is_not_dev_mode() {
+        temp_env::with_vars(
+            [
+                (ENV_API_TOKENS, Some("secret:tenant=*")),
+                (ENV_ALLOW_DEV_MODE, None::<&str>),
+            ],
+            || {
+                let cfg = AuthConfig::from_env();
+                assert!(!cfg.is_dev_mode());
+                assert!(cfg.accepts("secret"));
+            },
+        );
+    }
+
+    /// End-to-end: a fail-closed dev config (`dev_mode_allowed == false`) must
+    /// reject an unauthenticated request through the real `bearer_auth`
+    /// middleware with `401 Unauthorized`, rather than passing it through.
+    #[tokio::test]
+    async fn bearer_auth_fails_closed_when_dev_mode_not_allowed() {
+        use axum::routing::get;
+        use tower::ServiceExt as _;
+
+        let cfg = temp_env::with_vars(
+            [
+                (ENV_API_TOKENS, None::<&str>),
+                (ENV_ALLOW_DEV_MODE, None::<&str>),
+            ],
+            AuthConfig::from_env,
+        );
+        assert!(!cfg.dev_mode_allowed);
+
+        let router = axum::Router::new()
+            .route("/x", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(bearer_auth))
+            .layer(axum::Extension(cfg));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/x")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// End-to-end counterpart: with dev mode explicitly allowed the same
+    /// unauthenticated request passes through to the handler (`200 OK`).
+    #[tokio::test]
+    async fn bearer_auth_passes_through_when_dev_mode_allowed() {
+        use axum::routing::get;
+        use tower::ServiceExt as _;
+
+        // `default()` is an explicit in-process opt-in (dev_mode_allowed).
+        let router = axum::Router::new()
+            .route("/x", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(bearer_auth))
+            .layer(axum::Extension(AuthConfig::default()));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/x")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]

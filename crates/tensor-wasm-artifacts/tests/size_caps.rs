@@ -143,7 +143,7 @@ fn get_rejects_zstd_bomb_over_cap() {
     // the hash comparison.
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = DiskArtifactStore::new(tmp.path().to_path_buf(), TEST_KEY);
-    let fake_hash = ContentHash(content_hash_field);
+    let fake_hash = ContentHash::from_bytes(content_hash_field);
     let fname = format!("{}.{}.bin", fake_hash, key_fp_hex(&TEST_KEY));
     let target = tmp.path().join(&fname);
     std::fs::create_dir_all(tmp.path()).expect("mkdir");

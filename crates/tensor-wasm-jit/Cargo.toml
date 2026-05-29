@@ -168,6 +168,17 @@ pliron-llvm-backend = ["cuda-oxide-backend", "dep:pliron-llvm"]
 # `required-features` block below. No extra dependencies.
 test-utils = []
 
+# __unstable-test-internals gates `KernelCache::__test_only_insert_unchecked`
+# (jit M2). That fn installs a `CachedKernel` directly into L1 storage,
+# bypassing `put`'s S-3 integrity check, so it MUST NOT be reachable from a
+# default build — a downstream crate could otherwise forge a zero-hash entry
+# and defeat the integrity defence. The double-underscore prefix marks it as
+# unstable, internal, and outside the semver contract. Only the
+# `cache_verify_opt_out` integration test (which needs to install a
+# hand-crafted zero-hash entry to confirm the `verify_on_get=false` path
+# still rejects it on `get`) opts in via its `required-features` block below.
+__unstable-test-internals = []
+
 # differential-oracle gates the `differential` module — the roadmap
 # feature #6 ("differential JIT correctness oracle") scaffold. v0.3.6
 # only compiles the harness types; the v0.4 wiring against the
@@ -211,6 +222,18 @@ required-features = ["cuda-oxide-backend", "test-utils"]
 name = "differential_proptest"
 path = "tests/differential_proptest.rs"
 required-features = ["differential-oracle"]
+
+# The `verify_on_get` opt-out regression test installs a hand-crafted
+# zero-hash `CachedKernel` via `KernelCache::__test_only_insert_unchecked`
+# to confirm the opt-out path still rejects it on `get` (jit M2). That
+# entry-point is gated behind `__unstable-test-internals`, so this test
+# only compiles when the feature is on. Local invocation:
+#   cargo test -p tensor-wasm-jit \
+#     --features __unstable-test-internals --test cache_verify_opt_out
+[[test]]
+name = "cache_verify_opt_out"
+path = "tests/cache_verify_opt_out.rs"
+required-features = ["__unstable-test-internals"]
 
 [package.metadata.docs.rs]
 all-features = true

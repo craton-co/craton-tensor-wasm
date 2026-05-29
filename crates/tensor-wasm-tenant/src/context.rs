@@ -41,8 +41,6 @@
 use loom::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(feature = "loom"))]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "gpu-mem-pool")]
-use std::sync::Arc;
 
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::metrics::{TenantLabels, TensorWasmMetrics};
@@ -256,22 +254,6 @@ pub struct TenantContext {
     #[allow(dead_code)]
     cuda_mem_pool_quota_bytes: Option<u64>,
 
-    /// v0.4 driver-level GPU memory pool, when the `gpu-mem-pool`
-    /// feature is enabled AND
-    /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`] was
-    /// called. The pool's release-threshold caps every allocation that
-    /// routes through `cuMemAllocFromPoolAsync` at the driver level —
-    /// belt-and-braces complement to the in-process `bytes_in_use`
-    /// counter, so a tenant that somehow obtained a raw CUDA driver
-    /// handle still cannot exceed the cap. The `Arc` lets the same
-    /// pool be shared between this context and any future per-stream
-    /// allocator that wires through `tensor-wasm-mem`. v0.3.8 status:
-    /// pool creation + drop are wired; the allocator side is the v0.4
-    /// follow-up tracked in `tensor-wasm-mem::cuda_mem_pool`.
-    #[cfg(feature = "gpu-mem-pool")]
-    #[allow(dead_code)]
-    mem_pool: Option<Arc<tensor_wasm_mem::cuda_mem_pool::TenantMemPool>>,
-
     // Real `cust::context::Context` under the `cuda` feature; otherwise a
     // unit stub so the rest of the crate compiles on CUDA-less hosts.
     #[cfg(feature = "cuda")]
@@ -281,13 +263,18 @@ pub struct TenantContext {
     #[allow(dead_code)]
     cu_context: (),
 
-    /// Optional shared metrics handle. When present, every
+    /// Optional shared metrics handle. When present, every CPU-side
     /// [`Self::consume_bytes`] / [`Self::release_bytes`] transition updates
-    /// the per-tenant series of
-    /// [`tensor_wasm_core::metrics::TensorWasmMetrics::gpu_memory_bytes_per_tenant`]
-    /// with the new total. `None` keeps the historical no-op behaviour so
-    /// embedders that construct a `TenantContext` outside the API gateway
-    /// (e.g. benches, examples) do not need to plumb a metrics registry.
+    /// the process-wide
+    /// [`tensor_wasm_core::metrics::TensorWasmMetrics::gpu_memory_used_bytes`]
+    /// total, and every GPU-side
+    /// [`Self::consume_gpu_bytes`] / [`Self::release_gpu_bytes`] transition
+    /// updates the per-tenant series of
+    /// [`tensor_wasm_core::metrics::TensorWasmMetrics::gpu_memory_bytes_per_tenant`].
+    /// The two no longer collide on a single labelled series. `None` keeps
+    /// the historical no-op behaviour so embedders that construct a
+    /// `TenantContext` outside the API gateway (e.g. benches, examples) do
+    /// not need to plumb a metrics registry.
     metrics: Option<TensorWasmMetrics>,
     /// Memoized label tuple used to address the per-tenant gauge series.
     /// Built once at construction so the hot path of `consume_bytes` /
@@ -302,8 +289,9 @@ pub struct TenantContext {
     /// the token before wrapping the context in an `Arc`. A `None` here
     /// at `check_capability` time means the context was never registered
     /// (or was constructed for a test that bypasses the registry); the
-    /// strict-binding check degrades gracefully — see the comment in
-    /// [`Self::check_capability`].
+    /// strict-binding check then **fails closed** (rejects the cap),
+    /// since an unregistered context has no provenance to vouch for any
+    /// capability — see [`Self::check_capability`].
     #[cfg(feature = "strict-cap-binding")]
     pub(crate) registry_token: Option<std::sync::Arc<()>>,
 }
@@ -550,12 +538,16 @@ impl TenantContext {
     ///
     /// Under the `strict-cap-binding` feature, an additional check
     /// rejects caps minted by a *different* registry (by `Arc::ptr_eq` on
-    /// the per-registry token allocations). A context that was never
-    /// registered (no `registry_token` recorded) cannot ascribe blame to
-    /// a specific registry — in that mode the strict check is a no-op,
-    /// which preserves the existing behaviour for the few code paths
-    /// that synthesise a `TenantContext` directly via the builder (e.g.
-    /// unit tests inside this crate).
+    /// the per-registry token allocations). The check is **fail-closed**:
+    /// a context that was never registered (no `registry_token` recorded)
+    /// cannot prove which registry — if any — vouches for the cap, so the
+    /// capability check is rejected outright rather than waved through.
+    /// This closes the prior fail-open hole where a builder-constructed
+    /// context (`registry_token == None`) plus a foreign cap naming the
+    /// same tenant id silently passed. Registry-minted contexts always
+    /// carry a token (stamped by
+    /// [`crate::TenantRegistry::register_with_capability`]) and continue
+    /// to pass against caps from the same registry.
     fn check_capability(
         &self,
         cap: &TenantCapability,
@@ -569,13 +561,18 @@ impl TenantContext {
         }
         #[cfg(feature = "strict-cap-binding")]
         {
-            if let Some(ctx_token) = self.registry_token.as_ref() {
-                if !std::sync::Arc::ptr_eq(ctx_token, &cap.registry_token) {
-                    // The cap names the right tenant id, but was minted
-                    // by a different registry. Report the cap's tenant
-                    // id as the offender — the audit-flagged threat is
-                    // a holder of one registry's cap using it against a
-                    // namesake tenant in another registry.
+            match self.registry_token.as_ref() {
+                // Registered context: the cap must come from the same
+                // registry. Report the cap's tenant id as the offender —
+                // the audit-flagged threat is a holder of one registry's
+                // cap using it against a namesake tenant in another
+                // registry.
+                Some(ctx_token) if std::sync::Arc::ptr_eq(ctx_token, &cap.registry_token) => {}
+                // Either the cap was minted by a different registry, or
+                // this context carries no registry provenance at all
+                // (builder-constructed, never registered). Fail closed in
+                // both cases.
+                _ => {
                     return Err(TensorWasmError::TenantIsolationViolation {
                         tenant_id: cap.tenant_id,
                         resource: resource.into(),
@@ -586,37 +583,39 @@ impl TenantContext {
         Ok(())
     }
 
-    /// Push the current `bytes_in_use` total into the per-tenant gauge
-    /// series, if a metrics handle was wired into this context at build
-    /// time. Centralised so [`Self::consume_bytes`] and
-    /// [`Self::release_bytes`] share one update path. The `Gauge::set`
-    /// call is a single relaxed atomic store — cheap enough to live on
-    /// the allocation hot path.
+    /// Push the current CPU-side `bytes_in_use` total into the
+    /// process-wide `gpu_memory_used_bytes` total gauge, if a metrics
+    /// handle was wired into this context at build time. Centralised so
+    /// [`Self::consume_bytes`] and [`Self::release_bytes`] share one
+    /// update path. The `Gauge::set` call is a single relaxed atomic
+    /// store — cheap enough to live on the allocation hot path.
+    ///
+    /// The CPU counter and the GPU counter no longer collide on the same
+    /// labelled series: GPU usage owns the correctly-named per-tenant
+    /// family [`TensorWasmMetrics::gpu_memory_bytes_per_tenant`] (see
+    /// [`Self::publish_gpu_memory_gauge`]), while the CPU counter reports
+    /// against the process-wide total here.
+    ///
+    /// TODO(v0.4): the CPU side wants its own per-tenant breakdown
+    /// (`cpu_memory_bytes_per_tenant`), but adding that gauge family is a
+    /// change to `tensor_wasm_core::metrics::TensorWasmMetrics` (a
+    /// different crate) and is out of scope for this tenant-crate patch.
+    /// Until then the CPU counter publishes the single-series total only.
     fn publish_memory_gauge(&self, new_total: u64) {
         if let Some(metrics) = &self.metrics {
-            metrics
-                .gpu_memory_bytes_per_tenant()
-                .get_or_create(&self.metrics_labels)
-                .set(new_total);
+            metrics.gpu_memory_used_bytes().set(new_total);
         }
     }
 
-    /// Push the current `gpu_bytes_in_use` total into the per-tenant
+    /// Push the current `gpu_bytes_in_use` total into the per-tenant GPU
     /// gauge series.
     ///
     /// Centralised so [`Self::consume_gpu_bytes`] and
-    /// [`Self::release_gpu_bytes`] share one update path; mirrors
-    /// [`Self::publish_memory_gauge`] for the GPU side.
-    ///
-    /// NOTE: today both the CPU and GPU counters write to the same
-    /// `gpu_memory_bytes_per_tenant` series — last-write-wins. The
-    /// historical CPU path was named that way before this crate grew a
-    /// dedicated GPU counter; splitting into two series
-    /// (`gpu_memory_bytes_per_tenant` for this counter,
-    /// `cpu_memory_bytes_per_tenant` for the existing CPU one) is a
-    /// v0.4 follow-up tracked in `docs/GPU-QUOTAS.md` — it requires a
-    /// dashboard / alert-rule churn that is out of scope for this
-    /// quota-scaffold patch.
+    /// [`Self::release_gpu_bytes`] share one update path. GPU usage is the
+    /// owner of the correctly-named per-tenant family
+    /// [`TensorWasmMetrics::gpu_memory_bytes_per_tenant`]; the CPU counter
+    /// no longer writes to it (see [`Self::publish_memory_gauge`]), so the
+    /// two no longer clobber each other last-write-wins.
     fn publish_gpu_memory_gauge(&self, new_total: u64) {
         if let Some(metrics) = &self.metrics {
             metrics
@@ -640,23 +639,8 @@ impl TenantContext {
         self.cuda_mem_pool_quota_bytes
     }
 
-    /// Driver-level GPU memory pool wrapper, when configured via
-    /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`].
-    ///
-    /// Returns `Some(&Arc<TenantMemPool>)` only when:
-    ///
-    /// 1. The crate was compiled with `--features gpu-mem-pool`, AND
-    /// 2. The builder successfully created a `cuMemPool` via the
-    ///    cudarc FFI (i.e. `cuMemPoolCreate` returned `CUDA_SUCCESS`).
-    ///
-    /// Otherwise returns `None`. The v0.4 allocator path in
-    /// `tensor-wasm-mem::cuda_mem_pool` consults this getter to decide
-    /// between `cuMemAllocManaged` (unified-memory path) and
-    /// `cuMemAllocFromPoolAsync` (driver-enforced cap path).
-    #[cfg(feature = "gpu-mem-pool")]
-    pub fn mem_pool(&self) -> Option<&Arc<tensor_wasm_mem::cuda_mem_pool::TenantMemPool>> {
-        self.mem_pool.as_ref()
-    }
+    // TODO(v0.4): driver-enforced GPU cap requires breaking the mem<->tenant
+    // cycle (hoist TenantMemPool into tensor-wasm-core); tracked separately.
 
     /// Push this tenant's CUDA context onto the calling thread's context
     /// stack, returning a RAII guard that pops it on drop. Returns `None`
@@ -879,13 +863,6 @@ pub struct TenantContextBuilder {
     #[cfg(feature = "cuda")]
     cuda_device_index: Option<u32>,
     metrics: Option<TensorWasmMetrics>,
-    /// v0.4 driver-enforced GPU cap; populated by
-    /// [`Self::with_driver_enforced_gpu_cap`] when the `gpu-mem-pool`
-    /// feature is on. Held as the constructed `TenantMemPool` so the
-    /// builder hands the same `Arc` to both this context and any
-    /// future co-located allocator that the v0.4 follow-up wires up.
-    #[cfg(feature = "gpu-mem-pool")]
-    mem_pool: Option<Arc<tensor_wasm_mem::cuda_mem_pool::TenantMemPool>>,
 }
 
 impl TenantContextBuilder {
@@ -904,8 +881,6 @@ impl TenantContextBuilder {
             #[cfg(feature = "cuda")]
             cuda_device_index: None,
             metrics: None,
-            #[cfg(feature = "gpu-mem-pool")]
-            mem_pool: None,
         }
     }
 
@@ -928,8 +903,11 @@ impl TenantContextBuilder {
     }
 
     /// Wire a shared [`TensorWasmMetrics`] registry into the context so
-    /// every [`TenantContext::consume_bytes`] /
+    /// every CPU-side [`TenantContext::consume_bytes`] /
     /// [`TenantContext::release_bytes`] transition updates the
+    /// [`TensorWasmMetrics::gpu_memory_used_bytes`] total and every
+    /// GPU-side [`TenantContext::consume_gpu_bytes`] /
+    /// [`TenantContext::release_gpu_bytes`] transition updates the
     /// per-tenant series of
     /// [`TensorWasmMetrics::gpu_memory_bytes_per_tenant`]. The handle is
     /// cheap to clone (it shares an inner `Arc`); the caller normally
@@ -987,46 +965,8 @@ impl TenantContextBuilder {
         self
     }
 
-    /// Create a real CUDA `cuMemPool` for this tenant, configured with
-    /// `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = cap`, so allocations
-    /// past the cap fail at the driver level (`CUDA_ERROR_OUT_OF_MEMORY`).
-    ///
-    /// This is the v0.4 driver-level complement to the in-process
-    /// quota counter enforced by [`TenantContext::consume_bytes`]: a
-    /// tenant that somehow obtained a raw CUDA driver handle and
-    /// bypassed [`TenantContext::consume_bytes`] still cannot exceed
-    /// the cap because the driver itself refuses oversized
-    /// `cuMemAllocFromPoolAsync` calls.
-    ///
-    /// Mirrors the cust/cudarc precedence rule used elsewhere in the
-    /// crate: the in-process counter is the primary enforcement; the
-    /// `cuMemPool` is the belt-and-suspenders layer. v0.3.8 status:
-    /// pool creation + drop are wired; the allocator side is the v0.4
-    /// follow-up tracked in
-    /// [`tensor_wasm_mem::cuda_mem_pool::TenantMemPool`].
-    ///
-    /// Returns the wrapped error from
-    /// [`tensor_wasm_mem::cuda_mem_pool::MemPoolError`] if the cudarc
-    /// FFI rejects the pool creation or attribute-set. On success the
-    /// builder retains the `Arc<TenantMemPool>` so the eventual
-    /// `TenantContext` and any co-located v0.4 allocator share the
-    /// exact same pool handle.
-    #[cfg(feature = "gpu-mem-pool")]
-    pub fn with_driver_enforced_gpu_cap(
-        mut self,
-        cap: u64,
-    ) -> Result<Self, tensor_wasm_mem::cuda_mem_pool::MemPoolError> {
-        // T39: the driver pin now requires an explicit device ordinal.
-        // The tenant builder does not see a device index unless the
-        // optional `cuda` feature is on AND
-        // `with_cuda_device_index` was called; surfacing both options
-        // through this method would balloon the API. Default to
-        // ordinal 0 (matches the historical scaffold behaviour) and
-        // let the v0.5 cutover thread `cuda_device_index` through.
-        let pool = tensor_wasm_mem::cuda_mem_pool::TenantMemPool::new(0, cap)?;
-        self.mem_pool = Some(Arc::new(pool));
-        Ok(self)
-    }
+    // TODO(v0.4): driver-enforced GPU cap requires breaking the mem<->tenant
+    // cycle (hoist TenantMemPool into tensor-wasm-core); tracked separately.
 
     /// Set the CUDA device index this tenant's context should be built
     /// against. Only meaningful when the `cuda` feature is enabled and
@@ -1091,8 +1031,6 @@ impl TenantContextBuilder {
             gpu_memory_bytes_cap: self.gpu_memory_bytes_cap,
             gpu_bytes_in_use: AtomicU64::new(0),
             cuda_mem_pool_quota_bytes: self.cuda_mem_pool_quota_bytes,
-            #[cfg(feature = "gpu-mem-pool")]
-            mem_pool: self.mem_pool,
             cu_context,
             metrics: self.metrics,
             metrics_labels,
@@ -1283,36 +1221,61 @@ mod tests {
             .with_memory_quota_bytes(1 << 20)
             .with_metrics(metrics.clone())
             .build();
-        let labels = TenantLabels::new(TenantId(12).to_string());
 
-        // Consume → gauge reads the post-add total.
+        // CPU consume/release now publish to the process-wide
+        // `gpu_memory_used_bytes` total, NOT the per-tenant family
+        // (which is owned by the GPU counter). See `publish_memory_gauge`.
+
+        // Consume → total reads the post-add value.
         ctx.consume_bytes(4096).unwrap();
-        assert_eq!(
-            metrics
-                .gpu_memory_bytes_per_tenant()
-                .get_or_create(&labels)
-                .get(),
-            4096
-        );
+        assert_eq!(metrics.gpu_memory_used_bytes().get(), 4096);
 
         // A second consume composes.
         ctx.consume_bytes(2048).unwrap();
-        assert_eq!(
-            metrics
-                .gpu_memory_bytes_per_tenant()
-                .get_or_create(&labels)
-                .get(),
-            6144
-        );
+        assert_eq!(metrics.gpu_memory_used_bytes().get(), 6144);
 
-        // Release → gauge reads the post-sub total.
+        // Release → total reads the post-sub value.
         ctx.release_bytes(2048);
+        assert_eq!(metrics.gpu_memory_used_bytes().get(), 4096);
+    }
+
+    #[test]
+    fn gpu_metrics_publish_to_per_tenant_family() {
+        // The GPU counter owns the per-tenant `gpu_memory_bytes_per_tenant`
+        // family; the CPU counter no longer collides on it.
+        let metrics = TensorWasmMetrics::new();
+        let ctx = TenantContext::builder(TenantId(12))
+            .with_metrics(metrics.clone())
+            .build();
+        let labels = TenantLabels::new(TenantId(12).to_string());
+
+        ctx.consume_gpu_bytes(4096).unwrap();
         assert_eq!(
             metrics
                 .gpu_memory_bytes_per_tenant()
                 .get_or_create(&labels)
                 .get(),
             4096
+        );
+
+        ctx.release_gpu_bytes(2048);
+        assert_eq!(
+            metrics
+                .gpu_memory_bytes_per_tenant()
+                .get_or_create(&labels)
+                .get(),
+            2048
+        );
+
+        // A CPU consume on the same context must NOT perturb the GPU
+        // per-tenant series — the collision is gone.
+        ctx.consume_bytes(1024).unwrap();
+        assert_eq!(
+            metrics
+                .gpu_memory_bytes_per_tenant()
+                .get_or_create(&labels)
+                .get(),
+            2048
         );
     }
 
@@ -1320,18 +1283,17 @@ mod tests {
     fn metrics_two_tenants_produce_two_distinct_series() {
         // Mirrors the dashboard's expected shape: two registered tenants
         // reserving different amounts must surface as two distinct
-        // labelled series in the Prometheus exposition.
+        // labelled series in the Prometheus exposition. The per-tenant
+        // family is the GPU counter's, so drive it via `consume_gpu_bytes`.
         let metrics = TensorWasmMetrics::new();
         let a = TenantContext::builder(TenantId(101))
-            .with_memory_quota_bytes(1 << 20)
             .with_metrics(metrics.clone())
             .build();
         let b = TenantContext::builder(TenantId(102))
-            .with_memory_quota_bytes(1 << 20)
             .with_metrics(metrics.clone())
             .build();
-        a.consume_bytes(4096).unwrap();
-        b.consume_bytes(8192).unwrap();
+        a.consume_gpu_bytes(4096).unwrap();
+        b.consume_gpu_bytes(8192).unwrap();
 
         let text = metrics.encode_text();
         assert!(
@@ -1354,14 +1316,7 @@ mod tests {
         // Underflow path: release without prior consume. The counter
         // clamps to zero and the gauge should reflect zero, not wrap.
         ctx.release_bytes(123);
-        let labels = TenantLabels::new(TenantId(13).to_string());
-        assert_eq!(
-            metrics
-                .gpu_memory_bytes_per_tenant()
-                .get_or_create(&labels)
-                .get(),
-            0
-        );
+        assert_eq!(metrics.gpu_memory_used_bytes().get(), 0);
     }
 
     #[test]

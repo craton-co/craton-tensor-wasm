@@ -89,6 +89,21 @@ pub struct EngineConfig {
     /// [`crate::executor::MAX_MODULE_BYTES`] (64 MiB); embedders may
     /// tighten further but the constant is the documented floor.
     pub max_module_bytes: usize,
+    /// Upper bound on the number of `Module::from_binary` (Cranelift)
+    /// compiles allowed to run concurrently on the Tokio blocking pool.
+    ///
+    /// Each compile is offloaded via [`tokio::task::spawn_blocking`]; the
+    /// blocking pool is a shared process resource (default 512 threads).
+    /// Without a bound, an adversary submitting a stream of *unique* large
+    /// modules — each a cache miss, each a multi-hundred-millisecond
+    /// Cranelift run — can saturate the pool and starve every other
+    /// blocking operation in the process. This cap is independent of
+    /// [`Self::max_instances`] (which bounds live instances, not in-flight
+    /// compiles) and is enforced by a per-executor
+    /// [`tokio::sync::Semaphore`]. `None` selects a default derived from
+    /// [`std::thread::available_parallelism`] (floored at 1) at executor
+    /// construction time.
+    pub max_concurrent_compiles: Option<usize>,
 }
 
 impl Default for EngineConfig {
@@ -102,6 +117,10 @@ impl Default for EngineConfig {
             max_module_cache_entries: 1024,
             max_instances: Some(10_000),
             max_module_bytes: crate::executor::MAX_MODULE_BYTES,
+            // None => derive from available_parallelism at executor
+            // construction. Keeps the default tied to the host's core
+            // count without pulling in a `num_cpus` dependency.
+            max_concurrent_compiles: None,
         }
     }
 }
