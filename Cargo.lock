@@ -3354,11 +3354,9 @@ dependencies = [
 name = "tensor-wasm-artifacts"
 version = "0.3.7"
 dependencies = [
- "bincode",
  "blake3",
  "hmac",
  "parking_lot",
- "serde",
  "sha2",
  "subtle",
  "tempfile",
@@ -3380,12 +3378,14 @@ dependencies = [
  "tempfile",
  "tensor-wasm-api",
  "tensor-wasm-core",
+ "tensor-wasm-exec",
  "tensor-wasm-jit",
  "tensor-wasm-mem",
  "tensor-wasm-snapshot",
  "tensor-wasm-wasi-gpu",
  "tokio",
  "tower 0.5.3",
+ "wat",
 ]
 
 [[package]]

@@ -265,9 +265,9 @@ pub struct TenantContext {
 
     /// Optional shared metrics handle. When present, every CPU-side
     /// [`Self::consume_bytes`] / [`Self::release_bytes`] transition updates
-    /// the process-wide
-    /// [`tensor_wasm_core::metrics::TensorWasmMetrics::gpu_memory_used_bytes`]
-    /// total, and every GPU-side
+    /// the per-tenant series of
+    /// [`tensor_wasm_core::metrics::TensorWasmMetrics::cpu_memory_bytes_per_tenant`],
+    /// and every GPU-side
     /// [`Self::consume_gpu_bytes`] / [`Self::release_gpu_bytes`] transition
     /// updates the per-tenant series of
     /// [`tensor_wasm_core::metrics::TensorWasmMetrics::gpu_memory_bytes_per_tenant`].
@@ -583,27 +583,25 @@ impl TenantContext {
         Ok(())
     }
 
-    /// Push the current CPU-side `bytes_in_use` total into the
-    /// process-wide `gpu_memory_used_bytes` total gauge, if a metrics
-    /// handle was wired into this context at build time. Centralised so
-    /// [`Self::consume_bytes`] and [`Self::release_bytes`] share one
-    /// update path. The `Gauge::set` call is a single relaxed atomic
-    /// store — cheap enough to live on the allocation hot path.
+    /// Push the current CPU-side `bytes_in_use` total into this tenant's
+    /// per-tenant CPU gauge series, if a metrics handle was wired into
+    /// this context at build time. Centralised so [`Self::consume_bytes`]
+    /// and [`Self::release_bytes`] share one update path. The `Gauge::set`
+    /// call is a single relaxed atomic store — cheap enough to live on the
+    /// allocation hot path.
     ///
-    /// The CPU counter and the GPU counter no longer collide on the same
-    /// labelled series: GPU usage owns the correctly-named per-tenant
-    /// family [`TensorWasmMetrics::gpu_memory_bytes_per_tenant`] (see
-    /// [`Self::publish_gpu_memory_gauge`]), while the CPU counter reports
-    /// against the process-wide total here.
-    ///
-    /// TODO(v0.4): the CPU side wants its own per-tenant breakdown
-    /// (`cpu_memory_bytes_per_tenant`), but adding that gauge family is a
-    /// change to `tensor_wasm_core::metrics::TensorWasmMetrics` (a
-    /// different crate) and is out of scope for this tenant-crate patch.
-    /// Until then the CPU counter publishes the single-series total only.
+    /// The CPU counter and the GPU counter report against distinct,
+    /// correctly-named per-tenant families and never collide on the same
+    /// labelled series: CPU usage owns
+    /// [`TensorWasmMetrics::cpu_memory_bytes_per_tenant`] here, while GPU
+    /// usage owns [`TensorWasmMetrics::gpu_memory_bytes_per_tenant`] (see
+    /// [`Self::publish_gpu_memory_gauge`]).
     fn publish_memory_gauge(&self, new_total: u64) {
         if let Some(metrics) = &self.metrics {
-            metrics.gpu_memory_used_bytes().set(new_total);
+            metrics
+                .cpu_memory_bytes_per_tenant()
+                .get_or_create(&self.metrics_labels)
+                .set(new_total);
         }
     }
 
@@ -904,9 +902,9 @@ impl TenantContextBuilder {
 
     /// Wire a shared [`TensorWasmMetrics`] registry into the context so
     /// every CPU-side [`TenantContext::consume_bytes`] /
-    /// [`TenantContext::release_bytes`] transition updates the
-    /// [`TensorWasmMetrics::gpu_memory_used_bytes`] total and every
-    /// GPU-side [`TenantContext::consume_gpu_bytes`] /
+    /// [`TenantContext::release_bytes`] transition updates the per-tenant
+    /// series of [`TensorWasmMetrics::cpu_memory_bytes_per_tenant`] and
+    /// every GPU-side [`TenantContext::consume_gpu_bytes`] /
     /// [`TenantContext::release_gpu_bytes`] transition updates the
     /// per-tenant series of
     /// [`TensorWasmMetrics::gpu_memory_bytes_per_tenant`]. The handle is
@@ -1222,21 +1220,28 @@ mod tests {
             .with_metrics(metrics.clone())
             .build();
 
-        // CPU consume/release now publish to the process-wide
-        // `gpu_memory_used_bytes` total, NOT the per-tenant family
-        // (which is owned by the GPU counter). See `publish_memory_gauge`.
+        // CPU consume/release publish to the per-tenant CPU family
+        // `cpu_memory_bytes_per_tenant` (the CPU counterpart of the GPU
+        // counter's family). See `publish_memory_gauge`.
+        let labels = TenantLabels::new(TenantId(12).to_string());
+        let cpu = || {
+            metrics
+                .cpu_memory_bytes_per_tenant()
+                .get_or_create(&labels)
+                .get()
+        };
 
-        // Consume → total reads the post-add value.
+        // Consume → the per-tenant CPU gauge reads the post-add value.
         ctx.consume_bytes(4096).unwrap();
-        assert_eq!(metrics.gpu_memory_used_bytes().get(), 4096);
+        assert_eq!(cpu(), 4096);
 
         // A second consume composes.
         ctx.consume_bytes(2048).unwrap();
-        assert_eq!(metrics.gpu_memory_used_bytes().get(), 6144);
+        assert_eq!(cpu(), 6144);
 
-        // Release → total reads the post-sub value.
+        // Release → the gauge reads the post-sub value.
         ctx.release_bytes(2048);
-        assert_eq!(metrics.gpu_memory_used_bytes().get(), 4096);
+        assert_eq!(cpu(), 4096);
     }
 
     #[test]
@@ -1314,9 +1319,17 @@ mod tests {
             .with_metrics(metrics.clone())
             .build();
         // Underflow path: release without prior consume. The counter
-        // clamps to zero and the gauge should reflect zero, not wrap.
+        // clamps to zero and the per-tenant CPU gauge should reflect zero,
+        // not wrap.
+        let labels = TenantLabels::new(TenantId(13).to_string());
         ctx.release_bytes(123);
-        assert_eq!(metrics.gpu_memory_used_bytes().get(), 0);
+        assert_eq!(
+            metrics
+                .cpu_memory_bytes_per_tenant()
+                .get_or_create(&labels)
+                .get(),
+            0
+        );
     }
 
     #[test]

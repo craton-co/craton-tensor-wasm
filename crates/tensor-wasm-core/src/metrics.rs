@@ -609,6 +609,13 @@ struct TensorWasmMetricsInner {
     /// (`TenantContext::bytes_in_use`) and the existing single-series
     /// total at `tensor_wasm_gpu_memory_used_bytes`.
     gpu_memory_bytes_per_tenant: Family<TenantLabels, Gauge<u64, AtomicU64>>,
+    /// Per-tenant CPU (linear-memory / host) memory accounting (bytes
+    /// currently reserved). Mirrors [`Self::gpu_memory_bytes_per_tenant`]
+    /// in shape and `u64` width (the underlying
+    /// `TenantContext::bytes_in_use` counter). Updated by
+    /// `tensor-wasm-tenant`'s `publish_memory_gauge` on every
+    /// `consume_bytes` / `release_bytes` transition.
+    cpu_memory_bytes_per_tenant: Family<TenantLabels, Gauge<u64, AtomicU64>>,
     /// Cumulative count of streaming chunks emitted via
     /// `wasi:tensor/host.emit-chunk` and successfully forwarded onto
     /// the SSE / chunked-transfer response body of
@@ -776,6 +783,8 @@ impl TensorWasmMetrics {
         let jobs_active: Gauge<i64, AtomicI64> = Gauge::default();
         let gpu_memory_bytes_per_tenant: Family<TenantLabels, Gauge<u64, AtomicU64>> =
             Family::default();
+        let cpu_memory_bytes_per_tenant: Family<TenantLabels, Gauge<u64, AtomicU64>> =
+            Family::default();
         let streaming_chunks_emitted_total: Counter<u64> = Counter::default();
         // Prime the single build-info series so it is observable on the
         // very first scrape (Family<...> emits nothing until at least
@@ -873,6 +882,14 @@ impl TensorWasmMetrics {
             gpu_memory_bytes_per_tenant.clone(),
         );
         registry.register(
+            "tensor_wasm_cpu_memory_bytes_per_tenant",
+            "Per-tenant CPU (linear-memory / host) memory currently \
+             reserved, in bytes. Updated by `tensor-wasm-tenant` on every \
+             `consume_bytes` / `release_bytes` accounting transition. The \
+             CPU counterpart to `tensor_wasm_gpu_memory_bytes_per_tenant`",
+            cpu_memory_bytes_per_tenant.clone(),
+        );
+        registry.register(
             "tensor_wasm_streaming_chunks_emitted",
             "Cumulative count of streaming chunks emitted via \
              `wasi:tensor/host.emit-chunk` and successfully forwarded \
@@ -899,6 +916,7 @@ impl TensorWasmMetrics {
                 build_info,
                 jobs_active,
                 gpu_memory_bytes_per_tenant,
+                cpu_memory_bytes_per_tenant,
                 streaming_chunks_emitted_total,
             }),
         }
@@ -1015,6 +1033,19 @@ impl TensorWasmMetrics {
     /// cardinality contract.
     pub fn gpu_memory_bytes_per_tenant(&self) -> &Family<TenantLabels, Gauge<u64, AtomicU64>> {
         &self.inner.gpu_memory_bytes_per_tenant
+    }
+
+    /// Per-tenant CPU (linear-memory / host) memory currently reserved, in
+    /// bytes (gauge family).
+    ///
+    /// Set via
+    /// `metrics.cpu_memory_bytes_per_tenant().get_or_create(&labels).set(bytes)`
+    /// from the tenant subsystem on every `consume_bytes` /
+    /// `release_bytes` transition. The CPU counterpart to
+    /// [`Self::gpu_memory_bytes_per_tenant`]; see [`TenantLabels`] for the
+    /// cardinality contract.
+    pub fn cpu_memory_bytes_per_tenant(&self) -> &Family<TenantLabels, Gauge<u64, AtomicU64>> {
+        &self.inner.cpu_memory_bytes_per_tenant
     }
 
     /// Cumulative count of streaming chunks emitted via
@@ -1479,6 +1510,67 @@ mod tests {
         assert!(
             s.contains("tensor_wasm_gpu_memory_used_bytes"),
             "single-series total must be preserved alongside the per-tenant family; got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn cpu_memory_per_tenant_family_observable_after_set() {
+        // Mirror of `gpu_memory_per_tenant_family_observable_after_set`
+        // for the CPU counterpart family. Family<...> metrics emit nothing
+        // until a label tuple is touched; prime two tenants and assert
+        // both series appear with the expected values.
+        let m = TensorWasmMetrics::new();
+        let t1 = TenantLabels {
+            tenant_id: Cow::Borrowed("T#1"),
+        };
+        let t2 = TenantLabels {
+            tenant_id: Cow::Borrowed("T#2"),
+        };
+        m.cpu_memory_bytes_per_tenant().get_or_create(&t1).set(4096);
+        m.cpu_memory_bytes_per_tenant().get_or_create(&t2).set(8192);
+        let s = m.encode_text();
+        assert!(
+            s.contains("tensor_wasm_cpu_memory_bytes_per_tenant{tenant_id=\"T#1\"} 4096"),
+            "missing tenant T#1 sample in:\n{s}"
+        );
+        assert!(
+            s.contains("tensor_wasm_cpu_memory_bytes_per_tenant{tenant_id=\"T#2\"} 8192"),
+            "missing tenant T#2 sample in:\n{s}"
+        );
+    }
+
+    #[test]
+    fn cpu_memory_per_tenant_family_silent_until_observed() {
+        // The CPU family must NOT appear in the exposition until a label
+        // tuple has been touched — same cardinality contract as the GPU
+        // family and the W2.3 HTTP families.
+        let m = TensorWasmMetrics::new();
+        let s = m.encode_text();
+        assert!(
+            !s.contains("tensor_wasm_cpu_memory_bytes_per_tenant{"),
+            "per-tenant CPU gauge should be silent before observation; got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn cpu_and_gpu_per_tenant_families_are_independent_series() {
+        // Setting the CPU family for a tenant must not perturb the GPU
+        // family for the same tenant (the M1 regression: both writing the
+        // same series). Assert the two series coexist with distinct values.
+        let m = TensorWasmMetrics::new();
+        let t = TenantLabels {
+            tenant_id: Cow::Borrowed("T#7"),
+        };
+        m.cpu_memory_bytes_per_tenant().get_or_create(&t).set(1024);
+        m.gpu_memory_bytes_per_tenant().get_or_create(&t).set(2048);
+        let s = m.encode_text();
+        assert!(
+            s.contains("tensor_wasm_cpu_memory_bytes_per_tenant{tenant_id=\"T#7\"} 1024"),
+            "CPU series missing or wrong value in:\n{s}"
+        );
+        assert!(
+            s.contains("tensor_wasm_gpu_memory_bytes_per_tenant{tenant_id=\"T#7\"} 2048"),
+            "GPU series missing or wrong value in:\n{s}"
         );
     }
 

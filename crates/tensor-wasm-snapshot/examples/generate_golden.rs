@@ -113,6 +113,11 @@ fn build_snapshot(
             instance_id,
             created_unix_ms: GOLDEN_CREATED_UNIX_MS,
             total_uncompressed_bytes,
+            // Mirror `SnapshotWriter::capture`'s v0.3.x defaults so the
+            // golden bytes stay wire-identical to a real capture: no
+            // sequence number, no replay nonce (both land in v0.4).
+            sequence_no: 0,
+            nonce: None,
         },
         crc32,
     }

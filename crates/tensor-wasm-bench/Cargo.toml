@@ -30,8 +30,10 @@ criterion.workspace = true
 http-body-util = "0.1"
 serde_json.workspace = true
 tempfile.workspace = true
+tensor-wasm-exec = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
+wat = { workspace = true }
 
 [[bench]]
 name = "kernel_dispatch"
@@ -75,6 +77,24 @@ harness = false
 # the CI regression-gate path -- diagnostic only; see
 # `bench-results/README.md` for the broader convention.
 name = "metrics_label_validation"
+harness = false
+
+[[bench]]
+# Spawn/terminate + call_export_with_args round-trip through the real
+# `tensor-wasm-exec` engine. Requires `tensor-wasm-exec` + `wat` (dev-deps).
+# Registered with the criterion harness; previously auto-discovered, which
+# conflicted with its `criterion_main!`.
+name = "call_export_args"
+harness = false
+
+[[bench]]
+# B7.1 streaming-invoke harness. Bodies are `todo!()` placeholders until
+# the streaming spawn path lands; registered so `cargo bench --workspace`
+# compiles cleanly (the criterion_main! harness would otherwise clash with
+# auto-discovery). Running this bench panics until B7.1 — see the module
+# docs. Converting the todo!()s to clean skip lines is tracked for the
+# bench-cleanup pass.
+name = "streaming_invoke"
 harness = false
 
 [features]

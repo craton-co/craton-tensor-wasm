@@ -1177,7 +1177,7 @@ impl DiskCache {
         // verified envelope bytes.
         let mut sidecar = Vec::with_capacity(SIDECAR_LEN_V1);
         sidecar.extend_from_slice(SIDECAR_MAGIC_V1);
-        sidecar.extend_from_slice(&hash.0);
+        sidecar.extend_from_slice(hash.as_bytes());
         debug_assert_eq!(sidecar.len(), SIDECAR_LEN_V1);
         let sidecar_path = self.path_for(key);
         let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
