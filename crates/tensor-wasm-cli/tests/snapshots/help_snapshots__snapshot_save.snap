@@ -1,6 +1,5 @@
 ---
 source: crates/tensor-wasm-cli/tests/help_snapshots.rs
-assertion_line: 60
 expression: "help(&[\"snapshot\", \"save\", \"--help\"])"
 ---
 Capture the state of a running instance into a `.tensor-wasm` file via the API

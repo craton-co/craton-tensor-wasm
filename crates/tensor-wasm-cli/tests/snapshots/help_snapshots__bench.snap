@@ -1,6 +1,5 @@
 ---
 source: crates/tensor-wasm-cli/tests/help_snapshots.rs
-assertion_line: 45
 expression: "help(&[\"bench\", \"--help\"])"
 ---
 Benchmark local invocation latency (P50/P95/P99/max)
@@ -8,13 +7,41 @@ Benchmark local invocation latency (P50/P95/P99/max)
 Usage: tensor-wasm bench [OPTIONS] <FILE>
 
 Arguments:
-  <FILE>  Path to the `.wasm` file to benchmark
+  <FILE>
+          Path to the `.wasm` file to benchmark
 
 Options:
-      --export <EXPORT>  Name of the export to call on each iteration [default: main]
-      --tenant <TENANT>  Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
-      --n <N>            Number of iterations to run. Must be >= 1 [default: 100]
-      --output <OUTPUT>  Output format: `text` (human-readable table, default) or `json` (machine-readable document for CI perf gates) [default: text] [possible values: text, json]
-      --ca-cert <PATH>   Trust an additional PEM-encoded private CA root for HTTPS (added alongside the system trust store, not instead of it). Use this for a server fronted by an internal/self-signed CA instead of `--insecure`. The file must be PEM, not DER
-      --insecure         SECURITY HAZARD: disable TLS certificate verification for outbound HTTPS, exposing the connection to man-in-the-middle attacks and possible theft of the TENSOR_WASM_TOKEN credential. For local dev against a throwaway cert only; prefer --ca-cert. Warns on every run
-  -h, --help             Print help
+      --export <EXPORT>
+          Name of the export to call on each iteration
+          
+          [default: main]
+
+      --tenant <TENANT>
+          Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility
+          
+          [default: 0]
+
+      --n <N>
+          Number of iterations to run. Must be >= 1
+          
+          [default: 100]
+
+      --output <OUTPUT>
+          Output format: `text` (human-readable table, default) or `json` (machine-readable document for CI perf gates).
+          
+          `display_order` pinned so this sorts after the other local flags and before the global TLS flags, keeping the help layout stable.
+
+          Possible values:
+          - text: Human-readable tables / dashboard (the default)
+          - json: Machine-readable JSON document for scripting / CI perf gates
+          
+          [default: text]
+
+      --ca-cert <PATH>
+          Trust an additional PEM-encoded private CA root for HTTPS (added alongside the system trust store, not instead of it). Use this for a server fronted by an internal/self-signed CA instead of `--insecure`. The file must be PEM, not DER
+
+      --insecure
+          SECURITY HAZARD: disable TLS certificate verification for outbound HTTPS, exposing the connection to man-in-the-middle attacks and possible theft of the TENSOR_WASM_TOKEN credential. For local dev against a throwaway cert only; prefer --ca-cert. Warns on every run
+
+  -h, --help
+          Print help (see a summary with '-h')

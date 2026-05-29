@@ -54,9 +54,26 @@ async fn oversized_content_length() -> Response<Body> {
     use axum::body::Bytes;
     use futures::stream;
     let oversize = (MAX_RESPONSE_BODY_BYTES as u64) + 1;
-    let s = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
-        b"tiny",
-    ))]);
+    // Stream the *full* declared length lazily in 64 KiB chunks so the HTTP
+    // message is well-formed (actual body length == Content-Length). A body
+    // that ends early — as the original single 4-byte chunk did — makes the
+    // hyper client surface `IncompleteMessage` at `send()` before
+    // `bounded_text` ever sees the response. Because `bounded_bytes` rejects
+    // on the Content-Length header and drops the connection without draining
+    // the body, loopback backpressure means only a socket-buffer's worth ever
+    // crosses the wire — we never materialise 16 MiB. Using `Body::from_stream`
+    // (size not statically known) also stops axum from auto-overriding our
+    // explicit Content-Length header, regardless of chunk count.
+    let mut remaining = oversize;
+    let chunks = std::iter::from_fn(move || {
+        if remaining == 0 {
+            return None;
+        }
+        let n = remaining.min(64 * 1024) as usize;
+        remaining -= n as u64;
+        Some(Ok::<Bytes, std::io::Error>(Bytes::from(vec![0u8; n])))
+    });
+    let s = stream::iter(chunks);
     Response::builder()
         .status(StatusCode::OK)
         .header(

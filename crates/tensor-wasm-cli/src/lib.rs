@@ -42,10 +42,11 @@ pub struct Cli {
     /// alongside the system trust store, not instead of it). Use this for a
     /// server fronted by an internal/self-signed CA instead of `--insecure`.
     /// The file must be PEM, not DER.
-    ///
-    /// `display_order` is pinned high so this (and `--insecure`) always sort
-    /// at the end of every subcommand's option list, just before `--help`,
-    /// keeping the generated help layout stable as commands gain local flags.
+    //
+    // NOTE (not part of --help): `display_order` is pinned high so this (and
+    // `--insecure`) always sort at the end of every subcommand's option list,
+    // just before `--help`, keeping the generated help layout stable as
+    // commands gain local flags.
     #[arg(long, global = true, value_name = "PATH", display_order = 900)]
     pub ca_cert: Option<PathBuf>,
 

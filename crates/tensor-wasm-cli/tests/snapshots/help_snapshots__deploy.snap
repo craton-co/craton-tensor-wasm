@@ -1,6 +1,5 @@
 ---
 source: crates/tensor-wasm-cli/tests/help_snapshots.rs
-assertion_line: 35
 expression: "help(&[\"deploy\", \"--help\"])"
 ---
 Upload a Wasm module to a TensorWasm server

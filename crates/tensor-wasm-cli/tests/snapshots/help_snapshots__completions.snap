@@ -1,6 +1,5 @@
 ---
 source: crates/tensor-wasm-cli/tests/help_snapshots.rs
-assertion_line: 73
 expression: "help(&[\"completions\", \"--help\"])"
 ---
 Emit shell completion scripts for the named shell.

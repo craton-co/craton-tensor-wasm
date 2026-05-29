@@ -1,6 +1,5 @@
 ---
 source: crates/tensor-wasm-cli/tests/help_snapshots.rs
-assertion_line: 25
 expression: "help(&[\"--help\"])"
 ---
 Run, deploy, invoke, bench, snapshot, and inspect TensorWasm Wasm workloads.

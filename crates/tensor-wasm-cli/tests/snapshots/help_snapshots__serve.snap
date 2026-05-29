@@ -1,6 +1,5 @@
 ---
 source: crates/tensor-wasm-cli/tests/help_snapshots.rs
-assertion_line: 78
 expression: "help(&[\"serve\", \"--help\"])"
 ---
 Run the TensorWasm HTTP API gateway in-process (binds and serves)

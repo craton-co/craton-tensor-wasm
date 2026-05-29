@@ -207,13 +207,14 @@ fn run_passes_args_to_adder() {
         .stdout(predicate::str::contains("3"));
 }
 
-/// `--args` is parsed and validated but the values are not forwarded to
-/// `call_export` today (executor only supports `() -> ()`). When the
-/// caller passes a non-empty array we must emit a loud stderr warning so
-/// the user knows their arguments were silently dropped. Regression
-/// coverage for cli "Bug 1 — `run --args` silently dropped".
+/// T33 (v0.4): `run --args` now *forwards* typed arguments to the executor's
+/// dynamic `call_export_with_args` path (they are no longer parsed-then-
+/// silently-dropped). Passing arguments to an export whose signature accepts
+/// none must therefore surface a clear arity error naming the export, rather
+/// than succeeding with a "dropped args" warning. Regression coverage for the
+/// forwarding path's mismatch handling.
 #[test]
-fn run_warns_when_args_silently_dropped() {
+fn run_rejects_args_for_zero_arg_export() {
     let wat = r#"
         (module
             (func (export "add"))
@@ -234,19 +235,11 @@ fn run_warns_when_args_silently_dropped() {
             "[1,2]",
         ])
         .assert()
-        .success();
-    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
-    // Use insta to pin the user-visible warning copy. The line is
-    // wrapped/joined into a single rendered string in the binary; the
-    // snapshot makes any future drift visible in code review.
-    let warning_line = stderr
-        .lines()
-        .find(|l| l.starts_with("warning: --args"))
-        .unwrap_or("");
-    insta::assert_snapshot!("run_args_dropped_warning", warning_line);
+        .failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_lowercase();
     assert!(
-        stderr.contains("ignoring 2 argument(s)"),
-        "warning must name the dropped count, got: {stderr}"
+        stderr.contains("calling export `add`") && stderr.contains("argument"),
+        "expected a clear arity-mismatch error naming the export, got: {stderr}"
     );
 }
 

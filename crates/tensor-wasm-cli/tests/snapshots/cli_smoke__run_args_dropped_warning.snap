@@ -1,5 +1,0 @@
----
-source: crates/tensor-wasm-cli/tests/cli_smoke.rs
-expression: warning_line
----
-warning: --args is parsed but not forwarded to the guest export (signature () -> () currently); ignoring 2 argument(s). See https://github.com/craton-co/craton-tensor-wasm/issues/XXX for status.

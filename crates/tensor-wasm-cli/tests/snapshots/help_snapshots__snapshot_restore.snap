@@ -1,6 +1,5 @@
 ---
 source: crates/tensor-wasm-cli/tests/help_snapshots.rs
-assertion_line: 65
 expression: "help(&[\"snapshot\", \"restore\", \"--help\"])"
 ---
 Restore an instance from a `.tensor-wasm` archive via the API

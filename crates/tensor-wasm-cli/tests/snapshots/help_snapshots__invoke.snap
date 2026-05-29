@@ -1,6 +1,5 @@
 ---
 source: crates/tensor-wasm-cli/tests/help_snapshots.rs
-assertion_line: 40
 expression: "help(&[\"invoke\", \"--help\"])"
 ---
 Invoke a previously deployed function by id
@@ -12,8 +11,8 @@ Arguments:
 
 Options:
       --server <SERVER>  Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
-      --export <EXPORT>  Name of the exported function to call on the deployed module. Defaults to `_start` (WASI command convention); the server falls back to `main` when `_start` is absent [default: _start]
       --tenant <TENANT>  Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
+      --export <EXPORT>  Name of the exported function to call on the deployed module. Defaults to `_start` (WASI command convention); the server falls back to `main` when `_start` is absent [default: _start]
       --args <ARGS>      Arguments forwarded to the function, encoded as a JSON array
       --ca-cert <PATH>   Trust an additional PEM-encoded private CA root for HTTPS (added alongside the system trust store, not instead of it). Use this for a server fronted by an internal/self-signed CA instead of `--insecure`. The file must be PEM, not DER
       --insecure         SECURITY HAZARD: disable TLS certificate verification for outbound HTTPS, exposing the connection to man-in-the-middle attacks and possible theft of the TENSOR_WASM_TOKEN credential. For local dev against a throwaway cert only; prefer --ca-cert. Warns on every run

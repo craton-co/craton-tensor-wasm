@@ -49,6 +49,11 @@ async fn main() {
     // is already installed by an embedding harness). Honours `TENSOR_WASM_LOG` first,
     // then `RUST_LOG`, then defaults to `warn`.
     let _ = tracing_subscriber::fmt()
+        // Diagnostics/logs go to stderr so stdout stays clean for command
+        // output — critical for `--output json`, where any log line on stdout
+        // would corrupt the machine-readable payload. (`fmt()` otherwise
+        // defaults to stdout.)
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("TENSOR_WASM_LOG")
                 .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())

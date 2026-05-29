@@ -1,6 +1,5 @@
 ---
 source: crates/tensor-wasm-cli/tests/help_snapshots.rs
-assertion_line: 55
 expression: "help(&[\"snapshot\", \"--help\"])"
 ---
 Save or restore an instance snapshot
