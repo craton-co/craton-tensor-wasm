@@ -43,7 +43,6 @@ graphically.
 
 ```promql
 # 1. Confirm: is the 5-minute error rate above the alert threshold?
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}
 sum(rate(tensor_wasm_http_requests_total{status=~"5.."}[5m]))
   /
 sum(rate(tensor_wasm_http_requests_total[5m]))
@@ -55,7 +54,6 @@ flapping false positive.
 
 ```promql
 # 2. Scope: which route is failing?
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}
 sum by (route) (
   rate(tensor_wasm_http_requests_total{status=~"5.."}[5m])
 )
@@ -68,7 +66,6 @@ exhaustion).
 
 ```promql
 # 3. Scope: which status code dominates?
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}
 sum by (status) (
   rate(tensor_wasm_http_requests_total{status=~"5.."}[5m])
 )
@@ -81,7 +78,6 @@ sum by (status) (
 
 ```promql
 # 4. Trend: how long has this been bad?
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}
 sum(rate(tensor_wasm_http_requests_total{status=~"5.."}[1h]))
   /
 sum(rate(tensor_wasm_http_requests_total[1h]))

@@ -452,7 +452,7 @@ External:
 
 ---
 
-_Status: template, v0.1.0 era. Tables in §3 and §5 reflect
+_Status: template, v0.3.7. Tables in §3 and §5 reflect
 deprecations and behavioural changes that have landed in waves W1
 and W2 as of the current `Unreleased` line in
 [`CHANGELOG.md`](../CHANGELOG.md). §4 is empty by design until a

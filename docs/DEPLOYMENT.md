@@ -58,9 +58,9 @@ Craton TensorWasm is configured by environment variables. The full set:
 | `TENSOR_WASM_OTLP_ENDPOINT` | unset | OpenTelemetry collector endpoint (e.g. `http://otel:4317`). |
 | `TENSOR_WASM_LISTEN_ADDR` | `0.0.0.0:8080` | HTTP bind address for `tensor-wasm serve`. |
 | `CUDA_ROOT` | autodetected | Override CUDA toolkit location (build- and run-time). |
-| `CUDA_ARCH` | `sm_80` | Target GPU compute capability for shipped PTX. |
+| `CUDA_ARCH` | none (required for GPU builds) | Target GPU compute capability for emitted PTX; set to match your GPU (e.g. `sm_80` for A100, `sm_89` for L4). See [CUDA-SETUP.md](./CUDA-SETUP.md). |
 
-For zero-trust environments, also set `TENSOR_WASM_SNAPSHOT_BUCKET` to point at your object store and `TENSOR_WASM_SNAPSHOT_KMS_KEY` for envelope encryption (see [SECURITY-AUDIT.md](./SECURITY-AUDIT.md)).
+For zero-trust environments, set `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY` (32-byte hex HMAC key) to authenticate snapshot bytes, and `TENSOR_WASM_API_SNAPSHOT_REQUIRE_SIGNATURE=true` to refuse unsigned snapshots (see [SNAPSHOT-COMPATIBILITY.md](./SNAPSHOT-COMPATIBILITY.md)).
 
 ## 4. Docker Compose stack
 
@@ -74,7 +74,7 @@ The compose file pins versions, wires up the OTLP exporter, and pre-loads a Graf
 
 ## 5. Kubernetes
 
-A Helm chart is **deferred to v0.2**. In the meantime, a minimal `Deployment` looks like:
+A Helm chart ships at [`deploy/helm/tensor-wasm/`](../deploy/helm/tensor-wasm/) — it is the recommended way to install on Kubernetes (`helm install tensor-wasm ./deploy/helm/tensor-wasm -n tensor-wasm --create-namespace`; see the chart's [`README.md`](../deploy/helm/tensor-wasm/README.md) for the full values reference). If you prefer a hand-rolled manifest, a minimal `Deployment` looks like:
 
 ```yaml
 apiVersion: apps/v1
@@ -142,9 +142,9 @@ Snapshots are the **only** durable artifact in a TensorWasm deployment. They con
 
 Snapshots are **portable across hosts of the same architecture** — `sm_80` to `sm_80` is fine; `sm_80` to `sm_90` requires a rebuild because PTX is JITed per arch.
 
-The snapshot schema is versioned (currently **v2**). On startup, `tensor-wasm-api` will refuse to load a snapshot from a newer schema; older snapshots are migrated in place using the chain of `vN -> vN+1` migrators in `tensor-wasm-snapshot`. Always test a migration on a staging snapshot before bumping the binary in production.
+The snapshot schema is versioned. The reader does **not** migrate snapshots in place: a `version` mismatch is a hard error (within v0.x the reader version must equal the writer version). The supported upgrade path is to re-capture from the live instance under the new format — or, if the source instance is gone, run an older `tensor-wasm` binary against the old snapshot, restore the instance, then re-capture under the current binary. See [SNAPSHOT-COMPATIBILITY.md](./SNAPSHOT-COMPATIBILITY.md). Always rehearse this on a staging snapshot before bumping the binary in production.
 
-Recommended rotation: snapshot every active instance hourly, with a 7-day retention window in your object store. Pair with periodic integrity checks (`tensor-wasm snapshot restore --verify-only`) on a random 1% sample.
+Recommended rotation: snapshot every active instance hourly, with a 7-day retention window in your object store. Pair with periodic integrity checks on a random 1% sample — see the offline integrity check in [BACKUP-RESTORE.md](./BACKUP-RESTORE.md) §7.1, which parses each blob through `SnapshotReader::restore` (validating the CRC32 and per-blob size caps) without restoring it to a live instance.
 
 ## 9. Monitoring
 
@@ -164,10 +164,10 @@ The bundled Grafana dashboard groups these into a single overview page. For the 
 Because the gateway tier is stateless, DR is essentially **snapshot DR**:
 
 1. **Ship snapshots off-host.** Mirror to S3, GCS, or your equivalent. The snapshot format is content-addressed by sha256, so the mirror is naturally deduplicating.
-2. **Verify periodically.** Run `tensor-wasm snapshot restore --verify-only` against a sample of stored snapshots on a schedule.
+2. **Verify periodically.** Run the offline snapshot integrity check ([BACKUP-RESTORE.md](./BACKUP-RESTORE.md) §7.1) against a sample of stored snapshots on a schedule.
 3. **Practice restore.** A quarterly DR drill that restores a snapshot to a fresh region is cheaper than discovering schema drift the day you actually need it.
 4. **Keep the binary in sync with the snapshot schema.** A binary that can read your latest snapshots should be available in your registry at all times — not just rebuildable from source.
 
-If both the gateway and a snapshot are intact, recovery is a `tensor-wasm function restore <snapshot-id>` away. If only the Wasm module bytes survive, you can redeploy clean — you lose accumulated linear-memory state, but the function is back online.
+If both the gateway and a snapshot are intact, recovery is a `tensor-wasm snapshot restore --input <file>.tensor-wasm --as-instance <instance-id> --server <url>` away (see [BACKUP-RESTORE.md](./BACKUP-RESTORE.md) §6.1). If only the Wasm module bytes survive, you can redeploy clean — you lose accumulated linear-memory state, but the function is back online.
 
 For broader operational guidance, see the other runbooks in this directory.

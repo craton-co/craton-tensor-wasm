@@ -36,7 +36,6 @@ before the budget is gone.
 
 ```promql
 # 1. Confirm: is the 6-hour error rate at or above 0.005?
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}
 sum(rate(tensor_wasm_http_requests_total{status=~"5.."}[6h]))
   /
 sum(rate(tensor_wasm_http_requests_total[6h]))
@@ -46,7 +45,6 @@ A value at or above `0.005` (= 1 × 0.005) confirms the alert.
 
 ```promql
 # 2. Compare to a week ago: is the burn growing?
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}
 sum(rate(tensor_wasm_http_requests_total{status=~"5.."}[6h]))
   /
 sum(rate(tensor_wasm_http_requests_total[6h]))
@@ -63,7 +61,6 @@ means there's no room for any regression.
 
 ```promql
 # 3. Which routes dominate the 5xx tail?
-# TODO: emit tensor_wasm_http_requests_total{route,method,status}
 topk(5,
   sum by (route, status) (
     rate(tensor_wasm_http_requests_total{status=~"5.."}[24h])
@@ -113,7 +110,7 @@ business day.
 | Hypothesis | How to confirm | How to fix |
 |---|---|---|
 | Genuine baseline of expected client errors masquerading as 5xx (e.g. handler returns 500 on malformed input it should reject as 400) | `journalctl -u tensor-wasm \| grep '500' \| head -50` and inspect what the handler logged | Fix the handler to return the correct 4xx status; the SLI excludes 4xx per [`SLO.md`](../SLO.md) §2.1 |
-| One tenant generating a slow drip of failures (e.g. a buggy guest that crashes on 1% of inputs) | Per-tenant 5xx rate (requires the `tenant` label on `tensor_wasm_http_requests_total`, on the W2.3 TODO list); fall back to per-tenant termination rate today | Engage the tenant; help them debug their guest; raise a tenant-level SLO contract conversation |
+| One tenant generating a slow drip of failures (e.g. a buggy guest that crashes on 1% of inputs) | Per-tenant 5xx rate (requires a `tenant` label on `tensor_wasm_http_requests_total`; the metric ships as of W2.3 with `route`/`method`/`status` labels, but per-tenant labeling is still an open follow-up); fall back to per-tenant termination rate today | Engage the tenant; help them debug their guest; raise a tenant-level SLO contract conversation |
 | Snapshot subsystem occasionally times out under disk pressure (a slow tail of `504`) | Snapshot capture/restore P95 panels in the dashboard; correlate timestamps with the 5xx counts | Tune snapshot concurrency or move to faster storage; document if accepted |
 | Recent dependency bump introduced an edge-case panic that fires rarely | `git log --since '2 weeks ago' -- Cargo.lock`; `journalctl -u tensor-wasm \| grep -i panic` | Revert the dependency or patch the call site |
 | Network flap to an upstream auth backend producing intermittent 502s | Auth-backend health metrics; tracing spans showing intermittent failures on auth lookups | Improve auth-backend stability or add caching/retry in TensorWasm middleware |

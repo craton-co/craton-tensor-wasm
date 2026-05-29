@@ -139,7 +139,7 @@ lowering families without taking any cuda-oxide or Pliron dependency.
 | **D1** | This document. |
 
 All nine tasks are docs- or pure-Rust-only and ride the workspace default
-`nightly-2026-03-15` toolchain. No new external dependencies land in
+`nightly-2026-04-03` toolchain. No new external dependencies land in
 wave 1.
 
 ### Wave 2 — wire the families together
@@ -314,8 +314,8 @@ the rustdoc moves and this document points at the new location.
   IR still helps keep that hazard out of the workspace until wave 3
   triggers the feature flag.
 - **Toolchain split is real and intentional.** The workspace default
-  stays on `nightly-2026-03-15`; wave 3 adds an opt-in
-  `nightly-2026-04-03` override for the `cuda-oxide-backend` feature.
+  is `nightly-2026-04-03`, bumped from `nightly-2026-03-15` for the
+  `cuda-oxide-backend` feature wired in wave 3.
   Wave 1 and wave 2 do not touch the toolchain.
 - **v0.5 default flip is contingent.** If cuda-oxide ≥ 0.2.0 has not
   shipped by the v0.5 freeze, the default backend flips to
