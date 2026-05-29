@@ -147,10 +147,15 @@ async fn tenant_header_accepted_on_full_invoke_path() {
         TenantConfig::default(),
     );
 
+    // Deploy under tenant 42 so the function is owned by tenant 42 and the
+    // invoke below (also tenant 42) satisfies the per-resource owner check;
+    // the property under test is that the tenant header is accepted on the
+    // full invoke path.
     let deploy_req = Request::builder()
         .method(Method::POST)
         .uri("/functions")
         .header("content-type", "application/json")
+        .header(HEADER_TENANT, "42")
         .body(Body::from(
             serde_json::to_vec(&json!({ "name": "t", "wasm_b64": wasm_b64 })).unwrap(),
         ))

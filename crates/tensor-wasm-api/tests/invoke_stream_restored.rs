@@ -228,6 +228,10 @@ async fn cross_tenant_returns_403() {
         .uri("/functions")
         .header("authorization", "Bearer scoped")
         .header("content-type", "application/json")
+        // Deploy under tenant 1 (in the bearer's {1,2} scope) so the deploy
+        // itself is authorized; the invoke-stream below targets out-of-scope
+        // tenant 3.
+        .header(HEADER_TENANT, "1")
         .body(Body::from(
             serde_json::to_vec(&json!({ "name": "stream_403", "wasm_b64": wasm_b64 })).unwrap(),
         ))
@@ -265,19 +269,19 @@ async fn cross_tenant_returns_403() {
 #[tokio::test]
 async fn oversized_body_returns_413() {
     // Constructing a body larger than `MAX_REQUEST_BODY_BYTES` (64 MiB).
-    // `DefaultBodyLimit::max` short-circuits with `413 Payload Too Large`
-    // before the streaming handler runs — see `oversized_body.rs` for the
-    // matching coverage on `/functions`.
+    // The body cap is `DefaultBodyLimit::max`, enforced at body *extraction*
+    // time (not as a Content-Length short-circuit — see `body_limit_layer`).
+    // `invoke_function_stream` resolves and owner-checks the function id
+    // BEFORE it reads the request body, so the body cap is only the rejecting
+    // guard for a real function — a bogus id would 404 first. Deploy a trivial
+    // function (dev mode → owner tenant 0, matching the header-less request's
+    // resolved tenant) and post the oversized body to it.
     let router = router();
-    // We do NOT need a deployed function: the body cap fires before the
-    // handler resolves the function id. Use a syntactically-valid UUID so
-    // path routing succeeds and the per-route body cap is the first guard
-    // to reject.
-    let bogus = uuid::Uuid::new_v4();
+    let id = deploy_trivial(&router).await;
     let huge: Vec<u8> = vec![b'a'; MAX_REQUEST_BODY_BYTES + 1];
     let req = Request::builder()
         .method(Method::POST)
-        .uri(format!("/functions/{bogus}/invoke-stream"))
+        .uri(format!("/functions/{id}/invoke-stream"))
         .header(header::ACCEPT, "text/event-stream")
         .header("content-type", "application/json")
         .body(Body::from(huge))

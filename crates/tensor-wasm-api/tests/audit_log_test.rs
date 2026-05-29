@@ -87,7 +87,7 @@ fn router_with_audit(scopes: &[(&str, TokenScope)]) -> (axum::Router, Arc<Captur
     (router, sink)
 }
 
-async fn deploy_trivial_function(router: &axum::Router, bearer: &str) -> String {
+async fn deploy_trivial_function(router: &axum::Router, bearer: &str, tenant: u64) -> String {
     let wasm_bytes = wat::parse_str(r#"(module (func (export "_start")))"#).expect("WAT parses");
     let wasm_b64 = BASE64.encode(&wasm_bytes);
     let req = Request::builder()
@@ -95,6 +95,7 @@ async fn deploy_trivial_function(router: &axum::Router, bearer: &str) -> String 
         .uri("/functions")
         .header("authorization", format!("Bearer {bearer}"))
         .header("content-type", "application/json")
+        .header(HEADER_TENANT, tenant.to_string())
         .body(Body::from(
             serde_json::to_vec(&json!({ "name": "t", "wasm_b64": wasm_b64 })).unwrap(),
         ))
@@ -113,7 +114,7 @@ async fn deploy_trivial_function(router: &axum::Router, bearer: &str) -> String 
 async fn create_function_emits_audit_record() {
     let (router, sink) = router_with_audit(&[("scoped", TokenScope::all())]);
 
-    let _id = deploy_trivial_function(&router, "scoped").await;
+    let _id = deploy_trivial_function(&router, "scoped", 0).await;
     let records = sink.snapshot();
     assert_eq!(records.len(), 1, "exactly one record per POST /functions");
     let rec = &records[0];
@@ -141,7 +142,9 @@ async fn invoke_with_out_of_scope_tenant_emits_403_record() {
         TokenScope::from_tenants([TenantId(1), TenantId(2)]),
     )]);
 
-    let id = deploy_trivial_function(&router, "scoped").await;
+    // Deploy under tenant 1 (in scope) so the deploy itself is authorized;
+    // the invoke below targets out-of-scope tenant 3.
+    let id = deploy_trivial_function(&router, "scoped", 1).await;
     // Reset the buffer so we focus on just the invoke record.
     sink.records.lock().unwrap().clear();
 
@@ -269,7 +272,7 @@ async fn audit_record_round_trips_through_serde_json() {
     // proves the serialized form parses back into a structurally
     // equivalent shape.
     let (router, sink) = router_with_audit(&[("scoped", TokenScope::all())]);
-    let _id = deploy_trivial_function(&router, "scoped").await;
+    let _id = deploy_trivial_function(&router, "scoped", 0).await;
     let records = sink.snapshot();
     assert_eq!(records.len(), 1);
     let rec = &records[0];
@@ -294,7 +297,7 @@ async fn audit_record_round_trips_through_serde_json() {
 #[tokio::test]
 async fn delete_function_emits_audit_record() {
     let (router, sink) = router_with_audit(&[("scoped", TokenScope::all())]);
-    let id = deploy_trivial_function(&router, "scoped").await;
+    let id = deploy_trivial_function(&router, "scoped", 0).await;
     sink.records.lock().unwrap().clear();
 
     let req = Request::builder()
@@ -319,7 +322,9 @@ async fn delete_function_emits_audit_record() {
 #[tokio::test]
 async fn invoke_async_emits_audit_record() {
     let (router, sink) = router_with_audit(&[("scoped", TokenScope::all())]);
-    let id = deploy_trivial_function(&router, "scoped").await;
+    // Deploy under tenant 1 so the function is owned by tenant 1 and the
+    // invoke-async below (also tenant 1) clears the per-resource owner check.
+    let id = deploy_trivial_function(&router, "scoped", 1).await;
     sink.records.lock().unwrap().clear();
 
     let req = Request::builder()

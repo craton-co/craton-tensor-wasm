@@ -54,7 +54,14 @@ fn router_with_scopes(scopes: &[(&str, TokenScope)]) -> axum::Router {
 
 /// Deploy a trivial `_start`-only module so the synchronous `/invoke` path
 /// has something to call. Returns the assigned function id.
-async fn deploy_trivial_function(router: &axum::Router, bearer: &str) -> String {
+///
+/// The deploy is performed under `tenant` (sent as `X-TensorWasm-Tenant`).
+/// `create_function` enforces the bearer's tenant scope at deploy time (api
+/// B1.9), and the resulting `FunctionRecord` is owned by `tenant` — the
+/// per-resource owner check (api S-IDOR) then requires invokes to use the
+/// same tenant. Callers therefore deploy under a tenant the bearer is scoped
+/// for and invoke under that same tenant.
+async fn deploy_trivial_function(router: &axum::Router, bearer: &str, tenant: u64) -> String {
     let wasm_bytes = wat::parse_str(r#"(module (func (export "_start")))"#).expect("WAT parses");
     let wasm_b64 = BASE64.encode(&wasm_bytes);
 
@@ -63,6 +70,7 @@ async fn deploy_trivial_function(router: &axum::Router, bearer: &str) -> String 
         .uri("/functions")
         .header("authorization", format!("Bearer {bearer}"))
         .header("content-type", "application/json")
+        .header(HEADER_TENANT, tenant.to_string())
         .body(Body::from(
             serde_json::to_vec(&json!({ "name": "t", "wasm_b64": wasm_b64 })).unwrap(),
         ))
@@ -101,8 +109,11 @@ async fn scoped_token_denied_for_out_of_scope_tenant() {
         TokenScope::from_tenants([TenantId(1), TenantId(2)]),
     )]);
 
-    let id = deploy_trivial_function(&router, "scoped").await;
-    // Invoke with tenant=3 → 403.
+    // Deploy under tenant 1 (in scope) so the deploy itself is authorized.
+    let id = deploy_trivial_function(&router, "scoped", 1).await;
+    // Invoke with tenant=3 → 403. The token-scope check (`authorize_tenant`)
+    // fires before the per-resource owner check, so the rejection is the
+    // scope denial regardless of which tenant owns the function.
     let req = invoke_with_tenant(&router, &id, "scoped", 3);
     let resp = router.clone().oneshot(req).await.expect("invoke");
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -121,9 +132,11 @@ async fn scoped_token_accepted_for_in_scope_tenant() {
         TokenScope::from_tenants([TenantId(1), TenantId(2)]),
     )]);
 
-    let id = deploy_trivial_function(&router, "scoped").await;
-    // Tenant 1 is in scope → 200 + standard invoke envelope.
-    let req = invoke_with_tenant(&router, &id, "scoped", 1);
+    // A function is owned by the tenant it is deployed under (api S-IDOR),
+    // so to prove the token addresses BOTH tenants 1 and 2 we deploy one
+    // function per tenant and invoke each under its owning tenant.
+    let id1 = deploy_trivial_function(&router, "scoped", 1).await;
+    let req = invoke_with_tenant(&router, &id1, "scoped", 1);
     let resp = router.clone().oneshot(req).await.expect("invoke");
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
@@ -134,7 +147,8 @@ async fn scoped_token_accepted_for_in_scope_tenant() {
     );
 
     // Tenant 2 too.
-    let req = invoke_with_tenant(&router, &id, "scoped", 2);
+    let id2 = deploy_trivial_function(&router, "scoped", 2).await;
+    let req = invoke_with_tenant(&router, &id2, "scoped", 2);
     let resp = router.clone().oneshot(req).await.expect("invoke");
     assert_eq!(resp.status(), StatusCode::OK);
 }
@@ -142,8 +156,12 @@ async fn scoped_token_accepted_for_in_scope_tenant() {
 #[tokio::test]
 async fn wildcard_token_addresses_any_tenant() {
     let router = router_with_scopes(&[("wild", TokenScope::all())]);
-    let id = deploy_trivial_function(&router, "wild").await;
     for t in [0u64, 1, 7, 42, u64::MAX - 1, u64::MAX] {
+        // A wildcard token may address any tenant. Deploy the function under
+        // `t` so the per-resource owner check (api S-IDOR) is satisfied when
+        // we invoke under the same tenant — the property under test is that
+        // the token's scope never rejects, for any tenant id.
+        let id = deploy_trivial_function(&router, "wild", t).await;
         let req = invoke_with_tenant(&router, &id, "wild", t);
         let resp = router.clone().oneshot(req).await.expect("invoke");
         assert_eq!(resp.status(), StatusCode::OK, "tenant {t} should pass");
@@ -162,7 +180,9 @@ async fn legacy_bare_token_still_works_as_wildcard() {
         TenantConfig::default(),
     );
 
-    // Deploy.
+    // Deploy under the same (arbitrarily large) tenant we invoke below, so
+    // the per-resource owner check (api S-IDOR) is satisfied — the property
+    // under test is that the legacy bare token's wildcard scope never 403s.
     let wasm_bytes = wat::parse_str(r#"(module (func (export "_start")))"#).expect("WAT parses");
     let wasm_b64 = BASE64.encode(&wasm_bytes);
     let req = Request::builder()
@@ -170,6 +190,7 @@ async fn legacy_bare_token_still_works_as_wildcard() {
         .uri("/functions")
         .header("authorization", "Bearer legacy")
         .header("content-type", "application/json")
+        .header(HEADER_TENANT, "999999")
         .body(Body::from(
             serde_json::to_vec(&json!({ "name": "t", "wasm_b64": wasm_b64 })).unwrap(),
         ))
@@ -228,10 +249,13 @@ async fn dev_mode_allows_any_tenant() {
     );
     let wasm_bytes = wat::parse_str(r#"(module (func (export "_start")))"#).expect("WAT parses");
     let wasm_b64 = BASE64.encode(&wasm_bytes);
+    // Deploy under the same tenant we invoke below so the per-resource
+    // owner check is satisfied; dev mode's wildcard scope must not 403 it.
     let req = Request::builder()
         .method(Method::POST)
         .uri("/functions")
         .header("content-type", "application/json")
+        .header(HEADER_TENANT, "12345")
         .body(Body::from(
             serde_json::to_vec(&json!({ "name": "t", "wasm_b64": wasm_b64 })).unwrap(),
         ))

@@ -59,10 +59,9 @@ fn json_post(uri: &str, body: Value) -> Request<Body> {
         .unwrap()
 }
 
-/// Deploy a minimal WASI command module (exports `_start`) and return
-/// its server-assigned id.
-async fn deploy_min_module(router: &axum::Router) -> String {
-    let wasm_bytes = wat::parse_str(r#"(module (func (export "_start")))"#).expect("WAT parses");
+/// Deploy a module from its WAT source and return its server-assigned id.
+async fn deploy_module(router: &axum::Router, wat: &str) -> String {
+    let wasm_bytes = wat::parse_str(wat).expect("WAT parses");
     let wasm_b64 = BASE64.encode(&wasm_bytes);
     let deploy_req = json_post(
         "/functions",
@@ -82,6 +81,12 @@ async fn deploy_min_module(router: &axum::Router) -> String {
         .expect("deploy response has id")
 }
 
+/// Deploy a minimal WASI command module (exports a 0-arg `_start`) and
+/// return its server-assigned id.
+async fn deploy_min_module(router: &axum::Router) -> String {
+    deploy_module(router, r#"(module (func (export "_start")))"#).await
+}
+
 /// POST the documented envelope `{"export": "main", "args": [...]}` and
 /// confirm the response matches what POSTing `{}` produces. The handler
 /// currently ignores the envelope contents, so the two responses must be
@@ -92,12 +97,16 @@ async fn invoke_envelope_matches_empty_body_response() {
     let router = router();
     let id = deploy_min_module(&router).await;
 
-    // T33 typed-args validator rejects strings in the args array. Use an
-    // all-numeric body — the test's purpose is envelope-shape stability,
-    // not exercising the type matrix.
+    // The deployed module exports a 0-arg `_start`. Post the full documented
+    // envelope shape pointing at that export with no args so the envelope and
+    // empty-body invocations resolve to the SAME call and therefore produce
+    // byte-identical responses. (Pre-T33 the executor ignored `export`/`args`
+    // so any envelope matched the empty body; post-T33 the envelope is
+    // honoured, so it must name the export the empty-body path defaults to —
+    // `_start` — with arity-matching args, here none.)
     let envelope = json!({
-        "export": "main",
-        "args": [1.0, 2.0, 3.0],
+        "export": "_start",
+        "args": [],
     });
 
     let envelope_resp = router
@@ -143,7 +152,12 @@ async fn invoke_envelope_matches_empty_body_response() {
 #[tokio::test]
 async fn invoke_envelope_with_only_args_succeeds() {
     let router = router();
-    let id = deploy_min_module(&router).await;
+    // Post-T33 the args ARE forwarded to the resolved export, so the deployed
+    // module's default export (`_start`) must accept them. Deploy a `_start`
+    // that takes two i32 params matching the `[1, 2]` body. This proves both
+    // that an export-omitted envelope defaults to `_start` and that its args
+    // are threaded through to the call.
+    let id = deploy_module(&router, r#"(module (func (export "_start") (param i32 i32)))"#).await;
 
     let body = json!({ "args": [1, 2] });
     let resp = router

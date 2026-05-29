@@ -724,15 +724,27 @@ fn build_router_full(
         .route("/jobs/:id", get(get_job))
         .layer(concurrency_limit_layer(READ_CONCURRENCY_LIMIT));
 
+    // Desired execution order (request flows outer -> inner):
+    //   bearer_auth -> tenant_scope -> rate_limit -> audit -> handler
+    // so the auth layer rejects unauthenticated callers FIRST (before a
+    // rate-limit permit is spent), tenant_scope then resolves the
+    // `TenantId`, the per-token limiter reads the `AuthContext`, and the
+    // audit middleware runs INNERMOST so the record it synthesises sees
+    // the resolved actor / tenant / scope and the handler's final status.
+    //
+    // CRITICAL: in axum's `Router::layer`, the LAST `.layer(...)` added is
+    // the OUTERMOST (it runs first) — the opposite of `ServiceBuilder`.
+    // The calls below are therefore written innermost-first: `audit` is
+    // added first (runs last) and `bearer_auth` is added last (runs
+    // first). The `rate_limit_runs_after_bearer_auth` integration test
+    // pins this ordering.
     let protected_router = invoke_router
         .merge(write_router)
         .merge(read_router)
-        .layer(axum::middleware::from_fn(bearer_auth))
-        .layer(axum::middleware::from_fn(tenant_scope))
+        .layer(axum::middleware::from_fn(audit_log_middleware))
         .layer(axum::middleware::from_fn(rate_limit))
-        // Audit emission is the innermost middleware: it sees the final
-        // status code and any AuditOutcomeExt the handler stamped.
-        .layer(axum::middleware::from_fn(audit_log_middleware));
+        .layer(axum::middleware::from_fn(tenant_scope))
+        .layer(axum::middleware::from_fn(bearer_auth));
 
     // OpenAI-compat shim stack (B4.9). The two `/v1/...` routes accept
     // off-the-shelf OpenAI SDK requests; those clients send
@@ -774,11 +786,14 @@ fn build_router_full(
             "/v1/chat/completions",
             post(crate::openai::chat_completions_handler),
         )
+        // Innermost-first (see `protected_router`): bearer_auth added last
+        // runs first (outermost), audit added first runs last (innermost),
+        // concurrency stays closest to the handler.
         .layer(concurrency_limit_layer(INVOKE_CONCURRENCY_LIMIT))
-        .layer(axum::middleware::from_fn(bearer_auth))
-        .layer(axum::middleware::from_fn(tenant_scope))
+        .layer(axum::middleware::from_fn(audit_log_middleware))
         .layer(axum::middleware::from_fn(rate_limit))
-        .layer(axum::middleware::from_fn(audit_log_middleware));
+        .layer(axum::middleware::from_fn(tenant_scope))
+        .layer(axum::middleware::from_fn(bearer_auth));
 
     // Kernel registry routes (B6.4 — roadmap feature #3 server-side).
     // The endpoints are write-class (publish) and read-class (list /
@@ -832,25 +847,26 @@ fn build_router_full(
             "/kernels/:name/:version",
             get(crate::kernels::resolve_kernel),
         )
-        // Layer ordering mirrors the protected_router stack (which the
-        // `rate_limit_runs_after_bearer_auth` integration test pins as
-        // first `.layer(...)` = outermost in axum's `Router::layer`).
-        // bearer_auth runs first so the AuthContext is in the request
-        // extensions for the rest of the stack; tenant_scope then
-        // installs the TenantId. The KernelPublishTokens extension and
-        // the concurrency limit are layered last (inner-most) so they
-        // sit just above the handler — the publish-scope check reads
-        // KernelPublishTokens directly via `Extension<...>` in the
-        // handler signature, so the layer that installs it must run
-        // BEFORE the handler but AFTER any layer that might short-
-        // circuit (auth / rate-limit) — which is exactly where putting
-        // it innermost lands.
-        .layer(axum::middleware::from_fn(bearer_auth))
-        .layer(axum::middleware::from_fn(tenant_scope))
-        .layer(axum::middleware::from_fn(rate_limit))
-        .layer(axum::middleware::from_fn(audit_log_middleware))
+        // Layer ordering mirrors the protected_router stack. In axum's
+        // `Router::layer` the LAST `.layer(...)` added is the OUTERMOST
+        // (runs first), so the calls below are written innermost-first:
+        // bearer_auth is added last and therefore runs FIRST, putting the
+        // AuthContext in the request extensions before tenant_scope,
+        // rate_limit, and the innermost audit middleware run. The
+        // KernelPublishTokens extension and the concurrency limit are
+        // added first (inner-most) so they sit just above the handler —
+        // the publish-scope check reads KernelPublishTokens via
+        // `Extension<...>` in the handler signature, so the layer that
+        // installs it must run before the handler but after any layer that
+        // might short-circuit (auth / rate-limit). The
+        // `rate_limit_runs_after_bearer_auth` integration test pins this
+        // ordering.
+        .layer(concurrency_limit_layer(WRITE_CONCURRENCY_LIMIT))
         .layer(axum::Extension(kernel_publish_tokens))
-        .layer(concurrency_limit_layer(WRITE_CONCURRENCY_LIMIT));
+        .layer(axum::middleware::from_fn(audit_log_middleware))
+        .layer(axum::middleware::from_fn(rate_limit))
+        .layer(axum::middleware::from_fn(tenant_scope))
+        .layer(axum::middleware::from_fn(bearer_auth));
 
     let router = protected_router.merge(probe_router).merge(openai_router);
     #[cfg(feature = "kernel-registry-api")]
