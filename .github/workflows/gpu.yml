@@ -82,7 +82,7 @@ jobs:
       github.event.label.name == 'gpu-ci'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install Rust toolchain (workspace pin)
         uses: dtolnay/rust-toolchain@master
         with:
@@ -130,7 +130,7 @@ jobs:
       github.event.label.name == 'gpu-ci'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install Rust toolchain (workspace pin)
         uses: dtolnay/rust-toolchain@master
         with:
@@ -164,7 +164,7 @@ jobs:
       github.event.label.name == 'gpu-ci'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install Rust toolchain (workspace pin)
         uses: dtolnay/rust-toolchain@master
         with:
@@ -195,7 +195,7 @@ jobs:
       github.event.label.name == 'gpu-ci'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install Rust toolchain (workspace pin)
         uses: dtolnay/rust-toolchain@master
         with:

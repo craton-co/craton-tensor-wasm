@@ -34,7 +34,7 @@ jobs:
           - audit_json_round_trip
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain (workspace-pinned nightly)
         uses: dtolnay/rust-toolchain@master
