@@ -251,7 +251,9 @@ async fn save(
     // hex-encoded secret is scrubbed when it goes out of scope rather than
     // lingering on the heap.
     let hmac_key_hex: Option<zeroize::Zeroizing<String>> = match hmac_key_file {
-        Some(path) => Some(zeroize::Zeroizing::new(hex::encode(&*load_hmac_key(path)?))),
+        Some(path) => Some(zeroize::Zeroizing::new(hex::encode(
+            load_hmac_key(path)?.as_ref(),
+        ))),
         None => None,
     };
 
@@ -431,7 +433,9 @@ async fn restore(
     // sec LOW: same Zeroizing treatment as `save` — the key bytes and their
     // hex encoding are both scrubbed on drop.
     let hmac_key_hex: Option<zeroize::Zeroizing<String>> = match hmac_key_file {
-        Some(path) => Some(zeroize::Zeroizing::new(hex::encode(&*load_hmac_key(path)?))),
+        Some(path) => Some(zeroize::Zeroizing::new(hex::encode(
+            load_hmac_key(path)?.as_ref(),
+        ))),
         None => None,
     };
 

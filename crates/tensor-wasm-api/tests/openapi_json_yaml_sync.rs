@@ -49,15 +49,15 @@ const HTTP_METHODS: &[&str] = &[
 /// preserved here:
 ///
 /// * `Absent`        -- no operation-level `security` key. The operation
-///                      inherits the root `security` (here `[BearerAuth]`).
+///   inherits the root `security` (here `[BearerAuth]`).
 /// * `Empty`         -- `security: []`. Explicitly clears auth for this
-///                      operation ("no auth"), overriding the root.
+///   operation ("no auth"), overriding the root.
 /// * `Schemes(set)`  -- a non-empty list; each requirement object's
-///                      scheme name(s) collected into a sorted set. Two
-///                      requirement objects `{A:[]}` and `{B:[]}` flatten
-///                      into `{A, B}`. (The api specs use only `Absent`
-///                      and `Empty` today; `Schemes` keeps the assertion
-///                      meaningful if a scheme is ever added to a route.)
+///   scheme name(s) collected into a sorted set. Two
+///   requirement objects `{A:[]}` and `{B:[]}` flatten
+///   into `{A, B}`. (The api specs use only `Absent`
+///   and `Empty` today; `Schemes` keeps the assertion
+///   meaningful if a scheme is ever added to a route.)
 ///
 /// `Absent != Empty` by construction (distinct enum variants), which is
 /// exactly the drift the `/metrics` regression exposed: `security: []`

@@ -1190,8 +1190,8 @@ impl UnifiedBuffer {
     /// Returns [`UnifiedError::Cuda`] with the documented
     /// `"in-place grow not yet wired"` sentinel. `cuMemAllocManaged`
     /// returns a fixed-size allocation with no in-place grow; the Driver
-    /// API alternative (`cuMemAddressReserve` + `cuMemCreate` + `cuMemMap`
-    /// + `cuMemSetAccess`, see the `TODO(v0.4)` below) is the remaining
+    /// API alternative (`cuMemAddressReserve` + `cuMemCreate` + `cuMemMap` +
+    /// `cuMemSetAccess`, see the `TODO(v0.4)` below) is the remaining
     /// work. We deliberately do NOT report a CUDA error on the host build:
     /// the host path has no CUDA at all, so misclassifying its "no spare
     /// capacity" outcome as a CUDA failure (the previous stub's bug) would

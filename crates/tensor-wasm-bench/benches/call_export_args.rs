@@ -16,8 +16,8 @@
 //! 1. **`call_export/noargs/call_export_with_args_empty`** — same export
 //!    signature (`() -> ()`) called through the new args-aware entrypoint
 //!    with an empty arg slice. Compared against the historical
-//!    `cold_start::call_export` baseline this isolates the slice-iteration
-//!    + signature-reflection overhead the typed-args path adds even when no
+//!    `cold_start::call_export` baseline this isolates the slice-iteration +
+//!    signature-reflection overhead the typed-args path adds even when no
 //!    args are passed.
 //! 2. **`call_export/args/two_i32`** — a `(i32, i32) -> i32` export
 //!    invoked with `[WasmArg::I32(1), WasmArg::I32(2)]`. Pins the cost of

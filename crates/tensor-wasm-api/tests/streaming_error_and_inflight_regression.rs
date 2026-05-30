@@ -444,7 +444,10 @@ async fn in_flight_gauge_balances_when_request_times_out() {
     // `tower_http::timeout::TimeoutLayer` is exactly what the production
     // server uses (`crate::middleware::timeout_layer`); on deadline it
     // returns 408 and drops the inner future — the cancellation we test.
-    let timeout = tower_http::timeout::TimeoutLayer::new(Duration::from_millis(50));
+    let timeout = tower_http::timeout::TimeoutLayer::with_status_code(
+        StatusCode::REQUEST_TIMEOUT,
+        Duration::from_millis(50),
+    );
     let app: Router = Router::new()
         .route("/healthz", get(slow_handler))
         .layer(axum::middleware::from_fn(http_metrics_middleware))
