@@ -215,6 +215,27 @@ fn build_vector_add_launch_wat(
 /// `module: None` stub fall-back, so the caller's subsequent launch
 /// observes the `InvalidKernel` failure path instead of marshalling
 /// success.
+/// Initialise CUDA exactly once for this test process and keep the primary
+/// context alive for the whole run.
+///
+/// `cust::quick_init` calls `cuInit` and pushes a primary context; calling it
+/// twice in one process fails ("context already exists"), so the `Context` is
+/// cached in a `OnceLock`. Both `register_real_kernel` (which needs a current
+/// context for `Module::from_ptx`) and `device_compute_capability` (which needs
+/// `cuInit` to have run before any `cuDevice*` call) go through here — the
+/// latter previously failed with `CUDA_ERROR_NOT_INITIALIZED` because it queried
+/// the device before anything initialised the driver.
+#[cfg(feature = "cuda")]
+fn ensure_cuda_initialized() {
+    use std::sync::OnceLock;
+    static CTX: OnceLock<Result<cust::context::Context, String>> = OnceLock::new();
+    let init =
+        CTX.get_or_init(|| cust::quick_init().map_err(|e| format!("cust::quick_init: {e:?}")));
+    if let Err(msg) = init {
+        panic!("ensure_cuda_initialized: CUDA init failed: {msg}");
+    }
+}
+
 #[cfg(feature = "cuda")]
 fn register_real_kernel(
     ctx: &WasiCudaContext,
@@ -222,18 +243,11 @@ fn register_real_kernel(
     name: &str,
     ptx_bytes: &[u8],
 ) -> (u64, bool) {
-    // CUDA primary context. `cust::module::Module::from_ptx` requires a
-    // current context; the wasi-cuda launch path inherits whatever
-    // context is current on this thread. We cache the `quick_init`
-    // handle in a `OnceLock` because calling `quick_init` twice in the
-    // same process fails with "context already exists".
-    use std::sync::OnceLock;
-    static CTX: OnceLock<Result<cust::context::Context, String>> = OnceLock::new();
-    let init =
-        CTX.get_or_init(|| cust::quick_init().map_err(|e| format!("cust::quick_init: {e:?}")));
-    if let Err(msg) = init {
-        panic!("register_real_kernel: CUDA init failed: {msg}");
-    }
+    // `cust::module::Module::from_ptx` requires a current CUDA context; the
+    // wasi-cuda launch path inherits whatever context is current on this
+    // thread. Initialise once (and keep the primary context alive) via the
+    // shared helper.
+    ensure_cuda_initialized();
 
     let ptx_str = std::str::from_utf8(ptx_bytes).expect("PTX is valid UTF-8");
     let module = match cust::module::Module::from_ptx(ptx_str, &[]) {
@@ -273,6 +287,78 @@ fn register_real_kernel(
         "register_real_kernel requires --features cuda; \
          the no-CUDA build has no way to load a real PTX module."
     );
+}
+
+/// The current CUDA device's compute capability as `(major, minor)`.
+///
+/// Used by the end-to-end launch test to pick a PTX fixture whose `.target`
+/// the driver JIT will accept on THIS device, rather than feeding the JIT a
+/// known-mismatched fixture (which fails and leaves a sticky error on the
+/// context, poisoning the next load — the `InvalidPtx`-then-`UnknownError`
+/// cascade observed on the RTX 2060 / sm_75 dev box). Requires an initialised
+/// CUDA context (the caller runs `cust::quick_init` first).
+#[cfg(feature = "cuda")]
+fn device_compute_capability() -> (i32, i32) {
+    use cust::sys as cuda_sys;
+    // Make sure `cuInit` has run before any `cuDevice*` call — otherwise the
+    // driver returns `CUDA_ERROR_NOT_INITIALIZED`. Idempotent and cached.
+    ensure_cuda_initialized();
+    // The raw driver API is now usable. We go through `cust::sys`
+    // directly rather than the safe `Device::get_attribute` wrapper because
+    // the latter is not exposed under our `cust` feature set
+    // (`default-features = false`); the raw FFI is always linked.
+    // SAFETY: out-params are valid locals; the driver is initialised.
+    unsafe {
+        let mut dev: cuda_sys::CUdevice = 0;
+        let res = cuda_sys::cuDeviceGet(&mut dev as *mut cuda_sys::CUdevice, 0);
+        assert_eq!(
+            res,
+            cuda_sys::cudaError_enum::CUDA_SUCCESS,
+            "cuDeviceGet(0) failed: {res:?}"
+        );
+        let mut major = 0i32;
+        let mut minor = 0i32;
+        let r_major = cuda_sys::cuDeviceGetAttribute(
+            &mut major as *mut i32,
+            cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            dev,
+        );
+        let r_minor = cuda_sys::cuDeviceGetAttribute(
+            &mut minor as *mut i32,
+            cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+            dev,
+        );
+        assert_eq!(
+            r_major,
+            cuda_sys::cudaError_enum::CUDA_SUCCESS,
+            "cuDeviceGetAttribute(COMPUTE_CAPABILITY_MAJOR) failed: {r_major:?}"
+        );
+        assert_eq!(
+            r_minor,
+            cuda_sys::cudaError_enum::CUDA_SUCCESS,
+            "cuDeviceGetAttribute(COMPUTE_CAPABILITY_MINOR) failed: {r_minor:?}"
+        );
+        (major, minor)
+    }
+}
+
+/// Pick the `vector_add` PTX fixture whose `.target` JIT-loads on the current
+/// device: the sm_75 build for compute capability < 8.0 (Turing and older),
+/// the canonical sm_80 build otherwise. sm_75 PTX would also JIT forward onto
+/// Ampere+, but preferring the exact-arch fixture keeps the proof honest about
+/// what it exercised.
+#[cfg(feature = "cuda")]
+fn select_vector_add_ptx() -> (&'static [u8], &'static str) {
+    let (major, minor) = device_compute_capability();
+    if major >= 8 {
+        (VECTOR_ADD_PTX, "sm_80")
+    } else {
+        eprintln!(
+            "select_vector_add_ptx: device compute capability {major}.{minor} < 8.0; \
+             using the sm_75 fixture."
+        );
+        (VECTOR_ADD_PTX_SM75, "sm_75")
+    }
 }
 
 /// Scalar argv (mix of i32, i64, f32, f64, u32, u64) round-trips through
@@ -603,7 +689,7 @@ const VECTOR_ADD_PTX_SM75: &[u8] = include_bytes!("fixtures/vector_add_sm75.ptx"
 /// step is `#[cfg(feature = "cuda")]`-gated); the test simply returns
 /// early.
 #[tokio::test]
-#[ignore = "requires CUDA hardware with SM_80+ PTX support"]
+#[ignore = "requires CUDA hardware"]
 async fn vector_add_end_to_end_real_ptx_real_kernel() {
     #[cfg(not(feature = "cuda"))]
     {
@@ -644,23 +730,23 @@ async fn vector_add_end_to_end_real_ptx_real_kernel() {
         let owner = InstanceId(403);
         let mut ctx = WasiCudaContext::new(owner);
         ctx.enable_wasi_cuda();
-        let (mut kid, mut loaded) = register_real_kernel(&ctx, owner, "vector_add", VECTOR_ADD_PTX);
+        // Pick the fixture whose `.target` the driver JIT accepts on THIS
+        // device. We must NOT try a known-mismatched fixture first: a failed
+        // `Module::from_ptx` leaves a sticky error on the CUDA context that
+        // poisons the next load (the observed `InvalidPtx`-then-`UnknownError`
+        // cascade on the sm_75 dev box). `register_real_kernel` calls
+        // `quick_init` before this runs, so a context is current.
+        let (ptx, arch) = select_vector_add_ptx();
+        let (kid, loaded) = register_real_kernel(&ctx, owner, "vector_add", ptx);
         if !loaded {
-            // sm_80 fixture rejected by the driver JIT (e.g. on a Turing
-            // sm_75 dev box). Retry with the sm_75 variant so the launch
-            // actually runs on sub-Ampere hardware instead of skipping.
-            eprintln!(
-                "vector_add_end_to_end_real_ptx_real_kernel: sm_80 PTX rejected; \
-                 retrying with the sm_75 fixture."
+            // The arch-matched fixture failed to load — that is a real
+            // regression on a supported device, not a skip. Surface it.
+            panic!(
+                "vector_add_end_to_end_real_ptx_real_kernel: the {arch} fixture \
+                 (arch-matched to this device) was rejected by the driver JIT; \
+                 last error: {:?}",
+                ctx.last_error()
             );
-            (kid, loaded) = register_real_kernel(&ctx, owner, "vector_add", VECTOR_ADD_PTX_SM75);
-        }
-        if !loaded {
-            eprintln!(
-                "vector_add_end_to_end_real_ptx_real_kernel: PTX rejected by JIT \
-                 (likely SM mismatch); skipping the kernel-output assertion."
-            );
-            return;
         }
 
         let argv = encode_argv(&[

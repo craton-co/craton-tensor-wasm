@@ -114,3 +114,51 @@ compile first.)
 | Real kernel launch + verified output | ⏳ blocked on BUG-2 + sm_75 wiring |
 | `--features cuda` benches on GPU | ⏳ blocked on BUG-2 |
 | Self-hosted GPU CI lane active | ⏳ `gpu.yml` still needs a registered `[self-hosted, gpu]` runner |
+
+## Update — fix #7 (PTX regeneration + capability-aware selection) — code landed, launch still blocked by the driver JIT on this box
+
+This work made three correct, committable improvements, but did **not** achieve
+a verified kernel launch on this machine — the local driver's PTX JIT rejects
+every PTX we feed it, which is an environment limitation, not a code bug.
+
+**What landed (correct, and right for a healthy driver / the S22 runner):**
+1. `kernels/vector_add.cu` is now the source of truth; `make ptx` regenerates
+   all four fixtures with nvcc instead of hand-writing PTX.
+2. The e2e test queries device compute capability via the raw driver API
+   (`cuDeviceGetAttribute` — cust's safe `Device::get_attribute` is not exposed
+   under our `default-features = false` cust set) and loads ONLY the
+   arch-matched fixture (sm_75 for cc < 8.0, else sm_80). It never feeds a
+   known-mismatched fixture to the JIT first (which had left a sticky context
+   error that poisoned the next load — the `InvalidPtx`→`UnknownError` cascade).
+3. CUDA init ordering fixed: a shared `ensure_cuda_initialized()` runs `cuInit`
+   (via `quick_init`) before the capability query, which otherwise failed with
+   `CUDA_ERROR_NOT_INITIALIZED`.
+
+**What the hardware actually says (the blocker).** On the RTX 2060 (cc 7.5),
+`cust::module::Module::from_ptx` rejects the `vector_add` PTX at **every** ISA
+version we tried, for the arch-matched sm_75 target:
+
+| PTX source | `.version` | `Module::from_ptx` result |
+|---|---|---|
+| original hand-written | 8.0 | `InvalidPtx` |
+| nvcc 13.2 (toolkit) | 9.2 | `UnknownError` (cust can't map `UNSUPPORTED_PTX_VERSION`: driver is 13.1, toolkit 13.2) |
+| nvcc 12.6 (toolkit) | 8.5 | `InvalidPtx` |
+
+A structurally-valid, nvcc-generated, **arch-matched** `.version 8.5` sm_75
+module being rejected with `InvalidPtx` on an sm_75 device points at the
+**driver's JIT compiler being non-functional in this environment** (headless /
+WDDM / sandbox quirk), not at the PTX. Corroborating: the cust + cudarc *memory*
+paths (`cuMemAllocManaged`, pools, snapshot round-trip) all pass on this same
+box — those never invoke the PTX JIT; only module loading does, and only that
+fails.
+
+**Status of the launch proof:** still **not** verified on this machine, blocked
+by the local JIT. The code changes here are the right ones and should produce a
+real launch on a box with a working driver JIT (e.g. the S22 self-hosted
+runner). The e2e test now *fails loudly* (panics) when the arch-matched module
+is rejected, rather than silently skipping — deliberately, so a broken JIT or a
+bad fixture is surfaced rather than hidden. On a healthy runner it proceeds to
+`cuLaunchKernel` + readback.
+
+#6 (thread-bound context in the async path) and #1 (driver-level mem cap) remain
+open and untouched by this change.
