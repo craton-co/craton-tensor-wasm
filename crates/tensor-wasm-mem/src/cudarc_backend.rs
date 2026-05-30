@@ -227,6 +227,46 @@ pub(crate) fn ensure_context_bound(device: &Arc<CudaDevice>) -> Result<(), Unifi
         .map_err(|e| UnifiedError::Cuda(format!("CudaDevice::bind_to_thread: {e:?}")))
 }
 
+/// True if the device at `ordinal` reports
+/// `CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS != 0` — the prerequisite for
+/// `cuMemPrefetchAsync` on managed memory (finding #10).
+///
+/// On Windows under the **WDDM** driver model this attribute is `0`: the OS
+/// owns GPU memory residency, so explicit managed-memory prefetch is
+/// unsupported and `cuMemPrefetchAsync` fails with
+/// `CUDA_ERROR_INVALID_DEVICE`. It is `1` on Linux and on Windows/TCC. The
+/// prefetch entry points use this to degrade to an advisory no-op where the
+/// platform cannot honour the hint, rather than surfacing a spurious error
+/// (prefetch is a performance hint — managed memory remains correct without
+/// it). Verified on the RTX 2060 (Windows/WDDM, cc 7.5): the attribute is 0
+/// and `cuMemPrefetchAsync` returned `INVALID_DEVICE` before this gate.
+///
+/// Returns `false` on any driver error querying the attribute — the safe,
+/// conservative default (skip the optimisation) for a hint path.
+fn supports_managed_prefetch(ordinal: u32) -> bool {
+    // SAFETY: out-params are valid locals; a prior `device_for(ordinal)` (every
+    // caller allocates before prefetching) has primed the driver lib + run
+    // `cuInit`, so these queries cannot hit an uninitialised driver.
+    unsafe {
+        let mut dev: cuda_sys::CUdevice = 0;
+        if cuda_sys::lib().cuDeviceGet(&mut dev as *mut cuda_sys::CUdevice, ordinal as i32)
+            != cuda_sys::cudaError_enum::CUDA_SUCCESS
+        {
+            return false;
+        }
+        let mut val: i32 = 0;
+        if cuda_sys::lib().cuDeviceGetAttribute(
+            &mut val as *mut i32,
+            cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS,
+            dev,
+        ) != cuda_sys::cudaError_enum::CUDA_SUCCESS
+        {
+            return false;
+        }
+        val != 0
+    }
+}
+
 /// A contiguous CUDA Unified Memory region allocated via `cudarc`.
 ///
 /// Mirrors [`crate::unified::UnifiedBuffer`]'s public surface. The pointer
@@ -397,6 +437,20 @@ impl CudarcUnifiedBuffer {
         // primary context rather than whatever context the calling thread
         // last touched (potentially another tenant's device, or unset).
         ensure_context_bound(&self.device)?;
+        // Finding #10: `cuMemPrefetchAsync` requires the device's
+        // `CONCURRENT_MANAGED_ACCESS` attribute (0 on Windows/WDDM, where the
+        // call fails with `INVALID_DEVICE`). Prefetch is an advisory hint, so on
+        // platforms that cannot honour it we degrade to a no-op rather than
+        // erroring — managed memory stays correct, just without the migration
+        // optimisation.
+        if !supports_managed_prefetch(self.device_id.0) {
+            tracing::debug!(
+                target: "tensor_wasm_mem::cudarc_backend",
+                device = self.device_id.0,
+                "prefetch_to_device: skipped (device lacks CONCURRENT_MANAGED_ACCESS, e.g. Windows/WDDM)"
+            );
+            return Ok(());
+        }
         // SAFETY: ptr/size are derived from a valid live allocation; passing
         // the null stream (handle 0) requests prefetch on the default stream.
         let res = unsafe {
@@ -433,6 +487,18 @@ impl CudarcUnifiedBuffer {
         const CU_DEVICE_CPU: i32 = -1;
         // mem M4: bind first — see `prefetch_to_device` for the full rationale.
         ensure_context_bound(&self.device)?;
+        // Finding #10: gate on CONCURRENT_MANAGED_ACCESS — see
+        // `prefetch_to_device`. Migrating back to the host is the same
+        // `cuMemPrefetchAsync` API and is equally unsupported on WDDM, so we
+        // degrade to an advisory no-op there.
+        if !supports_managed_prefetch(self.device_id.0) {
+            tracing::debug!(
+                target: "tensor_wasm_mem::cudarc_backend",
+                device = self.device_id.0,
+                "prefetch_to_host: skipped (device lacks CONCURRENT_MANAGED_ACCESS, e.g. Windows/WDDM)"
+            );
+            return Ok(());
+        }
         // SAFETY: see `prefetch_to_device`.
         let res = unsafe {
             cuda_sys::lib().cuMemPrefetchAsync(
