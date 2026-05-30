@@ -560,6 +560,14 @@ async fn pointer_argv_real_cuda_launch() {
 #[cfg(feature = "cuda")]
 const VECTOR_ADD_PTX: &[u8] = include_bytes!("fixtures/vector_add.ptx");
 
+/// sm_75 (Turing) variant of the vector_add kernel — same body, lower
+/// `.target` — so the launch actually runs on sub-Ampere dev boxes (e.g. the
+/// RTX 2060, compute capability 7.5) where the sm_80 fixture is rejected by
+/// the driver JIT. The end-to-end test falls back to this when the canonical
+/// sm_80 PTX is refused, rather than skipping the kernel-output assertion.
+#[cfg(feature = "cuda")]
+const VECTOR_ADD_PTX_SM75: &[u8] = include_bytes!("fixtures/vector_add_sm75.ptx");
+
 /// End-to-end Wasm -> wasi-cuda -> `cuLaunchKernel` -> result-readback
 /// proof on real CUDA. Closes the v0.3.2 audit Problem #14.
 ///
@@ -636,7 +644,19 @@ async fn vector_add_end_to_end_real_ptx_real_kernel() {
         let owner = InstanceId(403);
         let mut ctx = WasiCudaContext::new(owner);
         ctx.enable_wasi_cuda();
-        let (kid, loaded) = register_real_kernel(&ctx, owner, "vector_add", VECTOR_ADD_PTX);
+        let (mut kid, mut loaded) =
+            register_real_kernel(&ctx, owner, "vector_add", VECTOR_ADD_PTX);
+        if !loaded {
+            // sm_80 fixture rejected by the driver JIT (e.g. on a Turing
+            // sm_75 dev box). Retry with the sm_75 variant so the launch
+            // actually runs on sub-Ampere hardware instead of skipping.
+            eprintln!(
+                "vector_add_end_to_end_real_ptx_real_kernel: sm_80 PTX rejected; \
+                 retrying with the sm_75 fixture."
+            );
+            (kid, loaded) =
+                register_real_kernel(&ctx, owner, "vector_add", VECTOR_ADD_PTX_SM75);
+        }
         if !loaded {
             eprintln!(
                 "vector_add_end_to_end_real_ptx_real_kernel: PTX rejected by JIT \

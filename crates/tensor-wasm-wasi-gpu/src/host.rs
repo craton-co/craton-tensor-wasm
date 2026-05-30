@@ -2596,6 +2596,8 @@ mod tests {
             .insert(crate::device_mem::DeviceMemEntry {
                 owner: InstanceId(300),
                 size: 1024 * 1024,
+                #[cfg(feature = "cuda")]
+                device_ptr: 0,
             })
             .expect("insert");
 
@@ -2641,6 +2643,8 @@ mod tests {
             .insert(crate::device_mem::DeviceMemEntry {
                 owner: InstanceId(301),
                 size: 8,
+                #[cfg(feature = "cuda")]
+                device_ptr: 0,
             })
             .expect("insert");
 
@@ -2686,6 +2690,8 @@ mod tests {
             .insert(crate::device_mem::DeviceMemEntry {
                 owner: InstanceId(999),
                 size: 4096,
+                #[cfg(feature = "cuda")]
+                device_ptr: 0,
             })
             .expect("insert");
 
@@ -2870,6 +2876,8 @@ mod tests {
             reg.insert(DeviceMemEntry {
                 owner: InstanceId(305),
                 size: per,
+                #[cfg(feature = "cuda")]
+                device_ptr: 0,
             })
             .expect("under cap");
         }
@@ -2877,6 +2885,8 @@ mod tests {
             reg.insert(DeviceMemEntry {
                 owner: InstanceId(305),
                 size: per,
+                #[cfg(feature = "cuda")]
+                device_ptr: 0,
             })
             .unwrap_err(),
             AbiError::QuotaExceeded
@@ -2925,6 +2935,8 @@ mod tests {
             .insert(crate::device_mem::DeviceMemEntry {
                 owner: InstanceId(401),
                 size: 65536,
+                #[cfg(feature = "cuda")]
+                device_ptr: 0,
             })
             .expect("insert");
 

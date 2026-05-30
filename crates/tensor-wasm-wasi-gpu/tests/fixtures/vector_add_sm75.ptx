@@ -1,0 +1,63 @@
+//
+// vector_add_sm75.ptx
+//
+// Element-wise float32 vector addition: c[i] = a[i] + b[i]
+//
+// sm_75 (Turing) variant of the canonical kernels/vector_add.ptx fixture.
+// Byte-for-byte identical body to the sm_80 fixture — the kernel uses only
+// capability-agnostic PTX (ld/st.global.f32, add.f32, mad.lo.s32, branch),
+// none of the sm_80-only tensor-core (wmma) ops — so the ONLY difference is
+// the `.target` line. This lets the Wasm -> wasi-cuda -> cuLaunchKernel
+// end-to-end proof actually JIT-load and run a real kernel on Turing-class
+// hardware (e.g. the RTX 2060 dev box, compute capability 7.5), where the
+// sm_80 fixture is rejected by the driver JIT with a target-mismatch error.
+//
+// .version 8.0 requires a CUDA 12.0+ driver; sm_75 is forward-compatible on
+// any driver that old or newer. Kept in lockstep with vector_add.ptx — if
+// the canonical fixture's body changes, regenerate this one to match.
+//
+
+.version 8.0
+.target sm_75
+.address_size 64
+
+.visible .entry vector_add(
+    .param .u64 a_ptr,
+    .param .u64 b_ptr,
+    .param .u64 c_ptr,
+    .param .u32 n
+)
+{
+    .reg .pred  %p<2>;
+    .reg .s32   %r<6>;
+    .reg .s64   %rd<11>;
+    .reg .f32   %f<4>;
+
+    ld.param.u64    %rd1, [a_ptr];
+    ld.param.u64    %rd2, [b_ptr];
+    ld.param.u64    %rd3, [c_ptr];
+    ld.param.u32    %r1,  [n];
+
+    mov.u32         %r2, %ntid.x;
+    mov.u32         %r3, %ctaid.x;
+    mov.u32         %r4, %tid.x;
+    mad.lo.s32      %r5, %r2, %r3, %r4;
+
+    setp.ge.s32     %p1, %r5, %r1;
+    @%p1 bra        L_done;
+
+    cvt.s64.s32     %rd4, %r5;
+    shl.b64         %rd5, %rd4, 2;
+
+    add.s64         %rd6, %rd1, %rd5;
+    add.s64         %rd7, %rd2, %rd5;
+    add.s64         %rd8, %rd3, %rd5;
+
+    ld.global.f32   %f1, [%rd6];
+    ld.global.f32   %f2, [%rd7];
+    add.f32         %f3, %f1, %f2;
+    st.global.f32   [%rd8], %f3;
+
+L_done:
+    ret;
+}
