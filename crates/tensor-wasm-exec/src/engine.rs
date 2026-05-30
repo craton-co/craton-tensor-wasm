@@ -261,7 +261,9 @@ impl TensorWasmEngine {
     /// Construct an engine with explicit configuration.
     pub fn with_config(cfg: EngineConfig) -> Result<Self, wasmtime::Error> {
         let mut wt_cfg = Config::new();
-        wt_cfg.async_support(true);
+        // wasmtime 45: async support is enabled by the `async` cargo feature
+        // and the `*_async` call sites; `Config::async_support` is deprecated
+        // and a no-op, so it is no longer set here.
         wt_cfg.epoch_interruption(true);
         wt_cfg.consume_fuel(false);
         wt_cfg.wasm_component_model(cfg.component_model);

@@ -36,9 +36,6 @@
 //! Wasm isolation via CPU PKU. The architectural exclusivity between the
 //! two modes is real and enforced by Wasmtime.
 
-// Only the test-only `wasm_accessible` helpers reference `Range` now that
-// wasmtime 45 dropped that method from the `LinearMemory` trait.
-#[cfg(test)]
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -354,14 +351,14 @@ unsafe impl LinearMemory for TensorWasmLinearMemory {
     }
 }
 
-// Test-only: wasmtime <45 called `wasm_accessible` through the `LinearMemory`
-// trait; wasmtime 45 dropped it (fault classification now derives the range
-// from `byte_capacity()`), so the only remaining callers are this crate's unit
-// tests. Gated on `cfg(test)` to avoid a `-D dead-code` error in the lib build.
-#[cfg(test)]
 impl TensorWasmLinearMemory {
     /// Native address range the guest can access — the full reservation,
-    /// including the reserved-but-not-yet-grown tail.
+    /// including the reserved-but-not-yet-grown tail. wasmtime <45 called this
+    /// through the `LinearMemory` trait; wasmtime 45 dropped it (fault
+    /// classification now derives the range from `byte_capacity()`), so it is
+    /// retained as an inherent diagnostic helper exercised by this crate's
+    /// tests. `allow(dead_code)` because the non-test lib build has no caller.
+    #[allow(dead_code)]
     pub(crate) fn wasm_accessible(&self) -> Range<usize> {
         // Finding (MEDIUM, wasm_accessible reports full cap, not visible size):
         // ------------------------------------------------------------------
@@ -551,11 +548,11 @@ unsafe impl LinearMemory for PooledLinearMemory {
     }
 }
 
-// Test-only — see the note on `TensorWasmLinearMemory::wasm_accessible`.
-#[cfg(test)]
 impl PooledLinearMemory {
     /// Native address range the guest can access — the full carved slab
-    /// reservation.
+    /// reservation. Retained diagnostic helper; see the note on
+    /// `TensorWasmLinearMemory::wasm_accessible`.
+    #[allow(dead_code)]
     pub(crate) fn wasm_accessible(&self) -> Range<usize> {
         // Finding (MEDIUM, wasm_accessible reports full cap, not visible size):
         // mirror the decision documented on
@@ -817,7 +814,7 @@ unsafe impl MemoryCreator for TensorWasmMemoryCreator {
             return Err(format!(
                 "TensorWasmMemoryCreator cannot honour guard_size_in_bytes = {guard_size_in_bytes}: \
                  managed-memory backings are incompatible with host page guards. \
-                 Set `Config::dynamic_memory_guard_size(0)` and \
+                 Set `Config::memory_guard_size(0)` and \
                  `Config::guard_before_linear_memory(false)`, or use the PoolingMpk backend."
             ));
         }

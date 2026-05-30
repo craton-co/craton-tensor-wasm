@@ -2037,8 +2037,7 @@ mod tests {
 
     #[test]
     fn add_to_linker_compiles() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2052,8 +2051,7 @@ mod tests {
     /// guest that imports `FN_LAST_ERROR_PTR` fails to instantiate.
     #[tokio::test]
     async fn add_to_linker_does_not_register_last_error_ptr() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2097,8 +2095,7 @@ mod tests {
     /// `docs/RISKS.md`.
     #[tokio::test]
     async fn launch_with_inbounds_unknown_tag_returns_invalid_args() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2165,8 +2162,7 @@ mod tests {
     /// the friendlier `KernelArgsUnsupported`.
     #[tokio::test]
     async fn launch_with_oob_args_returns_invalid_pointer() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2227,8 +2223,7 @@ mod tests {
     async fn launch_with_oversized_argv_returns_kernel_args_unsupported() {
         use crate::kernel_args::MAX_KERNEL_ARGS_BYTES;
 
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2290,8 +2285,7 @@ mod tests {
     /// only signal; this test asserts that contract.
     #[tokio::test]
     async fn launch_without_capability_returns_not_available() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2386,8 +2380,7 @@ mod tests {
     /// but only *after* validation runs — confirming the gate flipped).
     #[tokio::test]
     async fn launch_with_capability_passes_gate() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2469,8 +2462,7 @@ mod tests {
     /// cap.
     #[tokio::test]
     async fn launch_with_oversize_shared_mem_returns_invalid_dimensions() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2527,8 +2519,7 @@ mod tests {
     /// surface with `ptx_len = -1`.
     #[tokio::test]
     async fn load_ptx_negative_ptx_len_returns_invalid_pointer() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2626,8 +2617,7 @@ mod tests {
     /// source region, not the handle.
     #[tokio::test]
     async fn memcpy_h2d_oob_source_returns_invalid_pointer() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2674,8 +2664,7 @@ mod tests {
     /// from a memory fault.
     #[tokio::test]
     async fn memcpy_h2d_oversize_len_returns_invalid_args() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2720,8 +2709,7 @@ mod tests {
     /// `InstanceId` than the running context.
     #[tokio::test]
     async fn device_mem_cross_owner_handle_rejected() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2800,8 +2788,7 @@ mod tests {
     /// rejected before the no-CUDA `NotAvailable` stub.
     #[tokio::test]
     async fn alloc_rejects_zero_and_oversize() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");
@@ -2846,8 +2833,7 @@ mod tests {
     /// device-bytes gauge returns to zero.
     #[tokio::test]
     async fn alloc_tracks_handle_then_free_lifecycle() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
+        let config = wasmtime::Config::new();
         let engine = wasmtime::Engine::new(&config).unwrap();
         let mut linker: Linker<Dummy> = Linker::new(&engine);
         add_to_linker(&mut linker).expect("add_to_linker");

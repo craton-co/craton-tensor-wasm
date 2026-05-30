@@ -165,8 +165,7 @@ const AUDIT_WAT: &str = r#"
 "#;
 
 fn make_engine_and_linker() -> (wasmtime::Engine, wasmtime::Linker<TestStore>) {
-    let mut config = wasmtime::Config::new();
-    config.async_support(true);
+    let config = wasmtime::Config::new();
     let engine = wasmtime::Engine::new(&config).expect("engine");
     let mut linker: wasmtime::Linker<TestStore> = wasmtime::Linker::new(&engine);
     add_to_linker(&mut linker).expect("add_to_linker");

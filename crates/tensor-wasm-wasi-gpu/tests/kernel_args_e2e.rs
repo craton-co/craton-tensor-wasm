@@ -67,8 +67,7 @@ impl HasWasiCuda for TestStore {
 }
 
 fn make_engine_and_linker() -> (wasmtime::Engine, wasmtime::Linker<TestStore>) {
-    let mut config = wasmtime::Config::new();
-    config.async_support(true);
+    let config = wasmtime::Config::new();
     let engine = wasmtime::Engine::new(&config).expect("engine");
     let mut linker: wasmtime::Linker<TestStore> = wasmtime::Linker::new(&engine);
     add_to_linker(&mut linker).expect("add_to_linker");
@@ -99,7 +98,6 @@ fn make_managed_engine_and_linker() -> (wasmtime::Engine, wasmtime::Linker<TestS
     unsafe {
         config.with_host_memory(std::sync::Arc::new(TensorWasmMemoryCreator::default()));
     }
-    config.async_support(true);
     let engine = wasmtime::Engine::new(&config).expect("engine");
     let mut linker: wasmtime::Linker<TestStore> = wasmtime::Linker::new(&engine);
     add_to_linker(&mut linker).expect("add_to_linker");

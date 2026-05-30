@@ -40,8 +40,8 @@ fn make_engine() -> Engine {
     let creator = Arc::new(TensorWasmMemoryCreator::default());
     config.with_host_memory(creator);
     config.guard_before_linear_memory(false);
-    config.static_memory_maximum_size(0);
-    config.dynamic_memory_guard_size(0);
+    config.memory_reservation(0);
+    config.memory_guard_size(0);
     Engine::new(&config).expect("engine")
 }
 

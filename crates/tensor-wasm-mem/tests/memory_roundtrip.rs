@@ -28,8 +28,8 @@ fn wasm_writes_visible_in_host_buffer() {
     // Static memory size is at most one full Wasm page; growth happens via
     // TensorWasmLinearMemory::grow_to, not via guard-page magic.
     config.guard_before_linear_memory(false);
-    config.static_memory_maximum_size(0);
-    config.dynamic_memory_guard_size(0);
+    config.memory_reservation(0);
+    config.memory_guard_size(0);
 
     let engine = Engine::new(&config).expect("engine");
     let wasm = wat::parse_str(WAT).expect("wat → wasm");
@@ -67,8 +67,8 @@ fn memory_grow_through_wasm() {
     let creator = Arc::new(TensorWasmMemoryCreator::default());
     config.with_host_memory(creator);
     config.guard_before_linear_memory(false);
-    config.static_memory_maximum_size(0);
-    config.dynamic_memory_guard_size(0);
+    config.memory_reservation(0);
+    config.memory_guard_size(0);
 
     let engine = Engine::new(&config).expect("engine");
     let wasm = wat::parse_str(GROW_WAT).expect("wat → wasm");
@@ -105,8 +105,8 @@ fn pre_grow_bytes_survive_grow() {
     let creator = Arc::new(TensorWasmMemoryCreator::default());
     config.with_host_memory(creator);
     config.guard_before_linear_memory(false);
-    config.static_memory_maximum_size(0);
-    config.dynamic_memory_guard_size(0);
+    config.memory_reservation(0);
+    config.memory_guard_size(0);
 
     let engine = Engine::new(&config).expect("engine");
     let wasm = wat::parse_str(WAT).expect("wat → wasm");
