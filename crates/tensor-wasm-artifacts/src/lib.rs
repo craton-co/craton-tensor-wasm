@@ -711,7 +711,7 @@ impl DiskArtifactStore {
     /// accepted key (active or retired) the blob actually lives under.
     ///
     /// Rotation-aware: this resolves the blob's key with the same
-    /// [`Self::resolve_read_key`] probe `get` / `list` use, then reads the
+    /// `resolve_read_key` probe `get` / `list` use, then reads the
     /// sidecar partitioned under that key's fingerprint. A blob written
     /// under a now-retired key (and its sidecar) is therefore still
     /// readable here after rotation, matching what `get` exposes.

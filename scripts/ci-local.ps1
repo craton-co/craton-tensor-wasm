@@ -83,7 +83,7 @@ function Get-JobCmd([string]$job) {
         'clippy'     { 'cargo clippy --workspace --all-targets -- -D warnings' }
         'test'       { 'cargo build --workspace && cargo test --workspace --no-default-features && cargo test --workspace' }
         'doc'        { "RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --no-default-features" }
-        'deny'       { 'cargo deny check --all-features' }
+        'deny'       { 'cargo deny --all-features check' }
         'cuda-oxide' { 'cargo check --workspace --features tensor-wasm-mem/cuda-oxide-backend' }
         'openapi'    { 'redocly lint --config openapi/redocly.yaml openapi/tensor-wasm-api.yaml && swagger-cli validate crates/tensor-wasm-api/openapi.json && cargo test -p tensor-wasm-api --test openapi_validation_test --no-default-features' }
         'actionlint' { 'actionlint' }

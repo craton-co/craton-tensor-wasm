@@ -241,6 +241,19 @@ fn parse_yaml_operation_security(yaml: &str) -> BTreeMap<String, SecuritySpec> {
             let name = rest.trim_end_matches(':').trim().to_lowercase();
             if rest.ends_with(':') && HTTP_METHODS.contains(&name.as_str()) {
                 cur_method = Some(name);
+                // Register the operation up-front with a default of `Absent`
+                // so the YAML map's key set matches the JSON map's, which
+                // records every operation (defaulting missing `security` to
+                // `Absent`; see `json_operation_security`). An operation-level
+                // `security:` line at indent 6 overrides this default below.
+                // Without this, operations that inherit the root `security`
+                // (no explicit key) would be silently dropped from the YAML
+                // side, so `assert_eq!(json_ops, yaml_ops)` could never hold
+                // once any operation relies on root inheritance.
+                if let (Some(p), Some(m)) = (&cur_path, &cur_method) {
+                    out.entry(format!("{m} {p}"))
+                        .or_insert(SecuritySpec::Absent);
+                }
             } else {
                 // Non-operation Path Item field (e.g. `parameters:`,
                 // `summary:`); leave cur_method untouched but don't treat
