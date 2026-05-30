@@ -36,6 +36,9 @@
 //! Wasm isolation via CPU PKU. The architectural exclusivity between the
 //! two modes is real and enforced by Wasmtime.
 
+// Only the test-only `wasm_accessible` helpers reference `Range` now that
+// wasmtime 45 dropped that method from the `LinearMemory` trait.
+#[cfg(test)]
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -351,13 +354,14 @@ unsafe impl LinearMemory for TensorWasmLinearMemory {
     }
 }
 
+// Test-only: wasmtime <45 called `wasm_accessible` through the `LinearMemory`
+// trait; wasmtime 45 dropped it (fault classification now derives the range
+// from `byte_capacity()`), so the only remaining callers are this crate's unit
+// tests. Gated on `cfg(test)` to avoid a `-D dead-code` error in the lib build.
+#[cfg(test)]
 impl TensorWasmLinearMemory {
     /// Native address range the guest can access — the full reservation,
-    /// including the reserved-but-not-yet-grown tail. This was the
-    /// `LinearMemory::wasm_accessible` trait method in wasmtime <45; wasmtime
-    /// 45 dropped it from the trait (fault classification now derives the
-    /// range from `byte_capacity()`), so it lives here as an inherent helper
-    /// the crate's tests still assert against.
+    /// including the reserved-but-not-yet-grown tail.
     pub(crate) fn wasm_accessible(&self) -> Range<usize> {
         // Finding (MEDIUM, wasm_accessible reports full cap, not visible size):
         // ------------------------------------------------------------------
@@ -547,11 +551,11 @@ unsafe impl LinearMemory for PooledLinearMemory {
     }
 }
 
+// Test-only — see the note on `TensorWasmLinearMemory::wasm_accessible`.
+#[cfg(test)]
 impl PooledLinearMemory {
     /// Native address range the guest can access — the full carved slab
-    /// reservation. Was `LinearMemory::wasm_accessible` in wasmtime <45;
-    /// dropped from the 45 trait, kept here as an inherent helper (see the
-    /// note on `TensorWasmLinearMemory::wasm_accessible`).
+    /// reservation.
     pub(crate) fn wasm_accessible(&self) -> Range<usize> {
         // Finding (MEDIUM, wasm_accessible reports full cap, not visible size):
         // mirror the decision documented on

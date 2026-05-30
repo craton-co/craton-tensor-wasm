@@ -102,12 +102,7 @@ job_cmd() {
         deny)       echo 'cargo deny --all-features check' ;;
         cuda-oxide) echo 'cargo check --workspace --features tensor-wasm-mem/cuda-oxide-backend' ;;
         openapi)    echo 'redocly lint --config openapi/redocly.yaml openapi/tensor-wasm-api.yaml && swagger-cli validate crates/tensor-wasm-api/openapi.json && cargo test -p tensor-wasm-api --test openapi_validation_test --no-default-features' ;;
-        # Pass explicit paths instead of bare `actionlint`: with no args
-        # actionlint discovers workflows via `git`, which fails inside the
-        # mounted container when the checkout's `.git` is a worktree pointer
-        # to a host path that doesn't resolve in Linux ("no YAML file was
-        # found"). Globbing the files directly sidesteps git entirely.
-        actionlint) echo 'actionlint .github/workflows/*.yml' ;;
+        actionlint) echo 'actionlint' ;;
     esac
 }
 
