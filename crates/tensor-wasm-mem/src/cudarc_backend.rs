@@ -272,6 +272,16 @@ impl CudarcUnifiedBuffer {
             return Err(UnifiedError::ZeroSize);
         }
         let device = device_for(device_id.0)?;
+        // mem M4 / finding #9: bind the primary context to THIS thread before
+        // `cuMemAllocManaged`. `device_for` returns a cached `Arc<CudaDevice>`
+        // clone on every call after the first, and `CudaDevice::new` only binds
+        // the context on the thread that built it — so an allocation on any
+        // other thread (a tokio/rayon worker, or simply a libtest per-test
+        // thread) would otherwise fail with `CUDA_ERROR_INVALID_CONTEXT`. The
+        // sibling `apply_advice` / `prefetch_*` paths already call this; `new_on`
+        // was missing it (verified on the RTX 2060: cudarc_smoke round-trip tests
+        // failed with INVALID_CONTEXT — see docs/GPU-VALIDATION-2026-05-30.md).
+        ensure_context_bound(&device)?;
         let mut raw: cuda_sys::CUdeviceptr = 0;
         // CUDA documents the `flags` argument to `cuMemAllocManaged` as one of
         // `CU_MEM_ATTACH_GLOBAL = 1` or `CU_MEM_ATTACH_HOST = 2`. cudarc 0.13's
@@ -293,8 +303,9 @@ impl CudarcUnifiedBuffer {
             "cudarc renumbered CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL; \
              update the inlined constant in cudarc_backend.rs",
         );
-        // SAFETY: `raw` is a valid out-parameter; `size > 0`; the device above
-        // ensures the primary context is current on this thread.
+        // SAFETY: `raw` is a valid out-parameter; `size > 0`; the
+        // `ensure_context_bound` call above made the primary context current on
+        // this thread.
         // cudarc 0.13.x exposes CUDA driver functions as methods on a Lib
         // struct, accessed via cudarc::driver::sys::lib(). Free-function
         // imports like cust uses are not available; `device_for(ordinal)`

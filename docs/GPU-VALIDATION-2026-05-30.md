@@ -162,3 +162,51 @@ bad fixture is surfaced rather than hidden. On a healthy runner it proceeds to
 
 #6 (thread-bound context in the async path) and #1 (driver-level mem cap) remain
 open and untouched by this change.
+
+## Update — #1 verified, #9 found + fixed (cudarc context binding)
+
+After commit `47c5a05` (parallel session: host-side per-tenant cap for #1 +
+`cuda_ctx.rs` shared primary context for #6), re-running the gpu-mem-pool ignored
+suite on the RTX 2060 confirmed and uncovered:
+
+- **#1 VERIFIED ✅**: `over_cap_allocation_through_pool_is_rejected_by_driver ... ok`
+  (was FAILED), plus `under_cap` / `driver_pin_matches_requested_cap` /
+  `cuda_mem_pool_scaffold` (3) all ok. The host-side `live_bytes` reservation in
+  `TenantMemPool::allocate` closes BUG-1.
+- **BUG-9 (found, then fixed) ✅**: with #1 letting the run proceed past the old
+  failure, `cudarc_smoke::cudarc_round_trip_on_device` and
+  `cudarc_prefetch_round_trip_on_device` then failed with
+  `cuMemAllocManaged -> CUDA_ERROR_INVALID_CONTEXT`. Root cause:
+  `CudarcUnifiedBuffer::new_on` (cudarc_backend.rs) called `device_for()` (which
+  returns a cached `Arc<CudaDevice>` clone — only the thread that first built the
+  device has its context current) but did **not** call `ensure_context_bound`
+  before `cuMemAllocManaged`. Its sibling `apply_advice`/`prefetch_*` paths
+  already bound the context; `new_on` was the gap. This is the cudarc-path twin of
+  #6. One-line fix (add `ensure_context_bound(&device)?` in `new_on`); the stale
+  "the device above ensures the primary context is current" comment was wrong and
+  is corrected. These are `#[ignore]`d hardware tests, so hosted CI was unaffected
+  — only a real GPU surfaces it (and session 1's fail-fast had stopped before
+  these ran, so they had never actually executed on silicon).
+
+After the #9 fix, `cudarc_round_trip_on_device` and
+`cudarc_apply_advice_read_mostly_on_device` pass, along with the snapshot
+round-trip, visible-window, `cuda_mem_pool_scaffold` (3), and all three
+driver-pin tests (incl. `over_cap`). The cust `unified-memory` snapshot
+round-trip also passes.
+
+**BUG-10 (found, NOT fixed): `cuMemPrefetchAsync` unsupported on this box.**
+`cudarc_prefetch_round_trip_on_device` still fails — but now one line LATER than
+the #9 alloc failure (cudarc_smoke.rs:80, the prefetch, not :79 the alloc), with
+`cuMemPrefetchAsync(device) -> CUDA_ERROR_INVALID_DEVICE`. This is almost
+certainly an environment limitation, not a code bug: `cuMemPrefetchAsync`
+requires the device's `concurrentManagedAccess` attribute to be non-zero, which
+is **0 on Windows under the WDDM driver model** (managed-memory prefetch is a
+Linux / TCC feature). The right fix is to gate the prefetch path (and this test)
+on the `CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS` attribute and treat
+prefetch as a no-op/skip where unsupported — a small, separate change deferred
+here rather than landed unverified. Tracked as BUG-10.
+
+Remaining red items on this box are both environment limitations of the local
+Windows/WDDM driver, not code defects: the PTX-JIT launch proof (#7/BUG-8) and
+`cuMemPrefetchAsync` (BUG-10). Everything that does not depend on those two
+driver features passes on the RTX 2060.
