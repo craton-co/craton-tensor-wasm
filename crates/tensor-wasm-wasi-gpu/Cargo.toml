@@ -35,7 +35,13 @@ proptest = { workspace = true }
 
 [features]
 default = []
-cuda = ["dep:cust"]
+# `cuda` links cust for the real launch path AND enables tensor-wasm-mem's
+# `unified-memory` backing so the end-to-end launch test can back guest linear
+# memory with `cuMemAllocManaged` (finding #8): a kernel pointer-arg must
+# reference device-addressable memory, which plain host-heap linear memory is
+# not. Both pulls require a CUDA toolchain, which `--features cuda` already
+# implies, so this adds no new constraint to the default build.
+cuda = ["dep:cust", "tensor-wasm-mem/unified-memory"]
 
 # docs.rs build: deliberately disable `cuda` so the CUDA driver libs aren't
 # required on the docs.rs builders. The published docs cover the no-CUDA

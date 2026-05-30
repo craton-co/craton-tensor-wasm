@@ -75,6 +75,37 @@ fn make_engine_and_linker() -> (wasmtime::Engine, wasmtime::Linker<TestStore>) {
     (engine, linker)
 }
 
+/// Like [`make_engine_and_linker`], but backs guest linear memory with CUDA
+/// Unified Memory via [`TensorWasmMemoryCreator`] (finding #8).
+///
+/// The end-to-end launch test hands the kernel pointer args that resolve to
+/// host addresses inside the guest's linear memory. For `cuLaunchKernel` to
+/// dereference those pointers on the device, the linear memory must be
+/// device-addressable — i.e. allocated with `cuMemAllocManaged`, not plain host
+/// heap. Installing `TensorWasmMemoryCreator` (whose `new_memory` allocates a
+/// `UnifiedBuffer`, which under `tensor-wasm-mem/unified-memory` is managed
+/// memory) makes the guest's exported `memory` managed, so the same address the
+/// host reads back is the one the kernel wrote through. Without this the launch
+/// fails with `CUDA_ERROR_INVALID_VALUE` (BUG-8 in
+/// `docs/GPU-VALIDATION-2026-05-30.md`).
+#[cfg(feature = "cuda")]
+fn make_managed_engine_and_linker() -> (wasmtime::Engine, wasmtime::Linker<TestStore>) {
+    use tensor_wasm_mem::wasm_memory::TensorWasmMemoryCreator;
+    let mut config = wasmtime::Config::new();
+    // SAFETY: `TensorWasmMemoryCreator` satisfies the wasmtime `MemoryCreator`
+    // contract (it returns dedicated `cuMemAllocManaged` regions that live for
+    // the memory's lifetime). Same usage as tensor-wasm-mem's own
+    // `creator_behaviors` integration tests.
+    unsafe {
+        config.with_host_memory(std::sync::Arc::new(TensorWasmMemoryCreator::default()));
+    }
+    config.async_support(true);
+    let engine = wasmtime::Engine::new(&config).expect("engine");
+    let mut linker: wasmtime::Linker<TestStore> = wasmtime::Linker::new(&engine);
+    add_to_linker(&mut linker).expect("add_to_linker");
+    (engine, linker)
+}
+
 /// Build a tiny WAT module that copies `argv_bytes` into linear memory
 /// at offset `argv_offset` (via a `data` segment) and exports a
 /// `launch_with_args` function that hands that buffer to
@@ -726,7 +757,11 @@ async fn vector_add_end_to_end_real_ptx_real_kernel() {
             c_bytes.extend_from_slice(&0.0_f32.to_le_bytes());
         }
 
-        let (engine, linker) = make_engine_and_linker();
+        // Finding #8: back guest linear memory with cuMemAllocManaged so the
+        // kernel pointer-args (host addresses inside linear memory) are
+        // device-addressable; a plain-host-heap engine fails the launch with
+        // CUDA_ERROR_INVALID_VALUE.
+        let (engine, linker) = make_managed_engine_and_linker();
         let owner = InstanceId(403);
         let mut ctx = WasiCudaContext::new(owner);
         ctx.enable_wasi_cuda();
