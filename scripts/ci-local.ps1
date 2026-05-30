@@ -13,7 +13,7 @@
 # across runs and never collides with the host's MSVC target/ directory.
 #
 # Usage:
-#   scripts\ci-local.ps1 [-RebuildImage] [-Pull] [-FailFast] [-CleanCache] [job ...]
+#   scripts\ci-local.ps1 [-SkipImageBuild] [-Pull] [-FailFast] [-CleanCache] [job ...]
 #
 # Jobs (default: all, run in this order; every job runs even if an earlier one
 # fails, and the script exits non-zero if any failed — use -FailFast to stop
@@ -23,9 +23,14 @@
 # Examples:
 #   scripts\ci-local.ps1                 # full CI
 #   scripts\ci-local.ps1 fmt clippy      # just the fast lints
-#   scripts\ci-local.ps1 -RebuildImage test
+#   scripts\ci-local.ps1 -SkipImageBuild test   # reuse the cached image
 [CmdletBinding()]
 param(
+    # The CI image is rebuilt on every run by default (Docker layer cache makes
+    # it near-instant when docker\ci.Dockerfile is unchanged). Use
+    # -SkipImageBuild to reuse the existing image as-is.
+    [switch]$SkipImageBuild,
+    # Accepted for compatibility; rebuild is now the default.
     [switch]$RebuildImage,
     [switch]$Pull,
     [switch]$FailFast,
@@ -96,11 +101,12 @@ if ($CleanCache) {
     docker volume rm -f $TargetVolume $CargoVolume 2>$null | Out-Null
 }
 
-# Build the image if missing or requested.
+# Rebuild the image on every run by default (skip with -SkipImageBuild); always
+# build if it is missing.
 $imageExists = $false
 try { docker image inspect $Image *> $null; if ($LASTEXITCODE -eq 0) { $imageExists = $true } } catch {}
-if ($RebuildImage -or -not $imageExists) {
-    Write-Host ">> building $Image (one-time; cached afterwards)"
+if (-not $SkipImageBuild -or -not $imageExists) {
+    Write-Host ">> building $Image (Docker layer cache makes this near-instant when docker\ci.Dockerfile is unchanged)"
     $buildArgs = @('build', '-f', $Dockerfile, '-t', $Image)
     if ($Pull) { $buildArgs += '--pull' }
     $buildArgs += (Join-Path $RepoRoot 'docker')

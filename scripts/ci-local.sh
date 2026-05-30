@@ -30,8 +30,14 @@
 #   openapi      redocly lint + swagger-cli validate + openapi_validation_test
 #   actionlint   actionlint
 #
+# The local CI image is rebuilt on EVERY run by default (Docker layer cache
+# keeps it near-instant when docker/ci.Dockerfile is unchanged, and any edit —
+# e.g. a pinned tool-version bump — is picked up automatically). Pass
+# --skip-image-build to reuse the existing image as-is.
+#
 # Options:
-#   --rebuild-image   Force a rebuild of the local CI image before running.
+#   --skip-image-build  Reuse the existing CI image; skip the default rebuild.
+#   --rebuild-image     Accepted for compatibility; rebuild is now the default.
 #   --pull            Pass --pull to the image build (refresh the base image).
 #   --fail-fast       Stop at the first failing job (default: run them all).
 #   --keep-going      Accepted for compatibility; now the default (no-op).
@@ -41,7 +47,7 @@
 # Examples:
 #   scripts/ci-local.sh                 # full CI
 #   scripts/ci-local.sh fmt clippy      # just the fast lints
-#   scripts/ci-local.sh --rebuild-image test
+#   scripts/ci-local.sh --skip-image-build test   # reuse the cached image
 set -euo pipefail
 
 # --- locate the repo root (this script lives in <root>/scripts) -------------
@@ -57,7 +63,7 @@ CARGO_VOLUME="tensor-wasm-ci-cargo"
 # .github/workflows/ci.yml.
 ALL_JOBS=(fmt clippy test doc deny cuda-oxide openapi actionlint)
 
-REBUILD_IMAGE=0
+SKIP_IMAGE_BUILD=0
 PULL=0
 # Run every job even if an earlier one fails (the script still exits non-zero
 # when any failed). `--fail-fast` restores stop-at-first-failure.
@@ -69,7 +75,8 @@ usage() { sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --rebuild-image) REBUILD_IMAGE=1 ;;
+        --skip-image-build) SKIP_IMAGE_BUILD=1 ;;
+        --rebuild-image) : ;;  # rebuild is now the default; accepted for compatibility
         --pull)          PULL=1 ;;
         --fail-fast)     FAIL_FAST=1 ;;
         --keep-going)    : ;;  # now the default; accepted for compatibility
@@ -112,8 +119,8 @@ if [[ "${CLEAN_CACHE}" == "1" ]]; then
     docker volume rm -f "${TARGET_VOLUME}" "${CARGO_VOLUME}" >/dev/null 2>&1 || true
 fi
 
-if [[ "${REBUILD_IMAGE}" == "1" ]] || ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-    echo ">> building ${IMAGE} (one-time; cached afterwards)"
+if [[ "${SKIP_IMAGE_BUILD}" == "0" ]] || ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+    echo ">> building ${IMAGE} (Docker layer cache makes this near-instant when docker/ci.Dockerfile is unchanged)"
     build_args=(build -f "${DOCKERFILE}" -t "${IMAGE}")
     [[ "${PULL}" == "1" ]] && build_args+=(--pull)
     build_args+=("${REPO_ROOT}/docker")
