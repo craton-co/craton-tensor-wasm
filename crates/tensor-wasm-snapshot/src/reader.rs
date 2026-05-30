@@ -142,7 +142,10 @@ impl std::fmt::Debug for SnapshotReader {
         );
         d.field("require_signature", &self.require_signature);
         d.field("min_sequence_no", &self.min_sequence_no);
-        d.field("expected_nonce", &self.expected_nonce.as_ref().map(|_| "<set>"));
+        d.field(
+            "expected_nonce",
+            &self.expected_nonce.as_ref().map(|_| "<set>"),
+        );
         d.field("max_age", &self.max_age);
         d.finish()
     }
@@ -1062,8 +1065,7 @@ impl SnapshotReader {
                 // the writer and authenticates the trailer header, so an
                 // attacker cannot rewrite the kind byte (e.g. to claim HMAC)
                 // without invalidating the signature.
-                let mut message =
-                    Vec::with_capacity(prefix_len + V3_TRAILER_MAGIC_LEN + 1);
+                let mut message = Vec::with_capacity(prefix_len + V3_TRAILER_MAGIC_LEN + 1);
                 message.extend_from_slice(&bytes[..prefix_len]);
                 message.extend_from_slice(&V3_TRAILER_MAGIC);
                 message.push(kind_byte);
@@ -1565,9 +1567,9 @@ impl<W: std::io::Write> WriteSink<'_, W> {
         // Write, then let `bytes` drop at the end of this call so the blob's
         // allocation is released before the next blob is decoded out of the
         // owned `Snapshot`.
-        self.out.write_all(&bytes).map_err(|e| {
-            TensorWasmError::Serialization(format!("restore_to_writer: {e}").into())
-        })
+        self.out
+            .write_all(&bytes)
+            .map_err(|e| TensorWasmError::Serialization(format!("restore_to_writer: {e}").into()))
     }
 }
 
@@ -1624,10 +1626,7 @@ impl SnapshotReader {
     /// this method returns.
     #[cfg_attr(docsrs, doc(cfg(feature = "mmap")))]
     #[instrument(skip(self), fields(path = %path.as_ref().display()))]
-    pub fn restore_from_path_mmap<P: AsRef<std::path::Path>>(
-        &self,
-        path: P,
-    ) -> Result<Snapshot> {
+    pub fn restore_from_path_mmap<P: AsRef<std::path::Path>>(&self, path: P) -> Result<Snapshot> {
         let file = std::fs::File::open(path.as_ref()).map_err(|e| {
             TensorWasmError::Serialization(format!("restore_from_path_mmap open: {e}").into())
         })?;

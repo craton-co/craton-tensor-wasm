@@ -9,17 +9,21 @@
 //!       -> contains == false
 //!       -> remove == false (nothing left to delete; no-op, not an error)
 
-use tensor_wasm_artifacts::{
-    ArtifactStore, ContentHash, DiskArtifactStore, InMemoryArtifactStore,
-};
+use tensor_wasm_artifacts::{ArtifactStore, ContentHash, DiskArtifactStore, InMemoryArtifactStore};
 
 fn exercise<S: ArtifactStore>(store: &S) {
     let payload = b"contains/remove lifecycle payload";
     let hash = store.put(payload).expect("put");
 
-    assert!(store.contains(&hash).expect("contains after put"), "must exist after put");
+    assert!(
+        store.contains(&hash).expect("contains after put"),
+        "must exist after put"
+    );
 
-    assert!(store.remove(&hash).expect("first remove"), "first remove deletes -> true");
+    assert!(
+        store.remove(&hash).expect("first remove"),
+        "first remove deletes -> true"
+    );
 
     assert!(
         !store.contains(&hash).expect("contains after remove"),

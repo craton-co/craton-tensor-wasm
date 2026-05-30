@@ -44,7 +44,11 @@ fn sole_blob_file(dir: &std::path::Path) -> std::path::PathBuf {
             hits.push(entry.path());
         }
     }
-    assert_eq!(hits.len(), 1, "expected exactly one blob file, found {hits:?}");
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly one blob file, found {hits:?}"
+    );
     hits.into_iter().next().unwrap()
 }
 
@@ -116,7 +120,9 @@ fn remove_unlinks_retired_key_blob() {
     let dir = tmp.path().to_path_buf();
 
     let old_store = DiskArtifactStore::new(dir.clone(), K1);
-    let hash = old_store.put(b"retire me and reclaim me").expect("put under K1");
+    let hash = old_store
+        .put(b"retire me and reclaim me")
+        .expect("put under K1");
 
     let provider = Arc::new(RotatingKeyProvider::new(K2, [K1]));
     let rotated = DiskArtifactStore::with_key_provider(dir.clone(), provider);
@@ -191,12 +197,17 @@ fn metadata_reads_retired_key_sidecar() {
     let got = rotated
         .metadata(&hash)
         .expect("metadata across rotation boundary");
-    assert_eq!(got, meta, "retired-key sidecar must come back byte-for-byte");
+    assert_eq!(
+        got, meta,
+        "retired-key sidecar must come back byte-for-byte"
+    );
 
     // And `remove` then takes the sidecar with the blob, even across
     // rotation (the sidecar must not outlive the blob).
     assert!(rotated.remove(&hash).expect("remove"), "blob removed");
-    let err = rotated.metadata(&hash).expect_err("sidecar gone after remove");
+    let err = rotated
+        .metadata(&hash)
+        .expect_err("sidecar gone after remove");
     assert!(matches!(err, ArtifactError::NotFound(_)), "got {err:?}");
 }
 
@@ -214,7 +225,9 @@ fn get_to_streams_only_authenticated_bytes() {
 
     // Pseudo-random-ish, compressible-but-not-trivial body that forces the
     // two passes (verify, then decode) to each iterate several buffers.
-    let payload: Vec<u8> = (0..300_000u32).map(|n| (n.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let payload: Vec<u8> = (0..300_000u32)
+        .map(|n| (n.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
     let hash = store.put(&payload).expect("put");
 
     let mut sink: Vec<u8> = Vec::new();
@@ -256,7 +269,9 @@ fn get_to_tampered_body_emits_no_bytes() {
     // streams anything, so the tampered body surfaces as BadHmac with an
     // empty sink — no unverified bytes leaked to the writer.
     let mut sink = RecordingWriter { bytes: Vec::new() };
-    let err = store.get_to(&hash, &mut sink).expect_err("must reject tamper");
+    let err = store
+        .get_to(&hash, &mut sink)
+        .expect_err("must reject tamper");
     assert!(matches!(err, ArtifactError::BadHmac), "got {err:?}");
     assert!(
         sink.bytes.is_empty(),

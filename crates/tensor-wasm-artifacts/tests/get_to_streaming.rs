@@ -111,7 +111,9 @@ fn disk_get_to_tamper_emits_no_unverified_bytes() {
     // streams anything, so a tampered body must surface as BadHmac with an
     // empty sink — no unverified bytes leaked to the writer.
     let mut sink = RecordingWriter { bytes: Vec::new() };
-    let err = store.get_to(&hash, &mut sink).expect_err("must reject tamper");
+    let err = store
+        .get_to(&hash, &mut sink)
+        .expect_err("must reject tamper");
     assert!(matches!(err, ArtifactError::BadHmac), "got {err:?}");
     assert!(
         sink.bytes.is_empty(),

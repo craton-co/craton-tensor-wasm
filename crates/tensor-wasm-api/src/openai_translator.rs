@@ -595,10 +595,7 @@ mod tests {
             ..base.clone()
         };
         assert!(translate_completions_request(&req, &map).is_ok());
-        let req = CompletionsRequest {
-            n: Some(2),
-            ..base
-        };
+        let req = CompletionsRequest { n: Some(2), ..base };
         assert!(translate_completions_request(&req, &map).is_err());
     }
 

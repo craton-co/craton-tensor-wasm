@@ -342,10 +342,7 @@ fn wmma_m16n16k16_structural_gate() {
     assert!(errs.is_empty(), "wmma structural gate failed: {errs:?}");
 
     // Safe-default pin lives alongside the gate.
-    assert!(
-        emit(&bp).is_err(),
-        "default-config emit must refuse matmul"
-    );
+    assert!(emit(&bp).is_err(), "default-config emit must refuse matmul");
 }
 
 // ---------------------------------------------------------------------

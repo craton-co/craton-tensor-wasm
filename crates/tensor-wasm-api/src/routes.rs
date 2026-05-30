@@ -553,8 +553,7 @@ fn evict_jobs_if_over_cap(jobs: &DashMap<Uuid, JobRecord>) {
         .iter()
         .map(|e| {
             let rec = e.value();
-            let terminal =
-                matches!(rec.status, JobStatus::Completed | JobStatus::Failed);
+            let terminal = matches!(rec.status, JobStatus::Completed | JobStatus::Failed);
             (rec.created_unix_ms, *e.key(), terminal)
         })
         .collect();
@@ -1521,7 +1520,10 @@ pub async fn invoke_function(
     // bump regardless of payload size. We also read the record's owning
     // tenant so the per-resource check below runs against the same guard.
     let (wasm_bytes, owner) = match state.functions.get(&id) {
-        Some(entry) => (Arc::clone(&entry.value().wasm_bytes), entry.value().tenant_id),
+        Some(entry) => (
+            Arc::clone(&entry.value().wasm_bytes),
+            entry.value().tenant_id,
+        ),
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
     // Per-resource owner check (api S-IDOR): authorize_tenant above only
@@ -1640,7 +1642,10 @@ pub async fn invoke_function_async(
     let args = parse_invoke_args(&req.args)?;
     let export_override = req.export;
     let (wasm_bytes, owner) = match state.functions.get(&id) {
-        Some(entry) => (Arc::clone(&entry.value().wasm_bytes), entry.value().tenant_id),
+        Some(entry) => (
+            Arc::clone(&entry.value().wasm_bytes),
+            entry.value().tenant_id,
+        ),
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
     // Per-resource owner check (api S-IDOR): see `invoke_function`. Runs
@@ -1919,7 +1924,10 @@ pub async fn invoke_function_stream(
 
     // 404 before any negotiation work, mirroring `/invoke`.
     let (wasm_bytes, owner) = match state.functions.get(&id) {
-        Some(entry) => (Arc::clone(&entry.value().wasm_bytes), entry.value().tenant_id),
+        Some(entry) => (
+            Arc::clone(&entry.value().wasm_bytes),
+            entry.value().tenant_id,
+        ),
         None => return Err(ApiError::not_found(format!("function {id} not found"))),
     };
     // Per-resource owner check (api S-IDOR): see `invoke_function`. A
@@ -2422,7 +2430,10 @@ pub async fn snapshot_save(
     // Snapshot the Wasm bytes + owning tenant under the shard lock, then
     // drop the guard before any blocking / await work.
     let (wasm_bytes, owner) = match state.functions.get(&req.function_id) {
-        Some(entry) => (Arc::clone(&entry.value().wasm_bytes), entry.value().tenant_id),
+        Some(entry) => (
+            Arc::clone(&entry.value().wasm_bytes),
+            entry.value().tenant_id,
+        ),
         None => {
             return Err(ApiError::not_found(format!(
                 "function {} not found",
@@ -3022,7 +3033,10 @@ mod tests {
         assert_eq!(jobs.len(), MAX_JOB_RECORDS);
         // The three oldest were dropped.
         for old in ids_by_age.iter().take(3) {
-            assert!(!jobs.contains_key(old), "oldest Pending record should be evicted");
+            assert!(
+                !jobs.contains_key(old),
+                "oldest Pending record should be evicted"
+            );
         }
     }
 

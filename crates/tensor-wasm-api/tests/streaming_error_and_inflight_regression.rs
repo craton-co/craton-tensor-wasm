@@ -357,12 +357,13 @@ async fn streaming_and_sync_error_messages_agree() {
         .lines()
         .find(|l| l.starts_with("data:"))
         .expect("error frame has data line");
-    let stream_message = serde_json::from_str::<Value>(data_line.trim_start_matches("data:").trim())
-        .expect("error frame data is JSON")
-        .get("message")
-        .and_then(Value::as_str)
-        .expect("stream error frame carries a message")
-        .to_owned();
+    let stream_message =
+        serde_json::from_str::<Value>(data_line.trim_start_matches("data:").trim())
+            .expect("error frame data is JSON")
+            .get("message")
+            .and_then(Value::as_str)
+            .expect("stream error frame carries a message")
+            .to_owned();
 
     assert_eq!(
         stream_message, sync_message,

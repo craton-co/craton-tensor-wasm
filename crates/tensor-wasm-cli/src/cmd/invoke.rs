@@ -108,10 +108,8 @@ pub async fn run(args: InvokeArgs, ctx: &HttpContext) -> Result<()> {
     // with `NON_ALPHANUMERIC`, which covers every reserved/sub-delim and dot
     // character, so `.`/`..` traversal and query/fragment smuggling are all
     // neutralised.
-    let encoded_id = percent_encoding::utf8_percent_encode(
-        &args.id,
-        percent_encoding::NON_ALPHANUMERIC,
-    );
+    let encoded_id =
+        percent_encoding::utf8_percent_encode(&args.id, percent_encoding::NON_ALPHANUMERIC);
     let url = format!(
         "{}/functions/{}/invoke",
         super::server_base(&args.server),

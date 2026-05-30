@@ -89,7 +89,8 @@ fn n_threads_pressuring_one_cap_refuse_the_right_count() {
         }));
     }
     for h in handles {
-        h.join().expect("worker thread panicked under quota pressure");
+        h.join()
+            .expect("worker thread panicked under quota pressure");
     }
 
     // Exactly the right number of refusals — deterministic because no

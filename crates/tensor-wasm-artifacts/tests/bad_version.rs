@@ -24,7 +24,11 @@ fn sole_artifact_file(dir: &std::path::Path) -> std::path::PathBuf {
             hits.push(entry.path());
         }
     }
-    assert_eq!(hits.len(), 1, "expected exactly one artifact file, found {hits:?}");
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly one artifact file, found {hits:?}"
+    );
     hits.into_iter().next().unwrap()
 }
 
@@ -43,7 +47,10 @@ fn disk_flipped_version_byte_returns_bad_version() {
     let mut bytes = std::fs::read(&path).expect("read");
     // Byte 16 is the LSB of the LE u32 version. ARTIFACT_VERSION is 1,
     // so setting it to 0xFF yields version 0xFF (unsupported).
-    assert_eq!(bytes[16], ARTIFACT_VERSION as u8, "precondition: version LSB");
+    assert_eq!(
+        bytes[16], ARTIFACT_VERSION as u8,
+        "precondition: version LSB"
+    );
     bytes[16] = 0xFF;
     std::fs::write(&path, &bytes).expect("write tampered");
 
@@ -58,7 +65,10 @@ fn disk_flipped_version_byte_returns_bad_version() {
 fn envelope_flipped_version_byte_returns_bad_version() {
     let key = [0x9A; 32];
     let mut framed = encode_envelope_to_vec(b"in-memory body", &key).expect("encode");
-    assert_eq!(framed[16], ARTIFACT_VERSION as u8, "precondition: version LSB");
+    assert_eq!(
+        framed[16], ARTIFACT_VERSION as u8,
+        "precondition: version LSB"
+    );
     framed[16] = 0x7F;
     let err = decode_envelope_from_bytes(&framed, &key).expect_err("must reject bad version");
     assert!(matches!(err, ArtifactError::BadVersion(_)), "got {err:?}");

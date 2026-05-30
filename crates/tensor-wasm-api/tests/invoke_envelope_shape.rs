@@ -157,7 +157,11 @@ async fn invoke_envelope_with_only_args_succeeds() {
     // that takes two i32 params matching the `[1, 2]` body. This proves both
     // that an export-omitted envelope defaults to `_start` and that its args
     // are threaded through to the call.
-    let id = deploy_module(&router, r#"(module (func (export "_start") (param i32 i32)))"#).await;
+    let id = deploy_module(
+        &router,
+        r#"(module (func (export "_start") (param i32 i32)))"#,
+    )
+    .await;
 
     let body = json!({ "args": [1, 2] });
     let resp = router

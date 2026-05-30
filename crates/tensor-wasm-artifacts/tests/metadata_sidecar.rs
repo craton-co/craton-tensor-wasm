@@ -4,9 +4,7 @@
 //! `ArtifactMetadata` sidecar: `put_with_metadata` / `metadata` round-trip,
 //! and the guarantee that a plain `put` writes no sidecar.
 
-use tensor_wasm_artifacts::{
-    ArtifactError, ArtifactMetadata, ArtifactStore, DiskArtifactStore,
-};
+use tensor_wasm_artifacts::{ArtifactError, ArtifactMetadata, ArtifactStore, DiskArtifactStore};
 
 #[test]
 fn metadata_put_get_round_trip() {
@@ -20,7 +18,9 @@ fn metadata_put_get_round_trip() {
         source_tier: "jit-l2".to_string(),
     };
 
-    let hash = store.put_with_metadata(payload, &meta).expect("put_with_metadata");
+    let hash = store
+        .put_with_metadata(payload, &meta)
+        .expect("put_with_metadata");
 
     // The blob round-trips exactly like a plain put.
     assert_eq!(store.get(&hash).expect("get"), payload);
@@ -39,7 +39,9 @@ fn plain_put_has_no_metadata() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = DiskArtifactStore::new(tmp.path().to_path_buf(), [0x43; 32]);
     let hash = store.put(b"no sidecar here").expect("put");
-    let err = store.metadata(&hash).expect_err("plain put has no metadata");
+    let err = store
+        .metadata(&hash)
+        .expect_err("plain put has no metadata");
     assert!(matches!(err, ArtifactError::NotFound(_)), "got {err:?}");
 }
 

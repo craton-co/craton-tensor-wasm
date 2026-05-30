@@ -1488,9 +1488,7 @@ mod tests {
         // The `call $free; unreachable; end` suffix must appear AFTER the
         // prefix — i.e. the free call sits inside the trap branch and
         // precedes the `unreachable`, reclaiming scratch on the trap path.
-        let found_free_before_trap = out[prefix_at..]
-            .windows(SUFFIX.len())
-            .any(|w| w == SUFFIX);
+        let found_free_before_trap = out[prefix_at..].windows(SUFFIX.len()).any(|w| w == SUFFIX);
         assert!(
             found_free_before_trap,
             "trampoline missing `call $free; unreachable; end` in the trap \

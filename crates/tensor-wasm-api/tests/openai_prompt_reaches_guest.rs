@@ -22,7 +22,9 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use tensor_wasm_api::{build_router_with_config, AppState, AuthConfig, FunctionRecord, TenantConfig};
+use tensor_wasm_api::{
+    build_router_with_config, AppState, AuthConfig, FunctionRecord, TenantConfig,
+};
 use tensor_wasm_core::types::TenantId;
 
 /// WAT exporting `_start`. Reads the entire staged input into linear

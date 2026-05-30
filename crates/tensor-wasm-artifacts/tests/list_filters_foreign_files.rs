@@ -18,7 +18,10 @@ const KEY: [u8; 32] = [0x5Eu8; 32];
 /// 8-byte hex fingerprint of the key — matches `lib.rs::key_fingerprint_hex`.
 fn key_fp_hex(key: &[u8; 32]) -> String {
     let h = blake3::hash(&key[..]);
-    h.as_bytes()[..8].iter().map(|b| format!("{:02x}", b)).collect()
+    h.as_bytes()[..8]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 #[test]
@@ -53,8 +56,15 @@ fn list_skips_foreign_files() {
     }
 
     let listed = store.list().expect("list");
-    assert_eq!(listed.len(), 1, "list must skip every foreign file, got {listed:?}");
-    assert_eq!(listed[0], real_hash, "the sole listed entry is the genuine one");
+    assert_eq!(
+        listed.len(),
+        1,
+        "list must skip every foreign file, got {listed:?}"
+    );
+    assert_eq!(
+        listed[0], real_hash,
+        "the sole listed entry is the genuine one"
+    );
 }
 
 #[test]

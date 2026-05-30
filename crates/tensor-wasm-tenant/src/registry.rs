@@ -1231,7 +1231,10 @@ mod tests {
         );
         // Explicit prune still reclaims it (id 1 dead, id 2 live → kept).
         let pruned = reg.collect_tombstones(&cap);
-        assert_eq!(pruned, 1, "collect_tombstones must reclaim dead tombstone 1");
+        assert_eq!(
+            pruned, 1,
+            "collect_tombstones must reclaim dead tombstone 1"
+        );
         assert!(!reg.tombstones.contains_key(&TenantId(1)));
     }
 
@@ -1257,11 +1260,8 @@ mod tests {
         // Snapshot the tombstone set right before the refusal so we can
         // assert the refusal path left it byte-for-byte unchanged
         // (no prune work on a refusal, regardless of the op counter).
-        let before: std::collections::BTreeSet<u64> = reg
-            .tombstones
-            .iter()
-            .map(|e| e.key().get())
-            .collect();
+        let before: std::collections::BTreeSet<u64> =
+            reg.tombstones.iter().map(|e| e.key().get()).collect();
 
         // Re-register id 2 against the live orphan: MUST fail with
         // OrphanStillAlive (no resurrection) and MUST NOT prune.
@@ -1270,11 +1270,8 @@ mod tests {
             .expect_err("re-register against live orphan must fail");
         assert_eq!(err, RegistryError::OrphanStillAlive(TenantId(2)));
 
-        let after: std::collections::BTreeSet<u64> = reg
-            .tombstones
-            .iter()
-            .map(|e| e.key().get())
-            .collect();
+        let after: std::collections::BTreeSet<u64> =
+            reg.tombstones.iter().map(|e| e.key().get()).collect();
         assert_eq!(
             before, after,
             "refusal path must not prune or otherwise mutate tombstones"

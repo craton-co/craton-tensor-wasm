@@ -107,8 +107,7 @@ fn tenant_pool_over_cap_alloc_fails_without_free() {
     let log = FreeLog::new();
     let pool = Arc::new(MockDriverMemPool::new(log.clone()));
     pool.set_alloc_failure(true);
-    let err =
-        MockTenantPoolBuffer::new(pool.clone(), 4096).expect_err("over-cap alloc must fail");
+    let err = MockTenantPoolBuffer::new(pool.clone(), 4096).expect_err("over-cap alloc must fail");
     assert!(matches!(err, UnifiedError::Cuda(_)));
     assert_eq!(log.frees(), 0);
 }

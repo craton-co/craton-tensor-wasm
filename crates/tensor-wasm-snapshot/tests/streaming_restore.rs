@@ -115,7 +115,11 @@ fn streaming_matches_buffered_v4() {
         .restore_streaming(&bytes, &mut sink)
         .expect("streaming restore");
 
-    assert_eq!(sink.calls, ["wasm", "gpu", "regs"], "canonical order + once each");
+    assert_eq!(
+        sink.calls,
+        ["wasm", "gpu", "regs"],
+        "canonical order + once each"
+    );
     assert_eq!(sink.wasm, buffered.wasm_memory);
     assert_eq!(sink.gpu, buffered.gpu_memory);
     assert_eq!(sink.regs, buffered.registers);
@@ -271,7 +275,11 @@ fn streaming_tamper_rejected_before_any_output_v2() {
 
 /// `restore_from_path_mmap` maps the snapshot file and round-trips identically
 /// to the in-memory `restore`.
-#[cfg(all(feature = "mmap", feature = "artifact-backing", feature = "signed-snapshots"))]
+#[cfg(all(
+    feature = "mmap",
+    feature = "artifact-backing",
+    feature = "signed-snapshots"
+))]
 #[test]
 fn mmap_round_trips_v4() {
     use std::io::Write;
@@ -314,7 +322,11 @@ fn mmap_round_trips_v4() {
 }
 
 /// mmap path preserves verify-before-expose: a tampered file is rejected.
-#[cfg(all(feature = "mmap", feature = "artifact-backing", feature = "signed-snapshots"))]
+#[cfg(all(
+    feature = "mmap",
+    feature = "artifact-backing",
+    feature = "signed-snapshots"
+))]
 #[test]
 fn mmap_tamper_rejected() {
     use std::io::Write;

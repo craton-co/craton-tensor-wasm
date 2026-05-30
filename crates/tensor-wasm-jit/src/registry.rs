@@ -1267,7 +1267,10 @@ mod tests {
             0,
             "p".to_string(),
         );
-        assert_eq!(m.launch_geometry, None, "new() must default geometry to None");
+        assert_eq!(
+            m.launch_geometry, None,
+            "new() must default geometry to None"
+        );
         let m = m.with_launch_geometry(Some((8, 128)));
         assert_eq!(m.launch_geometry, Some((8, 128)));
         // Clearing back to None is supported.
@@ -1308,8 +1311,8 @@ mod tests {
     fn launch_geometry_round_trips_and_old_blobs_default_none() {
         let key = [0x42u8; 32];
         let ptx = "// fake ptx\n".to_string();
-        let m = signed_manifest("matmul.f32", "1.0.0", &ptx, &key)
-            .with_launch_geometry(Some((4, 256)));
+        let m =
+            signed_manifest("matmul.f32", "1.0.0", &ptx, &key).with_launch_geometry(Some((4, 256)));
 
         // Round-trip through the real disk codec.
         let blob: ManifestBlob = (m.clone(), ptx.clone());

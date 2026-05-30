@@ -36,12 +36,8 @@ const HELPER_STEMS: &[&str] = &["mod", "common"];
 /// the documented helper-module names.
 fn bench_files(benches_dir: &Path) -> BTreeSet<String> {
     let mut stems = BTreeSet::new();
-    let entries = fs::read_dir(benches_dir).unwrap_or_else(|e| {
-        panic!(
-            "failed to read benches dir {}: {e}",
-            benches_dir.display()
-        )
-    });
+    let entries = fs::read_dir(benches_dir)
+        .unwrap_or_else(|e| panic!("failed to read benches dir {}: {e}", benches_dir.display()));
     for entry in entries {
         let entry = entry.expect("readable benches/ dir entry");
         let path = entry.path();
@@ -101,9 +97,8 @@ fn every_bench_file_is_registered() {
     let benches_dir = Path::new(manifest_dir).join("benches");
     let cargo_toml_path = Path::new(manifest_dir).join("Cargo.toml");
 
-    let cargo_toml = fs::read_to_string(&cargo_toml_path).unwrap_or_else(|e| {
-        panic!("failed to read {}: {e}", cargo_toml_path.display())
-    });
+    let cargo_toml = fs::read_to_string(&cargo_toml_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", cargo_toml_path.display()));
 
     let files = bench_files(&benches_dir);
     let registered = registered_benches(&cargo_toml);

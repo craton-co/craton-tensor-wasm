@@ -385,12 +385,7 @@ fn lower_body(
                 // tile/fragment + alignment contract. The PTX produced
                 // here is validated ONLY by the differential oracle's
                 // structural assertions; it has NOT been run on a GPU.
-                lower_wmma_m16n16k16(
-                    &mut body,
-                    &mut next_f,
-                    &mut max_b32,
-                    &mut max_s64,
-                )?;
+                lower_wmma_m16n16k16(&mut body, &mut next_f, &mut max_b32, &mut max_s64)?;
             }
             TensorWasmOp::LoadUnified { lanes } => {
                 let _ = writeln!(
@@ -497,9 +492,7 @@ fn lower_wmma_m16n16k16(
     // %rd2 (B base) and %rd3 (C base) so the loads name distinct bases.
     let b_base = *max_s64; // %rd2
     let c_base = b_base + 1; // %rd3
-    *max_s64 = c_base
-        .checked_add(1)
-        .ok_or(EmitError::TooManyRegisters)?; // declare through %rd3
+    *max_s64 = c_base.checked_add(1).ok_or(EmitError::TooManyRegisters)?; // declare through %rd3
 
     // Leading dimension (stride in elements) for the row/col loads. A
     // tightly-packed 16-wide tile has stride 16.
@@ -519,7 +512,9 @@ fn lower_wmma_m16n16k16(
 
     // Render a `{%rbB, %rbB+1, …}` fragment register list.
     let frag_list = |base: u32, count: u32, prefix: &str| -> String {
-        let regs: Vec<String> = (0..count).map(|i| format!("%{prefix}{}", base + i)).collect();
+        let regs: Vec<String> = (0..count)
+            .map(|i| format!("%{prefix}{}", base + i))
+            .collect();
         format!("{{{}}}", regs.join(", "))
     };
     let a_list = frag_list(a_frag_base, WMMA_OPERAND_FRAG_REGS, "rb");
@@ -965,13 +960,13 @@ mod tests {
     /// `lanes`, so without this the emitter would loop `0..u32::MAX`.
     #[test]
     fn oversized_lanes_is_rejected() {
-        let bp = TensorWasmKernelBlueprint::new("k")
-            .push(TensorWasmOp::VecAdd { lanes: u32::MAX });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { lanes: u32::MAX });
         let err = emit(&bp).expect_err("oversized lanes must be refused");
         assert!(matches!(err, EmitError::EmissionBudgetExceeded { .. }));
         // Just over the per-op cap is also refused.
-        let bp = TensorWasmKernelBlueprint::new("k")
-            .push(TensorWasmOp::LoadUnified { lanes: MAX_LANES + 1 });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::LoadUnified {
+            lanes: MAX_LANES + 1,
+        });
         assert!(matches!(
             emit(&bp),
             Err(EmitError::EmissionBudgetExceeded { .. })
@@ -1000,8 +995,8 @@ mod tests {
     /// what is over budget.
     #[test]
     fn lanes_at_max_still_emits() {
-        let bp = TensorWasmKernelBlueprint::new("k")
-            .push(TensorWasmOp::VecAdd { lanes: MAX_LANES });
+        let bp =
+            TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { lanes: MAX_LANES });
         assert!(emit(&bp).is_ok());
     }
 

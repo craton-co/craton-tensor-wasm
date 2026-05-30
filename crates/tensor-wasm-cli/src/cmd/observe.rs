@@ -586,14 +586,8 @@ fn render_board_json(
             };
             ("ok", status)
         }
-        Health::Bad { status } => (
-            "bad",
-            serde_json::Value::String(format!("HTTP {status}")),
-        ),
-        Health::Unreachable { error } => (
-            "unreachable",
-            serde_json::Value::String(error.clone()),
-        ),
+        Health::Bad { status } => ("bad", serde_json::Value::String(format!("HTTP {status}"))),
+        Health::Unreachable { error } => ("unreachable", serde_json::Value::String(error.clone())),
     };
 
     let uptime = match health {
@@ -601,12 +595,12 @@ fn render_board_json(
         _ => None,
     };
 
-    let gpu_memory_bytes: Option<f64> =
-        if let Some(series) = metrics.get("tenant_gpu_memory_bytes") {
-            Some(series.iter().map(|s| s.value).sum())
-        } else {
-            scalar(metrics, "tensor_wasm_gpu_memory_used_bytes")
-        };
+    let gpu_memory_bytes: Option<f64> = if let Some(series) = metrics.get("tenant_gpu_memory_bytes")
+    {
+        Some(series.iter().map(|s| s.value).sum())
+    } else {
+        scalar(metrics, "tensor_wasm_gpu_memory_used_bytes")
+    };
 
     let dt_secs = match (prev.taken_at, cur.taken_at) {
         (Some(a), Some(b)) => (b - a).as_secs_f64().max(0.0),

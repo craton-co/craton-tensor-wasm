@@ -105,7 +105,11 @@ fn gc_removes_stale_fingerprint_files_and_retains_active() {
     assert_eq!(removed, 2, "exactly the old generation's 2 files removed");
 
     let after = all_files(&dir);
-    assert_eq!(after.len(), 2, "only the active generation remains; got {after:?}");
+    assert_eq!(
+        after.len(),
+        2,
+        "only the active generation remains; got {after:?}"
+    );
     for name in &after {
         assert!(
             name.contains(active.as_str()),

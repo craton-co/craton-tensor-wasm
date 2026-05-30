@@ -33,7 +33,9 @@ fn gpu_consume_accepts_owner_rejects_foreign() {
         .unwrap();
 
     // Owner's capability is accepted and moves the counter.
-    ctx_a.consume_gpu_bytes_with_capability(&cap_a, 4096).unwrap();
+    ctx_a
+        .consume_gpu_bytes_with_capability(&cap_a, 4096)
+        .unwrap();
     assert_eq!(ctx_a.gpu_bytes_in_use(), 4096);
 
     // Tenant B's capability presented against tenant A's context is rejected
@@ -65,7 +67,9 @@ fn gpu_release_accepts_owner_rejects_foreign() {
         .register_with_capability(TenantContext::builder(TenantId(11)).build())
         .unwrap();
 
-    ctx_a.consume_gpu_bytes_with_capability(&cap_a, 8192).unwrap();
+    ctx_a
+        .consume_gpu_bytes_with_capability(&cap_a, 8192)
+        .unwrap();
     assert_eq!(ctx_a.gpu_bytes_in_use(), 8192);
 
     // Foreign capability cannot release A's GPU bytes.
@@ -83,7 +87,9 @@ fn gpu_release_accepts_owner_rejects_foreign() {
     );
 
     // Owner's capability releases as expected.
-    ctx_a.release_gpu_bytes_with_capability(&cap_a, 4096).unwrap();
+    ctx_a
+        .release_gpu_bytes_with_capability(&cap_a, 4096)
+        .unwrap();
     assert_eq!(ctx_a.gpu_bytes_in_use(), 4096);
 }
 

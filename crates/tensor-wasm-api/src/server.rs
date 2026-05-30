@@ -356,10 +356,7 @@ pub fn __reset_metrics_warn_for_test() {
 ///   ([`subtle::ConstantTimeEq`]) so a timing side-channel cannot be used
 ///   to recover the token byte-by-byte, mirroring the bearer allowlist
 ///   compare in `crate::middleware::AuthConfig::scope_for`.
-async fn metrics_auth_gate(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
+async fn metrics_auth_gate(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let configured = req
         .extensions()
         .get::<MetricsAuth>()

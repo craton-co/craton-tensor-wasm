@@ -289,9 +289,7 @@ pub enum ExecError {
     /// reduce concurrency — not to wait for global load to drop. The API layer
     /// maps it to 429 (`tenant_capacity_exhausted`) rather than 503, giving
     /// callers a quota-specific retry signal. Other tenants are unaffected.
-    #[error(
-        "tenant {tenant} instance capacity exhausted: {active} active, limit {limit}"
-    )]
+    #[error("tenant {tenant} instance capacity exhausted: {active} active, limit {limit}")]
     TenantCapacityExhausted {
         /// The tenant whose per-tenant cap was hit (the spawn's owner).
         tenant: TenantId,
@@ -1200,7 +1198,10 @@ impl TensorWasmExecutor {
     /// the per-tenant cap is configured (it is otherwise left at 0 and the
     /// map stays empty).
     pub fn tenant_instance_count(&self, tenant: TenantId) -> usize {
-        self.tenant_counts.get(&tenant).map(|e| *e.value()).unwrap_or(0)
+        self.tenant_counts
+            .get(&tenant)
+            .map(|e| *e.value())
+            .unwrap_or(0)
     }
 
     /// Current **admission** count, sampled atomically. This is the counter
@@ -1263,10 +1264,7 @@ impl TensorWasmExecutor {
     /// that also need the digest for the pool key do not re-hash the bytes
     /// (PERF: the hash was previously computed here AND in
     /// `build_pooled_instance`).
-    async fn compile_module_cached(
-        &self,
-        wasm: &[u8],
-    ) -> Result<(Module, ModuleHash), ExecError> {
+    async fn compile_module_cached(&self, wasm: &[u8]) -> Result<(Module, ModuleHash), ExecError> {
         // Pre-compile size cap (exec hardening). Reject pathologically
         // large blobs *before* hashing or handing them to Cranelift —
         // a wasm with a malicious code section can otherwise force
@@ -1592,7 +1590,10 @@ impl TensorWasmExecutor {
         // a runaway `start` cannot burn forever. The relative tick counts now
         // govern only the YIELD cadence; the trap point is the wall-clock
         // `hard_deadline` instant the callback consults.
-        arm_cooperative_epoch(&mut store, start_deadline_ticks.min(COOPERATIVE_YIELD_TICKS));
+        arm_cooperative_epoch(
+            &mut store,
+            start_deadline_ticks.min(COOPERATIVE_YIELD_TICKS),
+        );
         // HIGH finding fix: build a single `Linker<InstanceState>` and
         // register every host surface whose backing machinery is actually
         // present, then instantiate against it. Previously only the
@@ -1650,8 +1651,7 @@ impl TensorWasmExecutor {
             // `InstanceState` implements (see `instance.rs` /
             // `jit_dispatch.rs`). The arena lives per-store; the cache is the
             // shared cross-tenant backing handle.
-            add_jit_dispatch_to_linker(&mut linker, cache.clone())
-                .map_err(ExecError::Wasmtime)?;
+            add_jit_dispatch_to_linker(&mut linker, cache.clone()).map_err(ExecError::Wasmtime)?;
         }
         let instance = match linker.instantiate_async(&mut store, module).await {
             Ok(inst) => inst,
@@ -2006,8 +2006,9 @@ impl TensorWasmExecutor {
         // register. The split lets the pool reuse the heavy work
         // without the registry insert when holding warm instances in a
         // channel.
-        let (inst, _module, _module_hash) =
-            self.build_pooled_instance(&cfg, effective_wasm.as_ref()).await?;
+        let (inst, _module, _module_hash) = self
+            .build_pooled_instance(&cfg, effective_wasm.as_ref())
+            .await?;
         // `build_pooled_instance` returns with the slot committed (charged),
         // so a failure between here and the registry insert must release
         // the slot explicitly. Wrap it in a `defer`-style guard so any

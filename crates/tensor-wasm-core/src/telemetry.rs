@@ -399,10 +399,7 @@ pub fn init_with_otlp(
 /// tested without mutating process-global env state. Production callers pass
 /// `|name| std::env::var(name).ok()`.
 #[cfg(feature = "otlp")]
-fn resolve_otlp_endpoint(
-    primary: &str,
-    lookup: impl Fn(&str) -> Option<String>,
-) -> String {
+fn resolve_otlp_endpoint(primary: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     lookup(primary)
         .or_else(|| lookup("OTEL_EXPORTER_OTLP_ENDPOINT"))
         .unwrap_or_else(|| "http://localhost:4317".to_string())

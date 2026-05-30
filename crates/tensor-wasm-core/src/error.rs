@@ -160,7 +160,10 @@ fn redact_token(token: &str) -> String {
     // Peel trailing punctuation off so e.g. `0x1234,` masks the address but
     // keeps the comma.
     let trimmed = token.trim_end_matches(|c: char| {
-        matches!(c, ':' | ',' | ';' | '.' | ')' | ']' | '}' | '\'' | '"' | '`')
+        matches!(
+            c,
+            ':' | ',' | ';' | '.' | ')' | ']' | '}' | '\'' | '"' | '`'
+        )
     });
     let suffix = &token[trimmed.len()..];
     let core = trimmed;
@@ -389,8 +392,7 @@ impl TensorWasmError {
     /// failures and the CLI's retry loop spins on doomed requests.
     pub fn is_retryable(&self) -> bool {
         match self {
-            TensorWasmError::KernelTimeout { .. }
-            | TensorWasmError::MemoryExhausted { .. } => true,
+            TensorWasmError::KernelTimeout { .. } | TensorWasmError::MemoryExhausted { .. } => true,
             TensorWasmError::Io(err) => is_retryable_io_kind(err.kind()),
             _ => false,
         }

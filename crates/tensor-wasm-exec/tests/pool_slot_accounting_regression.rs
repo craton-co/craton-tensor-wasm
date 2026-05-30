@@ -125,7 +125,9 @@ async fn pooled_invoke_under_cap_one_does_not_self_lockout() {
     for i in 0..8 {
         exec.invoke(SpawnConfig::for_tenant(tenant), &wasm, "noop", &[])
             .await
-            .unwrap_or_else(|e| panic!("invoke #{i} must be admitted (no self-lockout); got {e:?}"));
+            .unwrap_or_else(|e| {
+                panic!("invoke #{i} must be admitted (no self-lockout); got {e:?}")
+            });
         // The per-tenant count must never exceed the cap of 1. A leak would
         // park more than one slot's worth here.
         assert!(

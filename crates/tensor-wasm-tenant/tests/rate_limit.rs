@@ -73,7 +73,8 @@ fn no_rate_limit_by_default_admits_unconditionally() {
     let ctx = TenantContext::builder(TenantId(3)).build();
     assert!(!ctx.has_rate_limit());
     for _ in 0..100_000 {
-        ctx.try_acquire_op().expect("no limiter configured must always admit");
+        ctx.try_acquire_op()
+            .expect("no limiter configured must always admit");
     }
 }
 

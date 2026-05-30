@@ -28,7 +28,10 @@ fn concurrent_same_payload_put_is_idempotent() {
         let handles: Vec<_> = (0..N)
             .map(|_| s.spawn(|| store.put(payload).expect("concurrent put")))
             .collect();
-        handles.into_iter().map(|h| h.join().expect("thread join")).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("thread join"))
+            .collect()
     });
 
     // Every thread computed the same content hash.
@@ -38,7 +41,11 @@ fn concurrent_same_payload_put_is_idempotent() {
 
     // The store holds exactly one entry despite N concurrent puts.
     let listed = store.list().expect("list");
-    assert_eq!(listed.len(), 1, "concurrent identical puts collapse to one entry");
+    assert_eq!(
+        listed.len(),
+        1,
+        "concurrent identical puts collapse to one entry"
+    );
     assert_eq!(listed[0], expected);
 
     // And it reads back intact.

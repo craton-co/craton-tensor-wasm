@@ -258,7 +258,11 @@ async fn launch_over_back_pressure_cap_returns_quota_exceeded() {
             module: None,
         })
         .expect("register");
-    assert!(kid.0 > 0, "registry must hand out a positive kernel id, got {}", kid.0);
+    assert!(
+        kid.0 > 0,
+        "registry must hand out a positive kernel id, got {}",
+        kid.0
+    );
 
     let mut store = wasmtime::Store::new(&engine, TestStore { cuda: ctx });
     let instance = linker

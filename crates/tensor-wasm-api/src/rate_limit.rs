@@ -1046,10 +1046,7 @@ mod tests {
             RateLimitConfig {
                 qps: 0,
                 burst: 0,
-                per_tenant_default: PerTenantRateLimitConfig {
-                    burst: 5,
-                    qps: 1.0,
-                },
+                per_tenant_default: PerTenantRateLimitConfig { burst: 5, qps: 1.0 },
             },
             clock.clone(),
         );
@@ -1090,10 +1087,7 @@ mod tests {
             RateLimitConfig {
                 qps: 0,
                 burst: 0,
-                per_tenant_default: PerTenantRateLimitConfig {
-                    burst: 5,
-                    qps: 1.0,
-                },
+                per_tenant_default: PerTenantRateLimitConfig { burst: 5, qps: 1.0 },
             },
             clock.clone(),
         );
@@ -1112,7 +1106,9 @@ mod tests {
 
         // `quiet`'s lone bucket survived; only `noisy` was capped.
         assert!(
-            limiter.per_tenant_buckets.contains_key(&(quiet, TenantId(1))),
+            limiter
+                .per_tenant_buckets
+                .contains_key(&(quiet, TenantId(1))),
             "quiet token's bucket must not be evicted by noisy token's fan-out",
         );
         let noisy_count = limiter

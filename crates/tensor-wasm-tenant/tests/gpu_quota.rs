@@ -149,7 +149,11 @@ fn consume_to_u64_max_minus_one_then_overflow_saturates() {
     // for `2` more, which would push past `u64::MAX`. We run with no cap
     // (`None`) precisely so the overflow path is the only thing in play.
     let ctx = TenantContext::builder(TenantId(5)).build();
-    assert_eq!(ctx.gpu_memory_bytes_cap(), None, "test wants the no-cap path");
+    assert_eq!(
+        ctx.gpu_memory_bytes_cap(),
+        None,
+        "test wants the no-cap path"
+    );
 
     // Reserve everything but one byte. With no cap this is permitted; the
     // counter records real utilisation for dashboards.

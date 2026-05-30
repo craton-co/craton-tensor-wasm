@@ -79,7 +79,10 @@ fn encoded_envelope_is_byte_identical_to_disk_store() {
     std::fs::write(&target, &framed).expect("overwrite with encoder output");
 
     let got = store.get(&hash).expect("get reads encoder-produced bytes");
-    assert_eq!(got, payload, "encode_envelope_to_vec output must be get-able");
+    assert_eq!(
+        got, payload,
+        "encode_envelope_to_vec output must be get-able"
+    );
 }
 
 #[test]
@@ -101,7 +104,10 @@ fn with_cap_rejects_oversized_but_signed_payload() {
         .expect_err("must reject over-cap payload");
     match err {
         ArtifactError::TooLarge { actual, limit } => {
-            assert!(actual > small_cap, "actual {actual} should exceed cap {small_cap}");
+            assert!(
+                actual > small_cap,
+                "actual {actual} should exceed cap {small_cap}"
+            );
             assert_eq!(limit, small_cap, "limit echoes the supplied cap");
         }
         other => panic!("expected TooLarge, got {other:?}"),

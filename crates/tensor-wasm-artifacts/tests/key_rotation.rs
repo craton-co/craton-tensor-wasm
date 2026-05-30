@@ -7,9 +7,7 @@
 
 use std::sync::Arc;
 
-use tensor_wasm_artifacts::{
-    ArtifactError, ArtifactStore, DiskArtifactStore, RotatingKeyProvider,
-};
+use tensor_wasm_artifacts::{ArtifactError, ArtifactStore, DiskArtifactStore, RotatingKeyProvider};
 
 const OLD_KEY: [u8; 32] = [0x0A; 32];
 const NEW_KEY: [u8; 32] = [0x0B; 32];

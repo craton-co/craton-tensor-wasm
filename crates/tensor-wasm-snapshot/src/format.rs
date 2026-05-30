@@ -236,7 +236,10 @@ mod tests {
 
     #[test]
     fn trailer_len_matches_per_kind_constants() {
-        assert_eq!(SignatureKind::HmacSha256.trailer_len(), SIGNATURE_TRAILER_LEN);
+        assert_eq!(
+            SignatureKind::HmacSha256.trailer_len(),
+            SIGNATURE_TRAILER_LEN
+        );
         assert_eq!(SignatureKind::Ed25519.trailer_len(), ED25519_TRAILER_LEN);
         assert_eq!(ED25519_TRAILER_LEN, 69);
     }

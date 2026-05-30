@@ -79,8 +79,16 @@ async fn tenant_a_at_cap_does_not_block_tenant_b() {
         other => panic!("expected TenantCapacityExhausted, got {other:?}"),
     }
     // The refused spawn must not have leaked A's count or the engine-wide one.
-    assert_eq!(exec.tenant_instance_count(a), 2, "refused spawn leaks no A slot");
-    assert_eq!(exec.instances_len(), 2, "refused spawn leaks no engine slot");
+    assert_eq!(
+        exec.tenant_instance_count(a),
+        2,
+        "refused spawn leaks no A slot"
+    );
+    assert_eq!(
+        exec.instances_len(),
+        2,
+        "refused spawn leaks no engine slot"
+    );
 
     // CRUCIAL: tenant B is completely unaffected — it can still spawn up to
     // its own per-tenant cap even though A is saturated.
@@ -96,7 +104,11 @@ async fn tenant_a_at_cap_does_not_block_tenant_b() {
 
     // Terminating one of A's instances re-opens A's admission.
     exec.terminate(a1).await.expect("terminate a1");
-    assert_eq!(exec.tenant_instance_count(a), 1, "A slot freed on terminate");
+    assert_eq!(
+        exec.tenant_instance_count(a),
+        1,
+        "A slot freed on terminate"
+    );
     let a3 = exec
         .spawn_instance(SpawnConfig::for_tenant(a), &wasm)
         .await
@@ -144,7 +156,11 @@ async fn failed_spawn_rolls_back_per_tenant_count() {
         1,
         "failed spawn must roll back its per-tenant slot",
     );
-    assert_eq!(exec.instances_len(), 1, "failed spawn must roll back engine slot");
+    assert_eq!(
+        exec.instances_len(),
+        1,
+        "failed spawn must roll back engine slot"
+    );
 
     // Proof the per-tenant cap was not leaked: a SECOND valid spawn (filling
     // A's last slot) must still be admitted. If the failed spawn had leaked a

@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 use clap::CommandFactory;
 use clap_complete::{generate_to, Shell};
 use clap_mangen::Man;
-use tensor_wasm_cli::Cli;
 use tempfile::tempdir;
+use tensor_wasm_cli::Cli;
 
 /// Shells the CLI advertises in `tensor-wasm completions --help` and in
 /// `completions/README.md`. Keep this in lockstep with the help text: the whole

@@ -778,7 +778,8 @@ impl KernelCache {
                     let arc = Arc::new(kernel);
                     let promoted_bytes = Self::entry_bytes(&arc);
                     let replaced = self.storage.insert(*key, Arc::clone(&arc));
-                    self.total_bytes.fetch_add(promoted_bytes, Ordering::Relaxed);
+                    self.total_bytes
+                        .fetch_add(promoted_bytes, Ordering::Relaxed);
                     if let Some(old) = replaced {
                         self.total_bytes
                             .fetch_sub(Self::entry_bytes(&old), Ordering::Relaxed);
@@ -890,11 +891,7 @@ impl KernelCache {
         // diagnostics/log correlation and the `OffloadedFunction.fingerprint`
         // contract for registry-sourced entries. Key on `key.blueprint` so L1,
         // L2, and L3 entries are all fingerprinted consistently.
-        let cached = CachedKernel::new(
-            key.blueprint,
-            emitted,
-            CompiledHandle::default(),
-        );
+        let cached = CachedKernel::new(key.blueprint, emitted, CompiledHandle::default());
         // Best-effort L1 promote; `put` is infallible-by-design (any
         // integrity-mismatch case logs + drops the entry rather than
         // returning an error), so there is nothing to propagate even if
@@ -1930,7 +1927,10 @@ mod tests {
         );
         assert_eq!(cache.total_bytes(), 200);
         assert_eq!(cache.len(), 2);
-        assert!(cache.get(&k1).is_none(), "k1 is the LRU and must be evicted");
+        assert!(
+            cache.get(&k1).is_none(),
+            "k1 is the LRU and must be evicted"
+        );
         assert!(cache.get(&k2).is_some(), "k2 must survive");
         assert!(cache.get(&k3).is_some(), "k3 was just inserted");
     }
@@ -1954,7 +1954,10 @@ mod tests {
         // room. Total transiently exceeds the cap by exactly that one entry.
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.total_bytes(), 1000);
-        assert!(cache.get(&big).is_some(), "oversized entry must still serve");
+        assert!(
+            cache.get(&big).is_some(),
+            "oversized entry must still serve"
+        );
         assert!(cache.get(&small).is_none(), "smaller LRU entry evicted");
     }
 

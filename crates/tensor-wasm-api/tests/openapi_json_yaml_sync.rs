@@ -161,25 +161,24 @@ fn parse_yaml_operation_security(yaml: &str) -> BTreeMap<String, SecuritySpec> {
     let mut security_schemes: BTreeSet<String> = BTreeSet::new();
 
     // Flush an in-progress block-sequence `security:` into the map.
-    let flush_block =
-        |out: &mut BTreeMap<String, SecuritySpec>,
-         path: &Option<String>,
-         method: &Option<String>,
-         schemes: &mut BTreeSet<String>| {
-            if let (Some(p), Some(m)) = (path, method) {
-                let key = format!("{m} {p}");
-                let spec = if schemes.is_empty() {
-                    // `security:` with no list items underneath -- treat
-                    // as an empty requirement set ("no auth"), same as
-                    // the inline `[]` form.
-                    SecuritySpec::Empty
-                } else {
-                    SecuritySpec::Schemes(std::mem::take(schemes))
-                };
-                out.insert(key, spec);
-            }
-            schemes.clear();
-        };
+    let flush_block = |out: &mut BTreeMap<String, SecuritySpec>,
+                       path: &Option<String>,
+                       method: &Option<String>,
+                       schemes: &mut BTreeSet<String>| {
+        if let (Some(p), Some(m)) = (path, method) {
+            let key = format!("{m} {p}");
+            let spec = if schemes.is_empty() {
+                // `security:` with no list items underneath -- treat
+                // as an empty requirement set ("no auth"), same as
+                // the inline `[]` form.
+                SecuritySpec::Empty
+            } else {
+                SecuritySpec::Schemes(std::mem::take(schemes))
+            };
+            out.insert(key, spec);
+        }
+        schemes.clear();
+    };
 
     for raw_line in yaml.lines() {
         let line = strip_trailing_comment(raw_line);
@@ -328,9 +327,9 @@ fn json_operation_security(op: &Value) -> SecuritySpec {
         // `security` present but not an array -- malformed; surface it as
         // a distinct value so the assertion fails loudly rather than
         // silently coercing to Absent.
-        Some(_) => SecuritySpec::Schemes(
-            ["<non-array security>".to_string()].into_iter().collect(),
-        ),
+        Some(_) => {
+            SecuritySpec::Schemes(["<non-array security>".to_string()].into_iter().collect())
+        }
     }
 }
 
@@ -551,9 +550,7 @@ fn json_operation_security_matches_yaml() {
             .get(op)
             .expect("operation sets already asserted equal");
         if yaml_spec != json_spec {
-            mismatches.push(format!(
-                "  {op}: yaml={yaml_spec:?} json={json_spec:?}"
-            ));
+            mismatches.push(format!("  {op}: yaml={yaml_spec:?} json={json_spec:?}"));
         }
     }
     assert!(
