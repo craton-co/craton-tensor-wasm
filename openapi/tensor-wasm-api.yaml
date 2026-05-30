@@ -1113,8 +1113,7 @@ components:
         JSON surfaces as 400 invalid_json.
       properties:
         export:
-          type: string
-          nullable: true
+          type: [string, "null"]
           description: |
             Optional export-name override. When omitted (or null), the
             server tries `_start` first and falls back to `main`, matching
@@ -1544,11 +1543,10 @@ components:
           type: integer
           minimum: 0
         finish_reason:
-          type: string
+          type: [string, "null"]
           enum: [stop, length, content_filter, null]
-          nullable: true
         logprobs:
-          nullable: true
+          type: "null"
       required: [text, index]
     ChatCompletionsChoice:
       type: object
@@ -1569,9 +1567,8 @@ components:
               type: string
           required: [role, content]
         finish_reason:
-          type: string
+          type: [string, "null"]
           enum: [stop, length, content_filter, null]
-          nullable: true
       required: [index, message]
     CompletionsUsage:
       type: object
@@ -1652,11 +1649,9 @@ components:
           type: string
           description: OpenAI-conventional error category.
         param:
-          type: string
-          nullable: true
+          type: [string, "null"]
         code:
-          type: string
-          nullable: true
+          type: [string, "null"]
       required: [message, type]
     OpenAiError:
       type: object

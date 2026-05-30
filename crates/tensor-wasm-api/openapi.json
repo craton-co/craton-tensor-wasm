@@ -94,7 +94,7 @@
         ],
         "summary": "Prometheus text exposition",
         "operationId": "metrics",
-        "description": "Open by default so Prometheus scrapers and k8s tooling can hit it without a bearer token. Operators may opt into a bearer-token gate by setting `TENSOR_WASM_API_METRICS_TOKEN`; when that env var is set the endpoint requires `Authorization: Bearer <token>` and returns `401` otherwise.",
+        "description": "Open by default so Prometheus scrapers and k8s tooling can hit it\nwithout a bearer token. Operators may opt into a bearer-token gate\nby setting `TENSOR_WASM_API_METRICS_TOKEN`; when that env var is set\nthe endpoint requires `Authorization: Bearer <token>` and returns\n`401` otherwise.\n",
         "security": [],
         "responses": {
           "200": {
@@ -1333,8 +1333,10 @@
         "description": "Body of POST /functions/{id}/invoke (and the async sibling).\nBoth fields are optional — an empty body or `{}` is the canonical\nno-args case, matching the pre-args wire contract. Unknown\ntop-level fields are ignored for forward compatibility; malformed\nJSON surfaces as 400 invalid_json.\n",
         "properties": {
           "export": {
-            "type": "string",
-            "nullable": true,
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "Optional export-name override. When omitted (or null), the\nserver tries `_start` first and falls back to `main`, matching\nthe WASI command convention.\n"
           },
           "args": {
@@ -1814,17 +1816,19 @@
             "minimum": 0
           },
           "finish_reason": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "enum": [
               "stop",
               "length",
               "content_filter",
               null
-            ],
-            "nullable": true
+            ]
           },
           "logprobs": {
-            "nullable": true
+            "type": "null"
           }
         },
         "required": [
@@ -1859,14 +1863,16 @@
             ]
           },
           "finish_reason": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "enum": [
               "stop",
               "length",
               "content_filter",
               null
-            ],
-            "nullable": true
+            ]
           }
         },
         "required": [
@@ -1989,12 +1995,16 @@
             "description": "OpenAI-conventional error category."
           },
           "param": {
-            "type": "string",
-            "nullable": true
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "code": {
-            "type": "string",
-            "nullable": true
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [

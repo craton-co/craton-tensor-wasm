@@ -247,7 +247,7 @@ impl TensorWasmLinearMemory {
     /// v0.3.2 audit's "wasm linear memory not UVM-backed" gap: a guest
     /// pointer resolved through the W1.1 wasi-cuda kernel-args pipeline
     /// doubles as a device pointer iff this returns `true`. The pool-backed
-    /// [`PooledLinearMemory`] path also goes through [`UnifiedBuffer`] under
+    /// `PooledLinearMemory` path also goes through `UnifiedBuffer` under
     /// the hood, so it shares this property regardless of which CUDA
     /// backing feature is active.
     ///
@@ -664,7 +664,7 @@ impl TensorWasmMemoryCreator {
     /// `MemoryCreator::new_memory` returns `Result<_, String>`.
     ///
     /// **Pool-carved memories are intentionally unmetered** — see the
-    /// note on [`MemoryCreatorState::tenant_ctx`] for the
+    /// note on `MemoryCreatorState::tenant_ctx` for the
     /// rationale and the v0.4 follow-up.
     pub fn with_tenant_context(
         device_id: DeviceId,

@@ -29,7 +29,10 @@ FROM rust:1.84-slim-bookworm
 # Keep in lockstep with rust-toolchain.toml + every ci.yml `toolchain:` field.
 ARG RUST_NIGHTLY=nightly-2026-04-03
 ARG NODE_MAJOR=20
-ARG CARGO_DENY_VERSION=0.16.1
+# Must be new enough to parse edition-2024 cargo metadata: 0.16.1 chokes with
+# "unknown variant 2024" once any crate in the graph uses edition 2024. Built
+# with the nightly default set above, so cargo-deny's own MSRV is satisfied.
+ARG CARGO_DENY_VERSION=0.19.0
 ARG ACTIONLINT_VERSION=1.7.7
 
 ENV DEBIAN_FRONTEND=noninteractive

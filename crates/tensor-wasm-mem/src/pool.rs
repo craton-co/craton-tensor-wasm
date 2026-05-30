@@ -35,7 +35,7 @@ use crate::unified::{DeviceId, UnifiedBuffer, UnifiedError};
 /// dropped).
 ///
 /// As of audit T6, `crate::wasm_memory::PooledLinearMemory`'s own `Drop`
-/// mirrors the `mem::forget(alloc)` effect by calling [`Self::release`]
+/// mirrors the `mem::forget(alloc)` effect by calling `Self::release`
 /// from its destructor: the bump pointer is *not* rewound (so any
 /// `base_ptr` held by other pool consumers stays valid), but the live
 /// counter is decremented so a future `reset()` can run once every issued
@@ -50,7 +50,7 @@ use crate::unified::{DeviceId, UnifiedBuffer, UnifiedError};
 /// per tenant and drop the pool wholesale. The pinned behaviour lives in
 /// `crates/tensor-wasm-mem/tests/pool_teardown_contract.rs` and the
 /// call-site rationale is recorded inline above the `std::mem::forget(alloc)`
-/// line in [`crate::wasm_memory::TensorWasmMemoryCreator::new_memory`].
+/// line in `TensorWasmMemoryCreator::new_memory`.
 pub struct UnifiedMemoryPool {
     slab: UnifiedBuffer,
     /// Next free byte offset within the slab.
@@ -359,9 +359,9 @@ impl UnifiedMemoryPool {
     /// `PoolAllocation` drop guards are intentionally leaked at carve time
     /// to keep the bump pointer monotonic (see the `std::mem::forget(alloc)`
     /// site in
-    /// [`crate::wasm_memory::TensorWasmMemoryCreator::new_memory`]),
+    /// `TensorWasmMemoryCreator::new_memory`),
     /// `PooledLinearMemory`'s own `Drop` impl now mirrors the leak by calling
-    /// [`Self::release`] when the linear memory itself is torn down. The
+    /// `Self::release` when the linear memory itself is torn down. The
     /// [`live_allocations`](Self::live_allocations) counter therefore returns
     /// to zero once every issued pool-backed Wasm memory has been dropped, at
     /// which point `reset` succeeds (the existing `live > 0` guard below is

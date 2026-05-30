@@ -10,7 +10,7 @@
 //!   any host that opts into a CUDA backing and remains the cust-backed path
 //!   the audit-closed test matrix exercises.
 //! - With `cudarc-backend` (and `unified-memory` OFF): `cuMemAllocManaged`
-//!   via the W1.2 [`crate::cudarc_backend::CudarcUnifiedBuffer`] spike.
+//!   via the W1.2 `cudarc_backend::CudarcUnifiedBuffer` spike.
 //!   This is the v0.5 cust-successor fallback per
 //!   [RFC 0001](../../../rfcs/0001-cuda-oxide-integration.md): once
 //!   cuda-oxide v0.2 ships its managed-memory wrapper this path can be
@@ -93,7 +93,7 @@ pub enum UnifiedError {
 ///
 /// Mirrors the `cuMemAdvise` flags already used by the three concrete
 /// backings ([`crate::advise::Advice`] on the cust path,
-/// [`crate::cudarc_backend::apply_advice`] on the cudarc path, and the
+/// `cudarc_backend::apply_advice` on the cudarc path, and the
 /// `CudaOxideAdvice` enum on the cuda-oxide path). This trait-facing enum
 /// is declared in the common `unified` module so downstream code can
 /// target a single shape across every backing.
@@ -878,7 +878,7 @@ impl UnifiedBuffer {
     ///    body without scraping a message string. No CUDA driver call
     ///    happens on the rejection path — important because the only
     ///    realistic in-process recovery is to fail fast.
-    /// 2. Allocate the underlying [`Backing`]. If the driver itself
+    /// 2. Allocate the underlying `Backing`. If the driver itself
     ///    fails (OOM at the cuMemAllocManaged level, ZeroSize, etc.),
     ///    we **must** undo the `consume_gpu_bytes` so the counter does
     ///    not drift above true utilisation. Failure to release here

@@ -48,6 +48,10 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
+    # webpki-roots >=1.0 relicensed the bundled Mozilla CA root data under
+    # CDLA-Permissive-2.0 (a permissive data license). Pulled transitively
+    # via reqwest -> hyper-rustls -> webpki-roots in tensor-wasm-cli.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 
