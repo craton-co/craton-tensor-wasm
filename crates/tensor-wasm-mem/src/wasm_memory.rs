@@ -294,8 +294,12 @@ unsafe impl LinearMemory for TensorWasmLinearMemory {
         self.current_size()
     }
 
-    fn maximum_byte_size(&self) -> Option<usize> {
-        Some(self.maximum_size)
+    fn byte_capacity(&self) -> usize {
+        // Reserve-at-max design: the full ceiling is physically allocated up
+        // front (see `TensorWasmLinearMemory::new_on`), so the current
+        // allocation's capacity is exactly the maximum. (Replaces wasmtime
+        // <45's `maximum_byte_size(&self) -> Option<usize>`.)
+        self.maximum_size
     }
 
     fn grow_to(&mut self, new_size: usize) -> anyhow::Result<()> {
@@ -366,7 +370,7 @@ unsafe impl LinearMemory for TensorWasmLinearMemory {
         //     a faulting host address back to a wasm offset for diagnostics.
         //     It is NOT used in Cranelift bounds-check codegen, nor in any
         //     pooling/static-memory reservation logic (those read
-        //     `byte_size()` / `maximum_byte_size()` and the
+        //     `byte_size()` / `byte_capacity()` and the
         //     `VMMemoryDefinition.current_length`). The premise that this
         //     value feeds bounds reasoning does not hold for this version.
         //   * Reporting the full cap is therefore the CORRECT classification
@@ -484,8 +488,11 @@ unsafe impl LinearMemory for PooledLinearMemory {
         self.current_size
     }
 
-    fn maximum_byte_size(&self) -> Option<usize> {
-        Some(self.max_size)
+    fn byte_capacity(&self) -> usize {
+        // The pooled slab is carved to its ceiling up front, so the current
+        // allocation's capacity is the maximum. (Replaces wasmtime <45's
+        // `maximum_byte_size(&self) -> Option<usize>`.)
+        self.max_size
     }
 
     fn grow_to(&mut self, new_size: usize) -> anyhow::Result<()> {
@@ -934,7 +941,7 @@ mod tests {
     fn construct_and_query_size() {
         let mem = TensorWasmLinearMemory::new(64 * 1024, Some(1024 * 1024)).unwrap();
         assert_eq!(mem.byte_size(), 64 * 1024);
-        assert_eq!(mem.maximum_byte_size(), Some(1024 * 1024));
+        assert_eq!(mem.byte_capacity(), 1024 * 1024);
         assert_eq!(mem.capacity(), 1024 * 1024);
     }
 
@@ -1292,7 +1299,7 @@ mod tests {
             .new_memory(mt, 64 * 1024, Some(128 * 1024), None, 0)
             .expect("new_memory");
         assert!(mem.byte_size() == 64 * 1024);
-        assert!(mem.maximum_byte_size() == Some(128 * 1024));
+        assert!(mem.byte_capacity() == 128 * 1024);
         // Verify the pool's live count incremented (proving the carving path ran)
         assert_eq!(pool.live_allocations(), 1);
         // After audit T6: dropping `mem` decrements `live` back to 0 (the

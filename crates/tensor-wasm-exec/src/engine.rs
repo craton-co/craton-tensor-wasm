@@ -320,8 +320,13 @@ impl TensorWasmEngine {
                 let memory_creator = Arc::new(TensorWasmMemoryCreator::default());
                 wt_cfg.with_host_memory(memory_creator);
                 wt_cfg.guard_before_linear_memory(false);
-                wt_cfg.static_memory_maximum_size(0);
-                wt_cfg.dynamic_memory_guard_size(0);
+                // wasmtime 45 consolidated the static/dynamic memory tuning
+                // knobs: `static_memory_maximum_size` -> `memory_reservation`
+                // and `dynamic_memory_guard_size` -> `memory_guard_size`.
+                // Both are 0 here because the host `MemoryCreator` above owns
+                // the allocation (no wasmtime-side reservation or guard page).
+                wt_cfg.memory_reservation(0);
+                wt_cfg.memory_guard_size(0);
             }
             MemoryBackend::PoolingMpk {
                 max_memories,
