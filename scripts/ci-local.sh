@@ -17,7 +17,8 @@
 # Usage:
 #   scripts/ci-local.sh [options] [job ...]
 #
-# Jobs (default: all, run in this order, stopping at the first failure):
+# Jobs (default: all, run in this order; every job runs even if an earlier
+# one fails, and the script exits non-zero if any failed — see --fail-fast):
 #   fmt          cargo fmt --all -- --check
 #   clippy       cargo clippy --workspace --all-targets -- -D warnings
 #   test         cargo build --workspace
@@ -32,7 +33,8 @@
 # Options:
 #   --rebuild-image   Force a rebuild of the local CI image before running.
 #   --pull            Pass --pull to the image build (refresh the base image).
-#   --keep-going      Run every selected job even if one fails (report at end).
+#   --fail-fast       Stop at the first failing job (default: run them all).
+#   --keep-going      Accepted for compatibility; now the default (no-op).
 #   --clean-cache     Remove the cargo/target cache volumes, then run.
 #   -h | --help       Show this help.
 #
@@ -57,17 +59,20 @@ ALL_JOBS=(fmt clippy test doc deny cuda-oxide openapi actionlint)
 
 REBUILD_IMAGE=0
 PULL=0
-KEEP_GOING=0
+# Run every job even if an earlier one fails (the script still exits non-zero
+# when any failed). `--fail-fast` restores stop-at-first-failure.
+FAIL_FAST=0
 CLEAN_CACHE=0
 declare -a JOBS=()
 
-usage() { sed -n '2,49p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --rebuild-image) REBUILD_IMAGE=1 ;;
         --pull)          PULL=1 ;;
-        --keep-going)    KEEP_GOING=1 ;;
+        --fail-fast)     FAIL_FAST=1 ;;
+        --keep-going)    : ;;  # now the default; accepted for compatibility
         --clean-cache)   CLEAN_CACHE=1 ;;
         -h|--help)       usage; exit 0 ;;
         fmt|clippy|test|doc|deny|cuda-oxide|openapi|actionlint) JOBS+=("$1") ;;
@@ -117,7 +122,9 @@ fi
 
 # --- assemble the in-container program --------------------------------------
 # One container, jobs run sequentially so the warm build cache is shared.
-container_script='set -uo pipefail; rc=0;'
+# `failed` accumulates the names of jobs that failed so the tail can print a
+# single summary (relevant now that the default keeps going past a failure).
+container_script='set -uo pipefail; rc=0; failed="";'
 for job in "${JOBS[@]}"; do
     cmd="$(job_cmd "${job}")"
     container_script+="
@@ -125,14 +132,20 @@ printf '\n\033[1;36m===> ci job: %s\033[0m\n' '${job}';
 if ${cmd}; then
     printf '\033[1;32m===> %s: OK\033[0m\n' '${job}';
 else
-    printf '\033[1;31m===> %s: FAILED\033[0m\n' '${job}'; rc=1;"
-    if [[ "${KEEP_GOING}" != "1" ]]; then
+    printf '\033[1;31m===> %s: FAILED\033[0m\n' '${job}'; rc=1; failed=\"\${failed} ${job}\";"
+    if [[ "${FAIL_FAST}" == "1" ]]; then
         container_script+=" exit 1;"
     fi
     container_script+="
 fi;"
 done
-container_script+=' exit $rc;'
+container_script+='
+if [[ -n "${failed}" ]]; then
+    printf "\n\033[1;31m===> CI FAILED:%s\033[0m\n" "${failed}";
+else
+    printf "\n\033[1;32m===> CI OK (all jobs passed)\033[0m\n";
+fi;
+exit $rc;'
 
 echo ">> running CI jobs: ${JOBS[*]}"
 docker run --rm -t \

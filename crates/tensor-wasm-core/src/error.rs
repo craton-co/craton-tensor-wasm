@@ -173,29 +173,24 @@ fn redact_token(token: &str) -> String {
     }
 
     let bytes = core.as_bytes();
-    let masked = {
+    // Mask the token if it matches any address/path shape below. Folded into a
+    // single `||` chain (rather than an if/else ladder of `true` arms) so each
+    // shape is one predicate — clippy flags the ladder as `if_same_then_else`.
+    let masked =
         // Pointer-shaped: `0x` / `0X` followed by >=1 hex digit.
-        if core.len() > 2
+        (core.len() > 2
             && bytes[0] == b'0'
             && (bytes[1] == b'x' || bytes[1] == b'X')
-            && bytes[2..].iter().all(|&b| is_hex_digit(b))
-        {
-            true
+            && bytes[2..].iter().all(|&b| is_hex_digit(b)))
         // Unix-style path: starts with `/` and contains another `/`.
-        } else if bytes[0] == b'/' && core[1..].contains('/') {
-            true
+        || (bytes[0] == b'/' && core[1..].contains('/'))
         // Windows-style path: drive letter + `:\` + body.
-        } else if core.len() > 3
+        || (core.len() > 3
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
-            && bytes[2] == b'\\'
-        {
-            true
+            && bytes[2] == b'\\')
         // Long bare hex run (>= threshold digits, no `0x` prefix).
-        } else {
-            core.len() >= LONG_HEX_THRESHOLD && bytes.iter().all(|&b| is_hex_digit(b))
-        }
-    };
+        || (core.len() >= LONG_HEX_THRESHOLD && bytes.iter().all(|&b| is_hex_digit(b)));
 
     if masked {
         format!("{MASK}{suffix}")

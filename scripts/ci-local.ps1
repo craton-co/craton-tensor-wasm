@@ -13,9 +13,11 @@
 # across runs and never collides with the host's MSVC target/ directory.
 #
 # Usage:
-#   scripts\ci-local.ps1 [-RebuildImage] [-Pull] [-KeepGoing] [-CleanCache] [job ...]
+#   scripts\ci-local.ps1 [-RebuildImage] [-Pull] [-FailFast] [-CleanCache] [job ...]
 #
-# Jobs (default: all, run in this order, stopping at the first failure):
+# Jobs (default: all, run in this order; every job runs even if an earlier one
+# fails, and the script exits non-zero if any failed — use -FailFast to stop
+# at the first failure):
 #   fmt clippy test doc deny cuda-oxide openapi actionlint
 #
 # Examples:
@@ -26,6 +28,8 @@
 param(
     [switch]$RebuildImage,
     [switch]$Pull,
+    [switch]$FailFast,
+    # Accepted for compatibility; running every job is now the default.
     [switch]$KeepGoing,
     [switch]$CleanCache,
     [switch]$Help,
@@ -47,7 +51,7 @@ $AllJobs = @('fmt', 'clippy', 'test', 'doc', 'deny', 'cuda-oxide', 'openapi', 'a
 
 if ($Help) {
     Get-Content $MyInvocation.MyCommand.Path |
-        Select-Object -Skip 1 -First 24 |
+        Select-Object -Skip 1 -First 26 |
         ForEach-Object { $_ -replace '^#\s?', '' }
     exit 0
 }
@@ -106,15 +110,16 @@ if ($RebuildImage -or -not $imageExists) {
 
 # Assemble the single-line in-container program (no embedded double quotes, no
 # real newlines -> safe to pass as one argv from PowerShell 5.1).
-$prog = 'set -uo pipefail; rc=0; '
+$prog = 'set -uo pipefail; rc=0; failed=""; '
 foreach ($job in $selected) {
     $cmd = Get-JobCmd $job
     $prog += "printf '\n\033[1;36m===> ci job: %s\033[0m\n' '$job'; "
     $prog += "if $cmd; then printf '\033[1;32m===> %s: OK\033[0m\n' '$job'; "
-    $prog += "else printf '\033[1;31m===> %s: FAILED\033[0m\n' '$job'; rc=1;"
-    if (-not $KeepGoing) { $prog += ' exit 1;' }
+    $prog += "else printf '\033[1;31m===> %s: FAILED\033[0m\n' '$job'; rc=1; failed=`"`${failed} $job`";"
+    if ($FailFast) { $prog += ' exit 1;' }
     $prog += ' fi; '
 }
+$prog += 'if [ -n "$failed" ]; then printf "\n\033[1;31m===> CI FAILED:%s\033[0m\n" "$failed"; else printf "\n\033[1;32m===> CI OK (all jobs passed)\033[0m\n"; fi; '
 $prog += 'exit $rc;'
 
 Write-Host ">> running CI jobs: $($selected -join ', ')"
