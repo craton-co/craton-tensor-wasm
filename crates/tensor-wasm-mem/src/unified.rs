@@ -679,6 +679,11 @@ use backing::{Backing, IS_HOST_BACKED, IS_UVM_BACKED};
 #[cfg(feature = "gpu-mem-pool")]
 pub(crate) struct TenantPoolBacking {
     ptr: NonNull<u8>,
+    /// Allocation size in bytes. Held so [`Drop`] can return the host-side cap
+    /// reservation (`TenantMemPool::live_bytes`) that
+    /// [`TenantMemPool::allocate`] took — `deallocate` only carries the
+    /// pointer, not the size. See fix #1.
+    size: usize,
     pool: Arc<crate::cuda_mem_pool::TenantMemPool>,
 }
 
@@ -715,6 +720,12 @@ impl Drop for TenantPoolBacking {
                  allocation leaked, bounded by pool cap",
             );
         }
+        // Fix #1: return the host-side cap reservation regardless of whether
+        // the driver free succeeded. The reservation is admission control for
+        // *future* allocations; holding a phantom reservation for a buffer the
+        // tenant has dropped would slowly starve the tenant on repeated driver
+        // hiccups. A genuine driver-free failure is already logged loudly above.
+        self.pool.release_bytes(self.size);
     }
 }
 
@@ -1018,6 +1029,7 @@ impl UnifiedBuffer {
         let ptr = pool.allocate(size)?;
         let tp = TenantPoolBacking {
             ptr,
+            size,
             pool: Arc::clone(&pool),
         };
         Ok(Self {
@@ -1642,14 +1654,21 @@ mod tests {
             // prove the grow does NOT clobber existing bytes.
             b.as_mut_slice().fill(0xAB);
             // Grow in place to 200 (<= capacity): must succeed without realloc.
-            b.try_grow_in_place(200).expect("in-place grow within capacity");
+            b.try_grow_in_place(200)
+                .expect("in-place grow within capacity");
             assert_eq!(b.len(), 200);
             assert_eq!(b.capacity(), 256, "capacity unchanged by in-place grow");
             let s = b.as_slice();
             // Pre-existing bytes preserved.
-            assert!(s[..64].iter().all(|&x| x == 0xAB), "existing bytes clobbered");
+            assert!(
+                s[..64].iter().all(|&x| x == 0xAB),
+                "existing bytes clobbered"
+            );
             // H2: freshly-exposed region reads as zero.
-            assert!(s[64..200].iter().all(|&x| x == 0), "grown region not zeroed");
+            assert!(
+                s[64..200].iter().all(|&x| x == 0),
+                "grown region not zeroed"
+            );
         }
 
         #[test]
@@ -1700,7 +1719,8 @@ mod tests {
             assert_eq!(b.capacity(), b.len());
             assert!(b.try_grow_in_place(65).is_err());
             // Growing to exactly the current size is a no-op success.
-            b.try_grow_in_place(64).expect("grow to current len is a no-op");
+            b.try_grow_in_place(64)
+                .expect("grow to current len is a no-op");
             assert_eq!(b.len(), 64);
         }
     }

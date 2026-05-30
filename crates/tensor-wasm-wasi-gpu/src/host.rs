@@ -328,7 +328,8 @@ impl WasiCudaContext {
     /// Record that a launch was refused by the back-pressure path.
     /// Telemetry only.
     fn record_back_pressure_rejection(&self) {
-        self.back_pressure_rejections.fetch_add(1, Ordering::Relaxed);
+        self.back_pressure_rejections
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Install a per-invocation absolute deadline that drives the
@@ -1344,6 +1345,18 @@ fn load_ptx_impl<T: HasWasiCuda>(
                 .record_error("load_ptx: PTX bytes contain an interior NUL");
             return Err(AbiError::MalformedPtx);
         }
+        // Fix #6: the JIT compile needs a current CUDA context on THIS
+        // thread. `load_ptx` runs on whatever thread the wasmtime fiber is
+        // polled on, which may never have made the primary context current.
+        // Bind it before `Module::from_ptx` so the compile cannot fail with
+        // `CUDA_ERROR_INVALID_CONTEXT`.
+        crate::cuda_ctx::ensure_current_context().map_err(|e| {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("load_ptx: CUDA context bind failed: {e}"));
+            AbiError::NotAvailable
+        })?;
         let module = Module::from_ptx(ptx_str, &[]).map_err(|e| {
             caller
                 .data()
@@ -1726,6 +1739,20 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
 
         use crate::kernel_args::build_kernel_param_storage;
 
+        // Fix #6: bind the process-wide primary context to THIS thread before
+        // any of `Stream::new` / `cuLaunchKernel` / `Event::*` run. The async
+        // fiber may be polled on a tokio worker that has never made the context
+        // current, which would otherwise fail every driver call here with
+        // `CUDA_ERROR_INVALID_CONTEXT`. (The `spawn_blocking` synchronize
+        // closure below re-binds on its own pool thread.)
+        crate::cuda_ctx::ensure_current_context().map_err(|e| {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("launch: CUDA context bind failed: {e}"));
+            AbiError::LaunchFailed
+        })?;
+
         // The strong `Arc` we already hold keeps the module alive across
         // launch + synchronize without any raw-pointer gymnastics.
         let module = handle.module.clone().ok_or_else(|| {
@@ -1844,11 +1871,18 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
         // captured, but the closure keeps the backing alive in case
         // CUDA dereferences it again during sync.
         let handle_for_keepalive = handle.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let _keep_event = event;
             let _keep_module = handle_for_keepalive;
             let _keep_storage = storage;
-            stream.synchronize()
+            // Fix #6: re-bind the primary context on this blocking-pool thread.
+            // `spawn_blocking` runs the closure on a pool thread that may never
+            // have made the context current, so `cuStreamSynchronize` would
+            // otherwise fail with `CUDA_ERROR_INVALID_CONTEXT`.
+            crate::cuda_ctx::ensure_current_context()?;
+            stream
+                .synchronize()
+                .map_err(|e| format!("stream synchronize failed: {e:?}"))
         })
         .await
         .map_err(|_| {
@@ -1859,7 +1893,7 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
             caller
                 .data()
                 .wasi_cuda()
-                .record_error(format!("launch: stream synchronize failed: {e:?}"));
+                .record_error(format!("launch: {e}"));
             AbiError::LaunchFailed
         })?;
         // Stash the parsed args for observability before releasing the
@@ -1922,6 +1956,17 @@ fn sync_impl<T: HasWasiCuda>(_caller: &Caller<'_, T>) -> Result<(), AbiError> {
         // `CurrentContext::synchronize` is a blocking call that returns
         // once all queued work on the current context has finished.
         use cust::context::CurrentContext;
+        // Fix #6: `synchronize` drains *this thread's current context*, so the
+        // context must be current here. A `sync` call arriving on a thread
+        // that never bound it would otherwise fail with
+        // `CUDA_ERROR_INVALID_CONTEXT` (or drain the wrong context).
+        if let Err(e) = crate::cuda_ctx::ensure_current_context() {
+            _caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("sync: CUDA context bind failed: {e}"));
+            return Err(AbiError::LaunchFailed);
+        }
         match CurrentContext::synchronize() {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -2865,9 +2910,7 @@ mod tests {
     /// `MAX_TOTAL_DEVICE_BYTES` succeeds; one more trips `QuotaExceeded`.
     #[test]
     fn device_mem_aggregate_cap_via_registry() {
-        use crate::device_mem::{
-            DeviceMemEntry, MAX_DEVICE_ALLOC_BYTES, MAX_TOTAL_DEVICE_BYTES,
-        };
+        use crate::device_mem::{DeviceMemEntry, MAX_DEVICE_ALLOC_BYTES, MAX_TOTAL_DEVICE_BYTES};
         let ctx = WasiCudaContext::new(InstanceId(305));
         let reg = ctx.device_mem();
         let per = MAX_DEVICE_ALLOC_BYTES;

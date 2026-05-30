@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
 
-//! T39 driver-pin tests for [`tensor_wasm_mem::cuda_mem_pool`].
+//! T39 per-tenant memory-cap tests for [`tensor_wasm_mem::cuda_mem_pool`].
 //!
-//! These tests prove the v0.4 deliverable for PATH-TO-V1.md §3.1 #8 —
-//! that the per-tenant GPU memory cap is enforced by the CUDA driver
-//! itself (via `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-//! cap)`), not just by the in-process `consume_gpu_bytes` counter. A
-//! tenant who somehow obtained a raw CUDA driver handle and called
-//! `cuMemAllocFromPoolAsync` directly against this pool would still
-//! hit the cap.
+//! These tests prove the v0.4 deliverable for PATH-TO-V1.md §3.1 #8 — that the
+//! per-tenant GPU memory cap is enforced for allocations routed through the
+//! tenant pool, independently of the in-process
+//! `TenantContext::consume_gpu_bytes` counter.
+//!
+//! NOTE (fix #1, see `docs/GPU-VALIDATION-2026-05-30.md` BUG-1): enforcement is
+//! HOST-SIDE, inside [`TenantMemPool::allocate`], NOT driver-level.
+//! `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, cap)` is only a
+//! retention hint — it does not bound allocation size, and a hardware run
+//! confirmed a 128 MiB request against a 64 MiB-"capped" pool succeeded when
+//! the cap relied on the threshold alone. `allocate` now reserves against the
+//! cap before `cuMemAllocFromPoolAsync`, so an over-cap request — including one
+//! that bypasses the in-process counter by calling the pool directly, as these
+//! tests do — is refused with a `CUDA_ERROR_OUT_OF_MEMORY`-shaped error. The
+//! test names retain `_by_driver` for continuity; read them as "refused at the
+//! pool layer".
 //!
 //! Tests in this file:
 //!
@@ -59,9 +68,9 @@ fn over_cap_allocation_through_pool_is_rejected_by_driver() {
     let pool = TenantMemPool::new(0, CAP_64_MIB)
         .expect("cuMemPoolCreate + SetAttribute must succeed on a CUDA host");
     let pool = Arc::new(pool);
-    // 128 MiB > 64 MiB cap. The driver must reject this with
-    // `CUDA_ERROR_OUT_OF_MEMORY`, which the cudarc-side wrapper
-    // surfaces as `UnifiedError::Cuda(...)`.
+    // 128 MiB > 64 MiB cap. `TenantMemPool::allocate` must reject this at the
+    // host-side reservation (before `cuMemAllocFromPoolAsync`) with a
+    // `CUDA_ERROR_OUT_OF_MEMORY`-shaped `UnifiedError::Cuda(...)`.
     let res = UnifiedBuffer::new_in_tenant_pool(
         Arc::clone(&pool),
         (128 * MIB) as usize,
@@ -88,10 +97,12 @@ fn over_cap_allocation_through_pool_is_rejected_by_driver() {
         ),
         Ok(buf) => panic!(
             "T39 REGRESSION: 128 MiB allocation succeeded against a \
-             64 MiB-capped pool (len={}). The driver-level cap is NOT \
-             being enforced — either cuMemPoolSetAttribute did not run \
-             on construction, or the cap argument was wrong. Check \
-             TenantMemPool::new in crates/tensor-wasm-mem/src/cuda_mem_pool.rs.",
+             64 MiB-capped pool (len={}). The per-tenant cap is NOT being \
+             enforced — the host-side reservation in TenantMemPool::allocate \
+             (live_bytes vs cap_bytes) is missing or wrong. NB: \
+             CU_MEMPOOL_ATTR_RELEASE_THRESHOLD alone does NOT enforce this \
+             (it is a retention hint). Check TenantMemPool::allocate in \
+             crates/tensor-wasm-mem/src/cuda_mem_pool.rs.",
             buf.len(),
         ),
     }

@@ -182,7 +182,10 @@ impl DeviceMemRegistry {
                 return Err(AbiError::InvalidHandle);
             }
         }
-        let (_, entry) = self.entries.remove(&handle).ok_or(AbiError::InvalidHandle)?;
+        let (_, entry) = self
+            .entries
+            .remove(&handle)
+            .ok_or(AbiError::InvalidHandle)?;
         let _ = self
             .total_device_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
@@ -299,7 +302,8 @@ mod tests {
         let reg = DeviceMemRegistry::new();
         // Tiny allocations so the count cap (not the byte cap) gates.
         for _ in 0..MAX_DEVICE_ALLOCS_PER_INSTANCE {
-            reg.insert(entry(InstanceId(1), 1)).expect("under count cap");
+            reg.insert(entry(InstanceId(1), 1))
+                .expect("under count cap");
         }
         assert_eq!(
             reg.insert(entry(InstanceId(1), 1)).unwrap_err(),

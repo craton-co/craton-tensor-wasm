@@ -431,9 +431,11 @@ pub trait HasInput {
 pub fn add_input_to_linker<T: HasInput + Send + 'static>(
     linker: &mut Linker<T>,
 ) -> wasmtime::Result<()> {
-    linker.func_wrap(STREAMING_MODULE, FN_INPUT_LEN, |caller: Caller<'_, T>| -> u32 {
-        caller.data().input().len_u32()
-    })?;
+    linker.func_wrap(
+        STREAMING_MODULE,
+        FN_INPUT_LEN,
+        |caller: Caller<'_, T>| -> u32 { caller.data().input().len_u32() },
+    )?;
 
     linker.func_wrap(
         STREAMING_MODULE,

@@ -12,17 +12,30 @@
 //! tenant's quota-checked path before allocating — but a tenant that
 //! somehow obtained a raw CUDA driver handle could bypass it.
 //!
-//! `cuMemPool` (CUDA 11.2+) lets the host pin a hard ceiling that the
-//! driver itself enforces. T39 wires every tenant's allocations
-//! through a tenant-scoped `cuMemPoolHandle_t` configured with
-//! `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` matching the tenant's cap.
-//! Allocations past the cap fail at the driver level with
-//! `CUDA_ERROR_OUT_OF_MEMORY` — the in-process counter is a
-//! belt-and-suspenders layer on top.
+//! `cuMemPool` (CUDA 11.2+) gives each tenant its own
+//! `cuMemPoolHandle_t` so allocations are pool-scoped and freed memory is
+//! retained per-tenant. T39 routes every tenant allocation through a
+//! tenant-scoped pool via [`UnifiedBuffer::new_in_tenant_pool`].
 //!
-//! ## Status (T39): driver pin LANDED
+//! The per-tenant *cap*, however, is enforced HOST-SIDE in
+//! [`TenantMemPool::allocate`] (a CAS counter over `live_bytes` against
+//! `cap_bytes`), NOT by the driver. `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` —
+//! set at construction — is only a memory-*retention* hint (how much freed
+//! memory the pool caches before returning it to the OS); it is NOT an
+//! allocation ceiling, and CUDA memory pools expose no hard max-size
+//! attribute. The hardware run in `docs/GPU-VALIDATION-2026-05-30.md`
+//! (BUG-1) confirmed a 128 MiB request against a 64 MiB-"capped" pool
+//! succeeded when the cap relied on RELEASE_THRESHOLD alone; the host-side
+//! reservation in `allocate` closes that gap. Over-cap requests now fail
+//! before `cuMemAllocFromPoolAsync` with a `CUDA_ERROR_OUT_OF_MEMORY`-shaped
+//! `UnifiedError::Cuda`, and the in-process
+//! `TenantContext::gpu_bytes_in_use` counter remains a second line of
+//! defence on top.
 //!
-//! Pool creation, `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` set, drop, and a
+//! ## Status (T39): host-side cap enforced; pool wiring LANDED
+//!
+//! Pool creation, `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` set (retention hint),
+//! the host-side cap reservation in [`TenantMemPool::allocate`], drop, and a
 //! tenant-pool-routed [`UnifiedBuffer::new_in_tenant_pool`] allocation
 //! path are wired against the cudarc 0.13 FFI surface
 //! (`cudarc::driver::sys`). The FFI types used here
@@ -116,6 +129,18 @@ pub struct TenantMemPool {
     /// reporting, not a synchronisation point — the authoritative cap
     /// lives in the driver after the `cuMemPoolSetAttribute` call.
     cap_bytes: AtomicU64,
+    /// Live (allocated-but-not-yet-freed) bytes drawn from this pool.
+    ///
+    /// Fix #1 (T39 real enforcement): the per-tenant cap is enforced
+    /// **host-side** here, not by the driver. `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD`
+    /// is a memory-*retention* hint (how much freed memory the pool caches
+    /// before returning it to the OS) — it is NOT an allocation ceiling, and
+    /// CUDA memory pools expose no hard max-size attribute. So
+    /// [`Self::allocate`] reserves against `cap_bytes` using this counter
+    /// before calling `cuMemAllocFromPoolAsync`, and [`Self::release_bytes`]
+    /// gives the reservation back on free. Relaxed-but-CAS'd just like the
+    /// in-process `TenantContext::gpu_bytes_in_use` counter it backstops.
+    live_bytes: AtomicU64,
     device_ordinal: u32,
     /// Held purely to keep the device's primary context alive. Dropped
     /// AFTER `cuMemPoolDestroy` in [`Drop`] thanks to Rust's struct
@@ -134,9 +159,12 @@ impl TenantMemPool {
     ///
     /// The pool is created with `CU_MEM_ALLOCATION_TYPE_PINNED` on
     /// device-located memory for `device_ordinal`. The
-    /// `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` attribute is set to
-    /// `cap_bytes` so allocations past the cap fail at the driver
-    /// level with `CUDA_ERROR_OUT_OF_MEMORY`.
+    /// `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` attribute is set to `cap_bytes`
+    /// as a retention hint only (it bounds cached-freed memory, NOT
+    /// allocation). The per-tenant allocation cap is enforced host-side in
+    /// [`Self::allocate`] — allocations past `cap_bytes` fail there with a
+    /// `CUDA_ERROR_OUT_OF_MEMORY`-shaped error before the driver call. See
+    /// the module docs and `docs/GPU-VALIDATION-2026-05-30.md` BUG-1.
     ///
     /// The primary context for `device_ordinal` is retained via the
     /// T26 per-ordinal device cache (see [`crate::cudarc_backend`]);
@@ -227,6 +255,7 @@ impl TenantMemPool {
             Ok(Self {
                 pool,
                 cap_bytes: AtomicU64::new(cap_bytes),
+                live_bytes: AtomicU64::new(0),
                 device_ordinal,
                 device,
             })
@@ -276,10 +305,13 @@ impl TenantMemPool {
     /// `cuMemAllocFromPoolAsync` on the null stream.
     ///
     /// Returns the raw `CUdeviceptr` as a `NonNull<u8>` on success.
-    /// The driver enforces the release-threshold cap configured at
-    /// pool construction time — over-cap allocations fail with
-    /// `CUDA_ERROR_OUT_OF_MEMORY`, which is the exact bypass-resistant
-    /// gate T39 wires.
+    /// The per-tenant cap is enforced HOST-SIDE here (see [`Self::live_bytes`]
+    /// / the reservation loop below): an allocation that would push
+    /// `live_bytes` past `cap_bytes` is refused before the driver call with a
+    /// `CUDA_ERROR_OUT_OF_MEMORY`-shaped [`UnifiedError::Cuda`]. The driver
+    /// does NOT enforce this — `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` is a
+    /// retention hint, not an allocation ceiling (see the module docs and
+    /// `docs/GPU-VALIDATION-2026-05-30.md` BUG-1).
     ///
     /// # Stream choice
     ///
@@ -292,10 +324,38 @@ impl TenantMemPool {
     /// `TensorWasmMemoryCreator::with_tenant_context` to use this
     /// allocator will thread an explicit per-tenant stream through.
     pub(crate) fn allocate(&self, size: usize) -> Result<NonNull<u8>, UnifiedError> {
+        // Fix #1 (T39 real enforcement): reserve against the per-tenant cap
+        // BEFORE asking the driver. `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` does
+        // not bound allocation size (it is a retention hint), and CUDA memory
+        // pools expose no hard max-size attribute — so without this gate a
+        // tenant with a raw pool handle could allocate past its cap. The
+        // CAS-loop mirrors `TenantContext::consume_gpu_bytes`. The reservation
+        // is held until the matching `release_bytes` on free; on a driver
+        // failure below we roll it back so a transient CUDA error does not
+        // permanently shrink the tenant's headroom.
+        let cap = self.cap_bytes.load(Ordering::Acquire);
+        let size_u64 = size as u64;
+        let mut current = self.live_bytes.load(Ordering::Acquire);
+        loop {
+            let next = reserve_step(cap, current, size_u64)?;
+            match self.live_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+
         // mem M4: bind the primary context to the calling thread
         // before issuing the alloc-async driver call. See the
         // matching call in `CudarcUnifiedBuffer::prefetch_to_device`.
-        ensure_context_bound(&self.device)?;
+        if let Err(e) = ensure_context_bound(&self.device) {
+            self.release_bytes(size); // roll back the reservation
+            return Err(e);
+        }
         let mut raw: cuda_sys::CUdeviceptr = 0;
         // SAFETY: `raw` is a valid out-parameter; the pool handle was
         // returned by `cuMemPoolCreate` and is still live (this is a
@@ -311,15 +371,36 @@ impl TenantMemPool {
             )
         };
         if res != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+            self.release_bytes(size); // roll back the reservation
             return Err(UnifiedError::Cuda(format!(
                 "cuMemAllocFromPoolAsync -> {res:?}"
             )));
         }
         NonNull::new(raw as *mut u8).ok_or_else(|| {
+            self.release_bytes(size); // roll back the reservation
             UnifiedError::Allocation(
                 "cuMemAllocFromPoolAsync returned null with CUDA_SUCCESS".into(),
             )
         })
+    }
+
+    /// Give back `size` bytes of cap reservation previously taken by
+    /// [`Self::allocate`]. Called from `TenantPoolBacking::drop` on the free
+    /// path. Saturating on underflow — a bookkeeping mismatch must not wrap the
+    /// counter and permanently lock the tenant out of its own pool.
+    pub(crate) fn release_bytes(&self, size: usize) {
+        let size_u64 = size as u64;
+        let _ = self
+            .live_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some(cur.saturating_sub(size_u64))
+            });
+    }
+
+    /// Live (allocated-but-not-yet-freed) bytes currently drawn from this pool.
+    /// Visible for metrics and the host-side cap tests.
+    pub fn live_bytes(&self) -> u64 {
+        self.live_bytes.load(Ordering::Acquire)
     }
 
     /// Free a pointer previously returned by [`Self::allocate`].
@@ -343,6 +424,35 @@ impl TenantMemPool {
         }
         Ok(())
     }
+}
+
+/// Pure per-tenant cap-reservation decision, factored out of
+/// [`TenantMemPool::allocate`] so the ceiling logic is unit-testable without a
+/// CUDA driver (the `#[cfg(test)]` cases below run on a no-GPU host whenever
+/// the crate is built `--features gpu-mem-pool`).
+///
+/// Given the pool `cap`, the `current` live byte total, and a requested
+/// `size`, returns the new live total to install on success, or an
+/// `OUT_OF_MEMORY`-shaped [`UnifiedError::Cuda`] if the request would exceed
+/// the cap (or overflow `u64`). The error string is deliberately
+/// `CUDA_ERROR_OUT_OF_MEMORY`-shaped so callers see the same failure as a
+/// genuine driver OOM — the cap is a hard ceiling from the tenant's view.
+fn reserve_step(cap: u64, current: u64, size: u64) -> Result<u64, UnifiedError> {
+    let next = current.checked_add(size).ok_or_else(|| {
+        UnifiedError::Cuda(format!(
+            "CUDA_ERROR_OUT_OF_MEMORY: per-tenant pool reservation overflow \
+             (live={current}, requested={size})"
+        ))
+    })?;
+    if next > cap {
+        return Err(UnifiedError::Cuda(format!(
+            "CUDA_ERROR_OUT_OF_MEMORY: allocation of {size} bytes would exceed the \
+             per-tenant GPU memory cap (cap={cap}, live={current}). The cap is \
+             enforced host-side; CU_MEMPOOL_ATTR_RELEASE_THRESHOLD is only a \
+             retention hint, not an allocation ceiling."
+        )));
+    }
+    Ok(next)
 }
 
 impl DriverMemPool for TenantMemPool {
@@ -486,5 +596,52 @@ mod tests {
         assert!(format!("{e}").contains("not initialized"));
         let e = MemPoolError::Device("device_for(7): CudaDevice::new(7): ...".into());
         assert!(format!("{e}").contains("device retain failed"));
+    }
+
+    /// Fix #1: the host-side cap reservation arithmetic. Driver-free, so it
+    /// runs on a no-GPU host (unlike the `#[ignore]`d driver-pin tests). This
+    /// is the regression guard that the cap is a *hard ceiling*, independent of
+    /// `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD`.
+    #[test]
+    fn reserve_step_admits_up_to_the_cap() {
+        const CAP: u64 = 64 * 1024 * 1024;
+        // Exactly at the cap from empty: admitted.
+        assert_eq!(reserve_step(CAP, 0, CAP).unwrap(), CAP);
+        // Under cap: admitted, returns the new running total.
+        assert_eq!(
+            reserve_step(CAP, 16 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
+            32 * 1024 * 1024
+        );
+        // Fills the remaining headroom exactly.
+        assert_eq!(
+            reserve_step(CAP, 48 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
+            CAP
+        );
+    }
+
+    #[test]
+    fn reserve_step_rejects_over_cap_with_oom_shape() {
+        const CAP: u64 = 64 * 1024 * 1024;
+        // The BUG-1 scenario: 128 MiB against a 64 MiB cap from empty.
+        let err = reserve_step(CAP, 0, 128 * 1024 * 1024).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("OUT_OF_MEMORY"),
+            "over-cap rejection must be OOM-shaped so callers match the driver \
+             error; got: {msg}"
+        );
+        // One byte past the cap is still rejected (off-by-one guard).
+        assert!(reserve_step(CAP, CAP, 1).is_err());
+        // No headroom left, zero-byte step is fine (degenerate, but must not
+        // spuriously reject).
+        assert_eq!(reserve_step(CAP, CAP, 0).unwrap(), CAP);
+    }
+
+    #[test]
+    fn reserve_step_rejects_overflow_as_oom() {
+        // A near-u64::MAX live total + a large request overflows; treated as
+        // OOM rather than silently wrapping the counter.
+        let err = reserve_step(u64::MAX, u64::MAX - 4, 16).unwrap_err();
+        assert!(format!("{err}").contains("OUT_OF_MEMORY"));
     }
 }

@@ -23,6 +23,10 @@
 
 pub mod abi;
 pub mod async_dispatch;
+// Process-wide CUDA primary-context binding (roadmap fix #6). Only meaningful
+// on `--features cuda`; the module itself is `#![cfg(feature = "cuda")]`.
+#[cfg(feature = "cuda")]
+pub mod cuda_ctx;
 pub mod device_mem;
 pub mod host;
 pub mod kernel_args;

@@ -644,8 +644,7 @@ async fn vector_add_end_to_end_real_ptx_real_kernel() {
         let owner = InstanceId(403);
         let mut ctx = WasiCudaContext::new(owner);
         ctx.enable_wasi_cuda();
-        let (mut kid, mut loaded) =
-            register_real_kernel(&ctx, owner, "vector_add", VECTOR_ADD_PTX);
+        let (mut kid, mut loaded) = register_real_kernel(&ctx, owner, "vector_add", VECTOR_ADD_PTX);
         if !loaded {
             // sm_80 fixture rejected by the driver JIT (e.g. on a Turing
             // sm_75 dev box). Retry with the sm_75 variant so the launch
@@ -654,8 +653,7 @@ async fn vector_add_end_to_end_real_ptx_real_kernel() {
                 "vector_add_end_to_end_real_ptx_real_kernel: sm_80 PTX rejected; \
                  retrying with the sm_75 fixture."
             );
-            (kid, loaded) =
-                register_real_kernel(&ctx, owner, "vector_add", VECTOR_ADD_PTX_SM75);
+            (kid, loaded) = register_real_kernel(&ctx, owner, "vector_add", VECTOR_ADD_PTX_SM75);
         }
         if !loaded {
             eprintln!(

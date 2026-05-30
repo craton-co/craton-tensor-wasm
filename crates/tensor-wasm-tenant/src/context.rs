@@ -458,10 +458,12 @@ pub struct TenantContext {
     /// per-tenant series of
     /// [`tensor_wasm_core::metrics::TensorWasmMetrics::gpu_memory_bytes_per_tenant`]
     /// on every transition. v0.3.7 record-only: the value is the source
-    /// of truth for the in-process refusal of over-cap allocations, but
-    /// the CUDA driver itself sees no cap until v0.4 wires the
-    /// `cuMemPoolSetAttribute` path described on
-    /// [`Self::gpu_memory_bytes_cap`].
+    /// of truth for the in-process refusal of over-cap allocations. The
+    /// `gpu-mem-pool` `TenantMemPool` additionally enforces the cap
+    /// host-side in its `allocate` method; note that the CUDA driver itself
+    /// has no per-pool allocation ceiling
+    /// (`CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` is a retention hint, not a cap —
+    /// see [`Self::gpu_memory_bytes_cap`]).
     gpu_bytes_in_use: AtomicU64,
 
     /// Recorded-only CUDA memory-pool release-threshold value. `None`
@@ -594,12 +596,15 @@ impl TenantContext {
     /// allocator path
     /// (`tensor-wasm-mem::TensorWasmMemoryCreator::with_tenant_context`)
     /// reads this on every allocation and refuses to allocate when the
-    /// would-be new total of [`Self::gpu_bytes_in_use`] would exceed it —
-    /// but this is purely a process-local bookkeeping refusal. The CUDA
-    /// driver itself does NOT see this cap (so a tenant allocating through
-    /// a raw CUDA handle is uncapped) until v0.4 wires
-    /// `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`
-    /// (CUDA 11.2+). See `docs/GPU-QUOTAS.md` for the v0.4 plan.
+    /// would-be new total of [`Self::gpu_bytes_in_use`] would exceed it.
+    /// Under `gpu-mem-pool`, the `TenantMemPool` *also* enforces the cap
+    /// host-side in its `allocate` method (a second line of defence for
+    /// pool-routed allocations). NB: there is NO driver-level per-pool
+    /// allocation ceiling — `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` is a
+    /// retention hint, not a cap (a hardware run disproved the earlier
+    /// driver-pin claim; see `docs/GPU-VALIDATION-2026-05-30.md` BUG-1). A
+    /// tenant calling the CUDA driver *directly* (not through TenantMemPool)
+    /// is therefore still uncapped; see `docs/GPU-QUOTAS.md`.
     pub fn gpu_memory_bytes_cap(&self) -> Option<u64> {
         self.gpu_memory_bytes_cap
     }
@@ -631,13 +636,17 @@ impl TenantContext {
     ///
     /// # v0.3.7 vs v0.4 contract
     ///
-    /// In v0.3.7 this is the *only* enforcement: the allocator path
-    /// must call `consume_gpu_bytes` before handing back the buffer,
-    /// and a tenant who bypasses the allocator (e.g. by calling the
-    /// CUDA driver directly) is not capped. v0.4 will additionally
-    /// pin a driver-level cap via
-    /// `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`
-    /// at build time, closing the bypass. See `docs/GPU-QUOTAS.md`.
+    /// This in-process counter is the primary enforcement: the allocator
+    /// path calls `consume_gpu_bytes` before handing back the buffer. A
+    /// tenant that bypasses the allocator but still routes through the
+    /// `gpu-mem-pool` `TenantMemPool` is *additionally* capped host-side
+    /// in `TenantMemPool::allocate` (a second line of defence wired via
+    /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`]). NB: this
+    /// is NOT a driver-level cap — `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` is
+    /// a retention hint, not an allocation ceiling (see
+    /// `docs/GPU-QUOTAS.md` and `docs/GPU-VALIDATION-2026-05-30.md`
+    /// BUG-1). A tenant calling the CUDA driver *directly* is still
+    /// uncapped; that threat is out of scope today.
     pub fn consume_gpu_bytes(&self, n: u64) -> Result<(), TensorWasmError> {
         let limit = self.gpu_memory_bytes_cap;
         let mut current = self.gpu_bytes_in_use.load(Ordering::Acquire);
@@ -689,19 +698,20 @@ impl TenantContext {
             ) {
                 Ok(_) => {
                     self.publish_gpu_memory_gauge(next);
-                    // Driver-enforced cap (T39): when a driver memory pool
-                    // was wired in via
-                    // `with_driver_enforced_gpu_cap` AND a cap is set, pin
-                    // the pool's release threshold to the cap so the CUDA
-                    // driver itself rejects over-cap allocations — the
-                    // bypass-resistant second line of defence on top of
-                    // this in-process counter. We push the *cap* (a fixed
-                    // policy ceiling), not the running total, so the
-                    // driver sees the same ceiling regardless of
-                    // interleaving. A `set_release_threshold` failure is
+                    // Pool cap alignment (T39): when a driver memory pool was
+                    // wired in via `with_driver_enforced_gpu_cap` AND a cap is
+                    // set, keep the pool's recorded cap aligned to this
+                    // tenant's policy ceiling. NB: this is NOT what enforces
+                    // the cap on the pool path — `set_release_threshold` sets
+                    // `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD`, a memory-RETENTION
+                    // hint, not an allocation ceiling (see
+                    // `docs/GPU-VALIDATION-2026-05-30.md` BUG-1). The pool's
+                    // real cap is enforced host-side in
+                    // `TenantMemPool::allocate`. We push the *cap* (a fixed
+                    // policy ceiling), not the running total. A failure is
                     // logged but does NOT fail the consume: the in-process
-                    // counter already accepted this allocation, and the
-                    // driver pin is belt-and-braces.
+                    // counter already accepted this allocation, and the pool
+                    // cap is belt-and-braces.
                     if let (Some(pool), Some(cap)) = (&self.driver_mem_pool, limit) {
                         if let Err(e) = pool.set_release_threshold(cap) {
                             tracing::warn!(
@@ -2133,7 +2143,9 @@ mod tests {
         // and the second is rejected at the same instant.
         let bucket = TokenBucket::new(0, 0);
         let t0 = Instant::now();
-        bucket.try_acquire_at(1, t0).expect("clamped burst of 1 admits one");
+        bucket
+            .try_acquire_at(1, t0)
+            .expect("clamped burst of 1 admits one");
         assert!(bucket.try_acquire_at(1, t0).is_err());
     }
 

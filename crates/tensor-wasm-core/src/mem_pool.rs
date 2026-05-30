@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
 
-//! Backend-agnostic driver memory-pool abstraction shared across crates.
+//! Backend-agnostic tenant memory-pool abstraction shared across crates.
 //!
-//! The per-tenant driver-enforced GPU cap (roadmap feature #8, v0.4
-//! deliverable T39) needs `tensor-wasm-tenant` to push a tenant's cap
-//! down to a concrete CUDA memory pool living in `tensor-wasm-mem`. But
-//! `tensor-wasm-tenant` cannot depend on `tensor-wasm-mem`: `mem`
-//! already depends on `tenant` (its `TensorWasmMemoryCreator::with_tenant_context`
-//! builder takes an `Arc<TenantContext>` to drive `consume_gpu_bytes`),
-//! so a `tenant -> mem` edge would close a dependency cycle.
+//! The per-tenant GPU cap (roadmap feature #8, T39) needs
+//! `tensor-wasm-tenant` to keep a tenant's cap aligned with a concrete
+//! CUDA memory pool living in `tensor-wasm-mem`. But `tensor-wasm-tenant`
+//! cannot depend on `tensor-wasm-mem`: `mem` already depends on `tenant`
+//! (its `TensorWasmMemoryCreator::with_tenant_context` builder takes an
+//! `Arc<TenantContext>` to drive `consume_gpu_bytes`), so a `tenant -> mem`
+//! edge would close a dependency cycle.
 //!
 //! This module breaks that cycle by hoisting the *interface* into
 //! `tensor-wasm-core` — a crate both `mem` and `tenant` already depend
@@ -19,10 +19,15 @@
 //! `cuda_mem_pool::TenantMemPool` implements the trait. Neither crate
 //! references the other's concrete types, so no cycle forms.
 //!
-//! The surface here is deliberately minimal: only what the tenant
-//! driver-cap path needs (set the release threshold, read it back for
-//! honest reporting). The concrete `cuMemPool*` FFI, pool creation, and
-//! allocation paths stay in `tensor-wasm-mem` behind its cudarc gating.
+//! NB: `set_release_threshold` sets `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD`,
+//! a memory-*retention* hint — NOT an allocation ceiling. The actual
+//! per-tenant cap is enforced host-side in `TenantMemPool::allocate`
+//! (see `docs/GPU-QUOTAS.md` and BUG-1 in
+//! `docs/GPU-VALIDATION-2026-05-30.md`). The surface here is deliberately
+//! minimal: keep the threshold aligned with the cap, and read it back for
+//! honest reporting. The concrete `cuMemPool*` FFI, pool creation, the
+//! host-side cap check, and allocation paths stay in `tensor-wasm-mem`
+//! behind its cudarc gating.
 
 use std::sync::Arc;
 
@@ -86,22 +91,29 @@ impl MemPoolError {
     /// against.
     pub fn inner(&self) -> Option<&str> {
         match self {
-            MemPoolError::Create(s)
-            | MemPoolError::SetAttribute(s)
-            | MemPoolError::Device(s) => Some(s),
+            MemPoolError::Create(s) | MemPoolError::SetAttribute(s) | MemPoolError::Device(s) => {
+                Some(s)
+            }
             MemPoolError::NotInitialized => None,
         }
     }
 }
 
-/// A driver-level memory pool whose release threshold can be pinned to a
-/// per-tenant cap.
+/// A tenant memory pool whose release threshold (a CUDA memory-retention
+/// hint) can be aligned to a per-tenant cap.
 ///
 /// Implemented by `tensor-wasm-mem`'s `cuda_mem_pool::TenantMemPool`
 /// (backed by `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`)
 /// and by test mocks. `tensor-wasm-tenant` holds one as an
 /// `Arc<dyn DriverMemPool>` and never names the concrete type — that is
 /// what keeps the `mem` <-> `tenant` dependency graph acyclic.
+///
+/// NB: `set_release_threshold` does NOT enforce the allocation cap —
+/// `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` is a retention hint, not a ceiling.
+/// The concrete `TenantMemPool` enforces the cap host-side in its
+/// `allocate` method. The trait name retains "DriverMemPool" for
+/// compatibility; read it as "the tenant's driver-backed pool". See
+/// `docs/GPU-QUOTAS.md` (and BUG-1 in `docs/GPU-VALIDATION-2026-05-30.md`).
 ///
 /// `Send + Sync` so the pool can be shared across the threads that drive
 /// a tenant's allocations (the tenant context is itself shared behind an
@@ -110,14 +122,17 @@ impl MemPoolError {
 /// the concrete `tensor-wasm-mem::TenantMemPool` already derives it and
 /// test mocks can too.
 pub trait DriverMemPool: std::fmt::Debug + Send + Sync {
-    /// Pin the pool's release threshold to `bytes`.
+    /// Set the pool's release threshold (`CU_MEMPOOL_ATTR_RELEASE_THRESHOLD`)
+    /// to `bytes`.
     ///
-    /// Allocations past this ceiling fail at the driver level with
-    /// `CUDA_ERROR_OUT_OF_MEMORY` — the bypass-resistant gate the
-    /// in-process `consume_gpu_bytes` counter cannot enforce against a
-    /// tenant that obtained a raw CUDA driver handle. Returns
-    /// [`MemPoolError::SetAttribute`] if the underlying driver call
-    /// fails.
+    /// This keeps the pool's recorded cap aligned with the tenant's policy
+    /// ceiling. NB: the release threshold is a memory-*retention* hint, NOT
+    /// an allocation ceiling — it does NOT by itself stop an over-cap
+    /// allocation (a hardware run confirmed this; see BUG-1 in
+    /// `docs/GPU-VALIDATION-2026-05-30.md`). The concrete `TenantMemPool`
+    /// enforces the cap host-side in its `allocate` method; this call just
+    /// keeps the threshold and recorded cap value in sync. Returns
+    /// [`MemPoolError::SetAttribute`] if the underlying driver call fails.
     fn set_release_threshold(&self, bytes: u64) -> Result<(), MemPoolError>;
 
     /// The release-threshold cap (in bytes) this pool was last configured
