@@ -112,7 +112,7 @@ pub struct KernelManifest {
     /// Launch geometry is an advisory *launch hint*, not a security
     /// boundary — the PTX content itself is authenticated by `digest`
     /// (and transitively by the signature, which binds `digest`). Folding
-    /// geometry into [`KernelManifest::canonical_signed_bytes`] would
+    /// geometry into `KernelManifest::canonical_signed_bytes` would
     /// invalidate every previously-signed `twasm-kmf-v2` blob (a magic
     /// bump to `-v3` plus a dual-version verify path) for no security
     /// gain, so it is carried as an unsigned hint instead. A bad actor

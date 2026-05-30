@@ -21,8 +21,10 @@
 # (or, if `yq` is on PATH, swap the python invocation for
 #  `yq -o=json '.' openapi/tensor-wasm-api.yaml`).
 #
-# The leading `_comment` field in the JSON output is added by the
-# inline Python and warns hand-editors off.
+# The leading `x-comment` field in the JSON output is added by the
+# inline Python and warns hand-editors off. It uses the OpenAPI `x-`
+# extension prefix so the 3.1 schema's `unevaluatedProperties: false`
+# root check (enforced by swagger-cli) accepts it.
 
 set -euo pipefail
 
@@ -50,7 +52,7 @@ banner = (
     "edit the YAML and re-export this JSON (see scripts/regen-openapi-json.{sh,ps1}). "
     "The openapi_json_yaml_sync regression test enforces path-key parity at CI time."
 )
-out = {"_comment": banner}
+out = {"x-comment": banner}
 out.update(doc)
 
 with open(dst, "w", encoding="utf-8") as f:

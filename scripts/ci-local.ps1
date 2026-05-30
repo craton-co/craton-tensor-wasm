@@ -86,7 +86,11 @@ function Get-JobCmd([string]$job) {
         'deny'       { 'cargo deny --all-features check' }
         'cuda-oxide' { 'cargo check --workspace --features tensor-wasm-mem/cuda-oxide-backend' }
         'openapi'    { 'redocly lint --config openapi/redocly.yaml openapi/tensor-wasm-api.yaml && swagger-cli validate crates/tensor-wasm-api/openapi.json && cargo test -p tensor-wasm-api --test openapi_validation_test --no-default-features' }
-        'actionlint' { 'actionlint' }
+        # Explicit paths instead of bare `actionlint`: with no args actionlint
+        # discovers workflows via `git`, which fails inside the mounted
+        # container when the checkout's `.git` is a worktree pointer to a host
+        # path ("no YAML file was found"). Globbing sidesteps git entirely.
+        'actionlint' { 'actionlint .github/workflows/*.yml' }
     }
 }
 

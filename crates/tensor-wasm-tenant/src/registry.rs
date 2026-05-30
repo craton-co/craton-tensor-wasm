@@ -117,7 +117,7 @@ pub const MPS_PIPE_DIRECTORY_ENV: &str = "CUDA_MPS_PIPE_DIRECTORY";
 /// Holding a `&RegistryAdminCapability` is the only way to invoke
 /// [`TenantRegistry::get`], [`TenantRegistry::unregister`],
 /// [`TenantRegistry::tenants`], or [`TenantRegistry::len`]. The struct's
-/// sole field is private and its only constructor ([`Self::mint`]) is
+/// sole field is private and its only constructor (`Self::mint`) is
 /// crate-private, so external crates cannot synthesise a capability — they
 /// can only borrow the one minted at [`TenantRegistry::new`] time.
 ///

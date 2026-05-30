@@ -338,7 +338,7 @@ impl HttpRequestLabels {
     ///   the API binary). If an allow-list IS registered and `route`
     ///   is not in it, returns [`LabelError::UnknownRoute`].
     /// * `method` must be one of the nine HTTP verbs in
-    ///   [`ALLOWED_HTTP_METHODS`]. Comparison is case-sensitive
+    ///   `ALLOWED_HTTP_METHODS`. Comparison is case-sensitive
     ///   (uppercase) — the API middleware normalises before calling.
     /// * `status` must be in the standard HTTP range `100..=599`.
     ///

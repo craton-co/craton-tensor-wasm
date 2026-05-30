@@ -84,7 +84,7 @@ use tensor_wasm_core::types::TenantId;
 static ISOLATION_DOWNGRADE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide count of `ContextIsolated -> StreamIsolated` downgrades
-/// observed since startup. See [`ISOLATION_DOWNGRADE_COUNT`] for the
+/// observed since startup. See `ISOLATION_DOWNGRADE_COUNT` for the
 /// alert contract: any non-zero reading on an operator that requested
 /// `ContextIsolated` is a deployment-config bug.
 ///
@@ -630,7 +630,7 @@ impl TenantContext {
     /// to `u64::MAX` — the second such call observes the overflow and
     /// returns `GpuMemoryExhausted` while leaving the counter unchanged.
     ///
-    /// Mirrors [`Self::consume_bytes_inner`] for the GPU side; the
+    /// Mirrors `Self::consume_bytes_inner` for the GPU side; the
     /// atomic discipline is intentionally identical so a single mental
     /// model covers both counters.
     ///
@@ -735,7 +735,7 @@ impl TenantContext {
     ///
     /// Saturating on underflow — callers must not release more than
     /// they consumed, but a bookkeeping mismatch is not fatal. Mirrors
-    /// [`Self::release_bytes_inner`] for the GPU side: CAS loop on
+    /// `Self::release_bytes_inner` for the GPU side: CAS loop on
     /// `gpu_bytes_in_use`, computing `saturating_sub` on each iteration.
     /// The earlier `fetch_sub` + post-hoc clamp shape is intentionally
     /// avoided here for the same reason described on the CPU sibling
@@ -771,7 +771,7 @@ impl TenantContext {
 
     /// Capability-checked variant of [`Self::consume_gpu_bytes`].
     ///
-    /// Performs the same [`Self::check_capability`] gate the CPU path uses
+    /// Performs the same `Self::check_capability` gate the CPU path uses
     /// ([`Self::consume_bytes_with_capability`]) before touching the GPU
     /// counter, so the GPU side gets the identical cross-tenant isolation
     /// guarantee: a [`TenantCapability`] minted for a different tenant is

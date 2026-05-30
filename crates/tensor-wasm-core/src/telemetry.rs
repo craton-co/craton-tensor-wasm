@@ -8,12 +8,12 @@
 //!
 //! * [`init`] — wires a `tracing_subscriber` pipeline to stderr in either
 //!   human-friendly pretty format or line-delimited JSON.
-//! * [`init_with_otlp`] (gated on the `otlp` feature) — additionally exports
+//! * `init_with_otlp` (gated on the `otlp` feature) — additionally exports
 //!   spans to an OTLP collector.
 //!
 //! Each entry point guards itself with its own `std::sync::Once`. Mixing the
 //! two in the same process is a configuration bug: whichever runs first wins,
-//! and the other returns [`OtlpInitError::AlreadyInitialized`] (for
+//! and the other returns `OtlpInitError::AlreadyInitialized` (for
 //! `init_with_otlp`) or `false` (for `init`).
 
 use std::sync::Once;

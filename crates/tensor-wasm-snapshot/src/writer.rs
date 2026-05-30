@@ -287,7 +287,7 @@ pub fn payload_crc32(wasm_memory: &[u8], gpu_memory: &[u8], registers: &[u8]) ->
 ///
 /// Kept as a borrowed view so callers do not have to clone large memory blobs
 /// just to call into this crate — the writer serialises the byte slices in
-/// place via [`SnapshotRef`] and never materialises a host-side copy.
+/// place via `SnapshotRef` and never materialises a host-side copy.
 #[derive(Clone, Copy, Debug)]
 pub struct InstanceState<'a> {
     /// Tenant that owns the instance.

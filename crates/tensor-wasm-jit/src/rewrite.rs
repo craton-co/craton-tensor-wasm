@@ -36,10 +36,10 @@
 //! the full 64-bit value without needing the `multi-value` proposal.
 //!
 //! Supported parameter / result types for v0.1.0: **i32, i64, f32, f64**.
-//! v128 and reftypes are explicitly rejected by [`enc_val_type`] — the
+//! v128 and reftypes are explicitly rejected by `enc_val_type` — the
 //! detector also rejects candidates that use unsupported types, so the
 //! rewriter only sees compatible signatures by the time it gets to
-//! [`build_trampoline`].
+//! `build_trampoline`.
 //!
 //! The host-side implementations of `__tensor_wasm_jit_dispatch`, `__tensor_wasm_jit_alloc`,
 //! and `__tensor_wasm_jit_free` live in `tensor-wasm-exec`'s `jit_dispatch` module.

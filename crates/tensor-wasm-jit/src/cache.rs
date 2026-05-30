@@ -1114,7 +1114,7 @@ impl KernelCache {
 /// The caller-supplied `hmac_key` field is plain `[u8; 32]` for ergonomic
 /// construction; once handed to [`KernelCache::with_disk_persistence`] the
 /// bytes are copied into a private `Zeroizing<[u8; 32]>` inside
-/// [`DiskCache`] which wipes them on drop. The caller's own copy is the
+/// `DiskCache` which wipes them on drop. The caller's own copy is the
 /// caller's responsibility (e.g. construct via `Zeroizing::new` upstream
 /// and let it drop after the call).
 ///
@@ -1136,7 +1136,7 @@ pub struct DiskCacheConfig {
     /// jit S-3 (T13): redacted in the manual [`std::fmt::Debug`] impl
     /// below and zeroized in [`Drop`] so the construction-time copy
     /// does not linger in freed memory after the value is moved into
-    /// the long-lived [`DiskCache`].
+    /// the long-lived `DiskCache`.
     pub hmac_key: [u8; 32],
 }
 

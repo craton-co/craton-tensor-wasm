@@ -44,7 +44,7 @@ banner = (
     'edit the YAML and re-export this JSON (see scripts/regen-openapi-json.{sh,ps1}). '
     'The openapi_json_yaml_sync regression test enforces path-key parity at CI time.'
 )
-out = {'_comment': banner}
+out = {'x-comment': banner}
 out.update(doc)
 
 with open(dst, 'w', encoding='utf-8') as f:

@@ -42,7 +42,7 @@
 //! sets it. The generated PTX is **NOT verified on real GPU hardware** in
 //! this environment — its structural correctness (fragment shapes, mma.sync
 //! count, accumulator chaining, register declarations) is gated behind the
-//! differential oracle in [`crate::differential`], which MUST pass before
+//! differential oracle in `crate::differential`, which MUST pass before
 //! anyone enables this flag in a shipping path.
 //!
 //! ### wmma m16n16k16 tile / fragment contract
@@ -215,7 +215,7 @@ pub struct EmitConfig {
     /// This MUST stay `false` outside of explicitly opted-in experiments:
     /// the emitted PTX cannot be validated on a GPU here, so its
     /// correctness is gated solely behind the differential oracle's
-    /// structural assertions (see [`crate::differential`]).
+    /// structural assertions (see `crate::differential`).
     pub enable_experimental_matmul: bool,
 }
 

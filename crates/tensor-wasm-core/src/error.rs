@@ -336,7 +336,7 @@ pub enum TensorWasmError {
     /// positive without consulting any other field on the snapshot.
     ///
     /// Introduced in T9 alongside
-    /// [`tensor_wasm_snapshot::reader::SnapshotReader::with_max_age`].
+    /// `tensor_wasm_snapshot::reader::SnapshotReader::with_max_age`.
     /// The freshness check is **opt-in** — operators must set
     /// `max_age` on their reader to receive this error; the default
     /// reader continues to accept arbitrarily old snapshots for

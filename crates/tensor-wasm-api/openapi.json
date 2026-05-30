@@ -1,5 +1,5 @@
 {
-  "_comment": "Generated from openapi/tensor-wasm-api.yaml. Do NOT edit by hand -- edit the YAML and re-export this JSON (see scripts/regen-openapi-json.{sh,ps1}). The openapi_json_yaml_sync regression test enforces path-key parity at CI time.",
+  "x-comment": "Generated from openapi/tensor-wasm-api.yaml. Do NOT edit by hand -- edit the YAML and re-export this JSON (see scripts/regen-openapi-json.{sh,ps1}). The openapi_json_yaml_sync regression test enforces path-key parity at CI time.",
   "openapi": "3.1.0",
   "info": {
     "title": "TensorWasm HTTP API",

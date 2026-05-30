@@ -302,18 +302,18 @@ unsafe impl LinearMemory for TensorWasmLinearMemory {
         self.maximum_size
     }
 
-    fn grow_to(&mut self, new_size: usize) -> anyhow::Result<()> {
+    fn grow_to(&mut self, new_size: usize) -> wasmtime::Result<()> {
         if new_size > self.maximum_size {
-            return Err(anyhow::anyhow!(
+            return Err(wasmtime::Error::msg(format!(
                 "memory.grow requested {new_size} > maximum {}",
                 self.maximum_size
-            ));
+            )));
         }
         if new_size < self.current_size {
-            return Err(anyhow::anyhow!(
+            return Err(wasmtime::Error::msg(format!(
                 "memory.grow cannot shrink ({new_size} < current {})",
                 self.current_size
-            ));
+            )));
         }
         // Cross-tenant data-leak mitigation (audit H2):
         // -------------------------------------------------------------------
@@ -349,8 +349,16 @@ unsafe impl LinearMemory for TensorWasmLinearMemory {
         // borrow tracking.
         self.buffer.as_ptr() as *mut u8
     }
+}
 
-    fn wasm_accessible(&self) -> Range<usize> {
+impl TensorWasmLinearMemory {
+    /// Native address range the guest can access — the full reservation,
+    /// including the reserved-but-not-yet-grown tail. This was the
+    /// `LinearMemory::wasm_accessible` trait method in wasmtime <45; wasmtime
+    /// 45 dropped it from the trait (fault classification now derives the
+    /// range from `byte_capacity()`), so it lives here as an inherent helper
+    /// the crate's tests still assert against.
+    pub(crate) fn wasm_accessible(&self) -> Range<usize> {
         // Finding (MEDIUM, wasm_accessible reports full cap, not visible size):
         // ------------------------------------------------------------------
         // DECISION: keep the FULL reservation `[base, base + maximum_size)`;
@@ -495,18 +503,18 @@ unsafe impl LinearMemory for PooledLinearMemory {
         self.max_size
     }
 
-    fn grow_to(&mut self, new_size: usize) -> anyhow::Result<()> {
+    fn grow_to(&mut self, new_size: usize) -> wasmtime::Result<()> {
         if new_size > self.max_size {
-            return Err(anyhow::anyhow!(
+            return Err(wasmtime::Error::msg(format!(
                 "memory.grow requested {new_size} > maximum {}",
                 self.max_size
-            ));
+            )));
         }
         if new_size < self.current_size {
-            return Err(anyhow::anyhow!(
+            return Err(wasmtime::Error::msg(format!(
                 "memory.grow cannot shrink ({new_size} < current {})",
                 self.current_size
-            ));
+            )));
         }
         // Cross-tenant data-leak mitigation (audit H2): mirror the zero-fill
         // discipline of `TensorWasmLinearMemory::grow_to`. The carved slab
@@ -537,8 +545,14 @@ unsafe impl LinearMemory for PooledLinearMemory {
     fn as_ptr(&self) -> *mut u8 {
         self.base_ptr
     }
+}
 
-    fn wasm_accessible(&self) -> Range<usize> {
+impl PooledLinearMemory {
+    /// Native address range the guest can access — the full carved slab
+    /// reservation. Was `LinearMemory::wasm_accessible` in wasmtime <45;
+    /// dropped from the 45 trait, kept here as an inherent helper (see the
+    /// note on `TensorWasmLinearMemory::wasm_accessible`).
+    pub(crate) fn wasm_accessible(&self) -> Range<usize> {
         // Finding (MEDIUM, wasm_accessible reports full cap, not visible size):
         // mirror the decision documented on
         // `TensorWasmLinearMemory::wasm_accessible`. We keep the FULL carved

@@ -46,7 +46,7 @@ use std::sync::Arc;
 /// [`inner()`](Self::inner) pattern — the `Create`/`SetAttribute`/`Device`
 /// variants render an OPAQUE label via `Display` (no `{0}`) and surface
 /// the inner string only via [`Debug`](std::fmt::Debug) or the explicit
-/// [`inner()`](Self::inner) accessor. **Never expose [`inner()`] to a
+/// [`inner()`](Self::inner) accessor. **Never expose `inner()` to a
 /// tenant-facing surface** — it is for server-side operator logs only.
 #[derive(Debug, thiserror::Error)]
 pub enum MemPoolError {
