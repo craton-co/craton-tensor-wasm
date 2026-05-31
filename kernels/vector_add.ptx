@@ -1,19 +1,12 @@
 //
-// kernels/vector_add.ptx
+// vector_add.ptx
 //
-// Element-wise float32 vector addition: c[i] = a[i] + b[i]
-//
-// Canonical sm_80 (Ampere) build of the vector_add kernel, generated from
-// kernels/vector_add.cu with the CUDA 12.6 toolkit:
-//
-//   nvcc -arch=sm_80 -ptx kernels/vector_add.cu -o kernels/vector_add.ptx
-//   (or: make ptx)
-//
-// IMPORTANT — PTX ISA version vs driver: the driver JIT cannot consume PTX
-// newer than itself. nvcc 13.2 emits `.version 9.2`, rejected by this box's
-// CUDA 13.1 driver; the CUDA 12.6 toolkit emits `.version 8.5`, which it
-// accepts. See docs/GPU-VALIDATION-2026-05-30.md. Do NOT hand-edit —
-// regenerate via nvcc.
+// sm_80 (Ampere, canonical) build of kernels/vector_add.cu, generated VERBATIM by the CUDA 12.6
+// toolkit (make ptx). PTX ISA .version 8.5 is accepted by the installed CUDA
+// 13.1 driver JIT (nvcc 13.2 emits .version 9.2, which that driver rejects).
+// IMPORTANT: keep this file ASCII-only -- ptxas rejects non-ASCII bytes (e.g. a
+// U+2014 em-dash) in comments with "Parsing error near ...: syntax error". Do not
+// hand-edit; regenerate via make ptx. See docs/GPU-VALIDATION-2026-05-30.md.
 //
 
 //
@@ -70,3 +63,4 @@ $L__BB0_2:
 	ret;
 
 }
+

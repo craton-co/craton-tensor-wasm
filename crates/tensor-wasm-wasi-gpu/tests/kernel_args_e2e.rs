@@ -91,13 +91,24 @@ fn make_engine_and_linker() -> (wasmtime::Engine, wasmtime::Linker<TestStore>) {
 fn make_managed_engine_and_linker() -> (wasmtime::Engine, wasmtime::Linker<TestStore>) {
     use tensor_wasm_mem::wasm_memory::TensorWasmMemoryCreator;
     let mut config = wasmtime::Config::new();
-    // SAFETY: `TensorWasmMemoryCreator` satisfies the wasmtime `MemoryCreator`
-    // contract (it returns dedicated `cuMemAllocManaged` regions that live for
-    // the memory's lifetime). Same usage as tensor-wasm-mem's own
-    // `creator_behaviors` integration tests.
-    unsafe {
-        config.with_host_memory(std::sync::Arc::new(TensorWasmMemoryCreator::default()));
-    }
+    // `TensorWasmMemoryCreator` returns fixed-size `cuMemAllocManaged` regions
+    // that cannot satisfy wasmtime's default 4 GiB static reservation or its
+    // guard pages (the CUDA driver migrates managed pages, incompatible with
+    // host mprotect guards). Zero all three knobs so wasmtime asks the host
+    // allocator for the EXACT byte length. This is the SAME recipe
+    // tensor-wasm-exec's `MemoryBackend::UnifiedBuffer` uses (engine.rs).
+    config.with_host_memory(std::sync::Arc::new(TensorWasmMemoryCreator::default()));
+    config.guard_before_linear_memory(false);
+    config.memory_reservation(0);
+    config.memory_guard_size(0);
+    config.async_support(true);
+    // Wasmtime async host calls (`wasi_cuda_launch` -> `cuLaunchKernel`) run on
+    // the guest's fiber stack. The default 1 MiB fiber is too small once the
+    // launch actually SUCCEEDS and descends into the CUDA driver's
+    // `cuLaunchKernel` chain (the non-managed path never reached this -- it
+    // failed early with INVALID_VALUE). Give the fiber 16 MiB so a real driver
+    // dispatch cannot overflow it.
+    config.async_stack_size(16 << 20);
     let engine = wasmtime::Engine::new(&config).expect("engine");
     let mut linker: wasmtime::Linker<TestStore> = wasmtime::Linker::new(&engine);
     add_to_linker(&mut linker).expect("add_to_linker");

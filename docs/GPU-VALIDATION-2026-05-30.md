@@ -248,3 +248,57 @@ Five of seven fixed-and-verified on this box. The two that can't be verified her
 (BUG-7 launch, BUG-8 end-to-end) are both gated on the local driver's PTX JIT and
 should pass on a Linux/TCC host or the S22 self-hosted runner; the code for both
 is in place and compiles.
+
+## RESOLVED 2026-05-31 — BUG-7 + BUG-8 fixed; real kernel launch VERIFIED on GPU
+
+`vector_add_end_to_end_real_ptx_real_kernel` now **passes on the RTX 2060**: a
+real CUDA kernel launches through the full Wasm -> wasi:cuda -> cuLaunchKernel
+path and the test verifies `c[i] == a[i] + b[i]` read back from managed linear
+memory. The whole `kernel_args_e2e` suite is 8/8 green. This is the headline
+WASM->GPU proof the validation effort set out to establish.
+
+BUG-7 was NOT an environment limitation (my earlier conclusion was wrong). Two
+real causes, both fixed:
+1. **Non-ASCII bytes in the PTX.** The committed fixtures had a hand-written
+   header comment containing a U+2014 em-dash. `ptxas`/the driver JIT rejects
+   non-ASCII bytes anywhere in the PTX image with `CUDA_ERROR_INVALID_PTX`.
+   Fix: fixtures are now generated VERBATIM by nvcc (pure ASCII) from
+   `kernels/vector_add.cu`, with an ASCII-only provenance header.
+2. **PTX ISA version vs driver.** nvcc 13.2 emits `.version 9.2`, which this
+   box's CUDA 13.1 driver rejects (`UNSUPPORTED_PTX_VERSION`, surfaced by cust
+   as `UnknownError`). Fix: generate with the CUDA 12.6 toolkit (`.version 8.5`),
+   which the 13.1 driver accepts. sm_75 target matches the device.
+
+BUG-8 required three things, all now in `make_managed_engine_and_linker`:
+1. Guest linear memory backed by `cuMemAllocManaged` via `TensorWasmMemoryCreator`
+   (`Config::with_host_memory`), so kernel pointer-args are device-addressable.
+2. The wasmtime engine knobs the UnifiedBuffer backend needs (mirrors
+   `tensor-wasm-exec`'s engine.rs): `memory_reservation(0)`,
+   `memory_guard_size(0)`, `guard_before_linear_memory(false)` — managed memory
+   cannot satisfy the default 4 GiB static reservation or host mprotect guards.
+   Plus `async_support(true)` for the async launch path.
+3. A SINGLE CUDA context shared between module-load and launch: the test's
+   `ensure_cuda_initialized` now routes through `cuda_ctx::ensure_current_context`
+   (the same primary-context helper the launch path uses). Loading the module in
+   one context and launching its function on a stream from another context fails
+   `cuLaunchKernel` with `INVALID_VALUE`.
+
+### Final scoreboard (RTX 2060 / Windows / WDDM / CUDA 13.1 driver)
+
+| # | Status |
+|---|---|
+| BUG-1 (per-tenant cap) | fixed + verified on GPU |
+| BUG-2 (`--features cuda` compile) | fixed + verified |
+| BUG-6 (cust ctx thread-bind) | fixed + verified (shared ctx now exercised by the passing launch) |
+| BUG-7 (PTX rejected by JIT) | **fixed + VERIFIED: real kernel launches** |
+| BUG-8 (managed-backed guest mem) | **fixed + VERIFIED: launch output correct** |
+| BUG-9 (cudarc alloc ctx bind) | fixed + verified on GPU |
+| BUG-10 (`cuMemPrefetchAsync` on WDDM) | fixed + verified on GPU |
+
+Remaining known issue (separate, pre-existing, NOT a BUG-7/8 regression):
+`host::tests::alloc_tracks_handle_then_free_lifecycle` and
+`wasi_gpu_smoke::sync_returns_ok_without_cuda` hard-code the no-CUDA return value
+and now fail under `--features cuda` precisely BECAUSE the device path works
+(alloc returns a real handle, sync returns 0). These are the BUG-4 class; they
+each need a `#[cfg(feature = "cuda")]` arm. The `kernel_args_e2e` integration
+suite (which contains the launch proof) is fully green.
