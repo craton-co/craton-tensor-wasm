@@ -1819,6 +1819,64 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
         // the duration of the call (the `Arc<Module>` clone held in
         // `handle` keeps the module alive across the launch).
         use cust::sys as cuda_sys;
+
+        // SECURITY (cross-tenant context poisoning / DoS) — verify every
+        // pointer argument is actually GPU-dereferenceable (CUDA managed
+        // memory) BEFORE handing it to `cuLaunchKernel`.
+        //
+        // The argv pointer path resolves guest offsets to host addresses inside
+        // the guest's linear memory. Those double as device addresses ONLY when
+        // that linear memory is `cuMemAllocManaged`-backed (the unified-memory
+        // `MemoryCreator`). If an embedder runs `--features cuda` with plain
+        // host-heap linear memory, the addresses are not valid on the GPU and
+        // `cuLaunchKernel` makes the kernel dereference host memory, raising
+        // `CUDA_ERROR_ILLEGAL_ADDRESS`. That error is STICKY: it poisons the
+        // process-shared CUDA context, so every later CUDA op by EVERY tenant in
+        // the process then fails. A single guest could thus take down GPU
+        // offload for the whole host. (This is also what intermittently broke
+        // the launch e2e suite when an earlier test launched against host-heap
+        // memory — the poisoned context failed the next test's module load.)
+        //
+        // We reject such a launch up front — before any driver launch state is
+        // touched — so one guest cannot corrupt the context for others. Managed
+        // pointers cost one cheap `cuPointerGetAttribute` query each. The
+        // `docs/RISKS.md` "linear memory must be UVM-backed" constraint was
+        // documented but unenforced; this is the enforcement.
+        for arg in &lowered_args {
+            if let LoweredArg::Ptr { host_ptr, .. } = arg {
+                let mut is_managed: std::os::raw::c_int = 0;
+                // SAFETY: `is_managed` is a valid, correctly-typed out-param for
+                // the IS_MANAGED attribute (a 32-bit int). `host_ptr` was
+                // bounds-checked into the guest's live linear memory by
+                // `parse_argv`. `cuPointerGetAttribute` only reads driver
+                // bookkeeping for the address — it never dereferences it.
+                let res = unsafe {
+                    cuda_sys::cuPointerGetAttribute(
+                        &mut is_managed as *mut std::os::raw::c_int
+                            as *mut std::ffi::c_void,
+                        cuda_sys::CUpointer_attribute_enum::CU_POINTER_ATTRIBUTE_IS_MANAGED,
+                        *host_ptr as cuda_sys::CUdeviceptr,
+                    )
+                };
+                // Host-heap pointers are unknown to the driver and return
+                // `CUDA_ERROR_INVALID_VALUE`; managed pointers return success
+                // with `is_managed == 1`. Either non-success or `is_managed == 0`
+                // means the address is not safe to launch against.
+                if res != cuda_sys::CUresult::CUDA_SUCCESS || is_managed == 0 {
+                    caller.data().wasi_cuda().record_error(format!(
+                        "launch: kernel pointer argument is not GPU-addressable \
+                         (cuPointerGetAttribute IS_MANAGED -> {res:?}, \
+                         is_managed={is_managed}); refusing to launch so an invalid \
+                         device pointer cannot raise a sticky CUDA_ERROR_ILLEGAL_ADDRESS \
+                         that would poison the shared CUDA context for all tenants. Back \
+                         guest linear memory with the unified-memory MemoryCreator \
+                         (enable the `unified-memory` feature on tensor-wasm-mem)."
+                    ));
+                    return Err(AbiError::LaunchFailed);
+                }
+            }
+        }
+
         let launch_status = unsafe {
             cuda_sys::cuLaunchKernel(
                 // cust 0.3.2 exposes the raw CUfunction handle via `to_raw()`

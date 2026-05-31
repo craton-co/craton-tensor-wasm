@@ -363,3 +363,55 @@ attempted: give the launch/`from_ptx` path its own explicitly-created context
 (not the primary context shared with `cust`'s `quick_init`/drop lifecycle), or
 make every CUDA-using test acquire the context through one owner that never
 drops it. Tracked; does not block the launch proof.
+
+## RESOLVED 2026-05-31 — device-addressability guard fixes the full-file flake (a real bug)
+
+The intermittent full-file launch failure was **not** a test artifact. It was a
+real production defect with a security dimension, now fixed and verified.
+
+**Mechanism.** `dispatch_pipeline_compiles_against_real_module_bytes` launches a
+real `vector_add` module with pointer args into PLAIN host-heap linear memory
+(the default engine — no unified-memory `MemoryCreator`). The host's launch path
+bounds-checked those pointers against linear memory but did **not** verify they
+were GPU-addressable, and handed them straight to `cuLaunchKernel`. The kernel
+then dereferenced host addresses on the device, raising
+`CUDA_ERROR_ILLEGAL_ADDRESS` — a **sticky** error that poisons the process-shared
+CUDA context, so every later CUDA op fails. libtest does not fix test order, so
+this sometimes ran before `vector_add_end_to_end_real_ptx_real_kernel` and broke
+it (`InvalidContext`/`IllegalAddress`) → the intermittent failure.
+
+**Why it matters beyond tests (cross-tenant DoS).** In a multi-tenant deployment
+that runs `--features cuda` but backs Wasm linear memory with host heap (i.e.
+without `tensor-wasm-mem/unified-memory`), ANY guest could pass an in-bounds
+pointer arg to a kernel launch and trigger this sticky illegal-access, poisoning
+the GPU context for **every other tenant in the process**. `docs/RISKS.md`
+documented the "linear memory must be UVM-backed" constraint but nothing
+*enforced* it.
+
+**The fix (production code, `host::launch`).** Before `cuLaunchKernel`, each
+pointer arg is checked with
+`cuPointerGetAttribute(CU_POINTER_ATTRIBUTE_IS_MANAGED, host_ptr)`. Host-heap
+pointers are unknown to the driver (`INVALID_VALUE`); managed pointers return
+`is_managed == 1`. A launch with any non-managed pointer arg is refused up front
+with `AbiError::LaunchFailed` — no driver launch state is touched, so no sticky
+error and no context poison. One cheap driver query per pointer arg.
+
+**Verification (clean, serialized — no build contention).** Built the cuda test
+binary ONCE, then ran the prebuilt binary 12× back-to-back:
+
+```
+EXE=target/release/deps/kernel_args_e2e-*.exe
+for i in 1..12: $EXE --include-ignored --test-threads=1
+=> CLEAN_FINAL: pass=12 fail=0 of 12
+```
+
+All 8 tests (incl. `vector_add_end_to_end_real_ptx_real_kernel`, the real
+WASM->cuLaunchKernel launch) pass 12/12. `dispatch_pipeline_compiles_against_real_module_bytes`
+is deliberately kept on the host-heap engine so it exercises the guard, and now
+asserts the launch is refused (`rc != 0`, never `InvalidArgs`/`InvalidPointer`).
+
+NOTE on an earlier interim "9/10": that single failure was **build contention**,
+not a test failure — two concurrent `cargo` invocations against one `target/`
+dir produced `STATUS_STACK_BUFFER_OVERRUN` / `LNK1181 ...rcgu.o.rcgu.o`
+(corrupted object files) during *compilation*. Every run whose binary actually
+built passed 8/8. The clean serialized 12/12 above is the authoritative result.

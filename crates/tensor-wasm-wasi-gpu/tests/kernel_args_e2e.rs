@@ -981,8 +981,38 @@ async fn dispatch_pipeline_compiles_against_real_module_bytes() {
 
     #[cfg(feature = "cuda")]
     {
+        // This test drives a real `vector_add` module with POINTER args, but
+        // backs guest linear memory with the plain host-heap engine
+        // (`make_engine_and_linker`) — NOT the unified-memory creator. That is
+        // exactly the dangerous combination the host-side device-addressability
+        // guard in `host::launch` refuses: those host-heap pointers are not
+        // valid device addresses, so letting `cuLaunchKernel` run would raise a
+        // sticky `CUDA_ERROR_ILLEGAL_ADDRESS` that poisons the process-shared
+        // CUDA context (the root cause of the old full-file launch flake and a
+        // cross-tenant DoS). So under `--features cuda` the launch must be
+        // REFUSED, never succeed.
+        //
+        // Acceptable refusals:
+        // - `LaunchFailed` — the guard rejected the non-managed pointer arg
+        //   (the happy path for this test on any GPU), OR `cuLaunchKernel`
+        //   itself rejected the launch.
+        // - `MalformedPtx` / `InvalidKernel` — the module failed to JIT on this
+        //   device (older driver), so the kernel was registered `module: None`
+        //   and the launch never reached the guard.
+        //
+        // `0` (success) is explicitly forbidden: it would mean a launch against
+        // non-device-addressable memory was allowed through. `InvalidArgs` /
+        // `InvalidPointer` are forbidden too — those would mean the typed-argv
+        // marshalling regressed before the call reached the driver.
+        assert_ne!(
+            rc, 0,
+            "a real-module pointer-arg launch against NON-managed (host-heap) \
+             linear memory must be refused by the device-addressability guard, \
+             not silently succeed (would risk a context-poisoning \
+             CUDA_ERROR_ILLEGAL_ADDRESS). last_error: {:?}",
+            store.data().wasi_cuda().last_error()
+        );
         let allowed = [
-            0_i32,
             AbiError::MalformedPtx.code(),
             AbiError::InvalidKernel.code(),
             AbiError::LaunchFailed.code(),
@@ -990,7 +1020,7 @@ async fn dispatch_pipeline_compiles_against_real_module_bytes() {
         assert!(
             allowed.contains(&rc),
             "CUDA host: launch return code must be one of {allowed:?} \
-             (Ok / MalformedPtx / InvalidKernel / LaunchFailed); got {rc}. \
+             (MalformedPtx / InvalidKernel / LaunchFailed); got {rc}. \
              Anything else (InvalidArgs / InvalidPointer / NotAvailable) \
              indicates the typed-argv marshalling regressed before the call \
              reached the CUDA driver. last_error: {:?}",
