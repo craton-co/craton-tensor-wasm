@@ -269,12 +269,13 @@ cargo test -p tensor-wasm-wasi-gpu --features cuda --test kernel_args_e2e \
 
 KNOWN-FLAKY in the full-file run (NOT yet resolved). When the entire
 `kernel_args_e2e` file runs in one process, the launch test passes only
-intermittently — measured 2/5 (`8 passed`) vs 3/5 (`7 passed; 1 failed`, the
-launch test failing at `Module::from_ptx` with `InvalidContext`/`IllegalAddress`).
-This is a cross-test CUDA context/managed-memory lifecycle race in the test
-binary, NOT a defect in the launch path itself (which the isolation run proves
-correct every time). See "Full-file ordering" below — partially mitigated, root
-cause still open.
+intermittently — **measured 4/10 pass over 10 consecutive runs** (the 6 failures
+are the launch test alone, failing at `Module::from_ptx` with
+`InvalidContext`/`IllegalAddress`; the other 7 tests pass every run). This is a
+cross-test CUDA context/managed-memory lifecycle race in the test binary, NOT a
+defect in the launch path itself (which the isolation run proves correct every
+time). See "Full-file ordering" below — partially mitigated, root cause still
+open.
 
 BUG-7 was NOT an environment limitation (my earlier conclusion was wrong). Two
 real causes, both fixed:
@@ -350,9 +351,9 @@ A third change PARTIALLY mitigated the full-file flake (but did not eliminate it
    refcount never reaches zero. The e2e test's `ensure_cuda_initialized` routes
    through this shared helper too.
 
-HONEST RESULT: this changed the full-file launch test from *always* failing
-(0/5) to *intermittently* passing (measured 2/5 `8 passed`, 3/5
-`7 passed; 1 failed`). It is **still flaky** — the failure now also appears as
+HONEST RESULT: this changed the full-file launch test from *always* failing to
+*intermittently* passing — **measured 4/10 pass over 10 consecutive full-file
+runs**. It is **still flaky** — the failure now also appears as
 `IllegalAddress`, pointing at a deeper cross-test interaction (a managed
 allocation or stream/event from an earlier test outliving its context, or a
 context teardown racing the next test's bind). The isolation run is the
