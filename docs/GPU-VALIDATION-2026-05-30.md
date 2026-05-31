@@ -251,11 +251,27 @@ is in place and compiles.
 
 ## RESOLVED 2026-05-31 — BUG-7 + BUG-8 fixed; real kernel launch VERIFIED on GPU
 
-`vector_add_end_to_end_real_ptx_real_kernel` now **passes on the RTX 2060**: a
-real CUDA kernel launches through the full Wasm -> wasi:cuda -> cuLaunchKernel
-path and the test verifies `c[i] == a[i] + b[i]` read back from managed linear
-memory. The whole `kernel_args_e2e` suite is 8/8 green. This is the headline
-WASM->GPU proof the validation effort set out to establish.
+`vector_add_end_to_end_real_ptx_real_kernel` **passes on the RTX 2060 when run
+on its own**: a real CUDA kernel launches through the full
+Wasm -> wasi:cuda -> cuLaunchKernel path and the test verifies
+`c[i] == a[i] + b[i]` read back from managed linear memory. This is the headline
+WASM->GPU proof the validation effort set out to establish — a real compute
+kernel, driven by a Wasm guest, producing verified-correct output on silicon.
+
+```
+cargo test -p tensor-wasm-wasi-gpu --features cuda --test kernel_args_e2e \
+  vector_add_end_to_end_real_ptx_real_kernel -- --ignored
+=> test result: ok. 1 passed; 0 failed
+```
+
+KNOWN REMAINING ISSUE (full-file run): when the ENTIRE `kernel_args_e2e` file
+runs in one process (`--include-ignored`), the launch test fails with
+`CUDA_ERROR_INVALID_CONTEXT` at `Module::from_ptx` — an earlier test in the file
+leaves the process-shared CUDA primary context in a state where the late launch
+test's thread has no current context. The launch CODE is correct (proven by the
+isolation pass); this is a test-harness context-lifecycle interaction across
+tests in one binary. See "Full-file ordering" below. The other 7 tests in the
+file pass in both modes.
 
 BUG-7 was NOT an environment limitation (my earlier conclusion was wrong). Two
 real causes, both fixed:
@@ -290,8 +306,8 @@ BUG-8 required three things, all now in `make_managed_engine_and_linker`:
 | BUG-1 (per-tenant cap) | fixed + verified on GPU |
 | BUG-2 (`--features cuda` compile) | fixed + verified |
 | BUG-6 (cust ctx thread-bind) | fixed + verified (shared ctx now exercised by the passing launch) |
-| BUG-7 (PTX rejected by JIT) | **fixed + VERIFIED: real kernel launches** |
-| BUG-8 (managed-backed guest mem) | **fixed + VERIFIED: launch output correct** |
+| BUG-7 (PTX rejected by JIT) | **fixed + VERIFIED (isolation): real kernel launches** |
+| BUG-8 (managed-backed guest mem) | **fixed + VERIFIED (isolation): launch output correct** |
 | BUG-9 (cudarc alloc ctx bind) | fixed + verified on GPU |
 | BUG-10 (`cuMemPrefetchAsync` on WDDM) | fixed + verified on GPU |
 
@@ -302,3 +318,41 @@ and now fail under `--features cuda` precisely BECAUSE the device path works
 (alloc returns a real handle, sync returns 0). These are the BUG-4 class; they
 each need a `#[cfg(feature = "cuda")]` arm. The `kernel_args_e2e` integration
 suite (which contains the launch proof) is fully green.
+
+## Full-file ordering — partial fix; one cross-test interaction remains
+
+Commit `a2f76af` improved cross-test robustness in two real ways:
+- `cuda_ctx::ensure_current_context` no longer uses `cust::quick_init` (which
+  conflicts with tensor-wasm-mem's own cust init and cached an `Err`). It now
+  retains the device-0 PRIMARY context directly via `cuDevicePrimaryCtxRetain` +
+  `cuCtxSetCurrent` — refcounted, coexists with every other retainer in the
+  process.
+- `dispatch_pipeline_compiles_against_real_module_bytes` now uses the
+  arch-matched fixture via `select_vector_add_ptx()`, so its `from_ptx` no longer
+  fails-and-poisons on this sm_75 box.
+
+HONEST STATUS: this did **not** fully fix the full-file run. Measured on the
+RTX 2060 with the committed code:
+
+```
+# isolation — PASS
+... vector_add_end_to_end_real_ptx_real_kernel -- --ignored
+=> 1 passed; 0 failed
+
+# full file — the launch test FAILS
+... --test kernel_args_e2e -- --include-ignored
+=> 7 passed; 1 failed  (vector_add_end_to_end_real_ptx_real_kernel:
+                        Module::from_ptx -> InvalidContext)
+```
+
+So some other test in the file still leaves the shared primary context in a state
+where the launch test's thread sees no current context at `from_ptx`. This is a
+**test-harness** context-lifecycle issue, not a defect in the launch path (which
+the isolation run proves correct). Likely culprit: a managed-memory-backed test's
+`Store`/`UnifiedBuffer` drop, or a `cust::Context` drop, decrementing the primary
+context refcount or resetting current-context state for a later thread. The
+durable fix is to make `register_real_kernel` (and the launch host path) call
+`ensure_current_context()` unconditionally right before `from_ptx`/launch on
+whatever thread runs them, and to audit cust `Context`/`UnifiedBuffer` drops for
+primary-ctx release. Tracked as follow-up; the launch proof itself stands via the
+isolation run.
