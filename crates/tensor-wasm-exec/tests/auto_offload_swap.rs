@@ -113,16 +113,35 @@ async fn auto_offload_rewrites_and_runs_hot_module() {
     // `add(a, b) -> i32`, the offloaded result is `a` — distinct from the CPU
     // sum `a + b` whenever `b != 0`, which is exactly what proves the
     // trampoline (not the original body) executed.
-    let out = exec
-        .call_export_with_args(id, "add", &[WasmArg::I32(7), WasmArg::I32(5)])
-        .await
-        .expect("offloaded add must run without trapping");
-    assert_eq!(
-        first_i32(&out),
-        7,
-        "offloaded add must return the dispatch stub's echoed first arg (7), \
-         not the CPU sum (12) — proving the trampoline executed",
-    );
+    #[cfg(feature = "cuda")]
+    {
+        let out = exec
+            .call_export_with_args(id, "add", &[WasmArg::I32(7), WasmArg::I32(5)])
+            .await
+            .expect("offloaded add must run without trapping");
+        assert_eq!(
+            first_i32(&out),
+            7,
+            "offloaded add must return the dispatch stub's echoed first arg (7), \
+             not the CPU sum (12) — proving the trampoline executed",
+        );
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        // On no-CUDA builds, a cache hit deopts and traps to prevent silently
+        // returning wrong (echoed) data — see the correctness stub fix in `jit_dispatch.rs`.
+        let err = exec
+            .call_export_with_args(id, "add", &[WasmArg::I32(7), WasmArg::I32(5)])
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("wasm trap: wasm `unreachable` instruction executed")
+                || msg.contains("unreachable"),
+            "no-CUDA offload must trap with unreachable, got: {msg}"
+        );
+    }
 
     exec.terminate(id).await.expect("terminate");
 }

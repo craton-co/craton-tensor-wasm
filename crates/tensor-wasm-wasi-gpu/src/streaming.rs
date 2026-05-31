@@ -131,7 +131,7 @@ impl StreamingContext {
     ///   added to [`Self::bytes_emitted`].
     /// * `-1` if streaming is disabled (no channel attached).
     /// * `-2` if accepting this chunk would push the total past
-    ///   [`Self::max_total`]. The counter is rolled back afterward.
+    ///   `max_total`. The counter is rolled back afterward.
     /// * `-3` if the receiver has been dropped — the downstream HTTP
     ///   client disconnected. The counter is rolled back symmetrically.
     ///
@@ -423,7 +423,7 @@ pub trait HasInput {
 ///
 /// `read-input` bounds-checks the `(ptr, len)` destination region against
 /// the guest's exported `"memory"` with the same `checked_add` pattern as
-/// [`prepare_emit_chunk`] and the wasi-cuda `read_bytes` path, returning
+/// `prepare_emit_chunk` and the wasi-cuda `read_bytes` path, returning
 /// [`AbiError::InvalidPointer`] (`-2`) on any out-of-bounds / overflow /
 /// missing-memory failure. A successful copy returns the number of bytes
 /// written (`min(len, input-len())`); `0` means "nothing staged" or

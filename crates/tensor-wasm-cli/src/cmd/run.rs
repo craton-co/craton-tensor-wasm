@@ -73,7 +73,11 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let wasm = std::fs::read(&args.file)
         .with_context(|| format!("reading wasm file {}", args.file.display()))?;
 
-    let engine = Arc::new(TensorWasmEngine::new().context("constructing TensorWasmEngine")?);
+    let engine = Arc::new(
+        TensorWasmEngine::new()
+            .map_err(|e| anyhow::anyhow!("{e:#}"))
+            .context("constructing TensorWasmEngine")?,
+    );
     let executor = TensorWasmExecutor::new(engine);
 
     // T33 (v0.4): the typed argument list is also attached to the

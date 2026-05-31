@@ -18,7 +18,7 @@
 //! # Wiring
 //!
 //! [`SchedulerContext`] is the per-instance host state. The executor
-//! constructs one at spawn time from [`SpawnConfig::deadline`] and
+//! constructs one at spawn time from `SpawnConfig::deadline` and
 //! stashes it on its store-data payload (typically `InstanceState` in
 //! `tensor-wasm-exec`). The host functions registered by
 //! [`add_scheduler_to_linker`] reach the context through a closure-
@@ -80,7 +80,7 @@ pub const SUGGESTED_YIELD_THRESHOLD_MS: u64 = 10;
 /// `started_at` and `deadline_ms` fields are immutable for the life of
 /// a call: the executor constructs a fresh context per call-export to
 /// match how the epoch deadline is re-armed in
-/// [`tensor_wasm_exec::executor::TensorWasmExecutor::call_export`].
+/// `TensorWasmExecutor::call_export`.
 #[derive(Debug, Clone)]
 pub struct SchedulerContext {
     /// Wall-clock instant the invocation was started.
@@ -118,7 +118,7 @@ impl SchedulerContext {
     /// `deadline_ms = None` produces an unbounded context: every
     /// `yield()` returns [`YIELD_CODE_CONTINUE`] and
     /// `deadline_remaining_ms()` returns `u32::MAX`. This is the
-    /// shape spawns without a [`SpawnConfig::deadline`] get.
+    /// shape spawns without a `SpawnConfig::deadline` get.
     pub fn new(deadline_ms: Option<u32>) -> Self {
         Self {
             started_at: Instant::now(),
@@ -172,9 +172,9 @@ impl SchedulerContext {
     /// Re-arm the start instant. The executor calls this at the top
     /// of each `call_export` so back-to-back calls each get a fresh
     /// wall-clock window — mirroring how
-    /// [`tensor_wasm_exec::instance::InstanceState::deadline`] is
+    /// `InstanceState::deadline` is
     /// re-seeded in
-    /// [`tensor_wasm_exec::executor::TensorWasmExecutor::call_export`].
+    /// `TensorWasmExecutor::call_export`.
     pub fn rearm(&mut self) {
         self.started_at = Instant::now();
         // Yield count is cumulative across calls on the same context;

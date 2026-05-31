@@ -472,11 +472,11 @@ fn json_carries_do_not_edit_banner() {
     // started authoring the JSON directly. Fail loud.
     let json = read_json();
     let comment = json
-        .get("_comment")
+        .get("x-comment")
         .and_then(Value::as_str)
         .unwrap_or_else(|| {
             panic!(
-                "openapi.json is missing the `_comment` regen banner. \
+                "openapi.json is missing the `x-comment` regen banner. \
                  Re-run scripts/regen-openapi-json.sh (or .ps1) to refresh \
                  the JSON from openapi/tensor-wasm-api.yaml."
             )
@@ -735,8 +735,8 @@ components:
 ";
     let sec = parse_yaml_operation_security(yaml);
     assert_eq!(sec.get("get /open"), Some(&SecuritySpec::Empty));
-    // Inherit -> absent from the map entirely.
-    assert_eq!(sec.get("get /inherit"), None);
+    // Inherit -> Absent in the map.
+    assert_eq!(sec.get("get /inherit"), Some(&SecuritySpec::Absent));
     let schemes: BTreeSet<String> = ["ApiKey", "BearerAuth"]
         .iter()
         .map(|s| s.to_string())
@@ -747,7 +747,7 @@ components:
     );
     // The `security: []` buried under components.schemas.Foo must NOT
     // leak in -- the scanner only walks the paths block.
-    assert_eq!(sec.len(), 2);
+    assert_eq!(sec.len(), 3);
 }
 
 #[test]

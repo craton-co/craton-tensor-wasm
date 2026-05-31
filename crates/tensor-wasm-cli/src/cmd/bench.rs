@@ -49,7 +49,11 @@ pub async fn run(args: BenchArgs) -> Result<()> {
     }
     let wasm = std::fs::read(&args.file)
         .with_context(|| format!("reading wasm file {}", args.file.display()))?;
-    let engine = Arc::new(TensorWasmEngine::new().context("constructing TensorWasmEngine")?);
+    let engine = Arc::new(
+        TensorWasmEngine::new()
+            .map_err(|e| anyhow::anyhow!("{e:#}"))
+            .context("constructing TensorWasmEngine")?,
+    );
     let executor = TensorWasmExecutor::new(engine);
 
     let mut samples: Vec<Duration> = Vec::with_capacity(args.n);

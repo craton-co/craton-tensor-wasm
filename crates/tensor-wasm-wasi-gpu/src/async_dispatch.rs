@@ -463,7 +463,7 @@ impl Drop for BorrowedDispatchPermit<'_> {
 /// A future representing an in-flight GPU dispatch.
 ///
 /// On the no-CUDA stub path this resolves immediately. On CUDA hosts the
-/// future polls a [`cust::event::Event`] recorded on the launch stream:
+/// future polls a `cust::event::Event` recorded on the launch stream:
 /// `event.query()` returns `Ok(())` once the GPU has finished the
 /// associated work. Until then we re-schedule via the waker so the
 /// wasmtime fiber can continue to be suspended.

@@ -114,22 +114,38 @@ if (-not $SkipImageBuild -or -not $imageExists) {
     if ($LASTEXITCODE -ne 0) { Write-Error 'CI image build failed'; exit 1 }
 }
 
-# Assemble the single-line in-container program (no embedded double quotes, no
-# real newlines -> safe to pass as one argv from PowerShell 5.1).
-$prog = 'set -uo pipefail; rc=0; failed=""; '
+# Build a proper multi-line shell script and pipe it via stdin.
+# This sidesteps PowerShell's double-quote mangling when passing arguments
+# to external processes (the bash -c $prog approach breaks whenever $prog
+# contains any " because PowerShell corrupts them on the way to docker).
+$q  = [char]34  # " — avoids confusing PowerShell's own string parser
+$nl = "`n"
+
+$script  = "set -uo pipefail${nl}"
+$script += "rc=0${nl}"
+$script += "failed=${q}${q}${nl}"
+
 foreach ($job in $selected) {
     $cmd = Get-JobCmd $job
-    $prog += "printf '\n\033[1;36m===> ci job: %s\033[0m\n' '$job'; "
-    $prog += "if $cmd; then printf '\033[1;32m===> %s: OK\033[0m\n' '$job'; "
-    $prog += "else printf '\033[1;31m===> %s: FAILED\033[0m\n' '$job'; rc=1; failed=`"`${failed} $job`";"
-    if ($FailFast) { $prog += ' exit 1;' }
-    $prog += ' fi; '
+    $script += "printf ${q}\n\033[1;36m===> ci job: $job\033[0m\n${q}${nl}"
+    $script += "if $cmd; then${nl}"
+    $script += "    printf ${q}\033[1;32m===> $($job): OK\033[0m\n${q}${nl}"
+    $script += "else${nl}"
+    $script += "    printf ${q}\033[1;31m===> $($job): FAILED\033[0m\n${q}${nl}"
+    $script += "    rc=1${nl}"
+    $script += "    failed=${q}`$failed $job${q}${nl}"
+    if ($FailFast) { $script += "    exit 1${nl}" }
+    $script += "fi${nl}"
 }
-$prog += 'if [ -n "$failed" ]; then printf "\n\033[1;31m===> CI FAILED:%s\033[0m\n" "$failed"; else printf "\n\033[1;32m===> CI OK (all jobs passed)\033[0m\n"; fi; '
-$prog += 'exit $rc;'
+$script += "if [ -n ${q}`$failed${q} ]; then${nl}"
+$script += "    printf ${q}\n\033[1;31m===> CI FAILED: %s\033[0m\n${q} ${q}`$failed${q}${nl}"
+$script += "else${nl}"
+$script += "    printf ${q}\n\033[1;32m===> CI OK (all jobs passed)\033[0m\n${q}${nl}"
+$script += "fi${nl}"
+$script += "exit `$rc${nl}"
 
 Write-Host ">> running CI jobs: $($selected -join ', ')"
-& docker run --rm -t `
+$script | & docker run --rm -i `
     -v "${RepoRoot}:/work" `
     -v "${TargetVolume}:/cargo-target" `
     -v "${CargoVolume}:/cargo-home" `
@@ -138,6 +154,6 @@ Write-Host ">> running CI jobs: $($selected -join ', ')"
     -e CARGO_TERM_COLOR=always `
     -e "RUSTFLAGS=-D warnings" `
     -w /work `
-    $Image bash -c $prog
+    $Image bash
 
 exit $LASTEXITCODE

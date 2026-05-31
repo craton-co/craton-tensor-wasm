@@ -17,7 +17,7 @@ use std::time::Duration;
 use tensor_wasm_mem::wasm_memory::TensorWasmMemoryCreator;
 use tokio::task::JoinHandle;
 use wasmtime::{
-    Config, Engine, InstanceAllocationStrategy, MpkEnabled, PoolingAllocationConfig, Strategy,
+    Config, Enabled, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Strategy,
 };
 
 /// Default epoch tick. Matches the plan's 10 ms cadence.
@@ -365,11 +365,11 @@ impl TensorWasmEngine {
                 // slot. The pooling allocator caps `table_elements` at a
                 // `u32`, so saturate on the cast.
                 pooling.total_tables(max_memories);
-                let table_elems = (effective as u64 / TABLE_ENTRY_BYTES)
+                let table_elems: usize = (effective as u64 / TABLE_ENTRY_BYTES)
                     .try_into()
-                    .unwrap_or(u32::MAX);
+                    .unwrap_or(usize::MAX);
                 pooling.table_elements(table_elems);
-                pooling.memory_protection_keys(MpkEnabled::Auto);
+                pooling.memory_protection_keys(Enabled::Auto);
                 wt_cfg.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
             }
         }

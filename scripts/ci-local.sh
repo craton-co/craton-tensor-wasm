@@ -59,6 +59,18 @@ DOCKERFILE="${REPO_ROOT}/docker/ci.Dockerfile"
 TARGET_VOLUME="tensor-wasm-ci-target"
 CARGO_VOLUME="tensor-wasm-ci-cargo"
 
+# On Windows/MSYS, MSYS_NO_PATHCONV=1 (exported below) stops Git-Bash from
+# auto-converting Unix-style paths to Windows paths.  Docker needs native
+# Windows paths for the build context, Dockerfile flag, and volume source,
+# so convert them explicitly with cygpath when available.
+if command -v cygpath >/dev/null 2>&1; then
+    REPO_ROOT_WIN="$(cygpath -w "${REPO_ROOT}")"
+    DOCKERFILE_WIN="$(cygpath -w "${DOCKERFILE}")"
+else
+    REPO_ROOT_WIN="${REPO_ROOT}"
+    DOCKERFILE_WIN="${DOCKERFILE}"
+fi
+
 # Keep this list aligned with the job dispatch in run_job() below and with
 # .github/workflows/ci.yml.
 ALL_JOBS=(fmt clippy test doc deny cuda-oxide openapi actionlint)
@@ -121,9 +133,9 @@ fi
 
 if [[ "${SKIP_IMAGE_BUILD}" == "0" ]] || ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
     echo ">> building ${IMAGE} (Docker layer cache makes this near-instant when docker/ci.Dockerfile is unchanged)"
-    build_args=(build -f "${DOCKERFILE}" -t "${IMAGE}")
+    build_args=(build -f "${DOCKERFILE_WIN}" -t "${IMAGE}")
     [[ "${PULL}" == "1" ]] && build_args+=(--pull)
-    build_args+=("${REPO_ROOT}/docker")
+    build_args+=("${REPO_ROOT_WIN}\\docker")
     docker "${build_args[@]}"
 fi
 
@@ -156,7 +168,7 @@ exit $rc;'
 
 echo ">> running CI jobs: ${JOBS[*]}"
 docker run --rm -t \
-    -v "${REPO_ROOT}:/work" \
+    -v "${REPO_ROOT_WIN}:/work" \
     -v "${TARGET_VOLUME}:/cargo-target" \
     -v "${CARGO_VOLUME}:/cargo-home" \
     -e CARGO_TARGET_DIR=/cargo-target \

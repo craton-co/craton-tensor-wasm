@@ -677,9 +677,9 @@ impl ResourceLimiter for TensorWasmResourceLimiter {
 
     fn table_growing(
         &mut self,
-        _current: u32,
-        desired: u32,
-        maximum: Option<u32>,
+        _current: usize,
+        desired: usize,
+        maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
         // Cap table growth proportionally to the per-instance memory budget.
         // Each table entry costs ~16 bytes of host memory on wasmtime (a
@@ -696,7 +696,7 @@ impl ResourceLimiter for TensorWasmResourceLimiter {
         // Shared with the pooling allocator's `table_elements` derivation in
         // `engine.rs` (MED finding) so both backends budget tables against
         // the same per-instance byte ceiling.
-        let bytes_needed = u64::from(desired).saturating_mul(crate::engine::TABLE_ENTRY_BYTES);
+        let bytes_needed = (desired as u64).saturating_mul(crate::engine::TABLE_ENTRY_BYTES);
         if bytes_needed > self.engine_max as u64 {
             return Ok(false);
         }
@@ -2704,7 +2704,7 @@ mod tests {
         // 1 MiB engine cap → at 16 B/entry that's ~65k table entries max.
         // u32::MAX (~4.3 billion entries × 16 B = ~64 GiB) must be denied.
         let mut lim = TensorWasmResourceLimiter::new(1024 * 1024);
-        assert!(!lim.table_growing(0, u32::MAX, None).unwrap());
+        assert!(!lim.table_growing(0, usize::MAX, None).unwrap());
     }
 
     #[test]
