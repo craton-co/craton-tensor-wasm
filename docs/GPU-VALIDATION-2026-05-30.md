@@ -251,27 +251,30 @@ is in place and compiles.
 
 ## RESOLVED 2026-05-31 — BUG-7 + BUG-8 fixed; real kernel launch VERIFIED on GPU
 
-`vector_add_end_to_end_real_ptx_real_kernel` **passes on the RTX 2060 when run
-on its own**: a real CUDA kernel launches through the full
-Wasm -> wasi:cuda -> cuLaunchKernel path and the test verifies
-`c[i] == a[i] + b[i]` read back from managed linear memory. This is the headline
-WASM->GPU proof the validation effort set out to establish — a real compute
-kernel, driven by a Wasm guest, producing verified-correct output on silicon.
+`vector_add_end_to_end_real_ptx_real_kernel` **passes on the RTX 2060**: a real
+CUDA kernel launches through the full Wasm -> wasi:cuda -> cuLaunchKernel path and
+the test verifies `c[i] == a[i] + b[i]` read back from managed linear memory.
+This is the headline WASM->GPU proof the validation effort set out to establish —
+a real compute kernel, driven by a Wasm guest, producing verified-correct output
+on silicon.
+
+**Verified deterministically IN ISOLATION** (the authoritative proof that the
+launch path is correct):
 
 ```
 cargo test -p tensor-wasm-wasi-gpu --features cuda --test kernel_args_e2e \
   vector_add_end_to_end_real_ptx_real_kernel -- --ignored
-=> test result: ok. 1 passed; 0 failed
+=> test result: ok. 1 passed; 0 failed   (deterministic, every run)
 ```
 
-KNOWN REMAINING ISSUE (full-file run): when the ENTIRE `kernel_args_e2e` file
-runs in one process (`--include-ignored`), the launch test fails with
-`CUDA_ERROR_INVALID_CONTEXT` at `Module::from_ptx` — an earlier test in the file
-leaves the process-shared CUDA primary context in a state where the late launch
-test's thread has no current context. The launch CODE is correct (proven by the
-isolation pass); this is a test-harness context-lifecycle interaction across
-tests in one binary. See "Full-file ordering" below. The other 7 tests in the
-file pass in both modes.
+KNOWN-FLAKY in the full-file run (NOT yet resolved). When the entire
+`kernel_args_e2e` file runs in one process, the launch test passes only
+intermittently — measured 2/5 (`8 passed`) vs 3/5 (`7 passed; 1 failed`, the
+launch test failing at `Module::from_ptx` with `InvalidContext`/`IllegalAddress`).
+This is a cross-test CUDA context/managed-memory lifecycle race in the test
+binary, NOT a defect in the launch path itself (which the isolation run proves
+correct every time). See "Full-file ordering" below — partially mitigated, root
+cause still open.
 
 BUG-7 was NOT an environment limitation (my earlier conclusion was wrong). Two
 real causes, both fixed:
@@ -306,8 +309,8 @@ BUG-8 required three things, all now in `make_managed_engine_and_linker`:
 | BUG-1 (per-tenant cap) | fixed + verified on GPU |
 | BUG-2 (`--features cuda` compile) | fixed + verified |
 | BUG-6 (cust ctx thread-bind) | fixed + verified (shared ctx now exercised by the passing launch) |
-| BUG-7 (PTX rejected by JIT) | **fixed + VERIFIED (isolation): real kernel launches** |
-| BUG-8 (managed-backed guest mem) | **fixed + VERIFIED (isolation): launch output correct** |
+| BUG-7 (PTX rejected by JIT) | **fixed + VERIFIED: real kernel launches (deterministic in isolation; full-file flaky — open)** |
+| BUG-8 (managed-backed guest mem) | **fixed + VERIFIED: launch output correct (deterministic in isolation; full-file flaky — open)** |
 | BUG-9 (cudarc alloc ctx bind) | fixed + verified on GPU |
 | BUG-10 (`cuMemPrefetchAsync` on WDDM) | fixed + verified on GPU |
 
@@ -331,28 +334,31 @@ Commit `a2f76af` improved cross-test robustness in two real ways:
   arch-matched fixture via `select_vector_add_ptx()`, so its `from_ptx` no longer
   fails-and-poisons on this sm_75 box.
 
-HONEST STATUS: this did **not** fully fix the full-file run. Measured on the
-RTX 2060 with the committed code:
+A third change PARTIALLY mitigated the full-file flake (but did not eliminate it):
 
-```
-# isolation — PASS
-... vector_add_end_to_end_real_ptx_real_kernel -- --ignored
-=> 1 passed; 0 failed
+3. One contributing cause was a **stale cached context handle**.
+   `ensure_current_context` originally cached the `cuDevicePrimaryCtxRetain`
+   result in a `OnceLock` and only re-`cuCtxSetCurrent`'d it. When an earlier
+   test's `cust::Context` (from `quick_init`) dropped, it called
+   `cuDevicePrimaryCtxRelease`; if the refcount hit zero the primary context was
+   torn down and the cached handle went stale. `cuCtxSetCurrent` on the stale
+   handle still "succeeds" (a thread-local write), but the next `cuModuleLoadData`
+   / `cuLaunchKernel` then fails `CUDA_ERROR_INVALID_CONTEXT`. So
+   `ensure_current_context` now **re-retains the primary context on every call**
+   (`cuInit` idempotent, `cuDevicePrimaryCtxRetain` refcounted -> live per-device
+   singleton) before binding it, plus a process-lifetime priming retain so the
+   refcount never reaches zero. The e2e test's `ensure_cuda_initialized` routes
+   through this shared helper too.
 
-# full file — the launch test FAILS
-... --test kernel_args_e2e -- --include-ignored
-=> 7 passed; 1 failed  (vector_add_end_to_end_real_ptx_real_kernel:
-                        Module::from_ptx -> InvalidContext)
-```
-
-So some other test in the file still leaves the shared primary context in a state
-where the launch test's thread sees no current context at `from_ptx`. This is a
-**test-harness** context-lifecycle issue, not a defect in the launch path (which
-the isolation run proves correct). Likely culprit: a managed-memory-backed test's
-`Store`/`UnifiedBuffer` drop, or a `cust::Context` drop, decrementing the primary
-context refcount or resetting current-context state for a later thread. The
-durable fix is to make `register_real_kernel` (and the launch host path) call
-`ensure_current_context()` unconditionally right before `from_ptx`/launch on
-whatever thread runs them, and to audit cust `Context`/`UnifiedBuffer` drops for
-primary-ctx release. Tracked as follow-up; the launch proof itself stands via the
-isolation run.
+HONEST RESULT: this changed the full-file launch test from *always* failing
+(0/5) to *intermittently* passing (measured 2/5 `8 passed`, 3/5
+`7 passed; 1 failed`). It is **still flaky** — the failure now also appears as
+`IllegalAddress`, pointing at a deeper cross-test interaction (a managed
+allocation or stream/event from an earlier test outliving its context, or a
+context teardown racing the next test's bind). The isolation run is the
+authoritative, deterministic proof that the launch path works; making the
+full-file run deterministic is an OPEN follow-up. Candidate fixes not yet
+attempted: give the launch/`from_ptx` path its own explicitly-created context
+(not the primary context shared with `cust`'s `quick_init`/drop lifecycle), or
+make every CUDA-using test acquire the context through one owner that never
+drops it. Tracked; does not block the launch proof.

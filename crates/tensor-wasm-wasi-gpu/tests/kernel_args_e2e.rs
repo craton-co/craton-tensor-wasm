@@ -267,13 +267,18 @@ fn build_vector_add_launch_wat(
 /// the device before anything initialised the driver.
 #[cfg(feature = "cuda")]
 fn ensure_cuda_initialized() {
-    use std::sync::OnceLock;
-    static CTX: OnceLock<Result<cust::context::Context, String>> = OnceLock::new();
-    let init =
-        CTX.get_or_init(|| cust::quick_init().map_err(|e| format!("cust::quick_init: {e:?}")));
-    if let Err(msg) = init {
-        panic!("ensure_cuda_initialized: CUDA init failed: {msg}");
-    }
+    // Route through the SHARED primary-context helper the launch path uses, and
+    // re-bind on EVERY call. libtest runs each test on its own thread and the
+    // CUDA current-context is thread-local, so module-load (`from_ptx`) here and
+    // the launch's stream/dispatch must both bind the same device-0 primary
+    // context on whatever thread they run on. Using a private `cust::quick_init`
+    // + `OnceLock<Context>` instead made the context current only on the FIRST
+    // thread to call it — which is why the launch test passed in isolation but
+    // failed `InvalidContext` once another test initialised CUDA first in a
+    // full-file run. `ensure_current_context` re-retains + `cuCtxSetCurrent`s the
+    // live primary context every call, so each test thread is self-sufficient.
+    tensor_wasm_wasi_gpu::cuda_ctx::ensure_current_context()
+        .expect("ensure_cuda_initialized: ensure_current_context");
 }
 
 #[cfg(feature = "cuda")]

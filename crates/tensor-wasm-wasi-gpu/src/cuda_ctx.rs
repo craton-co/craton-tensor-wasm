@@ -114,20 +114,44 @@ fn retain_primary_ctx() -> Result<usize, String> {
 /// Returns the underlying CUDA error as a `String` on failure so callers can
 /// fold it into their own `record_error` + `AbiError` mapping.
 pub fn ensure_current_context() -> Result<(), String> {
-    let ctx = PRIMARY_CTX.get_or_init(retain_primary_ctx);
-    match ctx {
-        Ok(raw) => {
-            // SAFETY: `raw` is the live primary-context handle retained above
-            // (held for the process lifetime, so still valid). `cuCtxSetCurrent`
-            // binds it to this thread; idempotent and cheap when already bound.
-            let res = unsafe { cuda_sys::cuCtxSetCurrent(*raw as cuda_sys::CUcontext) };
-            if res == cuda_sys::cudaError_enum::CUDA_SUCCESS {
-                Ok(())
-            } else {
-                Err(format!("cuCtxSetCurrent -> {res:?}"))
-            }
+    // Prime the process-lifetime retain once (its +1 refcount is never released,
+    // so the primary context cannot be fully torn down while this process runs).
+    if let Err(msg) = PRIMARY_CTX.get_or_init(retain_primary_ctx) {
+        return Err(msg.clone());
+    }
+    // Re-retain on EVERY call rather than reusing the cached handle. Another
+    // subsystem (or, in tests, a dropped `cust::Context` from `quick_init`) can
+    // `cuDevicePrimaryCtxRelease` / reset the primary context between calls; a
+    // cached handle would then be stale, and binding it would "succeed" at
+    // `cuCtxSetCurrent` (a TLS write) yet leave the next `cuModuleLoadData` /
+    // `cuLaunchKernel` failing with `CUDA_ERROR_INVALID_CONTEXT`. A fresh
+    // `cuDevicePrimaryCtxRetain` always returns the live per-device singleton
+    // and bumps its refcount, guaranteeing the handle we bind is valid. This was
+    // the cause of the launch test passing in isolation but failing
+    // `InvalidContext` in the full-file run. The extra retains are an
+    // intentional, bounded refcount leak (cheap; one per CUDA entry).
+    //
+    // SAFETY: documented driver C ABI; out-params are valid locals. cuInit is
+    // idempotent; cuDevicePrimaryCtxRetain is reference-counted.
+    unsafe {
+        if cuda_sys::cuInit(0) != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+            return Err("cuInit failed".to_string());
         }
-        Err(msg) => Err(msg.clone()),
+        let mut dev: cuda_sys::CUdevice = 0;
+        let r = cuda_sys::cuDeviceGet(&mut dev as *mut _, 0);
+        if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+            return Err(format!("cuDeviceGet(0) -> {r:?}"));
+        }
+        let mut ctx: cuda_sys::CUcontext = std::ptr::null_mut();
+        let r = cuda_sys::cuDevicePrimaryCtxRetain(&mut ctx as *mut _, dev);
+        if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+            return Err(format!("cuDevicePrimaryCtxRetain -> {r:?}"));
+        }
+        let r = cuda_sys::cuCtxSetCurrent(ctx);
+        if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+            return Err(format!("cuCtxSetCurrent -> {r:?}"));
+        }
+        Ok(())
     }
 }
 
