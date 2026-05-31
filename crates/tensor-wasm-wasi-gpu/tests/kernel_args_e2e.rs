@@ -917,7 +917,13 @@ async fn dispatch_pipeline_compiles_against_real_module_bytes() {
 
     #[cfg(feature = "cuda")]
     let kid = {
-        let (id, _loaded) = register_real_kernel(&ctx, owner, "vector_add", VECTOR_ADD_PTX);
+        // Use the arch-matched fixture (sm_75 on Turing, sm_80 on Ampere+).
+        // Feeding the sm_80 fixture to an sm_75 driver JIT fails `from_ptx`,
+        // and that failed load poisons the process-shared CUDA context for the
+        // later `vector_add_end_to_end_real_ptx_real_kernel` (a real launch).
+        // Arch-matching here keeps every real `from_ptx` in the suite loadable.
+        let (id, _loaded) =
+            register_real_kernel(&ctx, owner, "vector_add", select_vector_add_ptx().0);
         // We deliberately do NOT branch on `_loaded` here: the whole
         // point of this test is to prove the dispatch path tolerates
         // a real PTX module regardless of whether the local GPU can

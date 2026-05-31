@@ -54,34 +54,79 @@
 
 use std::sync::OnceLock;
 
-use cust::context::{Context, CurrentContext};
+use cust::sys as cuda_sys;
 
-/// The process-wide retained primary context for device 0.
+/// The process-wide device-0 primary-context handle, retained once.
 ///
-/// Held for the lifetime of the process so the primary context's reference
-/// count never drops to zero (which would `cuDevicePrimaryCtxRelease` and
-/// invalidate every outstanding allocation). The `Result` caches an init
-/// failure so repeated calls on a no-driver host fail fast with the original
-/// message rather than re-attempting `cuInit` each time.
-static PRIMARY_CTX: OnceLock<Result<Context, String>> = OnceLock::new();
+/// We deliberately do NOT use `cust::quick_init` here. `quick_init` (and
+/// `cust::context::Context::new`) is a *one-per-process* initialiser: calling it
+/// after another subsystem has already initialised CUDA fails. In particular
+/// `tensor-wasm-mem`'s `unified-memory` (cust) path runs its own init when the
+/// `TensorWasmMemoryCreator` allocates a guest linear memory, so a `quick_init`
+/// here would race it and one of the two would cache an `Err` forever — which
+/// surfaced as spurious `CUDA_ERROR_INVALID_CONTEXT` at `Module::from_ptx` /
+/// `cuLaunchKernel` once both code paths ran in the same process.
+///
+/// Instead we retain the device's PRIMARY context directly via
+/// `cuDevicePrimaryCtxRetain`. The primary context is reference-counted and
+/// unique per device, so every retainer in the process (here, plus
+/// tensor-wasm-mem, plus cust's own `quick_init` if anything calls it) resolves
+/// to the SAME `CUcontext`. Binding it current on a thread is then just a
+/// thread-local `cuCtxSetCurrent`. We keep the handle for the process lifetime
+/// (never `cuDevicePrimaryCtxRelease`) so the refcount never hits zero and
+/// invalidates outstanding allocations.
+///
+/// Stored as `usize` (the raw `CUcontext` pointer value) so the `OnceLock` is
+/// `Send + Sync`; the driver handle is just an opaque pointer.
+static PRIMARY_CTX: OnceLock<Result<usize, String>> = OnceLock::new();
+
+fn retain_primary_ctx() -> Result<usize, String> {
+    // SAFETY: all calls are the documented driver C ABI; out-params are valid
+    // locals. `cuInit` is idempotent; `cuDevicePrimaryCtxRetain` is
+    // reference-counted and returns the per-device singleton context.
+    unsafe {
+        let r = cuda_sys::cuInit(0);
+        if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+            return Err(format!("cuInit -> {r:?}"));
+        }
+        let mut dev: cuda_sys::CUdevice = 0;
+        let r = cuda_sys::cuDeviceGet(&mut dev as *mut _, 0);
+        if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+            return Err(format!("cuDeviceGet(0) -> {r:?}"));
+        }
+        let mut ctx: cuda_sys::CUcontext = std::ptr::null_mut();
+        let r = cuda_sys::cuDevicePrimaryCtxRetain(&mut ctx as *mut _, dev);
+        if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+            return Err(format!("cuDevicePrimaryCtxRetain -> {r:?}"));
+        }
+        Ok(ctx as usize)
+    }
+}
 
 /// Ensure device 0's primary CUDA context exists **and** is current on the
 /// calling thread.
 ///
 /// Idempotent and safe to call from any thread — the tokio fiber thread, a
-/// `spawn_blocking` pool thread, or a libtest harness thread. The first call
-/// in the process runs `cust::quick_init` (`cuInit` + primary-context retain);
-/// every call (including the first) then `cuCtxSetCurrent`s the cached context
-/// onto the current thread.
+/// `spawn_blocking` pool thread, or a libtest harness thread. The first call in
+/// the process retains the device-0 primary context; every call (including the
+/// first) then `cuCtxSetCurrent`s it onto the current thread.
 ///
-/// Returns the underlying CUDA/init error as a `String` on failure so callers
-/// can fold it into their own `record_error` + `AbiError` mapping.
+/// Returns the underlying CUDA error as a `String` on failure so callers can
+/// fold it into their own `record_error` + `AbiError` mapping.
 pub fn ensure_current_context() -> Result<(), String> {
-    let ctx = PRIMARY_CTX
-        .get_or_init(|| cust::quick_init().map_err(|e| format!("cust::quick_init: {e:?}")));
+    let ctx = PRIMARY_CTX.get_or_init(retain_primary_ctx);
     match ctx {
-        Ok(c) => CurrentContext::set_current(c)
-            .map_err(|e| format!("CurrentContext::set_current: {e:?}")),
+        Ok(raw) => {
+            // SAFETY: `raw` is the live primary-context handle retained above
+            // (held for the process lifetime, so still valid). `cuCtxSetCurrent`
+            // binds it to this thread; idempotent and cheap when already bound.
+            let res = unsafe { cuda_sys::cuCtxSetCurrent(*raw as cuda_sys::CUcontext) };
+            if res == cuda_sys::cudaError_enum::CUDA_SUCCESS {
+                Ok(())
+            } else {
+                Err(format!("cuCtxSetCurrent -> {res:?}"))
+            }
+        }
         Err(msg) => Err(msg.clone()),
     }
 }
