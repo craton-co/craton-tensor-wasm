@@ -57,7 +57,7 @@ async-trait = "0.1"
 # 37-41 / <42.0.2; 45.x is past the 43.0.1 fix line.)
 wasmtime = { version = "45", default-features = false, features = ["async", "cranelift", "component-model", "runtime"] }
 wat = "1"
-wasmparser = "0.218"
+wasmparser = "0.250"
 cranelift-codegen = "0.111"
 
 # CUDA — gated by per-crate feature flags. Workspace deps cannot carry

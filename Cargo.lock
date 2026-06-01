@@ -1507,10 +1507,6 @@ name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
-dependencies = [
- "ahash",
- "serde",
-]
 
 [[package]]
 name = "hashbrown"
@@ -3373,7 +3369,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
- "wasmparser 0.218.1",
+ "wasmparser 0.250.0",
  "wat",
 ]
 
@@ -3493,7 +3489,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "tracing-subscriber",
- "wasmparser 0.218.1",
+ "wasmparser 0.250.0",
  "wasmtime",
  "wat",
 ]
@@ -3525,7 +3521,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wasm-encoder 0.218.1",
- "wasmparser 0.218.1",
+ "wasmparser 0.250.0",
  "wat",
  "zeroize",
 ]
@@ -4293,12 +4289,8 @@ version = "0.218.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "059739c2eac26eea736389a7d6d30b41a8201490bea204d0facde19183359849"
 dependencies = [
- "ahash",
  "bitflags 2.11.1",
- "hashbrown 0.14.5",
  "indexmap 2.14.0",
- "semver",
- "serde",
 ]
 
 [[package]]
@@ -4333,8 +4325,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071d99cdfb8111603ed05500506c3298a940b58d609dd0259d3981785dd33556"
 dependencies = [
  "bitflags 2.11.1",
+ "hashbrown 0.17.1",
  "indexmap 2.14.0",
  "semver",
+ "serde",
 ]
 
 [[package]]
