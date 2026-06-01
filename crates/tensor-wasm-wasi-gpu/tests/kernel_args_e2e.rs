@@ -1005,7 +1005,8 @@ async fn dispatch_pipeline_compiles_against_real_module_bytes() {
         // `InvalidPointer` are forbidden too — those would mean the typed-argv
         // marshalling regressed before the call reached the driver.
         assert_ne!(
-            rc, 0,
+            rc,
+            0,
             "a real-module pointer-arg launch against NON-managed (host-heap) \
              linear memory must be refused by the device-addressability guard, \
              not silently succeed (would risk a context-poisoning \

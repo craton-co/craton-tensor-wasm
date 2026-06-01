@@ -1852,8 +1852,7 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
                 // bookkeeping for the address — it never dereferences it.
                 let res = unsafe {
                     cuda_sys::cuPointerGetAttribute(
-                        &mut is_managed as *mut std::os::raw::c_int
-                            as *mut std::ffi::c_void,
+                        &mut is_managed as *mut std::os::raw::c_int as *mut std::ffi::c_void,
                         cuda_sys::CUpointer_attribute_enum::CU_POINTER_ATTRIBUTE_IS_MANAGED,
                         *host_ptr as cuda_sys::CUdeviceptr,
                     )
