@@ -3,12 +3,14 @@
 Roadmap feature #2: Server-Sent Events / chunked-transfer responses from
 Wasm-hosted LLM and token-streaming workloads.
 
-> **Status:** v0.3.7 lands the scaffold — route, WIT contract, and
-> `StreamingContext` channel surface — but does **not** yet drive the
-> executor through a streaming invocation. v0.4 wires actual mid-
-> execution streaming. Clients that hit the route today receive a
-> single `event: scaffold` frame carrying
-> `{"status":"not_yet_wired"}` and then end-of-stream.
+> **Status: Wired (T34).** As of v0.3.7 the route drives the executor
+> through a real streaming invocation: guest
+> `wasi:tensor/host.emit-chunk` calls surface as SSE `event: chunk`
+> frames via `StreamingContext`, and the stream honours T36 cooperative
+> deadlines (`DEADLINE-ELAPSED` → terminal `event: error`). This
+> replaces the earlier single `not_yet_wired` scaffold frame. See
+> [`FEATURE-STATUS.md`](FEATURE-STATUS.md) — the canonical status source
+> — for the authoritative matrix.
 
 ## Motivation
 
@@ -119,13 +121,12 @@ response body off it.
    carries the terminal status (success / deadline_elapsed /
    wasm_error) so the writer can emit a final `event: done` /
    `event: error` frame.
-4. OpenAPI: the operation description now references the
-   `event: chunk` / `event: done` / `event: error` framing instead of
-   the v0.3.7 `event: scaffold` placeholder.
+4. OpenAPI: the operation description references the
+   `event: chunk` / `event: done` / `event: error` framing.
 
-The URL, method, and response framing are unchanged between v0.3.7
-and v0.4 — only the body content swapped from the scaffold marker to
-real guest output.
+The URL, method, and response framing have been stable since the route
+was introduced; v0.3.7 (T34) swapped the body content from the earlier
+`not_yet_wired` scaffold marker to real guest output.
 
 ## Security
 
@@ -156,7 +157,11 @@ real guest output.
 * Host-side: `crates/tensor-wasm-wasi-gpu/tests/streaming_scaffold.rs`
   exercises the four error codes (`-1`, `-2`, `-3`, success) on the
   `StreamingContext` directly.
-* API-side:
-  `crates/tensor-wasm-api/tests/streaming_invoke_scaffold.rs` POSTs
-  to `/invoke-stream` and asserts the SSE / chunked content-types
-  and the `scaffold` event payload.
+* API-side (real path, T34):
+  `crates/tensor-wasm-api/tests/invoke_stream_real_emit.rs` POSTs to
+  `/invoke-stream` and asserts the SSE / chunked content-types and the
+  real `event: chunk` frames emitted by the guest;
+  `streaming_error_and_inflight_regression.rs` covers the
+  deadline/error framing. The earlier
+  `streaming_invoke_scaffold.rs` remains as the content-type
+  regression guard.

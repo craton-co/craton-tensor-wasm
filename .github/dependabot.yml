@@ -9,11 +9,11 @@ updates:
       - dependencies
       - rust
     ignore:
-      # wasmtime is pinned at 25.x per the risk register; major bumps require
-      # tensor-wasm-jit + tensor-wasm-wasi-gpu re-validation. See docs/RISKS.md.
+      # wasmtime is pinned at 45.x (bumped from 25.x to clear RUSTSEC-2026-0096;
+      # see Cargo.toml and docs/WASMTIME-UPGRADE.md). Major bumps require
+      # tensor-wasm-jit + tensor-wasm-wasi-gpu re-validation per the cadence
+      # policy, so they are handled deliberately rather than by Dependabot.
       - dependency-name: wasmtime
-        update-types: ["version-update:semver-major"]
-      - dependency-name: wasmtime-wasi
         update-types: ["version-update:semver-major"]
       # cust (CUDA bindings) tracks the system CUDA toolkit; major bumps are
       # coordinated with infrastructure rollouts.

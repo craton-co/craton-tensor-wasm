@@ -732,7 +732,7 @@ The full inventory of code paths that are written but **unverified on hardware**
 
 ## Cross-references
 
-- [`docs/BUILD.md`](BUILD.md) — full feature-flag taxonomy across all 10 crates, build matrix, test tiers, `make ci` parity.
+- [`docs/BUILD.md`](BUILD.md) — full feature-flag taxonomy across all 11 crates, build matrix, test tiers, `make ci` parity.
 - [`docs/MPS-SETUP.md`](MPS-SETUP.md) — full NVIDIA MPS operations guide (daemon, capabilities, limits, systemd unit).
 - [`docs/PERFORMANCE.md`](PERFORMANCE.md) — measured numbers, sizing guidance for `wasm_memory` / `gpu_memory`, SKU-specific baselines.
 - [`docs/RISKS.md`](RISKS.md) — v0.1.0 known limitations, the `cust → cudarc` migration timeline, and tracked upstream issues.

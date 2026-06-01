@@ -183,7 +183,7 @@ issue:
 - A pre-merge test or canary check that would have caught the
   regression, added in a follow-up PR.
 
-The next release notes ([`CHANGELOG.md`](../CHANGELOG.md)) must
+The next release notes ([`CHANGELOG.md`](../../CHANGELOG.md)) must
 acknowledge the rollback under "Operator-visible behaviour change"
 per [`SLO.md`](../SLO.md) §9.
 

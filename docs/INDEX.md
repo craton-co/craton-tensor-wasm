@@ -103,16 +103,16 @@ everything else in this section is a deeper cut into one subsystem.
 
 | Doc | Wave | One-sentence summary |
 |---|---|---|
-| [../ARCHITECTURE.md](../ARCHITECTURE.md) | W5.2 (refresh) | The ten-crate dependency graph, the layered execution model, and the trust boundaries between Wasm guest, host process, and CUDA driver. |
+| [../ARCHITECTURE.md](../ARCHITECTURE.md) | W5.2 (refresh) | The eleven-crate dependency graph, the layered execution model, and the trust boundaries between Wasm guest, host process, and CUDA driver. |
 | [WASMTIME-FORK.md](WASMTIME-FORK.md) | — | The decision record that explains why TensorWasm does **not** fork Wasmtime, and which alternative simplified-IR path the JIT detector walks instead. |
 | [RISKS.md](RISKS.md) | — | Living risk register tracking architectural risks, upstream pinning decisions, and known limitations, refreshed alongside every `CHANGELOG.md` release. |
 | [AUTO-OFFLOAD.md](AUTO-OFFLOAD.md) | — | User-facing reference for the auto-offload pipeline: which Wasm patterns the detector recognises, which it rejects, and how to enable it. |
 | [CUDARC-SPIKE.md](CUDARC-SPIKE.md) | W1.2 | The `cust` → `cudarc` migration spike record: version chosen, API mapping table, known gaps, and the recommended cutover plan. |
 | [COLD-START.md](COLD-START.md) | — | The five-component additive model for cold-start latency on a TensorWasm node and the operator levers that affect each component. |
-| [INSTANCE-POOL.md](INSTANCE-POOL.md) | B5.8 | Roadmap feature #5 (pre-instantiated instance pool): scaffold status, configuration knobs, the v0.4 implementation plan, and the reset-on-return contract. |
-| [KERNEL-REGISTRY.md](KERNEL-REGISTRY.md) | B6.3 | Roadmap feature #3 (signed kernel registry): HMAC-SHA256 `KernelManifest` records, `InMemoryRegistry` scaffold, and the v0.4 server-wire + on-disk store deliverable. |
+| [INSTANCE-POOL.md](INSTANCE-POOL.md) | B5.8 | Roadmap feature #5 (pre-instantiated instance pool): the wired (T37) warm pool through the invoke path, configuration knobs, and the reset-on-return contract. |
+| [KERNEL-REGISTRY.md](KERNEL-REGISTRY.md) | B6.3 | Roadmap feature #3 (signed kernel registry): HMAC-SHA256 `KernelManifest` records and the wired (T35) disk-persisted `DiskRegistry` over the artifact store, with paginated `GET /kernels`. |
 | [DIFFERENTIAL-ORACLE.md](DIFFERENTIAL-ORACLE.md) | B5.9 | Roadmap feature #6 (differential JIT correctness oracle): bit-identity assertion contract between the Wasmtime CPU path and the JIT PTX path, plus the per-kernel tolerance policy. |
-| [ARTIFACT-STORE.md](ARTIFACT-STORE.md) | B6.6 | Roadmap feature #9 (unified content-addressed signed artifact store): the `tensor-wasm-artifacts` trait surface, on-disk envelope, and the v0.4 convergence plan for the JIT L2 cache + snapshot store. |
+| [ARTIFACT-STORE.md](ARTIFACT-STORE.md) | B6.6 | Roadmap feature #9 (unified content-addressed signed artifact store): the `tensor-wasm-artifacts` trait surface, on-disk envelope, and the now-wired convergence that backs snapshots (T40) and the JIT L2 cache (T30). |
 | [glossary.md](glossary.md) | — | Short paragraph definitions of recurring CUDA, Wasm, and TensorWasm-internal terms (UVM, MPS, MIG, PTX, WMMA, BLAKE3 fingerprint, deopt guard, dispatch future, etc.). |
 
 ## API surface
@@ -129,8 +129,8 @@ for humans; the per-release rustdoc + OpenAPI bundle described in
 | [../crates/tensor-wasm-api/API.md](../crates/tensor-wasm-api/API.md) | — | Hand-written REST reference for every endpoint the `tensor-wasm-api` gateway serves, with request/response examples for each route. |
 | [API-REFERENCE.md](API-REFERENCE.md) | W4.8 | Publication-policy for the per-release rustdoc + OpenAPI archive: what is in it, what is not, the URL contract, and the workflow that produces it. |
 | [AUDIT-LOG.md](AUDIT-LOG.md) | W2.2 | Wire-format schema, sink configuration, rotation guidance, and stable-string contract for the structured audit log emitted on state-mutating routes. |
-| [STREAMING.md](STREAMING.md) | B6.1 | Roadmap feature #2 (streaming HTTP `invoke` responses): the `wasi:tensor/host.emit-chunk` host-fn contract, the SSE / chunked-transfer wire shape, and the v0.4 route-wiring deliverable. |
-| [OPENAI-COMPAT.md](OPENAI-COMPAT.md) | B4.9 / B5.6 | Roadmap feature #10 (OpenAI-compatible inference gateway shim): the `/v1/completions` and `/v1/chat/completions` route surface, the v0.3.5 scaffold returning `501 openai_not_yet_wired`, and the v0.4 translation-layer deliverable. |
+| [STREAMING.md](STREAMING.md) | B6.1 | Roadmap feature #2 (streaming HTTP `invoke` responses): the `wasi:tensor/host.emit-chunk` host-fn contract and the wired (T34) SSE / chunked-transfer path that surfaces real guest chunks. |
+| [OPENAI-COMPAT.md](OPENAI-COMPAT.md) | B4.9 / B5.6 | Roadmap feature #10 (OpenAI-compatible inference gateway shim): the `/v1/completions` and `/v1/chat/completions` routes, wired (T41) to internal invoke via `TENSOR_WASM_API_OPENAI_MODEL_MAP` (buffered or SSE), closing the earlier `501 openai_not_yet_wired` scaffold. |
 | [deployment/mtls.md](deployment/mtls.md) | W2.8 | Two production deployment shapes — self-terminated rustls and reverse-proxy fronting — with a recommended path for the v0.4 binary that still binds plaintext. |
 
 ## Performance and benchmarking
@@ -192,7 +192,7 @@ surface.
 | [BACKUP-RESTORE.md](BACKUP-RESTORE.md) | W3.7 | What a production TensorWasm deployment must back up, the tested strategies, the restore paths, and the validation procedure that confirms a backup is good. |
 | [OBSERVABILITY.md](OBSERVABILITY.md) | — | The `tracing` span schema, the optional OTLP exporter stack, and how to wire a local collector for development. |
 | [CONFIG.md](CONFIG.md) | B2.9 | Single-source reference for every environment variable consumed by `tensor-wasm`, grouped by crate, with default + type + effect columns. |
-| [GPU-QUOTAS.md](GPU-QUOTAS.md) | B6.5 | Roadmap feature #8 (per-tenant GPU memory quotas): the v0.3.7 in-process counter scaffold, the `TenantContextBuilder` surface, and the v0.4 `cuMemPool` driver-level enforcement plan. |
+| [GPU-QUOTAS.md](GPU-QUOTAS.md) | B6.5 | Roadmap feature #8 (per-tenant GPU memory quotas): the wired (T39) in-process counter as primary accounting via `TenantContextBuilder`, plus the host-side `cuMemPool` cap (hardware-gated, behind `gpu-mem-pool`). |
 | [COOPERATIVE-YIELD.md](COOPERATIVE-YIELD.md) | B6.4 | Roadmap feature #4 (cooperative deadlines via WASI yield): the `wasi:scheduler/host@0.1.0` protocol, the CONTINUE / DEADLINE-NEAR / DEADLINE-ELAPSED return codes, and the embedder wiring snippet. |
 
 ## Security

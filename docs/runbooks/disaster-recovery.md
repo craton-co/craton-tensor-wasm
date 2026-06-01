@@ -376,7 +376,7 @@ incident issue:
   verification, secret-manager replication), filed as a follow-up.
 
 The incident channel and postmortem are the durable record; DR
-events do not need a [`CHANGELOG.md`](../CHANGELOG.md) entry.
+events do not need a [`CHANGELOG.md`](../../CHANGELOG.md) entry.
 
 ## Related
 

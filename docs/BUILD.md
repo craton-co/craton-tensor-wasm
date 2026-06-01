@@ -1,10 +1,10 @@
 # Building Craton TensorWasm
 
-Craton TensorWasm is a Cargo workspace of 10 crates implementing a GPU-accelerated serverless Wasm runtime. It supports three build matrices: a full CUDA host (real hardware), a CUDA stub (for CI), and a no-CUDA configuration (quick local checks). This document walks through each, plus feature flags, tests, benchmarks, docs, and CI parity.
+Craton TensorWasm is a Cargo workspace of 11 crates implementing a GPU-accelerated serverless Wasm runtime. It supports three build matrices: a full CUDA host (real hardware), a CUDA stub (for CI), and a no-CUDA configuration (quick local checks). This document walks through each, plus feature flags, tests, benchmarks, docs, and CI parity.
 
 ## Prerequisites
 
-- Rust toolchain: pinned in `rust-toolchain.toml` (currently `nightly-2026-04-03`). Rustup picks it up automatically the first time you run `cargo` in the workspace.
+- Rust toolchain: pinned in `rust-toolchain.toml` (currently `nightly-2026-04-03`). Rustup picks it up automatically the first time you run `cargo` in the workspace. The nightly pin exists to **align the in-repo dev/CI toolchain with cuda-oxide's own pin** (a prerequisite for the `cuda-oxide-backend` scaffold), not because the runtime code needs nightly: the only nightly feature used is `doc_cfg`, and it is gated behind `cfg(docsrs)` so it activates **only** on the docs.rs builder. Downstream consumers who depend on the published crates from crates.io build on **stable Rust ≥ 1.78** — the `rust-version` MSRV declared in every crate's `Cargo.toml`. The `rust-toolchain.toml` pin applies only to builds run from inside this checkout.
 - For CUDA builds: see [CUDA-SETUP.md](./CUDA-SETUP.md).
 - For no-CUDA host: nothing extra needed beyond Rust.
 

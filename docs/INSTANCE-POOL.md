@@ -27,17 +27,18 @@ This is complementary to the pooling allocator + MPK memory backend
 addresses linear-memory allocation cost; the instance pool addresses
 the rest of the instantiation path.
 
-## v0.3.6 status: scaffold only
+## Status: Wired (T37)
 
+As of v0.3.7 (T37) the warm pool is wired through the invoke path.
 The public API surface — `InstancePool`, `InstancePoolConfig`,
-`PooledInstance`, `TensorWasmExecutor::with_instance_pool` — is
-wired and stable. The `InstancePool::acquire` path currently falls
-through to `TensorWasmExecutor::spawn_instance` on every call, so
-behaviour is identical to "no pool" until v0.4 lands the warm-pool
-machinery.
+`PooledInstance`, `TensorWasmExecutor::with_instance_pool` — is stable,
+and `InstancePool::acquire` now draws a pre-spawned instance from the
+per-`(tenant, module-hash)` channel (with reset-on-return) instead of
+falling through to `spawn_instance`. See
+[`FEATURE-STATUS.md`](FEATURE-STATUS.md) for the canonical status.
 
-Embedders can opt in today by constructing a pool and attaching it
-via the builder; the wiring is forward-compatible with v0.4.
+Embedders opt in by constructing a pool and attaching it via the
+builder.
 
 ## Configuration
 

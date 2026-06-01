@@ -9,8 +9,12 @@ every `auto_offload` candidate on both the Wasmtime CPU interpreter
 (the ground truth) and the JIT PTX path, then asserts bit-identity
 between the two outputs. Any divergence is an audit-blocking finding.
 
-Scaffold lives in [`crates/tensor-wasm-jit/src/differential.rs`](../crates/tensor-wasm-jit/src/differential.rs)
-behind the `differential-oracle` feature flag.
+The harness lives in [`crates/tensor-wasm-jit/src/differential.rs`](../crates/tensor-wasm-jit/src/differential.rs)
+behind the `differential-oracle` feature flag. **Status: Landed (T38)
+for the host path; GPU verdicts are hardware-gated** — the
+Wasmtime-CPU side runs end-to-end today, while the CUDA verdicts are
+`#[ignore]`d pending the S22 self-hosted runner. See
+[`FEATURE-STATUS.md`](FEATURE-STATUS.md) for the canonical status.
 [`docs/PATH-TO-V1.md#post-v036-strategic-features`](PATH-TO-V1.md#post-v036-strategic-features)
 tracks this as item #6.
 
@@ -33,25 +37,28 @@ pre-deploy gate that turns a class of "I'd need to read the lowering
 code to convince myself" objections into "the CI gate already failed
 on this in PR #X if it could have happened".
 
-## v0.4 implementation plan
+## Implementation status
 
-The v0.3.6 scaffold compiles harness types only. v0.4 wires the
-two-path runner:
+T38 landed the proptest harness driving `DifferentialOracle` over the
+matmul / vector_add / conv2d blueprints plus the per-kernel tolerance
+table. The **host (Wasmtime CPU) path runs end-to-end today**; the GPU
+path remains hardware-gated. The two-path runner:
 
-1. **CPU path** — re-use the existing `tensor-wasm-exec` Wasmtime
-   instance from the unit-test harness. Run the original Wasm body
-   (not the JIT-rewritten one) over a fixed guest-memory snapshot.
-2. **GPU path** — drive the JIT pipeline through to the
-   `KernelCache::get` + `cudarc` launch surface. Read back the
-   contiguous output region after the launch finishes.
-3. **Compare** — `memcmp` the two regions; produce
+1. **CPU path** (landed) — re-uses the existing `tensor-wasm-exec`
+   Wasmtime instance from the unit-test harness. Runs the original Wasm
+   body (not the JIT-rewritten one) over a fixed guest-memory snapshot.
+2. **GPU path** (hardware-gated) — drives the JIT pipeline through to
+   the `KernelCache::get` + `cudarc` launch surface and reads back the
+   contiguous output region after the launch finishes. The proving
+   verdicts are `#[ignore]`d until the S22 runner lands.
+3. **Compare** — `memcmp` the two regions; produces
    `OracleVerdict::Match` or `OracleVerdict::Divergence` with the
    `first_diff_offset` of the first non-matching byte.
-4. **CI gate** — a new job in [`.github/workflows/`](.github/workflows/)
+4. **CI gate** (pending hardware) — a job in [`../.github/workflows/`](../.github/workflows/)
    runs the oracle over the blueprint corpus on the self-hosted S22
-   runner (see [`docs/CUDA-SETUP.md`](CUDA-SETUP.md)). Divergences
-   block the PR; the workflow uploads the offending blueprint
-   fingerprint as a build artifact for triage.
+   runner (see [`CUDA-SETUP.md`](CUDA-SETUP.md)). Divergences block the
+   PR; the workflow uploads the offending blueprint fingerprint as a
+   build artifact for triage.
 
 S22 runner integration is the only piece that requires hardware the
 default CI lacks. Hosts without CUDA continue to receive

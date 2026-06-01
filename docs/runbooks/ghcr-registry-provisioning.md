@@ -114,7 +114,7 @@ To generate:
    separately).
 3. Expiry: 90 days. A longer-lived PAT is a standing audit finding;
    rotate on the same cadence as the SECURITY.md backport-window
-   review (see [`../SECURITY.md`](../SECURITY.md) "Backport policy").
+   review (see [`SECURITY.md`](../../SECURITY.md) "Backport policy").
 4. Store the token in a sponsor-controlled secret manager (1Password
    vault `craton-engineering`, key `ghcr-publish-pat`). Do **not**
    commit it to any repo, do not paste it into Slack or issue
@@ -365,7 +365,7 @@ recurring; defer until the demand is concrete.
 ## Rotation and EOL
 
 When a release line goes end-of-life per
-[`../SECURITY.md`](../SECURITY.md) backport policy ("Backport
+[`SECURITY.md`](../../SECURITY.md) backport policy ("Backport
 window"), the corresponding ghcr.io tags should be **marked
 deprecated, not deleted**. Operators on the EOL line may still be
 mid-migration; pulling the rug out from under them turns a planned
@@ -444,7 +444,7 @@ fronting the registry rather than a paid GHCR tier — see the
 - [`../../.github/workflows/api-reference.yml`](../../.github/workflows/api-reference.yml)
   — companion W4.8 workflow; attaches the API-reference bundle to
   the same release
-- [`../SECURITY.md`](../SECURITY.md) — backport window that drives the
+- [`SECURITY.md`](../../SECURITY.md) — backport window that drives the
   Rotation/EOL step's deprecation cadence
 - [`README.md`](README.md) — runbook contract; this is a procedure
   runbook variant

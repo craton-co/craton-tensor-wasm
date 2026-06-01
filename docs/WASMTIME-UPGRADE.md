@@ -201,8 +201,8 @@ higher rigor.
    ```
 
 6. **WAT fixtures load.** All `.wat`/`.wasm` files under
-   [`tests/wasm-fixtures/`](../tests/wasm-fixtures) and
-   [`crates/tensor-wasm-bench/src/fixtures.rs`](../crates/tensor-wasm-bench/src/fixtures.rs)
+   [`tests/wasm-fixtures/`](../tests/wasm-fixtures) and the inline WAT
+   fixtures in [`crates/tensor-wasm-bench/benches/`](../crates/tensor-wasm-bench/benches)
    must still parse and instantiate. Snapshot e2e tests cover the
    typical path.
 

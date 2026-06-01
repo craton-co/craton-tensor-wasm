@@ -287,7 +287,7 @@ path runs end-to-end on real hardware; the HTTP API has 0 audit problems
 open; the test suite has 70 passing batches and 0 failures.
 
 **Q: How does this compare to Wasmtime?**
-A: We **wrap** Wasmtime 25.x. We are not a fork. See `docs/WASMTIME-FORK.md`.
+A: We **wrap** Wasmtime 45.x. We are not a fork. See `docs/WASMTIME-FORK.md`.
 Pure CPU execution is within 5% of upstream Wasmtime per the dimension-1
 hyperfine comparison (statistically tied at v0.3.7). Everything else — GPU,
 multi-tenancy, snapshot, HTTP gateway, observability — is layered on top
