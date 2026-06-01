@@ -74,9 +74,10 @@ fn tombstone_count_is_observable() {
         "unregister must record a tombstone observable via the public gauge",
     );
 
-    // Drop the last strong reference so the tombstone's weak ref becomes
+    // Drop both strong references so the tombstone's weak ref becomes
     // dead and `collect_tombstones` can reclaim it.
     drop(orphan_arc);
+    drop(removed);
 
     // `collect_tombstones` is admin-cap-gated and mutates the map, pruning
     // the now-dead weak ref. The public gauge must drop back to zero.
