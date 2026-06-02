@@ -1,0 +1,75 @@
+name: fuzz
+
+on:
+  schedule:
+    # Nightly at 04:23 UTC.
+    - cron: "23 4 * * *"
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "crates/**"
+      - ".github/workflows/fuzz.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: cargo fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_ptx_emit
+          - fuzz_snapshot_restore
+          - fuzz_wasm_compile
+          - fuzz_wasi_cuda_abi
+          - token_scope_parser
+          - audit_json_round_trip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain (workspace-pinned nightly)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      - name: Install CUDA stub libraries
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Run ${{ matrix.target }} for 60 seconds
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60
+
+      - name: Upload reproduce artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/**
+            fuzz/corpus/${{ matrix.target }}/**
+          if-no-files-found: ignore

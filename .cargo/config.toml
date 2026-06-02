@@ -1,0 +1,7 @@
+# Project-wide Cargo configuration.
+#
+# Uncomment the rustflags line below on a known-fixed host (e.g. the self-hosted
+# CUDA runner) to enable AVX2/AVX-512 in blake3, zstd, and bincode inner loops.
+# Leave commented in CI so binaries stay portable across runner hardware.
+[build]
+# rustflags = ["-Ctarget-cpu=native"]

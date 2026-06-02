@@ -1,0 +1,12 @@
+0000000000000000000000000000000000000000 6db6010e4a192691384a477d9f2c3844e17363ae victor-craton <victor@craton.com.ar> 1780343179 -0300	commit (initial): Open-source initial commit
+6db6010e4a192691384a477d9f2c3844e17363ae 6db6010e4a192691384a477d9f2c3844e17363ae victor-craton <victor@craton.com.ar> 1780363862 -0300	checkout: moving from main to dev
+6db6010e4a192691384a477d9f2c3844e17363ae 7c371cf5d363c1200c49abba1421c49523e86269 victor-craton <victor@craton.com.ar> 1780365580 -0300	commit: security: remediate certification audit findings (wave 1) + reconcile GPU docs
+7c371cf5d363c1200c49abba1421c49523e86269 e071f94324e4bacf1af2ac88ae1d2126a8180da7 victor-craton <victor@craton.com.ar> 1780366222 -0300	commit: security: remediate certification audit findings (wave 2)
+e071f94324e4bacf1af2ac88ae1d2126a8180da7 dab51acefa206829c80c8eb922c711089ee0f5f3 victor-craton <victor@craton.com.ar> 1780366911 -0300	commit: test(gpu): bind primary CUDA context in alloc lifecycle unittest (BUG-4)
+dab51acefa206829c80c8eb922c711089ee0f5f3 052ddecc4eb8f469aa20571580ddeae171adb495 victor-craton <victor@craton.com.ar> 1780367958 -0300	commit: fix: fmt check
+052ddecc4eb8f469aa20571580ddeae171adb495 6db6010e4a192691384a477d9f2c3844e17363ae victor-craton <victor@craton.com.ar> 1780367984 -0300	checkout: moving from dev to main
+6db6010e4a192691384a477d9f2c3844e17363ae 052ddecc4eb8f469aa20571580ddeae171adb495 victor-craton <victor@craton.com.ar> 1780367988 -0300	merge dev: Fast-forward
+052ddecc4eb8f469aa20571580ddeae171adb495 052ddecc4eb8f469aa20571580ddeae171adb495 victor-craton <victor@craton.com.ar> 1780368001 -0300	checkout: moving from main to dev
+052ddecc4eb8f469aa20571580ddeae171adb495 a421e5d3b830ba27a9535d4201f77d5e8823c43d victor-craton <victor@craton.com.ar> 1780368162 -0300	commit: bench: restore committed baselines (reduced-sampling rerun is not a baseline)
+a421e5d3b830ba27a9535d4201f77d5e8823c43d 5b4cefe9a2f6214fa3efe0bbcfaa1cd44de5dccd victor-craton <victor@craton.com.ar> 1780370311 -0300	commit: fix(gpu): cuda host fns self-bind the primary context before driver calls
+5b4cefe9a2f6214fa3efe0bbcfaa1cd44de5dccd 90d246c3979d2d020fe545e3cba7968c27e0ee56 victor-craton <victor@craton.com.ar> 1780405931 -0300	commit: style: cargo fmt + fix clippy needless_borrow in classify_error test

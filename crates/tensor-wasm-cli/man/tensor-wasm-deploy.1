@@ -1,0 +1,22 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm-deploy 1  "tensor-wasm-deploy " 
+.SH NAME
+tensor\-wasm\-deploy \- Upload a Wasm module to a TensorWasm server
+.SH SYNOPSIS
+\fBtensor\-wasm\-deploy\fR <\fB\-\-server\fR> [\fB\-\-name\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIFILE\fR> 
+.SH DESCRIPTION
+Upload a Wasm module to a TensorWasm server
+.SH OPTIONS
+.TP
+\fB\-\-server\fR \fI<SERVER>\fR
+Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
+.TP
+\fB\-\-name\fR \fI<NAME>\fR
+Tenant\-supplied display name. Defaults to the file stem when omitted
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIFILE\fR>
+Path to the `.wasm` file to deploy

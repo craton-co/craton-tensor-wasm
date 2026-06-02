@@ -1,0 +1,116 @@
+[package]
+name = "tensor-wasm-snapshot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Wasm + GPU memory snapshot and restore for fast cold-start."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-snapshot"
+readme = "README.md"
+keywords = ["wasm", "snapshot", "checkpoint", "restore", "wasmtime"]
+categories = ["wasm", "encoding"]
+
+[lib]
+
+[dependencies]
+tensor-wasm-core = { workspace = true }
+bincode.workspace = true
+crc32fast = "1"
+serde.workspace = true
+serde_bytes = "0.11"
+tracing.workspace = true
+zstd.workspace = true
+cust = { workspace = true, optional = true }
+# HMAC-SHA256 snapshot signing (v3 wire format). Pulled in only when the
+# `signed-snapshots` feature is enabled; `subtle` provides the
+# constant-time equality check used to compare the trailing 32-byte
+# signature against the recomputed HMAC.
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+subtle = { version = "2", optional = true }
+# Ed25519 asymmetric snapshot signing (v3 wire format, signature_kind = 2).
+# A publisher signs with a private `SigningKey`; many verifiers hold only the
+# public `VerifyingKey` (HMAC, by contrast, requires sharing the symmetric
+# secret with every verifier). Default features include the `rand_core`
+# integration used to generate signing keys in tests. Gated behind
+# `signed-snapshots` alongside `hmac`/`sha2` so the no-feature build keeps its
+# current dependency surface. dalek performs its own (effectively
+# constant-time) verification internally.
+ed25519-dalek = { version = "2", optional = true }
+# Best-effort scrub of the in-memory HMAC key on drop. Wraps the 32-byte key
+# field in `zeroize::Zeroizing` so swap-backed memory is overwritten when
+# the writer/reader is dropped. Gated behind `signed-snapshots` since
+# the field itself only exists under that feature — keeps the no-feature
+# build dep-surface identical to before.
+zeroize = { workspace = true, optional = true }
+# Opt-in convergence path onto the unified content-addressed artifact store
+# (see `docs/ARTIFACT-STORE.md`). Activating the `artifact-backing` feature
+# enables `SnapshotWriter::capture_to_artifact_store` and
+# `SnapshotReader::restore_from_artifact_store`, which wrap the bincode-
+# encoded `Snapshot` in `DiskArtifactStore::put` / `get` instead of the
+# inline v2/v3 envelope. The default capture / restore methods continue
+# to emit and parse the legacy envelope byte-for-byte; this feature is
+# purely additive for v0.3.8.
+tensor-wasm-artifacts = { workspace = true, optional = true }
+# Optional memory-mapped input path for restore. When the `mmap` feature is
+# enabled, `SnapshotReader::restore_from_path_mmap` maps the snapshot file
+# read-only instead of reading it wholly into a `Vec<u8>`, then feeds the
+# mapped bytes through the unchanged verify-then-decode pipeline. Off by
+# default so the no-feature build keeps its current dependency surface.
+memmap2 = { version = "0.9", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+# Property-based roundtrip coverage — see `tests/roundtrip_proptest.rs`.
+# Pulled in only at test time so the published crate retains its current
+# dep surface.
+proptest = { workspace = true }
+
+[features]
+# T40 (v0.4 default flip): `artifact-backing` is now a default feature so new
+# writes route through the unified `DiskArtifactStore` envelope when the
+# writer has an HMAC key configured. Legacy v2/v3 reads remain supported
+# indefinitely; operators who depend on the inline v3 wire format for
+# writes can either (a) explicitly call `SnapshotWriter::with_legacy_envelope()`
+# / `SnapshotWriter::capture_legacy()`, or (b) build this crate with
+# `--no-default-features --features signed-snapshots` to keep the v0.3.x
+# behaviour. See `FORMAT.md` § "v4 (artifact-store-backed, default)" and
+# `CHANGELOG.md` under [Unreleased] for the migration story.
+default = ["signed-snapshots", "artifact-backing"]
+# Enables the GPU-side restore path that materialises the snapshot's
+# `gpu_memory` blob directly into a CUDA UnifiedBuffer and prefetches it to
+# the target device. Pulls in `cust`; off by default so the crate builds on
+# CUDA-less hosts.
+cuda = ["dep:cust"]
+# Enables HMAC-SHA256 signing/verification for snapshots (v3 wire format).
+# When enabled (the default), `SnapshotWriter::with_hmac_sha256_key` and
+# `SnapshotReader::with_hmac_sha256_key` become available; without it the
+# writer/reader continue to handle only the unsigned v2 wire format.
+signed-snapshots = ["dep:hmac", "dep:sha2", "dep:subtle", "dep:zeroize", "dep:ed25519-dalek"]
+# Artifact-store backing for snapshots (T40, now the default in v0.4).
+# When enabled the writer's default `capture` path routes through the
+# unified `tensor-wasm-artifacts` envelope (BLAKE3 content-hash + zstd +
+# HMAC-SHA256 + 16-byte ARTIFACT_MAGIC prefix) and the reader auto-detects
+# that envelope by its magic prefix, falling back to legacy v3 (T8
+# trailer-magic) and v2 detection for older blobs. The feature itself
+# remains separable so downstream consumers that need the byte-for-byte
+# legacy envelope on writes can build with
+# `--no-default-features --features signed-snapshots` to disable it.
+# `SnapshotWriter::with_legacy_envelope()` / `SnapshotWriter::capture_legacy`
+# also opt out per-call when the feature is enabled.
+artifact-backing = ["dep:tensor-wasm-artifacts"]
+# Memory-mapped restore input path (non-default). Pulls in the optional
+# `memmap2` dependency and enables `SnapshotReader::restore_from_path_mmap`
+# / `restore_streaming_from_path_mmap`, which map the snapshot file instead
+# of reading it into a `Vec<u8>` before restore. Purely additive: it changes
+# only how the input bytes are sourced; the verify-then-decode pipeline is
+# unchanged, so authentication still runs before any payload byte is exposed.
+mmap = ["dep:memmap2"]
+
+[package.metadata.docs.rs]
+all-features = false
+features = ["signed-snapshots", "artifact-backing", "mmap"]
+rustdoc-args = ["--cfg", "docsrs"]

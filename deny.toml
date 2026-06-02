@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Craton Software Company
+#
+# cargo-deny configuration. Run with `cargo deny check` (advisories +
+# bans + licenses + sources) or `cargo deny check sources` for the
+# git-pinned dependency audit only.
+#
+# Default posture: deny all unknown git sources. Each git pin must be
+# explicitly allowlisted below with a rationale + the upstream RFC or
+# CHANGELOG entry that introduced it.
+
+[graph]
+all-features = false
+# The workspace no longer carries any git-pinned dependency: the
+# cuda-oxide host/device crates (cuda-host/core/async/device/macros) were
+# removed for crates.io publishability, and pliron is consumed from
+# crates.io (0.15). There is therefore no feature whose transitive graph
+# needs to be force-evaluated for the git-source audit.
+features = []
+
+[advisories]
+version = 2
+# Blocking posture: any new RUSTSEC advisory fails the build, consistent
+# with `yanked = "deny"`. Under advisories schema v2 vulnerability/unsound
+# advisories already error and cannot be downgraded to a warning; we also
+# pin `unmaintained = "all"` so unmaintained advisories block too (the
+# strictest setting) rather than relying on the implicit default. The
+# `ignore` list below is the only escape hatch and takes precedence, so
+# documented, risk-accepted advisories (e.g. the bincode entry) stay green.
+yanked = "deny"
+unmaintained = "all"
+ignore = [
+    # RUSTSEC-2025-0141 — bincode is unmaintained. The bincode team ceased
+    # development permanently after a doxxing/harassment incident; there is
+    # NO safe upgrade (1.3.3 is the "complete" 1.x line and 2.x has no
+    # successor). bincode 2.x is a core, non-optional serialization
+    # dependency here (snapshot v3/v4 payloads in `tensor-wasm-snapshot`,
+    # kernel envelopes in `tensor-wasm-jit`). The advisory is informational
+    # (unmaintained, not a vulnerability), so we ignore it to keep CI green
+    # and track a migration to a maintained codec (postcard / bitcode) as a
+    # separate roadmap item — see docs/RISKS.md.
+    "RUSTSEC-2025-0141",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# Explicit allowlist for crates we deliberately ship at multiple major
+# versions. Add a `# rationale: ...` comment for every entry.
+skip = []
+skip-tree = []
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    # webpki-roots >=1.0 relicensed the bundled Mozilla CA root data under
+    # CDLA-Permissive-2.0 (a permissive data license). Pulled transitively
+    # via reqwest -> hyper-rustls -> webpki-roots in tensor-wasm-cli.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+[sources]
+# Default: refuse any git dependency that isn't on the allowlist below.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# Allowlist for git-pinned sources. EMPTY: the workspace deliberately
+# carries no git dependency so every crate is publishable to crates.io
+# (which rejects manifests containing a `git` dependency, even an
+# optional/feature-gated one).
+#
+# Previously this allowed:
+#   * https://github.com/NVlabs/cuda-oxide — the cuda-host / cuda-core /
+#     cuda-async / cuda-device / cuda-macros crates behind the
+#     experimental cuda-oxide host backend. Removed with that feature.
+#   * https://github.com/vaivaswatha/pliron — a transitive pin that came
+#     in via cuda-oxide; moot now that pliron is consumed from crates.io
+#     (0.15) and cuda-oxide is no longer in the graph.
+#
+# Re-add the cuda-oxide URL here ONLY if the host backend is restored as a
+# git dependency (publishing will then be blocked again); the preferred
+# path is to depend on the crates.io versions once NVlabs publishes them.
+# See RFC 0001 / docs/CUDA-OXIDE-CUTOVER.md.
+allow-git = []

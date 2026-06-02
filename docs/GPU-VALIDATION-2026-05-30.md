@@ -1,0 +1,454 @@
+# Hardware verification run — 2026-05-30
+
+First real-silicon validation of the WASM→GPU stack. Until this run every
+CUDA path was gated behind `#[ignore = "requires CUDA hardware"]` /
+`#[cfg(feature = "cuda")]` and had **never executed on a GPU** — and, as it
+turns out, the `--features cuda` host path had never even *compiled*.
+
+## Environment
+
+| Item | Value |
+|---|---|
+| GPU | NVIDIA GeForce RTX 2060 |
+| Compute capability | **7.5 (Turing)** |
+| Driver | 591.86 (CUDA 13.1 driver API) |
+| CUDA Toolkit | 13.2 (`nvcc` 13.2.78, `cuda.lib`/`cudart.lib`/`nvrtc.lib` present) |
+| Host | Windows 11, MSVC BuildTools 14.44, Rust nightly-2026-04-03 |
+| libclang | 18.1.1 via `pip install --user libclang` (needed by `cust_raw` bindgen; not previously present) |
+
+Reproduce with `scripts/run-gpu-tests.{sh,ps1}` (auto-detects CUDA + libclang,
+runs every suite single-threaded, logs to `bench-results/gpu-run/`).
+
+## Results
+
+### ✅ `tensor-wasm-mem --features unified-memory` (cust path) — PASS
+`cust` 0.3.2 / `cust_raw` 0.11.3 **build cleanly against CUDA 13.2 + libclang 18**
+(the single biggest unknown). On hardware:
+- `cust_unified_buffer_snapshot_round_trip_on_device` … **ok** — real
+  `cuMemAllocManaged` allocate → write → snapshot → restore round-trip.
+
+### ◑ `tensor-wasm-mem --features gpu-mem-pool` (cudarc path) — 4 PASS / 1 FAIL
+- `cudarc_backend::allocate_and_drop_small_buffer` … ok
+- `cudarc_backend::device_cache_returns_same_arc_for_same_ordinal` … ok
+- `driver_pin_matches_requested_cap` … ok
+- `under_cap_allocation_through_pool_succeeds` … ok
+- **`over_cap_allocation_through_pool_is_rejected_by_driver` … FAIL** — see BUG-1.
+
+`cudarc` 0.13.9 (`features = ["driver","cuda-12000"]`) loads the 13.1 driver
+fine — the CUDA 12 driver-API bindings are forward-compatible.
+
+### ✗ `tensor-wasm-wasi-gpu --features cuda` — DOES NOT COMPILE — see BUG-2
+
+## BUG-1 — driver-level per-tenant GPU memory cap (T39) is not enforced
+
+`tests/cuda_mem_pool_driver_pin.rs::over_cap_allocation_through_pool_is_rejected_by_driver`
+asks for 128 MiB from a pool created with a 64 MiB "cap" and expects the driver
+to refuse with `CUDA_ERROR_OUT_OF_MEMORY`. **The allocation succeeds.**
+
+Root cause (`crates/tensor-wasm-mem/src/cuda_mem_pool.rs:215`): the cap is wired
+as `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, cap)`. But
+`RELEASE_THRESHOLD` is a *memory-retention hint* — it controls how much freed
+memory the pool caches before returning it to the OS. **It is not an allocation
+ceiling**, and CUDA memory pools expose no hard max-size attribute. So the T39
+threat model (a tenant with a raw driver handle bypassing the in-process
+`consume_gpu_bytes` counter) is **not** closed at the driver level, contrary to
+the module's "driver pin LANDED" status note and `docs/GPU-QUOTAS.md`.
+
+Severity: this is a security-relevant correctness defect in a multi-tenant
+isolation feature, and it would have shipped silently — the test that catches it
+only runs on hardware. Fix options: enforce the cap host-side in
+`TenantMemPool::allocate` (reject when `live + size > cap` before
+`cuMemAllocFromPoolAsync`), and/or back the pool with a fixed-size virtual-memory
+reservation (`cuMemAddressReserve` + `cuMemCreate` + `cuMemMap`) whose mapped
+size is the hard cap. Either way, drop the claim that `RELEASE_THRESHOLD` is the
+enforcement mechanism.
+
+## BUG-2 — the `--features cuda` host path has bit-rotted (never compiled)
+
+`cargo test -p tensor-wasm-wasi-gpu --features cuda` fails to build with six
+`error[E0063]: missing field 'device_ptr' in initializer of
+'device_mem::DeviceMemEntry'`:
+
+```
+crates/tensor-wasm-wasi-gpu/src/host.rs:2596
+crates/tensor-wasm-wasi-gpu/src/host.rs:2641
+crates/tensor-wasm-wasi-gpu/src/host.rs:2686
+crates/tensor-wasm-wasi-gpu/src/host.rs:2870
+crates/tensor-wasm-wasi-gpu/src/host.rs:2877
+crates/tensor-wasm-wasi-gpu/src/host.rs:2925
+```
+
+A `device_ptr` field was added to `DeviceMemEntry` but the six `cfg(cuda)`-gated
+constructors were never updated. Because there is no GPU CI runner, nothing ever
+compiles this feature — so the headline path (Wasm → `wasi:cuda` →
+`cuLaunchKernel` → readback) could not even be built, let alone run. This is the
+strongest argument for the GPU CI lane: a plain `cargo build --features cuda` in
+CI would have caught it.
+
+Fix: initialize `device_ptr` at each site with the device pointer the
+allocation/registration already has in scope. (In progress.)
+
+## sm_75 support (this GPU is Turing, the kernels target Ampere)
+
+`kernels/vector_add.ptx`, the test fixture, and `ptx_emit`'s `DEFAULT_TARGET`
+all hard-code `.target sm_80`. sm_80 PTX is rejected by the driver JIT on this
+sm_75 card, so `vector_add_end_to_end_real_ptx_real_kernel` self-skips. The
+kernel body is capability-agnostic (no wmma/tensor-core ops), so sm_75 variants
+were added:
+- `kernels/vector_add_sm75.ptx`
+- `crates/tensor-wasm-wasi-gpu/tests/fixtures/vector_add_sm75.ptx`
+
+Remaining: make `register_real_kernel` / the emitter pick the sm_75 fixture when
+the device's compute capability is < 8.0, so the end-to-end launch proof runs on
+Turing-class hardware. (In progress, blocked on BUG-2 — the test crate must
+compile first.)
+
+## Status of the loop
+
+> **STALE — superseded.** This table captures an *intermediate* state from the
+> 2026-05-30 debugging session. The launch proof was subsequently fixed and
+> VERIFIED on hardware (and re-confirmed 8/8 on 2026-06-01). Jump to
+> [RE-CONFIRMED 2026-06-01](#re-confirmed-2026-06-01--launch-proof-still-green-88--supersedes-every-earlier-blocked-note)
+> for the final status; the ⏳ "blocked" rows below no longer reflect reality.
+
+| Stage | State |
+|---|---|
+| cust builds on CUDA 13.2 | ✅ proven |
+| cudarc builds + runs on GPU | ✅ proven (1 real bug found) |
+| cust unified-memory round-trip on GPU | ✅ proven |
+| `--features cuda` host path compiles | ❌ BUG-2 (fix pending) |
+| Real kernel launch + verified output | ⏳ blocked on BUG-2 + sm_75 wiring |
+| `--features cuda` benches on GPU | ⏳ blocked on BUG-2 |
+| Self-hosted GPU CI lane active | ⏳ `gpu.yml` still needs a registered `[self-hosted, gpu]` runner |
+
+## Update — fix #7 (PTX regeneration + capability-aware selection) — code landed, launch still blocked by the driver JIT on this box
+
+This work made three correct, committable improvements, but did **not** achieve
+a verified kernel launch on this machine — the local driver's PTX JIT rejects
+every PTX we feed it, which is an environment limitation, not a code bug.
+
+**What landed (correct, and right for a healthy driver / the S22 runner):**
+1. `kernels/vector_add.cu` is now the source of truth; `make ptx` regenerates
+   all four fixtures with nvcc instead of hand-writing PTX.
+2. The e2e test queries device compute capability via the raw driver API
+   (`cuDeviceGetAttribute` — cust's safe `Device::get_attribute` is not exposed
+   under our `default-features = false` cust set) and loads ONLY the
+   arch-matched fixture (sm_75 for cc < 8.0, else sm_80). It never feeds a
+   known-mismatched fixture to the JIT first (which had left a sticky context
+   error that poisoned the next load — the `InvalidPtx`→`UnknownError` cascade).
+3. CUDA init ordering fixed: a shared `ensure_cuda_initialized()` runs `cuInit`
+   (via `quick_init`) before the capability query, which otherwise failed with
+   `CUDA_ERROR_NOT_INITIALIZED`.
+
+**What the hardware actually says (the blocker).** On the RTX 2060 (cc 7.5),
+`cust::module::Module::from_ptx` rejects the `vector_add` PTX at **every** ISA
+version we tried, for the arch-matched sm_75 target:
+
+| PTX source | `.version` | `Module::from_ptx` result |
+|---|---|---|
+| original hand-written | 8.0 | `InvalidPtx` |
+| nvcc 13.2 (toolkit) | 9.2 | `UnknownError` (cust can't map `UNSUPPORTED_PTX_VERSION`: driver is 13.1, toolkit 13.2) |
+| nvcc 12.6 (toolkit) | 8.5 | `InvalidPtx` |
+
+A structurally-valid, nvcc-generated, **arch-matched** `.version 8.5` sm_75
+module being rejected with `InvalidPtx` on an sm_75 device points at the
+**driver's JIT compiler being non-functional in this environment** (headless /
+WDDM / sandbox quirk), not at the PTX. Corroborating: the cust + cudarc *memory*
+paths (`cuMemAllocManaged`, pools, snapshot round-trip) all pass on this same
+box — those never invoke the PTX JIT; only module loading does, and only that
+fails.
+
+**Status of the launch proof:** still **not** verified on this machine, blocked
+by the local JIT. The code changes here are the right ones and should produce a
+real launch on a box with a working driver JIT (e.g. the S22 self-hosted
+runner). The e2e test now *fails loudly* (panics) when the arch-matched module
+is rejected, rather than silently skipping — deliberately, so a broken JIT or a
+bad fixture is surfaced rather than hidden. On a healthy runner it proceeds to
+`cuLaunchKernel` + readback.
+
+#6 (thread-bound context in the async path) and #1 (driver-level mem cap) remain
+open and untouched by this change.
+
+## Update — #1 verified, #9 found + fixed (cudarc context binding)
+
+After commit `47c5a05` (parallel session: host-side per-tenant cap for #1 +
+`cuda_ctx.rs` shared primary context for #6), re-running the gpu-mem-pool ignored
+suite on the RTX 2060 confirmed and uncovered:
+
+- **#1 VERIFIED ✅**: `over_cap_allocation_through_pool_is_rejected_by_driver ... ok`
+  (was FAILED), plus `under_cap` / `driver_pin_matches_requested_cap` /
+  `cuda_mem_pool_scaffold` (3) all ok. The host-side `live_bytes` reservation in
+  `TenantMemPool::allocate` closes BUG-1.
+- **BUG-9 (found, then fixed) ✅**: with #1 letting the run proceed past the old
+  failure, `cudarc_smoke::cudarc_round_trip_on_device` and
+  `cudarc_prefetch_round_trip_on_device` then failed with
+  `cuMemAllocManaged -> CUDA_ERROR_INVALID_CONTEXT`. Root cause:
+  `CudarcUnifiedBuffer::new_on` (cudarc_backend.rs) called `device_for()` (which
+  returns a cached `Arc<CudaDevice>` clone — only the thread that first built the
+  device has its context current) but did **not** call `ensure_context_bound`
+  before `cuMemAllocManaged`. Its sibling `apply_advice`/`prefetch_*` paths
+  already bound the context; `new_on` was the gap. This is the cudarc-path twin of
+  #6. One-line fix (add `ensure_context_bound(&device)?` in `new_on`); the stale
+  "the device above ensures the primary context is current" comment was wrong and
+  is corrected. These are `#[ignore]`d hardware tests, so hosted CI was unaffected
+  — only a real GPU surfaces it (and session 1's fail-fast had stopped before
+  these ran, so they had never actually executed on silicon).
+
+After the #9 fix, `cudarc_round_trip_on_device` and
+`cudarc_apply_advice_read_mostly_on_device` pass, along with the snapshot
+round-trip, visible-window, `cuda_mem_pool_scaffold` (3), and all three
+driver-pin tests (incl. `over_cap`). The cust `unified-memory` snapshot
+round-trip also passes.
+
+**BUG-10 (found, NOT fixed): `cuMemPrefetchAsync` unsupported on this box.**
+`cudarc_prefetch_round_trip_on_device` still fails — but now one line LATER than
+the #9 alloc failure (cudarc_smoke.rs:80, the prefetch, not :79 the alloc), with
+`cuMemPrefetchAsync(device) -> CUDA_ERROR_INVALID_DEVICE`. This is almost
+certainly an environment limitation, not a code bug: `cuMemPrefetchAsync`
+requires the device's `concurrentManagedAccess` attribute to be non-zero, which
+is **0 on Windows under the WDDM driver model** (managed-memory prefetch is a
+Linux / TCC feature). The right fix is to gate the prefetch path (and this test)
+on the `CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS` attribute and treat
+prefetch as a no-op/skip where unsupported — a small, separate change deferred
+here rather than landed unverified. Tracked as BUG-10.
+
+Remaining red items on this box are both environment limitations of the local
+Windows/WDDM driver, not code defects: the PTX-JIT launch proof (#7/BUG-8) and
+`cuMemPrefetchAsync` (BUG-10). Everything that does not depend on those two
+driver features passes on the RTX 2060.
+
+## Update — BUG-10 fixed+verified, BUG-8 fixed (code), BUG-9 verified
+
+- **BUG-10 — FIXED + VERIFIED ✅.** `CudarcUnifiedBuffer::prefetch_to_device` /
+  `prefetch_to_host` now query `CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS`
+  (helper `supports_managed_prefetch`) and degrade to an advisory no-op where it
+  is 0 (Windows/WDDM), instead of erroring. The full `cudarc_smoke` ignored suite
+  is now green on the RTX 2060 — `cudarc_prefetch_round_trip_on_device ... ok`
+  (was FAILED with `INVALID_DEVICE`), plus round-trip and advice. On Linux/TCC the
+  real prefetch path runs unchanged.
+- **BUG-9 — FIXED + VERIFIED ✅** (commit `842ad14`): `CudarcUnifiedBuffer::new_on`
+  binds the primary context before `cuMemAllocManaged`.
+- **BUG-8 — FIXED (code) + compiles; runtime still gated by BUG-7 JIT.** The e2e
+  test now backs guest linear memory with `cuMemAllocManaged` via
+  `make_managed_engine_and_linker` (`TensorWasmMemoryCreator` installed through
+  `Config::with_host_memory`), and the wasi-gpu `cuda` feature pulls in
+  `tensor-wasm-mem/unified-memory`. Confirmed: it **compiles cleanly under
+  `--features cuda`** and the test runs up to the module-load gate, where it still
+  hits the local driver's `InvalidPtx` (BUG-7) before instantiation/launch. So
+  the managed-memory wiring is in place; the only thing between here and a
+  verified launch is a host with a working PTX JIT (Linux / TCC / the S22 runner).
+
+### Final scoreboard (RTX 2060 / Windows / WDDM / CUDA 13.1 driver)
+
+| # | Status |
+|---|---|
+| BUG-1 (per-tenant cap) | fixed + **verified on GPU** |
+| BUG-2 (`--features cuda` compile) | fixed + **verified** |
+| BUG-6 (cust ctx thread-bind) | fixed (code); mem paths verified |
+| BUG-7 (PTX JIT rejects modules) | nvcc-regen + cap-select landed; **launch blocked by local JIT (env)** |
+| BUG-8 (managed-backed guest mem) | fixed (code) + **compiles**; runtime gated by BUG-7 |
+| BUG-9 (cudarc alloc ctx bind) | fixed + **verified on GPU** |
+| BUG-10 (`cuMemPrefetchAsync` on WDDM) | fixed + **verified on GPU** |
+
+Five of seven fixed-and-verified on this box. The two that can't be verified here
+(BUG-7 launch, BUG-8 end-to-end) are both gated on the local driver's PTX JIT and
+should pass on a Linux/TCC host or the S22 self-hosted runner; the code for both
+is in place and compiles.
+
+## RESOLVED 2026-05-31 — BUG-7 + BUG-8 fixed; real kernel launch VERIFIED on GPU
+
+`vector_add_end_to_end_real_ptx_real_kernel` **passes on the RTX 2060**: a real
+CUDA kernel launches through the full Wasm -> wasi:cuda -> cuLaunchKernel path and
+the test verifies `c[i] == a[i] + b[i]` read back from managed linear memory.
+This is the headline WASM->GPU proof the validation effort set out to establish —
+a real compute kernel, driven by a Wasm guest, producing verified-correct output
+on silicon.
+
+**Verified deterministically IN ISOLATION** (the authoritative proof that the
+launch path is correct):
+
+```
+cargo test -p tensor-wasm-wasi-gpu --features cuda --test kernel_args_e2e \
+  vector_add_end_to_end_real_ptx_real_kernel -- --ignored
+=> test result: ok. 1 passed; 0 failed   (deterministic, every run)
+```
+
+KNOWN-FLAKY in the full-file run (NOT yet resolved). When the entire
+`kernel_args_e2e` file runs in one process, the launch test passes only
+intermittently — **measured 4/10 pass over 10 consecutive runs** (the 6 failures
+are the launch test alone, failing at `Module::from_ptx` with
+`InvalidContext`/`IllegalAddress`; the other 7 tests pass every run). This is a
+cross-test CUDA context/managed-memory lifecycle race in the test binary, NOT a
+defect in the launch path itself (which the isolation run proves correct every
+time). See "Full-file ordering" below — partially mitigated, root cause still
+open.
+
+BUG-7 was NOT an environment limitation (my earlier conclusion was wrong). Two
+real causes, both fixed:
+1. **Non-ASCII bytes in the PTX.** The committed fixtures had a hand-written
+   header comment containing a U+2014 em-dash. `ptxas`/the driver JIT rejects
+   non-ASCII bytes anywhere in the PTX image with `CUDA_ERROR_INVALID_PTX`.
+   Fix: fixtures are now generated VERBATIM by nvcc (pure ASCII) from
+   `kernels/vector_add.cu`, with an ASCII-only provenance header.
+2. **PTX ISA version vs driver.** nvcc 13.2 emits `.version 9.2`, which this
+   box's CUDA 13.1 driver rejects (`UNSUPPORTED_PTX_VERSION`, surfaced by cust
+   as `UnknownError`). Fix: generate with the CUDA 12.6 toolkit (`.version 8.5`),
+   which the 13.1 driver accepts. sm_75 target matches the device.
+
+BUG-8 required three things, all now in `make_managed_engine_and_linker`:
+1. Guest linear memory backed by `cuMemAllocManaged` via `TensorWasmMemoryCreator`
+   (`Config::with_host_memory`), so kernel pointer-args are device-addressable.
+2. The wasmtime engine knobs the UnifiedBuffer backend needs (mirrors
+   `tensor-wasm-exec`'s engine.rs): `memory_reservation(0)`,
+   `memory_guard_size(0)`, `guard_before_linear_memory(false)` — managed memory
+   cannot satisfy the default 4 GiB static reservation or host mprotect guards.
+   Plus `async_support(true)` for the async launch path.
+3. A SINGLE CUDA context shared between module-load and launch: the test's
+   `ensure_cuda_initialized` now routes through `cuda_ctx::ensure_current_context`
+   (the same primary-context helper the launch path uses). Loading the module in
+   one context and launching its function on a stream from another context fails
+   `cuLaunchKernel` with `INVALID_VALUE`.
+
+### Final scoreboard (RTX 2060 / Windows / WDDM / CUDA 13.1 driver)
+
+| # | Status |
+|---|---|
+| BUG-1 (per-tenant cap) | fixed + verified on GPU |
+| BUG-2 (`--features cuda` compile) | fixed + verified |
+| BUG-6 (cust ctx thread-bind) | fixed + verified (shared ctx now exercised by the passing launch) |
+| BUG-7 (PTX rejected by JIT) | **fixed + VERIFIED: real kernel launches (deterministic in isolation; full-file flaky — open)** |
+| BUG-8 (managed-backed guest mem) | **fixed + VERIFIED: launch output correct (deterministic in isolation; full-file flaky — open)** |
+| BUG-9 (cudarc alloc ctx bind) | fixed + verified on GPU |
+| BUG-10 (`cuMemPrefetchAsync` on WDDM) | fixed + verified on GPU |
+
+Remaining known issue (separate, pre-existing, NOT a BUG-7/8 regression):
+`host::tests::alloc_tracks_handle_then_free_lifecycle` and
+`wasi_gpu_smoke::sync_returns_ok_without_cuda` hard-code the no-CUDA return value
+and now fail under `--features cuda` precisely BECAUSE the device path works
+(alloc returns a real handle, sync returns 0). These are the BUG-4 class; they
+each need a `#[cfg(feature = "cuda")]` arm. The `kernel_args_e2e` integration
+suite (which contains the launch proof) is fully green.
+
+## Full-file ordering — partial fix; one cross-test interaction remains
+
+Commit `a2f76af` improved cross-test robustness in two real ways:
+- `cuda_ctx::ensure_current_context` no longer uses `cust::quick_init` (which
+  conflicts with tensor-wasm-mem's own cust init and cached an `Err`). It now
+  retains the device-0 PRIMARY context directly via `cuDevicePrimaryCtxRetain` +
+  `cuCtxSetCurrent` — refcounted, coexists with every other retainer in the
+  process.
+- `dispatch_pipeline_compiles_against_real_module_bytes` now uses the
+  arch-matched fixture via `select_vector_add_ptx()`, so its `from_ptx` no longer
+  fails-and-poisons on this sm_75 box.
+
+A third change PARTIALLY mitigated the full-file flake (but did not eliminate it):
+
+3. One contributing cause was a **stale cached context handle**.
+   `ensure_current_context` originally cached the `cuDevicePrimaryCtxRetain`
+   result in a `OnceLock` and only re-`cuCtxSetCurrent`'d it. When an earlier
+   test's `cust::Context` (from `quick_init`) dropped, it called
+   `cuDevicePrimaryCtxRelease`; if the refcount hit zero the primary context was
+   torn down and the cached handle went stale. `cuCtxSetCurrent` on the stale
+   handle still "succeeds" (a thread-local write), but the next `cuModuleLoadData`
+   / `cuLaunchKernel` then fails `CUDA_ERROR_INVALID_CONTEXT`. So
+   `ensure_current_context` now **re-retains the primary context on every call**
+   (`cuInit` idempotent, `cuDevicePrimaryCtxRetain` refcounted -> live per-device
+   singleton) before binding it, plus a process-lifetime priming retain so the
+   refcount never reaches zero. The e2e test's `ensure_cuda_initialized` routes
+   through this shared helper too.
+
+HONEST RESULT: this changed the full-file launch test from *always* failing to
+*intermittently* passing — **measured 4/10 pass over 10 consecutive full-file
+runs**. It is **still flaky** — the failure now also appears as
+`IllegalAddress`, pointing at a deeper cross-test interaction (a managed
+allocation or stream/event from an earlier test outliving its context, or a
+context teardown racing the next test's bind). The isolation run is the
+authoritative, deterministic proof that the launch path works; making the
+full-file run deterministic is an OPEN follow-up. Candidate fixes not yet
+attempted: give the launch/`from_ptx` path its own explicitly-created context
+(not the primary context shared with `cust`'s `quick_init`/drop lifecycle), or
+make every CUDA-using test acquire the context through one owner that never
+drops it. Tracked; does not block the launch proof.
+
+## RESOLVED 2026-05-31 — device-addressability guard fixes the full-file flake (a real bug)
+
+The intermittent full-file launch failure was **not** a test artifact. It was a
+real production defect with a security dimension, now fixed and verified.
+
+**Mechanism.** `dispatch_pipeline_compiles_against_real_module_bytes` launches a
+real `vector_add` module with pointer args into PLAIN host-heap linear memory
+(the default engine — no unified-memory `MemoryCreator`). The host's launch path
+bounds-checked those pointers against linear memory but did **not** verify they
+were GPU-addressable, and handed them straight to `cuLaunchKernel`. The kernel
+then dereferenced host addresses on the device, raising
+`CUDA_ERROR_ILLEGAL_ADDRESS` — a **sticky** error that poisons the process-shared
+CUDA context, so every later CUDA op fails. libtest does not fix test order, so
+this sometimes ran before `vector_add_end_to_end_real_ptx_real_kernel` and broke
+it (`InvalidContext`/`IllegalAddress`) → the intermittent failure.
+
+**Why it matters beyond tests (cross-tenant DoS).** In a multi-tenant deployment
+that runs `--features cuda` but backs Wasm linear memory with host heap (i.e.
+without `tensor-wasm-mem/unified-memory`), ANY guest could pass an in-bounds
+pointer arg to a kernel launch and trigger this sticky illegal-access, poisoning
+the GPU context for **every other tenant in the process**. `docs/RISKS.md`
+documented the "linear memory must be UVM-backed" constraint but nothing
+*enforced* it.
+
+**The fix (production code, `host::launch`).** Before `cuLaunchKernel`, each
+pointer arg is checked with
+`cuPointerGetAttribute(CU_POINTER_ATTRIBUTE_IS_MANAGED, host_ptr)`. Host-heap
+pointers are unknown to the driver (`INVALID_VALUE`); managed pointers return
+`is_managed == 1`. A launch with any non-managed pointer arg is refused up front
+with `AbiError::LaunchFailed` — no driver launch state is touched, so no sticky
+error and no context poison. One cheap driver query per pointer arg.
+
+**Verification (clean, serialized — no build contention).** Built the cuda test
+binary ONCE, then ran the prebuilt binary 12× back-to-back:
+
+```
+EXE=target/release/deps/kernel_args_e2e-*.exe
+for i in 1..12: $EXE --include-ignored --test-threads=1
+=> CLEAN_FINAL: pass=12 fail=0 of 12
+```
+
+All 8 tests (incl. `vector_add_end_to_end_real_ptx_real_kernel`, the real
+WASM->cuLaunchKernel launch) pass 12/12. `dispatch_pipeline_compiles_against_real_module_bytes`
+is deliberately kept on the host-heap engine so it exercises the guard, and now
+asserts the launch is refused (`rc != 0`, never `InvalidArgs`/`InvalidPointer`).
+
+NOTE on an earlier interim "9/10": that single failure was **build contention**,
+not a test failure — two concurrent `cargo` invocations against one `target/`
+dir produced `STATUS_STACK_BUFFER_OVERRUN` / `LNK1181 ...rcgu.o.rcgu.o`
+(corrupted object files) during *compilation*. Every run whose binary actually
+built passed 8/8. The clean serialized 12/12 above is the authoritative result.
+
+## RE-CONFIRMED 2026-06-01 — launch proof still green (8/8) — SUPERSEDES every earlier "blocked" note
+
+The end-to-end GPU launch proof was re-run on this same box on the
+open-source `dev` branch and **passes 8/8 again**:
+
+```
+cargo test -p tensor-wasm-wasi-gpu --release --features cuda \
+  --test kernel_args_e2e -- --include-ignored --test-threads=1
+=> 8 passed; 0 failed
+   (incl. vector_add_end_to_end_real_ptx_real_kernel ... ok)
+```
+
+Environment unchanged: RTX 2060, compute capability 7.5, driver 591.86,
+CUDA Toolkit 13.2.
+
+**This is the FINAL status of the validation effort. The headline
+WASM → `wasi:cuda` → `cuLaunchKernel` → verified-readback path is PROVEN ON
+HARDWARE.** Earlier sections of this file (the "Status of the loop" table, the
+"blocked on BUG-2 + sm_75" notes, BUG-7's interim "blocked by the local JIT"
+conclusion, and the first scoreboard) describe *intermediate* states during the
+debugging run and are **superseded** — do not read them as the current status.
+BUG-7 and BUG-8 are fixed and verified; the launch path is correct and
+deterministic in isolation.
+
+Separately, the lib unittests `host::tests::alloc_tracks_handle_then_free_lifecycle`
+and `wasi_gpu_smoke::sync_returns_ok_without_cuda` currently FAIL under
+`--features cuda` because they hardcode stale *no-CUDA* return expectations
+(they assert the device path is absent). That is a known test-expectation bug
+(BUG-4 class) being fixed separately — it is **NOT** a failure of the launch
+path, which the `kernel_args_e2e` suite proves green.

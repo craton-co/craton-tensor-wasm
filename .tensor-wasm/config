@@ -1,0 +1,13 @@
+[core]
+	repositoryformatversion = 0
+	filemode = false
+	bare = false
+	logallrefupdates = true
+	symlinks = false
+	ignorecase = true
+[user]
+	name = victor-craton
+	email = victor@craton.com.ar
+[remote "origin"]
+	url = git@github-craton:craton-co/craton-tensor-wasm.git
+	fetch = +refs/heads/*:refs/remotes/origin/*

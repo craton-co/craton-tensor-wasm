@@ -1,0 +1,141 @@
+[package]
+name = "tensor-wasm-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Benchmark harness for Craton TensorWasm (Criterion + custom suites)."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-bench"
+readme = "README.md"
+keywords = ["wasm", "benchmark", "criterion", "latency", "gpu"]
+categories = ["development-tools::profiling", "wasm"]
+publish = false
+
+[lib]
+# The lib carries no benchmarks; without this `cargo bench` would still build
+# and run the lib unittest binary, which rejects Criterion's CLI flags
+# (e.g. `--warm-up-time`) and aborts the whole `cargo bench --benches` run.
+bench = false
+
+[dependencies]
+tensor-wasm-api = { workspace = true }
+tensor-wasm-core = { workspace = true }
+tensor-wasm-jit = { workspace = true }
+tensor-wasm-mem = { workspace = true }
+tensor-wasm-snapshot = { workspace = true }
+tensor-wasm-wasi-gpu = { workspace = true }
+tokio.workspace = true
+
+[dev-dependencies]
+axum = { workspace = true }
+base64 = "0.22"
+criterion.workspace = true
+http-body-util = "0.1"
+serde_json.workspace = true
+tempfile.workspace = true
+tensor-wasm-exec = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { workspace = true, features = ["util"] }
+wat = { workspace = true }
+
+[[bench]]
+name = "kernel_dispatch"
+harness = false
+
+[[bench]]
+name = "cold_start"
+harness = false
+
+[[bench]]
+name = "memory_bandwidth"
+harness = false
+
+[[bench]]
+name = "jit_compile"
+harness = false
+
+[[bench]]
+name = "e2e_inference"
+harness = false
+
+[[bench]]
+name = "tail_latency"
+harness = false
+
+[[bench]]
+# F3 — RFC 0001 Unresolved question #3 harness. Compares the existing
+# busy-poll `DispatchFuture` path against a future cuda-async-backed
+# alternative. The cuda-async backend is a documented stub in v0.3.x and
+# emits a skip line until the v0.4 cuda-oxide port wires it. See
+# `crates/tensor-wasm-bench/benches/dispatch_future_backends.rs` for the
+# wiring contract.
+name = "dispatch_future_backends"
+harness = false
+
+[[bench]]
+# Hot-path validator for `HttpRequestLabels::try_new` against a 100-route
+# allow-list. Pins the `RouteAllowlist::lookup` migration from a
+# `Vec<&'static str>` linear scan to a `HashSet<&'static str>` index so a
+# regression that drags the lookup back to `O(n)` is caught here. Not on
+# the CI regression-gate path -- diagnostic only; see
+# `bench-results/README.md` for the broader convention.
+name = "metrics_label_validation"
+harness = false
+
+[[bench]]
+# Spawn/terminate + call_export_with_args round-trip through the real
+# `tensor-wasm-exec` engine. Requires `tensor-wasm-exec` + `wat` (dev-deps).
+# Registered with the criterion harness; previously auto-discovered, which
+# conflicted with its `criterion_main!`.
+name = "call_export_args"
+harness = false
+
+[[bench]]
+# B7.1 streaming-invoke harness. The three bench functions emit clean
+# `"status":"skipped"` JSON lines (mirroring the dispatch_future_backends
+# skip pattern) and return without measuring until the streaming spawn path
+# lands; registered so `cargo bench --workspace` compiles cleanly (the
+# criterion_main! harness would otherwise clash with auto-discovery).
+# Running this bench completes cleanly today — it does NOT panic. The
+# per-function TODO(B7.1) markers in the source track the real wiring; see
+# the module docs.
+name = "streaming_invoke"
+harness = false
+
+[features]
+# Default off so the existing `cargo bench -p tensor-wasm-bench` pipeline
+# stays cuda-toolkit-free on CI runners and developer laptops.
+default = []
+# Forwards to `tensor-wasm-wasi-gpu/cuda`. Required to compile the real
+# body of `benches/dispatch_future_backends.rs`; without it the bench
+# emits two skip lines and exits cleanly so `cargo bench --bench
+# dispatch_future_backends` still works as a sanity check.
+cuda = ["tensor-wasm-wasi-gpu/cuda"]
+# Forwards to `tensor-wasm-mem/cuda-oxide-backend`. Required (in addition
+# to `cuda`) once the v0.4 port wires the cuda-async path; v0.3.x doesn't
+# need it because the scaffold deliberately carries no `cuda-async` use
+# statement. Listed here so a v0.4 reviewer can flip both features in one
+# `cargo bench --features cuda,cuda-oxide-backend` invocation and get
+# real numbers instead of a skip line. See RFC 0001 (rfcs/0001-cuda-oxide-integration.md).
+cuda-oxide-backend = ["tensor-wasm-mem/cuda-oxide-backend"]
+# W4.4 added this flag so the tail-latency bench's backend axis (RFC 0001
+# Unresolved questions — extension of the W4.6 P99.9 bench with a
+# per-backend label) can be exercised three times: default (`unified-memory`),
+# `--features cudarc-backend` (`cudarc`), and `--features cuda-oxide-backend`
+# (`cuda-oxide`). The flag is **deliberately label-only at the bench layer**
+# — it does NOT forward to `tensor-wasm-mem/cudarc-backend`. Two reasons:
+# (1) the bench's `measure()` path runs on the dispatch / e2e router and
+# does not touch CUDA memory directly, so the flag's side-effect is purely
+# in `BACKEND_LABEL`; (2) the workspace nightly-2026-04-03 currently has a
+# stable-feature-flag mismatch with `tensor-wasm-mem`'s cudarc backend
+# (`once_cell_try` is still nightly-only on that toolchain), and forwarding
+# the feature would surface that pre-existing issue on every
+# `--features cudarc-backend` bench invocation. When the mem-crate toolchain
+# story stabilises this forwarding can be added without changing the bench
+# source. See `benches/tail_latency.rs` for the `BACKEND_LABEL` constant
+# and `docs/BENCHMARKING.md` for the operator recipe (run the bench three
+# times, diff the three JSON files).
+cudarc-backend = []

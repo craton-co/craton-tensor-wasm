@@ -1,0 +1,9 @@
+style: cargo fmt + fix clippy needless_borrow in classify_error test
+
+Resolves CI fmt and clippy(-D warnings) gates: drop the needless &format! borrow
+in the wasmtime-phrasing pin test (wat::parse_str takes impl AsRef), and apply
+rustfmt across the audit-remediation changes (routes.rs, core types.rs,
+wasi-gpu device_mem.rs). No behavior change. Verified: cargo fmt --all --check
+clean, cargo clippy --workspace --all-targets clean (0 warnings).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>

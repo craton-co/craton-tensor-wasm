@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
+//
+// `wasi:tensor@0.1.0` — TensorWasm's streaming-output host surface
+// (roadmap feature #2). Lets a Wasm guest emit chunks of bytes that the
+// host gateway buffers and flushes to the HTTP client as Server-Sent
+// Events (when the request `Accept`-ed `text/event-stream`) or as raw
+// chunked-transfer bytes (otherwise).
+//
+// v0.3.7 lands the contract + a buffered in-memory channel. The actual
+// mid-execution wiring through the axum response path is a v0.4 follow-up
+// — see `docs/STREAMING.md` for the implementation plan and security
+// notes (log-injection sanitisation, downstream-disconnect handling,
+// total-bytes cap).
+//
+// Keep this file and `crates/tensor-wasm-wasi-gpu/src/streaming.rs` in
+// lockstep — every error code must match.
+
+package wasi:tensor@0.1.0;
+
+interface host {
+    /// Emit a chunk of streaming output. The host buffers chunks and
+    /// flushes them to the HTTP client as Server-Sent Events (or chunked
+    /// transfer-encoding bytes when the request didn't accept SSE).
+    ///
+    /// Returns 0 when the chunk is accepted (the full `bytes` payload is
+    /// forwarded — the host does not perform partial acceptance), or a
+    /// negative error code:
+    ///   -1 = streaming not enabled for this invocation
+    ///   -2 = guest tried to emit past the documented size cap
+    ///   -3 = downstream client disconnected
+    /// The contract is all-or-nothing: a chunk is either fully accepted
+    /// (return 0) or fully rejected (negative code). It never returns a
+    /// partial byte count. See
+    /// `crates/tensor-wasm-wasi-gpu/src/streaming.rs::StreamingContext::emit_chunk`.
+    emit-chunk: func(bytes: list<u8>) -> s32;
+
+    /// Flush any buffered chunks. Implicit on guest return; explicit
+    /// flush is useful to mark logical record boundaries.
+    flush: func() -> s32;
+
+    /// Number of input bytes the host has staged for this invocation.
+    ///
+    /// This is the pull-model counterpart to `emit-chunk`: the gateway
+    /// (e.g. the OpenAI completions shim) stages the assembled prompt
+    /// bytes on the per-instance host state before the guest runs, and
+    /// the guest learns how many bytes are waiting via this call. Returns
+    /// `0` when no input was staged for this invocation (the default).
+    ///
+    /// The count is fixed for the lifetime of the invocation — the host
+    /// never mutates the staged buffer mid-call — so a guest may size a
+    /// single read buffer from one `input-len` call and then drain it via
+    /// one or more `read-input` calls.
+    input-len: func() -> u32;
+
+    /// Copy up to `len` bytes of the staged input into guest linear
+    /// memory at `ptr`, returning the number of bytes written.
+    ///
+    /// The whole staged buffer is presented as a single contiguous run
+    /// starting at offset 0; a guest reading the full input passes
+    /// `len >= input-len()` and receives every byte in one call. The
+    /// host writes `min(len, input-len())` bytes and returns that count.
+    ///
+    /// Returns a negative error code on failure, drawn from the same ABI
+    /// error space as the wasi-cuda surface (`crate::abi::AbiError`):
+    ///   -2 = the `(ptr, len)` pair is invalid — negative, or the region
+    ///        `[ptr, ptr+len)` falls outside the guest's exported
+    ///        `memory` (bounds-checked with the same `checked_add`
+    ///        pattern as `emit-chunk` / the wasi-cuda `read_bytes` path).
+    /// A return of `0` means "no input staged" (or `len == 0`), never an
+    /// error.
+    read-input: func(ptr: u32, len: u32) -> s32;
+}
+
+world tensor-streaming {
+    import host;
+}

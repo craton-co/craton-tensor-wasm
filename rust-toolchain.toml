@@ -1,0 +1,12 @@
+[toolchain]
+# Bumped 2026-05-25 from nightly-2026-03-15 -> nightly-2026-04-03 to
+# match cuda-oxide's own rust-toolchain.toml pin (a prerequisite for
+# the cuda-oxide-backend feature scaffolded in v0.3.1 per RFC 0001
+# "Toolchain plan" step 3 / PATH-TO-V1 Open Decision #8 quarterly
+# cadence). Rolling back to 2026-03-15 is a one-character change if
+# something downstream breaks; the prior pin compiled the whole
+# workspace + benches + tests green at 0.3.0 + 0.3.1-pre-bump.
+channel = "nightly-2026-04-03"
+components = ["rustfmt", "clippy", "rust-src", "llvm-tools-preview"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+profile = "minimal"

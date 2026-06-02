@@ -1,0 +1,166 @@
+[package]
+name = "tensor-wasm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+tensor-wasm-core = { path = "../crates/tensor-wasm-core" }
+tensor-wasm-api = { path = "../crates/tensor-wasm-api" }
+# `cuda-oxide-backend` is required so the `lowering_driver` module
+# (gated behind that feature, per `crates/tensor-wasm-jit/src/lib.rs`) is
+# compiled in. The `lowering_driver` fuzz target depends on it; the other
+# targets are feature-agnostic so the extra opt-in is harmless for them.
+tensor-wasm-jit = { path = "../crates/tensor-wasm-jit", features = ["cuda-oxide-backend"] }
+tensor-wasm-mem = { path = "../crates/tensor-wasm-mem" }
+tensor-wasm-snapshot = { path = "../crates/tensor-wasm-snapshot" }
+# The artifact-envelope decode fuzzer (`fuzz_artifact_decode_envelope`) drives
+# `decode_envelope_from_bytes` directly; the snapshot crate also re-enters this
+# code via its default `artifact-backing` feature (used by
+# `fuzz_snapshot_restore_arbitrary`'s v4 path).
+tensor-wasm-artifacts = { path = "../crates/tensor-wasm-artifacts" }
+tensor-wasm-wasi-gpu = { path = "../crates/tensor-wasm-wasi-gpu" }
+# Used by `lowering_driver` to hand-build small Cranelift `Function`s.
+# Pinned to the same version as the workspace (see top-level Cargo.toml).
+cranelift-codegen = "0.111"
+wasmparser = "0.218"
+wasmtime = { version = "25", default-features = false, features = ["async", "cranelift", "runtime"] }
+tokio = { version = "1.40", features = ["rt", "macros"] }
+wat = "1"
+# The audit-log round-trip target needs `Uuid: Arbitrary`, which the
+# `uuid` crate gates behind its own `arbitrary` feature.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde", "arbitrary"] }
+
+[[bin]]
+name = "fuzz_wasm_compile"
+path = "fuzz_targets/fuzz_wasm_compile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ptx_emit"
+path = "fuzz_targets/fuzz_ptx_emit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_snapshot_restore"
+path = "fuzz_targets/fuzz_snapshot_restore.rs"
+test = false
+doc = false
+bench = false
+
+# v4 artifact-envelope reader fuzz — prepends `ARTIFACT_MAGIC` and a synthetic
+# 32-byte HMAC key so `SnapshotReader::restore` dispatches onto the v0.4
+# artifact-store envelope decode path rather than the legacy v3/v2 readers.
+# Complements `fuzz_snapshot_restore` (v2). See
+# `fuzz_targets/fuzz_snapshot_restore_arbitrary.rs`.
+[[bin]]
+name = "fuzz_snapshot_restore_arbitrary"
+path = "fuzz_targets/fuzz_snapshot_restore_arbitrary.rs"
+test = false
+doc = false
+bench = false
+
+# v2 (unsigned) reader fuzz — drives `SnapshotReader::default().restore(data)`
+# against arbitrary bytes. See `fuzz_targets/snapshot_restore.rs`.
+[[bin]]
+name = "snapshot_restore"
+path = "fuzz_targets/snapshot_restore.rs"
+test = false
+doc = false
+bench = false
+
+# v3 (HMAC-SHA256 signed) reader fuzz — splits the first 32 bytes off as a
+# synthetic key and feeds the rest to `restore`. See
+# `fuzz_targets/snapshot_restore_signed.rs`.
+[[bin]]
+name = "snapshot_restore_signed"
+path = "fuzz_targets/snapshot_restore_signed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parse_argv"
+path = "fuzz_targets/fuzz_parse_argv.rs"
+test = false
+doc = false
+bench = false
+
+# Split-input variant of `fuzz_parse_argv`: lets the fuzzer mutate the
+# argv buffer and the fake guest-memory slice independently (the other
+# target pins `mem` to a fixed 4 KiB zeroed slab). Both targets share
+# the same contract — see `fuzz_targets/parse_argv.rs`.
+[[bin]]
+name = "parse_argv"
+path = "fuzz_targets/parse_argv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_rewrite_wasm"
+path = "fuzz_targets/fuzz_rewrite_wasm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pool_allocate"
+path = "fuzz_targets/fuzz_pool_allocate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wasi_cuda_abi"
+path = "fuzz_targets/fuzz_wasi_cuda_abi.rs"
+test = false
+doc = false
+bench = false
+
+# Artifact-store envelope decode fuzz — splits a synthetic 32-byte HMAC key off
+# the input and feeds the rest to `decode_envelope_from_bytes` /
+# `decode_envelope_from_bytes_with_cap`. See
+# `fuzz_targets/fuzz_artifact_decode_envelope.rs`.
+[[bin]]
+name = "fuzz_artifact_decode_envelope"
+path = "fuzz_targets/fuzz_artifact_decode_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "token_scope_parser"
+path = "fuzz_targets/token_scope_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_json_round_trip"
+path = "fuzz_targets/audit_json_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lowering_driver"
+path = "fuzz_targets/lowering_driver.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

@@ -1,0 +1,43 @@
+{
+  "// generated": "Baseline for CI regression check. Update via `cargo bench` + manual review.",
+  "// schema": "Each metric has { name, median_ns, tolerance_pct }. To exclude a metric from the CI gate while still listing it for visibility, set baseline_ns to null and regression_check to false; the gate parser skips entries with regression_check=false.",
+  "metrics": [
+    { "name": "cold_start/capture/1048576",    "median_ns": 25000000,  "tolerance_pct": 30 },
+    { "name": "cold_start/capture/16777216",   "median_ns": 350000000, "tolerance_pct": 30 },
+    { "name": "cold_start/restore/1048576",    "median_ns": 30000000,  "tolerance_pct": 30 },
+    { "name": "cold_start/restore/16777216",   "median_ns": 400000000, "tolerance_pct": 30 },
+    { "name": "dispatch/serial/10",            "median_ns": 50000,     "tolerance_pct": 50 },
+    { "name": "dispatch/concurrent_cap64/100", "median_ns": 200000,    "tolerance_pct": 50 },
+    { "name": "jit_compile/emit_text/matmul[16x16x16]", "median_ns": 50000, "tolerance_pct": 50 },
+    { "name": "jit_compile/cache/warm_hit",    "median_ns": 1000,      "tolerance_pct": 100 },
+    { "name": "tenant_registry/lookup/16",     "median_ns": 500,       "tolerance_pct": 100 },
+
+    { "name": "memory_bandwidth/sequential/1048576",  "median_ns": null, "tolerance_pct": 50, "regression_check": false,
+      "// TODO": "fill from `cargo bench --bench memory_bandwidth -- sequential/1048576` on a quiet host.",
+      "// note": "Placeholder. No sibling JSON in bench-results/ to seed from. Tolerance 50% because host CV on copy-bandwidth is high. Until median_ns is filled in, regression_check=false makes the CI gate skip this entry." },
+    { "name": "memory_bandwidth/sequential/16777216", "median_ns": null, "tolerance_pct": 50, "regression_check": false,
+      "// TODO": "fill from `cargo bench --bench memory_bandwidth -- sequential/16777216` on a quiet host." },
+    { "name": "memory_bandwidth/strided/1048576",     "median_ns": null, "tolerance_pct": 50, "regression_check": false,
+      "// TODO": "fill from `cargo bench --bench memory_bandwidth -- strided/1048576` AFTER throughput-math fix lands (pre-fix numbers would be misleading because the strided group used to overstate MB/s ~64x)." },
+    { "name": "memory_bandwidth/strided/16777216",    "median_ns": null, "tolerance_pct": 50, "regression_check": false,
+      "// TODO": "fill from `cargo bench --bench memory_bandwidth -- strided/16777216` AFTER throughput-math fix lands." },
+
+    { "name": "e2e/healthz/get",             "median_ns": 6700,  "tolerance_pct": 50,
+      "// note": "Seeded from bench-results/tail-latency.json p50 (unified-memory backend, 2026 baseline). Tolerance 50% because HTTP-stack microbenches are CI-noisy and a tighter gate would flap." },
+    { "name": "e2e/invoke_not_found/post",   "median_ns": 28100, "tolerance_pct": 50,
+      "// note": "Seeded from bench-results/tail-latency.json p50 (unified-memory backend, 2026 baseline)." },
+    { "name": "e2e/create_function/post",    "median_ns": null,  "tolerance_pct": 50, "regression_check": false,
+      "// TODO": "no tail-latency entry exists for create_function; run `cargo bench --bench e2e_inference -- create_function` on a quiet host and fill in." },
+
+    { "name": "call_export/noargs/call_export_with_args_empty", "median_ns": null, "tolerance_pct": 50, "regression_check": false,
+      "// TODO": "fill from `cargo bench --bench call_export_args -- call_export/noargs` on a quiet host.",
+      "// note": "Batch 6 typed-args path (benches/call_export_args.rs). Ungated stub: spawn+terminate dominates the envelope so absolute CV is high; the cross-group delta vs call_export/args/two_i32 is the signal. Flip regression_check on once a quiet-host median lands." },
+    { "name": "call_export/args/two_i32",    "median_ns": null,  "tolerance_pct": 50, "regression_check": false,
+      "// TODO": "fill from `cargo bench --bench call_export_args -- call_export/args/two_i32` on a quiet host.",
+      "// note": "Batch 6 typed-args marshalling cost (WasmArg -> Val and back). Ungated stub until a quiet-host median lands." }
+  ],
+  "policy": {
+    "regress_pct_threshold": 10,
+    "note": "Tolerance widens for sub-microsecond measurements where CV is naturally higher. Entries with regression_check=false are tracked for visibility but skipped by the gate."
+  }
+}

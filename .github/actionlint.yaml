@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Craton Software Company
+#
+# actionlint configuration.
+#
+# Declares the custom self-hosted runner labels this project's workflows
+# target, so actionlint does not flag `runs-on: [self-hosted, <label>]` as
+# an unknown label. These runners are provisioned out-of-band (see
+# docs/runbooks/self-hosted-cuda-runner.md); the GPU/CUDA lanes queue until
+# a matching runner registers with the repository.
+self-hosted-runner:
+  labels:
+    - cuda
+    - gpu

@@ -1,0 +1,48 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+expression: "help(&[\"invoke\", \"--help\"])"
+---
+Invoke a previously deployed function by id
+
+Usage: tensor-wasm invoke [OPTIONS] --server <SERVER> <ID>
+
+Arguments:
+  <ID>
+          Identifier of the deployed function to invoke
+
+Options:
+      --server <SERVER>
+          Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
+
+      --tenant <TENANT>
+          Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility
+          
+          [default: 0]
+
+      --export <EXPORT>
+          Name of the exported function to call on the deployed module. Defaults to `_start` (WASI command convention); the server falls back to `main` when `_start` is absent
+          
+          [default: _start]
+
+      --args <ARGS>
+          Arguments forwarded to the function, encoded as a JSON array
+
+      --output <OUTPUT>
+          Output format: `text` (the server response pretty-printed, default) or `json` (a stable machine-readable envelope wrapping the response for scripting / CI).
+          
+          `display_order` pinned so this sorts after the other local flags and before the global TLS flags, keeping the help layout stable — matching the `metrics` / `observe` / `bench` commands.
+
+          Possible values:
+          - text: Human-readable tables / dashboard (the default)
+          - json: Machine-readable JSON document for scripting / CI perf gates
+          
+          [default: text]
+
+      --ca-cert <PATH>
+          Trust an additional PEM-encoded private CA root for HTTPS (added alongside the system trust store, not instead of it). Use this for a server fronted by an internal/self-signed CA instead of `--insecure`. The file must be PEM, not DER
+
+      --insecure
+          SECURITY HAZARD: disable TLS certificate verification for outbound HTTPS, exposing the connection to man-in-the-middle attacks and possible theft of the TENSOR_WASM_TOKEN credential. For local dev against a throwaway cert only; prefer --ca-cert. Warns on every run
+
+  -h, --help
+          Print help (see a summary with '-h')

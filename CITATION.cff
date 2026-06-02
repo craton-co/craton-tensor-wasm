@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use Craton TensorWasm in academic or research work, please cite it as below."
+title: "Craton TensorWasm"
+abstract: "A tensor-aware WebAssembly runtime with GPU integration for serverless workloads."
+authors:
+  - name: "Craton Software Company"
+type: software
+license: Apache-2.0
+repository-code: "https://github.com/craton-co/craton-tensor-wasm"
+url: "https://github.com/craton-co/craton-tensor-wasm"
+version: "0.3.7"
+date-released: "2026-05-28"
+keywords:
+  - webassembly
+  - wasm
+  - gpu
+  - cuda
+  - serverless
+  - tensor
+  - runtime

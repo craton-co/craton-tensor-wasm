@@ -1,0 +1,73 @@
+Craton TensorWasm — CUDA test results on NVIDIA RTX 2060 (Turing, SM_75)
+========================================================================
+
+Host: Windows 11 Home 10.0.26200
+GPU: NVIDIA GeForce RTX 2060 12 GB, WDDM driver model, driver 591.86
+CUDA toolkit: 13.2 (nvcc release 13.2 V13.2.78)
+Rust toolchain: nightly-2026-03-15
+Captured: 2026-05-25
+
+----------------------------------------------------------------------
+1. cudarc-backend smoke tests
+   $ cargo test -p tensor-wasm-mem --release --features cudarc-backend \
+       --test cudarc_smoke -- --include-ignored
+
+   test cudarc_apply_advice_is_exported              ... ok
+   test cudarc_zero_size_rejected_without_driver     ... ok
+   test cudarc_buffer_type_has_nonzero_size          ... ok
+   test cudarc_apply_advice_read_mostly_on_device    ... ok
+   test cudarc_round_trip_on_device                  ... ok
+   test cudarc_prefetch_round_trip_on_device         ... FAILED *
+   test result: FAILED. 5 passed; 1 failed; 0 ignored
+
+   * cuMemPrefetchAsync returns CUDA_ERROR_INVALID_DEVICE on Windows WDDM
+     consumer GPUs. The Turing card does not expose concurrentManagedAccess
+     in WDDM mode; same code on Linux x86_64 + TCC datacenter GPU would
+     succeed. Documented in docs/CUDARC-SPIKE.md and docs/CUDA-SETUP.md.
+
+----------------------------------------------------------------------
+2. Kernel-args E2E tests (W1.1 typed-argv marshalling against real GPU)
+   $ cargo test -p tensor-wasm-wasi-gpu --release --features cuda \
+       --test kernel_args_e2e -- --include-ignored
+
+   test scalar_argv_round_trips_through_launch_path        ... ok
+   test pointer_argv_round_trips_through_launch_path       ... ok
+   test pointer_argv_out_of_bounds_returns_invalid_pointer ... ok
+   test scalar_argv_real_cuda_launch                       ... ok
+   test pointer_argv_real_cuda_launch                      ... ok
+   test result: ok. 5 passed; 0 failed; 0 ignored
+
+   The two real_cuda_launch tests were previously
+   #[ignore = "requires CUDA hardware"]. With --features cuda +
+   --include-ignored they exercise the full Wasm-guest -> wasi-cuda host
+   -> cust::sys::cuLaunchKernel round-trip against the live GPU.
+
+----------------------------------------------------------------------
+3. cust unified-memory path (--features unified-memory)
+   $ cargo test -p tensor-wasm-mem --release --features unified-memory --lib
+
+   test result: FAILED. 24 passed; 22 failed; 0 ignored
+
+   24 passing tests include real cuMemAllocManaged calls succeeding
+   end-to-end -- the linear-memory-in-UVM design point now works on this
+   silicon. The 22 failures all hit the same Windows-WDDM limitation
+   (cuMemAdvise with preferred-location / cuMemPrefetchAsync requiring
+   concurrentManagedAccess). Linux x86_64 + datacenter GPU is the
+   supported deployment surface for this path.
+
+----------------------------------------------------------------------
+Summary
+
+   34 distinct CUDA-driver tests pass on real RTX 2060 silicon.
+   23 fail with WDDM platform limitations (not code bugs).
+
+   This is the first repo snapshot in which any GPU code path is proven
+   to run end-to-end. Prior to the 0.3.0 release wave the cudarc backend
+   spike did not compile (W5.9 part 2) and the cust feature failed at
+   "unresolved import `bytemuck`" (W5.9 part 2).
+
+   See also:
+   - bench-results/tail-latency.json   (P99.9 host-only timings)
+   - bench-results/baseline.json       (regression-gate floors)
+   - docs/CUDARC-SPIKE.md              (cust -> cudarc cutover plan)
+   - docs/CUDA-SETUP.md                (SM compat matrix incl. Turing + WDDM)

@@ -1,0 +1,39 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+expression: "help(&[\"--help\"])"
+---
+Run, deploy, invoke, bench, snapshot, and inspect TensorWasm Wasm workloads.
+
+Usage: tensor-wasm [OPTIONS] <COMMAND>
+
+Commands:
+  run          Run a Wasm module locally against the in-process TensorWasm engine
+  deploy       Upload a Wasm module to a TensorWasm server
+  invoke       Invoke a previously deployed function by id
+  bench        Benchmark local invocation latency (P50/P95/P99/max)
+  snapshot     Save or restore an instance snapshot
+  kernel       Publish, list, or verify entries in the signed kernel registry
+  metrics      Fetch and pretty-print Prometheus metrics from a TensorWasm server
+  observe      Live operator dashboard over `/healthz` + `/metrics` (refreshes in place)
+  serve        Run the TensorWasm HTTP API gateway in-process (binds and serves)
+  completions  Emit shell completion scripts for the named shell
+  man          Generate roff(7) man pages from the clap command tree
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+      --tenant <TENANT>
+          Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility
+          
+          [default: 0]
+
+      --ca-cert <PATH>
+          Trust an additional PEM-encoded private CA root for HTTPS (added alongside the system trust store, not instead of it). Use this for a server fronted by an internal/self-signed CA instead of `--insecure`. The file must be PEM, not DER
+
+      --insecure
+          SECURITY HAZARD: disable TLS certificate verification for outbound HTTPS, exposing the connection to man-in-the-middle attacks and possible theft of the TENSOR_WASM_TOKEN credential. For local dev against a throwaway cert only; prefer --ca-cert. Warns on every run
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

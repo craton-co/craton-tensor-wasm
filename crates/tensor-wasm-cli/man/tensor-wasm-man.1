@@ -1,0 +1,16 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm-man 1  "tensor-wasm-man " 
+.SH NAME
+tensor\-wasm\-man \- Generate roff(7) man pages from the clap command tree
+.SH SYNOPSIS
+\fBtensor\-wasm\-man\fR [\fB\-\-out\-dir\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Generate roff(7) man pages from the clap command tree
+.SH OPTIONS
+.TP
+\fB\-\-out\-dir\fR \fI<OUT_DIR>\fR
+Output directory. When omitted, only the root `tensor\-wasm.1` page is emitted to stdout. When provided, every subcommand gets its own page written as `<binary>\-<subcommand>.1` (matching the established convention used by `git\-status.1`, `cargo\-build.1`, etc.)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help

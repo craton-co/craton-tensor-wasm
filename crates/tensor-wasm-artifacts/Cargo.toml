@@ -1,0 +1,53 @@
+[package]
+name = "tensor-wasm-artifacts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Unified content-addressed, HMAC-signed, on-disk artifact store primitive for TensorWasm."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-artifacts"
+readme = "README.md"
+keywords = ["wasm", "cache", "content-addressed", "hmac", "artifact"]
+categories = ["caching", "encoding"]
+
+[dependencies]
+# Content addressing — payloads are keyed by BLAKE3 of the uncompressed bytes,
+# and the filename's key-fingerprint prefix is also BLAKE3 of the HMAC key.
+blake3 = { workspace = true }
+# HMAC-SHA256 — matches the snapshot writer's `signed-snapshots` trailer
+# format so the two stores share a verifiable signature primitive.
+hmac = "0.12"
+sha2 = "0.10"
+# Constant-time signature comparison — defends the verifier against the
+# byte-by-byte timing oracle that `==` on `[u8; 32]` would expose.
+subtle = "2"
+# Streaming compression for the payload body. Level 3 matches the
+# snapshot writer's `DEFAULT_ZSTD_LEVEL`; the disk store inherits the
+# same default.
+zstd = { workspace = true }
+# Atomic on-disk writes via temp-then-rename.
+tempfile = { workspace = true }
+# Structured tracing for put / get / verification-failure events.
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# Best-effort scrub of the in-memory HMAC key on drop. Mirrors the
+# `SnapshotWriter::hmac_key` and `DiskCache::hmac_key` patterns.
+zeroize = { workspace = true }
+# In-memory store uses a parking_lot Mutex for its entries map. Matches
+# the JIT cache's choice.
+parking_lot = { workspace = true }
+# `ArtifactMetadata` sidecar: a serde-encoded record stored alongside the
+# blob so `list`-based auditing has creation time / original length / source
+# tier to work with. (Re-added — they were dropped earlier when unused.)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+# Integration tests re-hash payloads to assert the `put` return value
+# matches a known BLAKE3, and the tamper test re-derives the same hash
+# after flipping bytes.
+blake3.workspace = true
