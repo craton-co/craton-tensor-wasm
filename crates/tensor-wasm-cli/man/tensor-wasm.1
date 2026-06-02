@@ -1,0 +1,56 @@
+.\" NOTE: regenerate via `tensor-wasm man --out-dir crates/tensor-wasm-cli/man` after building.
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm 1  "tensor-wasm 0.3.7"
+.SH NAME
+tensor\-wasm \- Developer CLI for Craton TensorWasm
+.SH SYNOPSIS
+\fBtensor\-wasm\fR [\fB\-\-tenant\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Run, deploy, invoke, bench, snapshot, and inspect TensorWasm Wasm workloads.
+.SH OPTIONS
+.TP
+\fB\-\-tenant\fR \fI<TENANT>\fR [default: 0]
+Tenant id to advertise on outbound API requests via `X\-TensorWasm\-Tenant`. Zero (the default) suppresses the header for backwards compatibility
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+tensor\-wasm\-run(1)
+Run a Wasm module locally against the in\-process TensorWasm engine
+.TP
+tensor\-wasm\-deploy(1)
+Upload a Wasm module to a TensorWasm server
+.TP
+tensor\-wasm\-invoke(1)
+Invoke a previously deployed function by id
+.TP
+tensor\-wasm\-bench(1)
+Benchmark local invocation latency (P50/P95/P99/max)
+.TP
+tensor\-wasm\-snapshot(1)
+Save or restore an instance snapshot
+.TP
+tensor\-wasm\-metrics(1)
+Fetch and pretty\-print Prometheus metrics from a TensorWasm server
+.TP
+tensor\-wasm\-observe(1)
+Live operator dashboard over `/healthz` + `/metrics` (refreshes in place)
+.TP
+tensor\-wasm\-serve(1)
+Run the TensorWasm HTTP API gateway in\-process (binds and serves)
+.TP
+tensor\-wasm\-completions(1)
+Emit shell completion scripts for the named shell
+.TP
+tensor\-wasm\-man(1)
+Generate roff(7) man pages from the clap command tree
+.TP
+tensor\-wasm\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.3.7

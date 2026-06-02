@@ -1,0 +1,31 @@
+{{- if .Values.prometheus.enabled -}}
+---
+# Requires the prometheus-operator CRDs (monitoring.coreos.com/v1). The
+# install fails with `no matches for kind "ServiceMonitor"` if the CRDs
+# are absent; verify with:
+#   kubectl get crd servicemonitors.monitoring.coreos.com
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "tensor-wasm.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tensor-wasm.labels" . | nindent 4 }}
+    {{- with .Values.prometheus.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "tensor-wasm.selectorLabels" . | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.prometheus.interval }}
+      scrapeTimeout: {{ .Values.prometheus.scrapeTimeout }}
+      scheme: http
+      honorLabels: {{ .Values.prometheus.honorLabels }}
+{{- end }}

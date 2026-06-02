@@ -1,0 +1,36 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+expression: "help(&[\"run\", \"--help\"])"
+---
+Run a Wasm module locally against the in-process TensorWasm engine
+
+Usage: tensor-wasm run [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>
+          Path to the `.wasm` file to execute
+
+Options:
+      --export <EXPORT>
+          Name of the exported function to call. Defaults to `main`
+          
+          [default: main]
+
+      --tenant <TENANT>
+          Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility
+          
+          [default: 0]
+
+      --args <ARGS>
+          Arguments to pass to the export, encoded as a JSON array.
+          
+          Example: `--args '[1, 2.0]'`. Each element is parsed into a [`WasmArg`] — integers that fit in `i32` become `I32`, larger integers become `I64`, and non-integer numerics become `F64`. The values are forwarded to the executor via the dynamic `call_export_with_args` path; the export's signature must accept the resulting parameter types or wasmtime returns an error.
+
+      --ca-cert <PATH>
+          Trust an additional PEM-encoded private CA root for HTTPS (added alongside the system trust store, not instead of it). Use this for a server fronted by an internal/self-signed CA instead of `--insecure`. The file must be PEM, not DER
+
+      --insecure
+          SECURITY HAZARD: disable TLS certificate verification for outbound HTTPS, exposing the connection to man-in-the-middle attacks and possible theft of the TENSOR_WASM_TOKEN credential. For local dev against a throwaway cert only; prefer --ca-cert. Warns on every run
+
+  -h, --help
+          Print help (see a summary with '-h')

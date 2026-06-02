@@ -1,0 +1,136 @@
+[package]
+name = "tensor-wasm-mem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "CUDA Unified Memory allocator and Wasmtime `MemoryCreator` integration."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-mem"
+readme = "README.md"
+keywords = ["wasm", "cuda", "memory", "wasmtime", "gpu"]
+categories = ["memory-management", "wasm"]
+
+[lib]
+
+[dependencies]
+anyhow.workspace = true
+tensor-wasm-core = { workspace = true }
+# Per-tenant GPU memory quota accounting (roadmap feature #8). The
+# `TensorWasmMemoryCreator::with_tenant_context` builder accepts an
+# `Arc<TenantContext>` so the allocator path can call
+# `consume_gpu_bytes` / `release_gpu_bytes` on every
+# `UnifiedBuffer` lifecycle event. Adding the dep here cannot
+# introduce a cycle: `tensor-wasm-tenant` itself only depends on
+# `tensor-wasm-core`.
+tensor-wasm-tenant = { workspace = true }
+parking_lot.workspace = true
+region = "3"
+thiserror.workspace = true
+tracing.workspace = true
+wasmtime.workspace = true
+cust = { workspace = true, optional = true }
+cudarc = { workspace = true, optional = true }
+# NOTE: the five cuda-oxide host/device crates (`cuda-host`, `cuda-core`,
+# `cuda-async`, `cuda-device`, `cuda-macros`) used to be declared here as
+# `{ workspace = true, optional = true }` behind the
+# `experimental-cuda-oxide-host-backend` feature. They were git-pinned in
+# the workspace manifest, which crates.io refuses to publish (a `git`
+# dependency — even optional/feature-gated — is rejected). Both the deps
+# and that never-building feature have been removed so this crate (and its
+# downstream consumers) can be published. The dep-less `cuda-oxide-backend`
+# scaffold feature below is retained. Re-add these crates once cuda-oxide
+# ships to crates.io — see RFC 0001 / docs/CUDA-OXIDE-CUTOVER.md.
+
+[dev-dependencies]
+wat.workspace = true
+wasmtime.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+# W4.2 — cross-backend snapshot conformance tests pull in the snapshot
+# crate to drive the capture/restore round-trip against bytes produced by
+# each CUDA backing (`unified-memory` / cust, `cudarc-backend`). The
+# snapshot crate itself is intentionally
+# backend-agnostic (bytes-in, bytes-out); these tests are the regression
+# guard documented in RFC 0001 "Test plan" that the W1.3 cross-version
+# compat suite runs cleanly under each backend feature.
+tensor-wasm-snapshot = { workspace = true }
+
+# Integration test for the `mock-cuda` seam. Gated on the feature so the
+# default `cargo test` (no GPU, no mock) does not try to compile it; CI
+# runs it with `cargo test -p tensor-wasm-mem --features mock-cuda`.
+[[test]]
+name = "mock_cuda_branches"
+required-features = ["mock-cuda"]
+
+[features]
+# Default is empty so `cargo build` works on hosts without a CUDA toolkit
+# (cust's build script panics without one). The `unified-memory` feature is
+# opt-in via `--features unified-memory` on CUDA hosts. CI may also enable it
+# once stub libraries are provisioned.
+default = []
+# `mock-cuda` provides hardware-free test doubles for the CUDA backings
+# (see `src/mock_cuda.rs`). It is dep-less and off by default. Its purpose
+# is to make three logic paths CI-runnable on a host with no GPU — paths
+# that previously only ran behind `#[ignore]`'d hardware tests:
+#
+#   * the tenant-accounting ROLLBACK branch of
+#     `UnifiedBuffer::new_with_visible_window_on_with_tenant_context`
+#     (`release_gpu_bytes` after a failed driver allocation),
+#   * the leak-recording / free-on-drop `Drop` discipline of the CUDA
+#     backings, and
+#   * the tenant-pool free-on-drop path (`TenantPoolBacking::drop` ->
+#     `TenantMemPool::deallocate`).
+#
+# The mocks (`MockUnifiedBacking` implementing `UnifiedBacking`, and
+# `MockDriverMemPool` implementing `tensor_wasm_core::mem_pool::DriverMemPool`)
+# expose an INJECTABLE allocation failure so a test can deterministically
+# trigger the failure/rollback branch that real hardware never fails on in
+# CI. Enable with `--features mock-cuda`.
+mock-cuda = []
+unified-memory = ["dep:cust"]
+# `cudarc-backend` is the cust → cudarc migration spike. When enabled it
+# pulls in the `cudarc` crate and exposes a parallel `UnifiedBuffer`
+# implementation under `crate::cudarc_backend`. The cust path remains the
+# default; both backends coexist for the v0.2 spike. See
+# `docs/CUDARC-SPIKE.md` for the API mapping and cutover plan.
+cudarc-backend = ["dep:cudarc"]
+# T39 (v0.4): driver-level per-tenant GPU memory cap via
+# `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, ...)`.
+# Strict-superset alias for `cudarc-backend` — the `cuMemPool*` API
+# only exists on the cudarc side (cust 0.3.x has no binding) so
+# enabling this feature pulls cudarc in automatically. Operators turn
+# it on with `--features gpu-mem-pool` to make their intent explicit
+# on the command line; the alias guarantees the resolver picks up
+# `cuda_mem_pool` and the `UnifiedBuffer::new_in_tenant_pool` allocator
+# in one go. See `docs/GPU-QUOTAS.md` for the threat model the driver
+# pin closes (a tenant who obtained a raw CUDA driver handle and
+# bypassed the in-process `consume_gpu_bytes` counter).
+gpu-mem-pool = ["cudarc-backend"]
+# `cuda-oxide-backend` is the v0.5 cust-successor scaffold (RFC 0001 —
+# rfcs/0001-cuda-oxide-integration.md). It is intentionally **dep-less**:
+# enabling it exposes the `crate::cuda_oxide_backend` module (with the
+# scaffold `CudaOxideUnifiedBuffer` returning the documented
+# `NOT_YET_WIRED` sentinel) but does NOT pull any cuda-oxide crate into the
+# resolved dependency graph. That keeps `cargo check --features
+# cuda-oxide-backend` building cleanly on contributor boxes that lack a
+# CUDA Toolkit and `libclang`, and — because it adds no `git` dependency —
+# keeps this crate publishable to crates.io.
+#
+# This feature ships the FEATURE FLAG and the scaffold module only. The
+# real host-runtime port (`cuMemAllocManaged` and friends) previously lived
+# behind a strict-superset `experimental-cuda-oxide-host-backend` feature
+# that pulled in the git-pinned cuda-oxide host/device crates and never
+# compiled (its module opened with a `compile_error!`). That feature and
+# those git deps were REMOVED for crates.io publishability; re-add the port
+# once cuda-oxide ships to crates.io (RFC 0001 / docs/CUDA-OXIDE-CUTOVER.md).
+# The feature is intentionally mutually compatible with `unified-memory`
+# and `cudarc-backend`; enabling all three at once is valid.
+cuda-oxide-backend = []
+
+[package.metadata.docs.rs]
+all-features = false
+features = []
+rustdoc-args = ["--cfg", "docsrs"]

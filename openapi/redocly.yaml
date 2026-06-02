@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Craton Software Company
+#
+# Redocly CLI configuration for the OpenAPI lint job in
+# .github/workflows/ci.yml. We opt out of the full opinionated style
+# ruleset and keep only the structural / minimal checks — the goal of
+# the CI lint is to catch malformed spec files (broken $refs, missing
+# required keys, invalid JSON Schema) rather than to enforce Redocly's
+# editorial preferences on operationId casing, tag descriptions, etc.
+#
+# To run locally:
+#
+#     npx --yes @redocly/cli@1 lint openapi/tensor-wasm-api.yaml \
+#         --config openapi/redocly.yaml
+#
+# To tighten the ruleset later, switch `extends` to `recommended` and
+# selectively disable the rules that don't matter for this codebase.
+
+extends:
+  - minimal
+
+apis:
+  tensor-wasm@latest:
+    root: tensor-wasm-api.yaml

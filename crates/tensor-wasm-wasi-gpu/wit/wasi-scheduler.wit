@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
+//
+// wasi:scheduler/host@0.1.0 — TensorWasm's cooperative deadline interface
+// for Wasm guests (roadmap feature #4). Well-behaved guests call
+// `yield()` at safe boundaries — between matrix tiles, between kernel
+// dispatches, at the top of an inner loop — and the host returns a
+// non-zero code when the per-instance deadline is approaching, asking
+// the guest to stop voluntarily.
+//
+// This is a COOPERATIVE protocol. Adversarial guests that never call
+// `yield()` are still preempted by the existing epoch-interruption
+// path (see `tensor-wasm-exec::engine` `epoch_tick` and the
+// `set_epoch_deadline` wiring in the executor); the WASI yield surface
+// just lowers P99 latency for well-behaved guests under MPS contention
+// by trimming the wait between "deadline elapsed" and "guest actually
+// stops" from up to one epoch tick down to one yield-loop iteration.
+//
+// Keep this file in lockstep with `crates/tensor-wasm-wasi-gpu/src/scheduler.rs`
+// — the WIT and the constants in that module are the authoritative
+// description of the interface for tooling that consumes WIT
+// (wit-bindgen, jco, etc.).
+
+package wasi:scheduler@0.1.0;
+
+interface host {
+    /// Yield to the host scheduler. Returns 0 to continue, non-zero to
+    /// signal the guest should stop (typically deadline approaching).
+    /// The host MAY consult the per-instance deadline and return a
+    /// non-zero code when remaining budget < SUGGESTED_YIELD_THRESHOLD.
+    ///
+    /// Specific return codes (see scheduler.rs):
+    ///   * 0 — continue.
+    ///   * 1 — deadline approaching (remaining budget < ~10ms).
+    ///   * 2 — stop (deadline elapsed).
+    /// Future codes may be added; guests should treat any non-zero
+    /// value as "wind down and return."
+    yield: func() -> u32;
+
+    /// Probe the remaining deadline budget. Returns milliseconds
+    /// remaining, or u32::MAX if unbounded.
+    deadline-remaining-ms: func() -> u32;
+}
+
+world tensor-cooperative {
+    import host;
+}

@@ -1,0 +1,66 @@
+[package]
+name = "tensor-wasm-tenant"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Multi-tenant CUDA context management (MPS-backed or per-context fallback)."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-tenant"
+readme = "README.md"
+keywords = ["multi-tenant", "quota", "isolation", "gpu", "tenant"]
+categories = ["concurrency", "memory-management"]
+
+[package.metadata.docs.rs]
+all-features = false
+features = []
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+tensor-wasm-core = { workspace = true }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+cust = { workspace = true, optional = true }
+loom = { version = "0.7", optional = true }
+
+[dev-dependencies]
+tokio-test.workspace = true
+criterion.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "context_switch"
+harness = false
+
+[[test]]
+name = "loom_consume_release"
+path = "tests/loom_consume_release.rs"
+required-features = ["loom"]
+
+# The strict-cap-binding test exercises foreign-cap refusal across two
+# `TenantRegistry` instances — it only compiles under the feature, which
+# turns the registry-token machinery on. Listed here so
+# `cargo test --features strict-cap-binding` picks it up by name.
+[[test]]
+name = "cap_binding_strict"
+path = "tests/cap_binding_strict.rs"
+required-features = ["strict-cap-binding"]
+
+[features]
+default = ["strict-cap-binding"]
+cuda = ["dep:cust"]
+loom = ["dep:loom"]
+# H1 fix: capability-to-registry binding (a cap from registry A is rejected
+# by registry B even if both name the same `TenantId`, and forged/foreign
+# admin caps are refused) is now UNCONDITIONAL — it is enforced whether or
+# not this feature is enabled, including in a release build with
+# `default-features = false`. This feature flag is retained only to gate the
+# typed `*_strict` admin APIs and the `cap_binding_strict` integration test
+# (it no longer toggles any security behaviour). Kept in `default` so the
+# `*_strict` surface is available out of the box.
+strict-cap-binding = []

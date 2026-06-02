@@ -1,0 +1,13 @@
+---
+# Namespace for the Craton TensorWasm reference deployment.
+#
+# Applied first; every other manifest in this directory pins
+# `metadata.namespace: tensor-wasm` so a single `kubectl apply -f deploy/k8s/`
+# brings the whole stack up in one shot.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tensor-wasm
+  labels:
+    app.kubernetes.io/name: tensor-wasm
+    app.kubernetes.io/part-of: craton-tensor-wasm

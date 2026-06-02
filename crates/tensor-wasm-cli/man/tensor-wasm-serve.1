@@ -1,0 +1,60 @@
+.\" NOTE: regenerate via `tensor-wasm man --out-dir crates/tensor-wasm-cli/man` after building.
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm-serve 1  "tensor-wasm-serve "
+.SH NAME
+tensor\-wasm\-serve \- Run the TensorWasm HTTP API gateway in\-process (binds and serves)
+.SH SYNOPSIS
+\fBtensor\-wasm\-serve\fR [\fB\-\-addr\fR] [\fB\-\-token\fR] [\fB\-\-tenant\-header\-policy\fR] [\fB\-\-cors\-origin\fR] [\fB\-\-max\-body\-bytes\fR] [\fB\-h\fR|\fB\-\-help\fR]
+.SH DESCRIPTION
+Run the TensorWasm HTTP API gateway in\-process (binds and serves).
+
+Stands up the axum router from \fBtensor\-wasm\-api\fR's \fBbuild_router_with_full_config\fR,
+binds it to \fB\-\-addr\fR, and serves until Ctrl\-C. Flags map onto the existing
+API config surface; knobs not yet exposed by the api crate fall back to the
+\fBTENSOR_WASM_API_*\fR environment variables documented in
+\fBcrates/tensor-wasm-api/src/lib.rs\fR.
+.SH OPTIONS
+.TP
+\fB\-\-addr\fR \fI<ADDR>\fR [default: 127.0.0.1:8080]
+Address to bind the HTTP server to (e.g. \fB127.0.0.1:8080\fR, \fB0.0.0.0:8080\fR).
+.TP
+\fB\-\-token\fR \fI<TOKEN>\fR
+Bearer token accepted by the gateway. Repeat to allowlist multiple tokens.
+If omitted, the gateway reads \fBTENSOR_WASM_API_TOKENS\fR from the environment;
+empty/unset there enables dev\-mode pass\-through with a startup warning.
+.TP
+\fB\-\-tenant\-header\-policy\fR \fI<POLICY>\fR [default: optional]
+Policy for the \fBX\-TensorWasm\-Tenant\fR header. \fBoptional\fR mirrors
+\fBTENSOR_WASM_API_REQUIRE_TENANT\fR unset; \fBrequired\fR mirrors
+\fBTENSOR_WASM_API_REQUIRE_TENANT=1\fR. Possible values: \fBoptional\fR, \fBrequired\fR.
+.TP
+\fB\-\-cors\-origin\fR \fI<ORIGIN>\fR
+Origin to allow via CORS. Repeat for multiple origins. Currently
+informational \(em the api crate does not yet expose a programmatic
+\fBCorsConfig\fR.
+.TP
+\fB\-\-max\-body\-bytes\fR \fI<BYTES>\fR [default: 67108864]
+Maximum inbound request body size, in bytes. Currently informational;
+the gateway uses its compiled\-in 64 MiB cap until \fBtensor\-wasm\-api\fR
+exposes a programmatic body\-cap knob.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH ENVIRONMENT
+.TP
+\fBTENSOR_WASM_API_TOKENS\fR
+Fallback bearer\-token allowlist when \fB\-\-token\fR is not supplied; see
+\fBcrates/tensor-wasm-api/src/middleware.rs\fR.
+.TP
+\fBTENSOR_WASM_API_REQUIRE_TENANT\fR
+Set to \fB1\fR to require the \fBX\-TensorWasm\-Tenant\fR header (overrides
+the default \fBoptional\fR policy when \fB\-\-tenant\-header\-policy\fR is omitted).
+.TP
+\fBTENSOR_WASM_API_RATE_LIMIT_QPS\fR, \fBTENSOR_WASM_API_RATE_LIMIT_BURST\fR
+Per\-token rate limiter knobs; zero or unset disables the limiter.
+.TP
+\fBTENSOR_WASM_API_AUDIT_LOG\fR
+Selects the audit\-log sink (defaults to stdout).
+.SH SEE ALSO
+tensor\-wasm(1), tensor\-wasm\-deploy(1), tensor\-wasm\-invoke(1), tensor\-wasm\-metrics(1)

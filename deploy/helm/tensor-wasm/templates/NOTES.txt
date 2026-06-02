@@ -1,0 +1,49 @@
+Craton TensorWasm chart {{ .Chart.Version }} (appVersion {{ .Chart.AppVersion }})
+installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Image:     {{ include "tensor-wasm.image" . }}
+Replicas:  {{ .Values.replicaCount }}
+GPU:       {{ ternary "enabled" "disabled" .Values.gpu.enabled }}
+{{- if .Values.auth.existingSecret }}
+Tokens:    using existing Secret "{{ .Values.auth.existingSecret }}"
+{{- else }}
+Tokens:    chart-managed Secret "{{ include "tensor-wasm.tokensSecretName" . }}"
+           (default value is "changeme:tenant=*" — rotate via
+            --set auth.tokens=... OR helm upgrade --reuse-values
+            --set auth.existingSecret=my-secret)
+{{- end }}
+
+1. Wait for the pod to become Ready:
+
+   kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "tensor-wasm.fullname" . }}
+
+2. Port-forward the in-cluster service to your laptop:
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "tensor-wasm.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+
+3. Hit the health endpoint (subject to the bearer-token allowlist):
+
+   curl -s -H "Authorization: Bearer changeme" http://localhost:{{ .Values.service.port }}/healthz
+
+   Expected: {"status":"ok"}
+
+{{- if .Values.ingress.enabled }}
+
+4. Ingress is enabled. Reachable hosts:
+   {{- range .Values.ingress.hosts }}
+     - http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+   {{- end }}
+{{- end }}
+
+{{- if .Values.prometheus.enabled }}
+
+5. ServiceMonitor is registered for prometheus-operator. Confirm scrape:
+
+   kubectl -n {{ .Release.Namespace }} get servicemonitor {{ include "tensor-wasm.fullname" . }}
+{{- end }}
+
+For production guidance see:
+  - docs/DEPLOYMENT.md      (topology, capacity, DR)
+  - docs/SLO.md             (probe semantics, latency targets)
+  - docs/CUDA-SETUP.md      (GPU node prerequisites)
+  - crates/tensor-wasm-api/API.md  (env vars, endpoints, error envelope)

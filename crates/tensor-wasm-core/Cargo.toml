@@ -1,0 +1,51 @@
+[package]
+name = "tensor-wasm-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-core"
+readme = "README.md"
+description = "Foundational types, errors, metrics, and telemetry shared by every TensorWasm crate."
+keywords = ["wasm", "gpu", "runtime", "telemetry", "observability"]
+categories = ["development-tools", "api-bindings", "concurrency"]
+build = "build.rs"
+
+[lib]
+
+[dependencies]
+anyhow.workspace = true
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+parking_lot.workspace = true
+prometheus-client.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+tracing.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber.workspace = true
+
+[features]
+default = []
+otlp = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry", "dep:tokio"]
+
+[dev-dependencies]
+tokio.workspace = true
+serde_json.workspace = true
+# `temp-env` provides scoped environment-variable mutation for the
+# `telemetry::build_filter` tests (B5.1). The crate restores the prior
+# value when the closure returns, so concurrent tests that observe
+# `TENSOR_WASM_LOG` / `RUST_LOG` cannot leak state into one another.
+temp-env = "0.3"
+
+[package.metadata.docs.rs]
+# docs.rs builds the documentation with every Cargo feature enabled so the
+# OTLP entry points show up alongside the always-available ones. The `--cfg
+# docsrs` flag enables `#[doc(cfg(...))]` annotations once they're added.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

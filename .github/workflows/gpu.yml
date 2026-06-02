@@ -1,0 +1,215 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Craton Software Company
+#
+# Hardware-gated GPU test lane (label- / dispatch-triggered, self-hosted).
+#
+# ---------------------------------------------------------------------------
+# DORMANT UNTIL A SELF-HOSTED GPU RUNNER IS REGISTERED.
+# ---------------------------------------------------------------------------
+# Every job here pins `runs-on: [self-hosted, gpu]`. Until a runner registers
+# with BOTH the `self-hosted` and `gpu` labels (the S22 box per PATH-TO-V1
+# v0.2), a triggered run simply queues forever and never claims a runner — it
+# is a no-op, NOT a required check, and cannot block a PR. The moment such a
+# runner comes online the lane starts exercising the real CUDA driver paths.
+#
+# This is DELIBERATELY SEPARATE from `.github/workflows/cuda.yml`:
+#   * `cuda.yml` is the per-push/per-PR self-hosted CUDA build+smoke lane
+#     (`runs-on: [self-hosted, cuda]`) that compiles every backend feature
+#     and runs the unignored scaffold smoke tests on each commit.
+#   * THIS file is the on-demand *hardware verification* lane. It runs the
+#     expensive `#[ignore = "requires CUDA hardware"]` suite (which actually
+#     allocates managed memory, launches kernels, and round-trips bytes
+#     through the driver) plus the `--features cuda` benches. Those are too
+#     slow / too hardware-bound to gate every push on, so they fire only when
+#     a maintainer asks for them — by applying the `gpu-ci` label to a PR or
+#     by dispatching the workflow manually.
+#
+# WHY NOT on push: there is no hosted GPU runner. Triggering this on every
+# push would queue a job that never runs (or, once the self-hosted box is up,
+# would burn the single shared GPU on every commit). Keep it on-demand.
+#
+# WHAT THIS VALIDATES: the work items catalogued in
+# `docs/HARDWARE-GATED-WORK.md` — the cust / cudarc / cuda-oxide allocation +
+# prefetch paths, the device-memory host functions, `try_grow_in_place`, the
+# experimental wmma MatMul lowering, and the snapshot conformance round-trips
+# — all of which are written but UNVERIFIED on silicon until this lane runs.
+#
+# Runner registration runbook: `docs/runbooks/self-hosted-cuda-runner.md`.
+# See also `docs/CUDA-SETUP.md` ("Stub libraries for CI") and `docs/RISKS.md`.
+
+name: gpu
+
+on:
+  # Label-gated: apply the `gpu-ci` label to a PR to request a hardware run.
+  # `types: [labeled]` fires once when the label is added; the `if:` guard on
+  # each job filters to the specific label so unrelated labels are ignored.
+  pull_request:
+    types: [labeled]
+  # Manual trigger from the Actions tab (or `gh workflow run gpu.yml`). This
+  # is the path a maintainer uses to validate a branch on demand without
+  # touching labels.
+  workflow_dispatch:
+
+concurrency:
+  # One hardware run per ref at a time — the self-hosted GPU is a single
+  # shared resource, so cancel an in-flight run when a newer one supersedes it.
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # No -D warnings on the CUDA path: cust + nightly drift surfaces as warning
+  # noise here. Warning-strictness is the hosted `ci` workflow's job; this
+  # lane exists to exercise the runtime, not to gate on lints. (Mirrors the
+  # rationale in `.github/workflows/cuda.yml`.)
+  RUSTFLAGS: ""
+
+jobs:
+  # tensor-wasm-mem: the deepest GPU surface. Runs the ignored hardware tests
+  # across all three backing implementations (cust / cudarc / cuda-oxide
+  # scaffold). cust 0.3's primary-context model does not survive parallel test
+  # execution, so every test invocation is single-threaded
+  # (`--test-threads=1`) — mirrors the W5.9 / F4 / B5 workaround documented on
+  # the dev box and in `cuda.yml`.
+  mem-hardware-tests:
+    name: tensor-wasm-mem ignored CUDA tests
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 45
+    # Run on manual dispatch always; on a labeled PR only when the label is
+    # exactly `gpu-ci`.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'gpu-ci'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain (workspace pin)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Confirm GPU + driver
+        run: |
+          nvidia-smi
+          nvcc --version
+      # cust path (`unified-memory`): cuMemAllocManaged + advise + prefetch +
+      # the cust snapshot conformance round-trip.
+      - name: cust ignored tests (--features unified-memory --ignored)
+        run: cargo test -p tensor-wasm-mem --release --features unified-memory -- --ignored --test-threads=1
+      # cudarc path (`cudarc-backend`): the parallel cudarc UnifiedBuffer,
+      # the visible-window-only allocation guard, the gpu-mem-pool driver pin
+      # (cuMemPool*), and the cudarc snapshot conformance round-trip.
+      - name: cudarc ignored tests (--features gpu-mem-pool --ignored)
+        # gpu-mem-pool is the strict-superset of cudarc-backend (it pulls
+        # cudarc in and also compiles the cuMemPool driver-pin tests), so a
+        # single feature flag exercises both the cudarc allocation path and
+        # the per-tenant pool cap. See crates/tensor-wasm-mem/Cargo.toml.
+        run: cargo test -p tensor-wasm-mem --release --features gpu-mem-pool -- --ignored --test-threads=1
+      # cuda-oxide scaffold path (`cuda-oxide-backend`, dep-less): the ignored
+      # round-trip / advise / prefetch device tests in tests/cuda_oxide_smoke.rs
+      # and the cuda-oxide snapshot conformance test. NOTE: the strict-superset
+      # `experimental-cuda-oxide-host-backend` feature is intentionally NOT
+      # enabled here — its module opens with a `compile_error!` until the host
+      # FFI port is validated, so building it would fail. Once that guard is
+      # lifted on the self-hosted box, swap the feature below.
+      - name: cuda-oxide scaffold ignored tests (--features cuda-oxide-backend --ignored)
+        run: cargo test -p tensor-wasm-mem --release --features cuda-oxide-backend -- --ignored --test-threads=1
+
+  # tensor-wasm-wasi-gpu: the Wasm -> wasi:cuda -> cuLaunchKernel surface.
+  # Runs the ignored kernel-args end-to-end tests (real PTX, real kernel
+  # launch, readback) and the device-memory host-function tests (alloc / free
+  # / memcpy-h2d / memcpy-d2h backed by cuMemAlloc + cuMemcpy*).
+  wasi-gpu-hardware-tests:
+    name: tensor-wasm-wasi-gpu ignored CUDA tests
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 45
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'gpu-ci'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain (workspace pin)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Confirm GPU + driver
+        run: |
+          nvidia-smi
+          nvcc --version
+      - name: wasi-gpu ignored tests (--features cuda --ignored)
+        # Covers the B2 vector_add_end_to_end_real_ptx_real_kernel proof
+        # (Wasm -> wasi-cuda -> cuLaunchKernel -> readback), the kernel-arg
+        # marshalling argv lowering, and the device-memory host functions.
+        run: cargo test -p tensor-wasm-wasi-gpu --release --features cuda -- --ignored --test-threads=1
+
+  # tensor-wasm-tenant: the per-tenant GPU memory quota path. The v0.3.x tests
+  # exercise only the in-process counter (not #[ignore]d, run on hosted CI),
+  # but the crate carries a `cuda` feature for the v0.4 driver-level
+  # enforcement (cuMemPoolSetAttribute) whose hardware tests will be
+  # `#[ignore]`d here. `--ignored` is a no-op today (no ignored tests exist
+  # yet under this gate) and starts validating the moment the v0.4 driver-pin
+  # tests land — wiring the lane now keeps that work covered on arrival.
+  tenant-hardware-tests:
+    name: tensor-wasm-tenant ignored CUDA tests
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 30
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'gpu-ci'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain (workspace pin)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Confirm GPU + driver
+        run: |
+          nvidia-smi
+          nvcc --version
+      - name: tenant ignored tests (--features cuda --ignored)
+        run: cargo test -p tensor-wasm-tenant --release --features cuda -- --ignored --test-threads=1
+
+  # CUDA benches. These need a real GPU to produce meaningful numbers (the
+  # dispatch-future backend bench and the e2e inference bench both run their
+  # real body only under `--features cuda`; without it they emit skip lines).
+  # We compile-and-run a short pass — this is a smoke that the `--features cuda`
+  # bench bodies build and execute on hardware, NOT a regression gate (the
+  # `bench` workflow owns the committed-baseline regression check on hosted
+  # CPU runners).
+  cuda-benches:
+    name: --features cuda benches (smoke)
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 45
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'gpu-ci'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain (workspace pin)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Confirm GPU + driver
+        run: |
+          nvidia-smi
+          nvcc --version
+      - name: Compile benches (--features cuda)
+        # `tensor-wasm-bench/cuda` forwards to `tensor-wasm-wasi-gpu/cuda`,
+        # which is what activates the real (non-skip) bench bodies.
+        run: cargo bench -p tensor-wasm-bench --features cuda --no-run
+      - name: Run benches (--features cuda, short)
+        run: cargo bench -p tensor-wasm-bench --features cuda -- --warm-up-time 3 --measurement-time 5

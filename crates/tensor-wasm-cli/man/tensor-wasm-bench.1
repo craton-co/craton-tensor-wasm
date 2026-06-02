@@ -1,0 +1,22 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm-bench 1  "tensor-wasm-bench " 
+.SH NAME
+tensor\-wasm\-bench \- Benchmark local invocation latency (P50/P95/P99/max)
+.SH SYNOPSIS
+\fBtensor\-wasm\-bench\fR [\fB\-\-export\fR] [\fB\-\-n\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIFILE\fR> 
+.SH DESCRIPTION
+Benchmark local invocation latency (P50/P95/P99/max)
+.SH OPTIONS
+.TP
+\fB\-\-export\fR \fI<EXPORT>\fR [default: main]
+Name of the export to call on each iteration
+.TP
+\fB\-\-n\fR \fI<N>\fR [default: 100]
+Number of iterations to run. Must be >= 1
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIFILE\fR>
+Path to the `.wasm` file to benchmark

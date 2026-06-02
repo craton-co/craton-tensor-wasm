@@ -1,0 +1,9 @@
+{
+  "// generated": "BusyPoll vs cuda-async DispatchFuture comparison (see crates/tensor-wasm-bench/benches/dispatch_future_backends.rs).",
+  "// rfc": "rfcs/0001-cuda-oxide-integration.md -- Unresolved question #3",
+  "// algorithm": "nearest-rank percentile per ISO/IEC 25062 over 10000 sorted samples per backend",
+  "backends": [
+    {"backend":"busy-poll","status":"measured","samples":10000,"p50_ns":400,"p95_ns":400,"p99_ns":400,"p99_9_ns":1800,"max_ns":93600},
+    {"backend":"cuda-async","status":"skipped","reason":"cuda-async-backend: not yet wired -- see RFC 0001 v0.4 port"}
+  ]
+}

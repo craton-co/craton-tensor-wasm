@@ -1,0 +1,19 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm-observe 1  "tensor-wasm-observe " 
+.SH NAME
+tensor\-wasm\-observe \- Live operator dashboard over `/healthz` + `/metrics` (refreshes in place)
+.SH SYNOPSIS
+\fBtensor\-wasm\-observe\fR [\fB\-\-addr\fR] [\fB\-\-interval\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Live operator dashboard over `/healthz` + `/metrics` (refreshes in place)
+.SH OPTIONS
+.TP
+\fB\-\-addr\fR \fI<ADDR>\fR [default: http://localhost:8080]
+Base URL of the target TensorWasm server. Defaults to `http://localhost:8080`
+.TP
+\fB\-\-interval\fR \fI<INTERVAL>\fR [default: 2]
+Refresh interval, in seconds. Must be at least 1
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help

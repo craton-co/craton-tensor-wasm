@@ -1,0 +1,188 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tensor-wasm-core",
+    "crates/tensor-wasm-mem",
+    "crates/tensor-wasm-exec",
+    "crates/tensor-wasm-wasi-gpu",
+    "crates/tensor-wasm-jit",
+    "crates/tensor-wasm-snapshot",
+    "crates/tensor-wasm-artifacts",
+    "crates/tensor-wasm-tenant",
+    "crates/tensor-wasm-api",
+    "crates/tensor-wasm-cli",
+    "crates/tensor-wasm-bench",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.3.7"
+edition = "2021"
+rust-version = "1.78"
+license = "Apache-2.0"
+authors = ["Craton Software Company <security@craton.com.ar>"]
+repository = "https://github.com/craton-co/craton-tensor-wasm"
+
+# Centralised dependency versions. Crates inherit via `dep.workspace = true`.
+# CUDA-dependent crates (cust, ptx-builder) are marked `optional = true` so the
+# default `cargo build --workspace` succeeds on hosts without CUDA libraries.
+# Enabling the `unified-memory` feature on tensor-wasm-mem (transitively) pulls them in.
+[workspace.dependencies]
+# Internal crates — both `path` (used during workspace builds) and `version`
+# (required by crates.io publish) are specified. Member crates reference these
+# via `tensor-wasm-foo = { workspace = true }`. `tensor-wasm-cli` and
+# `tensor-wasm-bench` are `publish = false`, so they are intentionally omitted.
+tensor-wasm-core = { path = "crates/tensor-wasm-core", version = "0.3.7" }
+tensor-wasm-mem = { path = "crates/tensor-wasm-mem", version = "0.3.7" }
+tensor-wasm-exec = { path = "crates/tensor-wasm-exec", version = "0.3.7" }
+tensor-wasm-wasi-gpu = { path = "crates/tensor-wasm-wasi-gpu", version = "0.3.7" }
+tensor-wasm-jit = { path = "crates/tensor-wasm-jit", version = "0.3.7" }
+tensor-wasm-snapshot = { path = "crates/tensor-wasm-snapshot", version = "0.3.7" }
+tensor-wasm-artifacts = { path = "crates/tensor-wasm-artifacts", version = "0.3.7" }
+tensor-wasm-tenant = { path = "crates/tensor-wasm-tenant", version = "0.3.7" }
+tensor-wasm-api = { path = "crates/tensor-wasm-api", version = "0.3.7" }
+
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+# tokio-util — `io` feature enables `ReaderStream`, used by the CLI to turn a
+# `tokio::fs::File` into a `Stream<Item = Result<Bytes, _>>` for streaming
+# uploads via `reqwest::Body::wrap_stream`. Pinned at 0.7 (matches the rest
+# of the tokio-stack version floor).
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Wasmtime (pinned to 45.x — bumped from 25.x to clear RUSTSEC-2026-0096,
+# a critical aarch64 Cranelift sandbox-escape advisory affecting <36.0.7 /
+# 37-41 / <42.0.2; 45.x is past the 43.0.1 fix line.)
+wasmtime = { version = "45", default-features = false, features = ["async", "cranelift", "component-model", "runtime"] }
+wat = "1"
+wasmparser = "0.218"
+cranelift-codegen = "0.111"
+
+# CUDA — gated by per-crate feature flags. Workspace deps cannot carry
+# `optional = true` themselves; the individual crate `[dependencies]` tables
+# add `optional = true` and a corresponding feature in their `[features]` table.
+# cust 0.3.2 has a known bug at src/memory/device/device_buffer.rs:9 where
+# `pub use bytemuck;` is unconditional (the `cfg_attr(docsrs, ...)` only
+# sets docs metadata). Enabling the bytemuck feature pulls the optional
+# dep in for real, sidestepping the "no external crate `bytemuck`" build
+# error on hosts that actually exercise the cust path. The bytemuck-related
+# DeviceBuffer methods are unused by TensorWasm so the additional surface is
+# cost-free.
+cust = { version = "0.3", default-features = false, features = ["bytemuck"] }
+ptx-builder = "0.5"
+# cudarc — actively maintained alternative to `cust`. Pinned at 0.13 (latest
+# 0.13.x as of 2026-05). Driver-only feature set keeps the build script light;
+# `cuda-12000` selects CUDA 12.0+ headers (matches the toolkit on the S22
+# runner). Currently behind the per-crate `cudarc-backend` feature flag while
+# the cust → cudarc migration spike (see `docs/CUDARC-SPIKE.md`) lands.
+cudarc = { version = "0.13", default-features = false, features = ["driver", "cuda-12000"] }
+
+# cuda-oxide — NVIDIA Labs' new Rust-to-CUDA compiler + host runtime
+# (repo: github.com/NVlabs/cuda-oxide), the planned v0.5 cust successor per
+# RFC 0001 (rfcs/0001-cuda-oxide-integration.md).
+#
+# REMOVED FOR CRATES.IO PUBLISHABILITY: the five cuda-oxide host/device
+# crates (`cuda-host`, `cuda-core`, `cuda-async`, `cuda-device`,
+# `cuda-macros`) were previously declared here as git-pinned workspace
+# dependencies (NVlabs/cuda-oxide v0.1.0 tag, rev
+# 4a56e4220aab8ce5d085a411e7f806cebb647d14). crates.io rejects ANY crate
+# whose manifest contains a `git` dependency — even an optional,
+# feature-gated one — so those entries blocked publishing `tensor-wasm-mem`
+# and everything downstream. They have been removed along with the
+# never-compiling `experimental-cuda-oxide-host-backend` feature that
+# consumed them (its host FFI surface was an inferred, `compile_error!`-
+# quarantined scaffold that had never built against the real bindings).
+#
+# The dep-less `cuda-oxide-backend` scaffold feature on `tensor-wasm-mem`
+# (and the crates.io-published `pliron` lever on `tensor-wasm-jit`) are
+# unaffected and still build. Re-add these git deps — or, preferably, the
+# crates.io versions — once NVlabs publishes cuda-oxide's workspace members
+# to crates.io. See RFC 0001 and docs/CUDA-OXIDE-CUTOVER.md for the cutover
+# plan.
+
+# HTTP / API
+axum = { version = "0.7", features = ["macros", "tracing"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "cors"] }
+hyper = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-opentelemetry = "0.27"
+opentelemetry = "0.26"
+opentelemetry-otlp = { version = "0.26", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
+prometheus-client = "0.24"
+
+# Errors / serde
+thiserror = "1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = { version = "2", features = ["serde"] }
+zstd = "0.13"
+
+# Concurrency utilities
+dashmap = "6"
+lru = "0.12"
+parking_lot = "0.12"
+once_cell = "1"
+crossbeam-channel = "0.5"
+
+# Hashing — used for stable, cross-Rust-version fingerprints (TensorWasmKernelBlueprint).
+blake3 = "1"
+
+# Best-effort memory wiping for secret material. Used by the JIT disk-cache
+# HMAC key (jit S-3 follow-up). The `zeroize_derive` feature provides the
+# `#[derive(Zeroize, ZeroizeOnDrop)]` macros so a small wrapper struct can
+# carry the key by value without leaking it on drop.
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# Data-parallel iterators. Used by the JIT rewrite analyser to emit candidate
+# PTX kernels in parallel while preserving source order via index-stable
+# collection. Bench-validated on synthetic 16-candidate modules; trivially
+# falls back to single-threaded under low candidate counts.
+rayon = "1"
+
+# Hex encoding/decoding — used by the CLI to read 32-byte HMAC-SHA256 keys
+# from disk (snapshot signing) and to render them as ASCII for the
+# `X-TensorWasm-Snapshot-HMAC-Key` HTTP header. Pinned at 0.4 (latest 0.4.x).
+hex = "0.4"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+
+# Test / bench
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+proptest = "1"
+tokio-test = "0.4"
+tempfile = "3"
+mockall = "0.13"
+# `temp-env` scopes a process env-var mutation to a closure and serialises
+# concurrent users behind an internal Mutex. The CLI crate's tests use this
+# instead of raw `std::env::set_var` / `remove_var`, both because the latter
+# became `unsafe` in Rust 2024 and because parallel mutation of process env
+# from tests is undefined behaviour. Pinned at 0.3 (latest 0.3.x).
+temp-env = { version = "0.3", features = ["async_closure"] }
+
+# Logging / time
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+debug = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+
+[profile.dev]
+opt-level = 0
+debug = 2

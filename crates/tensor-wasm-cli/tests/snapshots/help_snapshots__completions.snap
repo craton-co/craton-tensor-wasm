@@ -1,0 +1,33 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+expression: "help(&[\"completions\", \"--help\"])"
+---
+Emit shell completion scripts for the named shell.
+
+By default the script is written to stdout. Pass `--out-dir <dir>` to write it to a conventional filename inside `<dir>` instead — used by `crates/tensor-wasm-cli/completions/` regeneration.
+
+Usage: tensor-wasm completions [OPTIONS] <SHELL>
+
+Arguments:
+  <SHELL>
+          Target shell (bash, zsh, fish, powershell, elvish)
+          
+          [possible values: bash, elvish, fish, powershell, zsh]
+
+Options:
+      --out-dir <OUT_DIR>
+          Optional output directory. When provided, the script is written to `<dir>/<conventional-name>` (e.g. `tensor-wasm.bash`, `_tensor-wasm` for zsh, `tensor-wasm.fish`)
+
+      --tenant <TENANT>
+          Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility
+          
+          [default: 0]
+
+      --ca-cert <PATH>
+          Trust an additional PEM-encoded private CA root for HTTPS (added alongside the system trust store, not instead of it). Use this for a server fronted by an internal/self-signed CA instead of `--insecure`. The file must be PEM, not DER
+
+      --insecure
+          SECURITY HAZARD: disable TLS certificate verification for outbound HTTPS, exposing the connection to man-in-the-middle attacks and possible theft of the TENSOR_WASM_TOKEN credential. For local dev against a throwaway cert only; prefer --ca-cert. Warns on every run
+
+  -h, --help
+          Print help (see a summary with '-h')

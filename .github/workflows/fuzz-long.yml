@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Craton Software Company
+#
+# Long-form fuzz cron -- targets the v0.5 PATH-TO-V1 exit criterion
+# "Fuzz corpus accumulates 24+ hours of clean run per target."
+#
+# The short-form `fuzz.yml` runs 60s per target nightly to catch
+# regressions fast; this workflow runs each target for the full
+# GitHub Actions hosted-runner job budget (~5h 50m per matrix cell)
+# weekly, on a Sunday, when fewer humans are merging.
+#
+# True 24h+ continuous per target requires either:
+#   (a) a self-hosted runner with no job time-cap, or
+#   (b) chaining multiple GitHub-hosted runs that share corpus state
+#       via the actions/cache@v4 keyed on the target name
+# This workflow uses (b): the cargo-fuzz corpus directory is cached
+# between runs, so each weekly run picks up where the previous left
+# off. After 5 weekly runs the cumulative wall-clock per target
+# clears 24h.
+#
+# Trigger via workflow_dispatch for an ad-hoc burn (e.g. before a
+# release tag).
+
+name: fuzz-long
+
+on:
+  schedule:
+    # Sunday at 02:11 UTC (4-night spacing from the nightly fuzz.yml).
+    - cron: "11 2 * * 0"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-long:
+    name: cargo fuzz long (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    # Per-target concurrency: defined at job level (not workflow level) so the
+    # `matrix` context is available — one in-flight long-fuzz run per target,
+    # queued rather than cancelled so corpus-accumulating runs are not lost.
+    concurrency:
+      group: "${{ github.workflow }}-${{ matrix.target }}"
+      cancel-in-progress: false
+    # GitHub-hosted runners are capped at 6h (free tier) / 35h (paid
+    # team tier). We allow 350 min to leave headroom for the corpus
+    # upload step that runs after `cargo fuzz run` returns.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        target:
+          - fuzz_ptx_emit
+          - fuzz_snapshot_restore
+          - fuzz_wasm_compile
+          - fuzz_wasi_cuda_abi
+          - token_scope_parser
+          - audit_json_round_trip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain (workspace-pinned nightly)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      - name: Cache fuzz corpus (per target)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          # Year-keyed so accumulated corpus survives a full annual
+          # cycle of long-form runs. Reset by changing the year suffix.
+          key: fuzz-corpus-2026-${{ matrix.target }}
+          restore-keys: |
+            fuzz-corpus-2026-${{ matrix.target }}
+            fuzz-corpus-${{ matrix.target }}
+
+      - name: Install CUDA stub libraries
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Run ${{ matrix.target }} for ~5.5 hours
+        # 5.5h = 19800s. Leaves ~50 min of the 350 min job budget for
+        # cache write + artifact upload.
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=19800
+
+      - name: Upload reproduce artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-long-artifacts-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/**
+            fuzz/corpus/${{ matrix.target }}/**
+          if-no-files-found: ignore
+
+      - name: Summary
+        if: always()
+        # cargo-fuzz writes a "Done <iters> runs in <secs> seconds" line
+        # to stdout that we capture into the job summary so the long-
+        # form trend is visible without downloading artifacts.
+        run: |
+          echo "## Long-form fuzz: ${{ matrix.target }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -d "fuzz/corpus/${{ matrix.target }}" ]; then
+            echo "Corpus size: $(find fuzz/corpus/${{ matrix.target }} -type f | wc -l) inputs" >> "$GITHUB_STEP_SUMMARY"
+          fi

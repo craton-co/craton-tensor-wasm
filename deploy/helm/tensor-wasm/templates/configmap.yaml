@@ -1,0 +1,17 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tensor-wasm.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tensor-wasm.labels" . | nindent 4 }}
+data:
+  TENSOR_WASM_API_LISTEN_ADDR: {{ printf "0.0.0.0:%d" (int .Values.service.port) | quote }}
+  TENSOR_WASM_LOG: {{ .Values.log.level | quote }}
+  TENSOR_WASM_API_RATE_LIMIT_QPS: {{ .Values.rateLimit.qps | quote }}
+  TENSOR_WASM_API_RATE_LIMIT_BURST: {{ .Values.rateLimit.burst | quote }}
+  TENSOR_WASM_API_REQUIRE_TENANT: {{ ternary "1" "0" .Values.auth.requireTenant | quote }}
+  TENSOR_WASM_OTLP_ENDPOINT: {{ .Values.otlp.endpoint | quote }}
+  CUDA_ARCH: {{ .Values.cuda.arch | quote }}
+  RUST_BACKTRACE: "1"
