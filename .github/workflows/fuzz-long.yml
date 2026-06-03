@@ -75,7 +75,7 @@ jobs:
             fuzz
 
       - name: Cache fuzz corpus (per target)
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: fuzz/corpus/${{ matrix.target }}
           # Year-keyed so accumulated corpus survives a full annual
