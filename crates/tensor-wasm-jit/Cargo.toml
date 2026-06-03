@@ -103,7 +103,7 @@ pliron-llvm = { version = "0.15", optional = true }
 # `zeroize` scrubs the in-memory copy of the HMAC signing key when the
 # registry is dropped — the same scrub-on-Drop guarantee the cli's
 # `load_hmac_key` provides for its on-disk key buffer.
-hmac = { version = "0.12", optional = true }
+hmac = { version = "0.13", optional = true }
 sha2 = { version = "0.10", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

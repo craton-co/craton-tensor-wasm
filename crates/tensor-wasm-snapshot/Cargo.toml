@@ -28,7 +28,7 @@ cust = { workspace = true, optional = true }
 # `signed-snapshots` feature is enabled; `subtle` provides the
 # constant-time equality check used to compare the trailing 32-byte
 # signature against the recomputed HMAC.
-hmac = { version = "0.12", optional = true }
+hmac = { version = "0.13", optional = true }
 sha2 = { version = "0.10", optional = true }
 subtle = { version = "2", optional = true }
 # Ed25519 asymmetric snapshot signing (v3 wire format, signature_kind = 2).
