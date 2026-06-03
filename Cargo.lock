@@ -1892,15 +1892,6 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
@@ -2221,6 +2212,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "opentelemetry-otlp"
 version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2229,7 +2234,7 @@ dependencies = [
  "async-trait",
  "futures-core",
  "http",
- "opentelemetry",
+ "opentelemetry 0.26.0",
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
@@ -2244,7 +2249,7 @@ version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9d3968ce3aefdcca5c27e3c4ea4391b37547726a70893aab52d3de95d5f8b34"
 dependencies = [
- "opentelemetry",
+ "opentelemetry 0.26.0",
  "opentelemetry_sdk",
  "prost",
  "tonic",
@@ -2262,7 +2267,7 @@ dependencies = [
  "futures-util",
  "glob",
  "once_cell",
- "opentelemetry",
+ "opentelemetry 0.26.0",
  "percent-encoding",
  "rand 0.8.6",
  "serde_json",
@@ -2559,7 +2564,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -3353,7 +3358,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "ipnet",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "opentelemetry_sdk",
  "serde",
  "serde_json",
@@ -3457,7 +3462,7 @@ name = "tensor-wasm-core"
 version = "0.3.7"
 dependencies = [
  "anyhow",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "parking_lot",
@@ -3936,7 +3941,7 @@ checksum = "dc58af5d3f6c5811462cabb3289aec0093f7338e367e5a33d28c0433b3c7360b"
 dependencies = [
  "js-sys",
  "once_cell",
- "opentelemetry",
+ "opentelemetry 0.26.0",
  "opentelemetry_sdk",
  "smallvec",
  "tracing",
