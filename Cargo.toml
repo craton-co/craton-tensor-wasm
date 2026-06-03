@@ -103,7 +103,7 @@ cudarc = { version = "0.13", default-features = false, features = ["driver", "cu
 # plan.
 
 # HTTP / API
-axum = { version = "0.7", features = ["macros", "tracing"] }
+axum = { version = "0.8", features = ["macros", "tracing"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "timeout", "cors"] }
 hyper = "1"
