@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Craton Software Company
+#
+# Generate a CycloneDX SBOM for the workspace and attach it to every
+# published GitHub release. See docs/SBOM.md for the rationale (SLSA L3
+# target per docs/PATH-TO-V1.md) and docs/REPRODUCIBLE-BUILDS.md for the
+# broader supply-chain story.
+name: sbom
+
+on:
+  release:
+    types: [published]
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pin cargo-cyclonedx to a known-good minor. Bump deliberately.
+  CARGO_CYCLONEDX_VERSION: "~0.5"
+
+jobs:
+  generate-sbom:
+    name: generate CycloneDX SBOM
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed by softprops/action-gh-release on release events.
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          # SHA pin replaces the @stable ref, so the channel can no longer be
+          # inferred from the ref name -- request it explicitly.
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version "${CARGO_CYCLONEDX_VERSION}" --locked
+
+      - name: Generate SBOM (CycloneDX JSON)
+        run: |
+          # --top-level emits a single SBOM rooted at the workspace
+          # rather than one per crate. --output-pattern bom names the
+          # file `bom.json`; we rename it below to the documented
+          # release-asset convention.
+          cargo cyclonedx --format json --output-pattern bom --top-level
+          # Locate the workspace-root SBOM. cargo-cyclonedx writes it
+          # next to the workspace Cargo.toml.
+          if [ ! -f bom.json ]; then
+            echo "::error::expected bom.json at workspace root, not found"
+            ls -la
+            exit 1
+          fi
+
+      - name: Validate SBOM is well-formed JSON
+        run: |
+          python3 -c "import json,sys; json.load(open('bom.json')); print('SBOM parses as JSON')"
+
+      - name: Derive release-asset filename
+        id: name
+        run: |
+          # On a release event: pin the filename to the released tag.
+          # Otherwise fall back to a short commit SHA so dev-branch
+          # artifacts are still uniquely named.
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="${GITHUB_SHA::8}"
+          fi
+          ASSET="tensor-wasm-cdx-v${VERSION}.json"
+          cp bom.json "${ASSET}"
+          echo "asset=${ASSET}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload SBOM as workflow artifact (always)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.name.outputs.asset }}
+          path: ${{ steps.name.outputs.asset }}
+          if-no-files-found: error
+
+      - name: Attach SBOM to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: ${{ steps.name.outputs.asset }}
+          fail_on_unmatched_files: true

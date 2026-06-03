@@ -1,0 +1,49 @@
+---
+# In-cluster Service for tensor-wasm-api.
+#
+# ClusterIP is the default and the only sensible production choice; expose
+# externally with an Ingress (see ../helm/tensor-wasm/templates/ingress.yaml
+# for a templated example) or a LoadBalancer service of your own.
+apiVersion: v1
+kind: Service
+metadata:
+  name: tensor-wasm-api
+  namespace: tensor-wasm
+  labels:
+    app.kubernetes.io/name: tensor-wasm
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: tensor-wasm
+    app.kubernetes.io/component: api
+
+# NodePort variant — uncomment in place of the ClusterIP Service above when
+# running on a bare-metal cluster with no LoadBalancer controller. Pick a
+# port in the 30000-32767 range that does not collide with other workloads.
+#
+# ---
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: tensor-wasm-api-nodeport
+#   namespace: tensor-wasm
+#   labels:
+#     app.kubernetes.io/name: tensor-wasm
+#     app.kubernetes.io/component: api
+# spec:
+#   type: NodePort
+#   ports:
+#     - name: http
+#       port: 8080
+#       targetPort: http
+#       nodePort: 30080
+#       protocol: TCP
+#   selector:
+#     app.kubernetes.io/name: tensor-wasm
+#     app.kubernetes.io/component: api

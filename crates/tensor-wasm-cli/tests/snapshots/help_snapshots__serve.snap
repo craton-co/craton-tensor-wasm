@@ -1,0 +1,54 @@
+---
+source: crates/tensor-wasm-cli/tests/help_snapshots.rs
+expression: "help(&[\"serve\", \"--help\"])"
+---
+Run the TensorWasm HTTP API gateway in-process (binds and serves)
+
+Usage: tensor-wasm serve [OPTIONS]
+
+Options:
+      --addr <ADDR>
+          Address to bind the HTTP server to (e.g. `127.0.0.1:8080`, `0.0.0.0:8080`)
+          
+          [default: 127.0.0.1:8080]
+
+      --tenant <TENANT>
+          Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility
+          
+          [default: 0]
+
+      --token <TOKEN>
+          Bearer token accepted by the gateway. Repeat to allowlist multiple tokens. Each value is treated as a wildcard-scope token (equivalent to `token:tenant=*` in the env-driven `TENSOR_WASM_API_TOKENS` allowlist). If omitted entirely, the gateway falls back to reading `TENSOR_WASM_API_TOKENS` from the environment; empty/unset there = dev mode (auth disabled with a startup warning)
+
+      --tenant-header-policy <TENANT_HEADER_POLICY>
+          Policy for the `X-TensorWasm-Tenant` header. `optional` (default) mirrors `TENSOR_WASM_API_REQUIRE_TENANT` unset; `required` mirrors `TENSOR_WASM_API_REQUIRE_TENANT=1`
+
+          Possible values:
+          - optional: Header is optional; absence defaults to `TenantId(0)`. Mirrors the gateway's behaviour when `TENSOR_WASM_API_REQUIRE_TENANT` is unset
+          - required: Header is mandatory; requests without it are rejected `400`. Mirrors `TENSOR_WASM_API_REQUIRE_TENANT=1`
+          
+          [default: optional]
+
+      --cors-origin <ORIGIN>
+          Origin to allow via CORS. Repeat for multiple origins. NOTE: the api crate does not yet expose a programmatic CORS knob, so this flag is currently informational — the gateway's CORS surface is wired via tower-http defaults inside `tensor-wasm-api`. The flag is kept so the README quickstart command parses cleanly; once `tensor_wasm_api::CorsConfig` lands (H18-H20 follow-up) this will thread through to the router builder
+
+      --max-body-bytes <MAX_BODY_BYTES>
+          Maximum inbound request body size, in bytes. Defaults to 64 MiB to match the api crate's `MAX_REQUEST_BODY_BYTES`. NOTE: the api crate does not yet expose a programmatic body-cap knob via `build_router_with_full_config`; passing a non-default value here emits a warning and the router uses the compiled-in 64 MiB cap. Wired through once the api crate grows a `BodyLimitConfig`
+          
+          [default: 67108864]
+
+      --allow-plaintext-public
+          Acknowledge that you are knowingly exposing a dev-mode (no auth) deployment to a non-loopback address. Required when `--addr` resolves to `0.0.0.0`, `::`, or any non-loopback IP AND no bearer-token allowlist is configured (no `--token` flags AND empty/unset `TENSOR_WASM_API_TOKENS`). Without this opt-in, the CLI refuses to bind such a configuration: a no-auth gateway reachable on a routable address is a critical misconfiguration that has historically leaked internal endpoints to the public internet (cli S-35 + api S-35).
+          
+          Setting this flag does NOT enable auth — it merely silences the safety gate. The 60-second recurring "no auth + public bind" warning continues to fire so the misconfiguration remains visible in long-running container logs.
+          
+          [env: TENSOR_WASM_ALLOW_PLAINTEXT_PUBLIC=]
+
+      --ca-cert <PATH>
+          Trust an additional PEM-encoded private CA root for HTTPS (added alongside the system trust store, not instead of it). Use this for a server fronted by an internal/self-signed CA instead of `--insecure`. The file must be PEM, not DER
+
+      --insecure
+          SECURITY HAZARD: disable TLS certificate verification for outbound HTTPS, exposing the connection to man-in-the-middle attacks and possible theft of the TENSOR_WASM_TOKEN credential. For local dev against a throwaway cert only; prefer --ca-cert. Warns on every run
+
+  -h, --help
+          Print help (see a summary with '-h')

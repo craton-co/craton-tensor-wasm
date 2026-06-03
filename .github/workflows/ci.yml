@@ -1,0 +1,268 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install CUDA stub libraries
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install CUDA stub libraries
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+      - name: Build (CUDA stub, default features)
+        run: cargo build --workspace
+      - name: Test (no CUDA)
+        run: cargo test --workspace --no-default-features
+      - name: Test (CUDA stub, default features)
+        run: cargo test --workspace
+
+  macos-build:
+    name: macos-compile-test
+    runs-on: macos-latest
+    # macOS is a Tier 3 platform: compile-tested only, no CUDA, no MPS
+    # (CUDA-gated crates would fail to link on macOS). Tests are not
+    # run because the GitHub macos-latest runners are slow; the goal is
+    # to catch breakage in pure-CPU paths, not feature-test the stack.
+    # See docs/BUILD.md "Platform support tiers".
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build (no CUDA, release)
+        # No --all-features: CUDA-gated crates (cust linkage) are not
+        # supported on macOS. Pure release build of the default workspace.
+        run: cargo build --workspace --release
+
+  doc:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install CUDA stub libraries
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+      - name: cargo doc
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --no-default-features
+
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run actionlint
+        uses: reviewdog/action-actionlint@6fb7acc99f4a1008869fa8a0f09cfca740837d9d # v1
+        with:
+          fail_level: error
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    # Enforces the workspace deny.toml posture: unknown-git = "deny" +
+    # unknown-registry = "deny" + the two allow-git entries
+    # (NVlabs/cuda-oxide and vaivaswatha/pliron at the pinned revs).
+    # Lands per F2 follow-up to RFC 0001; the policy without
+    # enforcement was the gap the v0.3.2 audit flagged.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Run cargo-deny
+        # check = advisories + bans + licenses + sources. The sources
+        # subcheck is the one that enforces deny.toml's allow-git
+        # entries; the others are belt-and-braces against unrelated
+        # supply-chain drift.
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          command: check
+          arguments: --all-features
+
+  cuda-oxide-backend-check:
+    name: cuda-oxide-backend-check
+    runs-on: ubuntu-latest
+    # Lands per RFC 0001 ("cuda-oxide as the v0.5 cust successor") -
+    # "Toolchain plan" step 2 and "Rollout" step 1: the workspace gains
+    # exactly one CI matrix entry exercising --features
+    # cuda-oxide-backend on the cuda-oxide-pinned nightly. The existing
+    # matrix (fmt / clippy / test / macos-build / doc / deny / openapi)
+    # is unchanged. See docs/CUDA-SETUP.md "Using the cuda-oxide-backend
+    # feature" for the local-invocation pattern this job mirrors.
+    #
+    # We `cargo check` rather than `cargo test`: hardware-gated tests
+    # under the cuda-oxide-backend gate require an NVIDIA GPU and live
+    # on the S22 self-hosted runner. The intent of this job is to keep
+    # the cuda-oxide-backend feature wiring compiling green at every
+    # PR, NOT to exercise the runtime path.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain
+        # cuda-oxide pins nightly-2026-04-03 (RFC 0001 "Toolchain
+        # plan"). The workspace currently pins the same nightly via
+        # rust-toolchain.toml, so this matches; if a future workspace
+        # bump diverges from cuda-oxide's pin, change ONLY this
+        # toolchain field (and the docs/CUDA-SETUP.md snippet) -- do
+        # not bump the workspace pin to satisfy this job.
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install CUDA stub libraries
+        # cuda-oxide-backend is a dep-less scaffold at v0.3.1 (RFC 0001
+        # "Rollout" step 1), but other workspace crates still link
+        # libcuda under default features; mirror the stub setup the
+        # rest of the matrix uses.
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+      - name: cargo check (--features cuda-oxide-backend)
+        # check, not build: we are validating that the feature-flag
+        # wiring resolves and typechecks, not that we can link a binary
+        # against a real cuda-oxide host runtime (no GPU on hosted
+        # runners). Tests gated on real cuda-oxide call paths live on
+        # the S22 self-hosted runner and are not exercised here.
+        run: cargo check --workspace --features tensor-wasm-mem/cuda-oxide-backend
+
+  openapi:
+    name: openapi-validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install CUDA stub libraries
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+      - name: Set up Node (for OpenAPI tooling)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - name: Install Redocly CLI (OpenAPI 3.0 + 3.1 linter)
+        # @redocly/cli replaces the legacy swagger-cli for OpenAPI 3.1
+        # validation; the 3.1 dialect (JSON Schema 2020-12) is a first-
+        # class target. We additionally install @apidevtools/swagger-cli
+        # for the legacy 3.0 JSON copy, which Redocly also handles but
+        # we keep both for belt-and-braces coverage.
+        run: |
+          npm install --global @redocly/cli@1
+          npm install --global @apidevtools/swagger-cli@4
+      - name: Validate OpenAPI YAML (3.1)
+        # Redocly lints structural correctness AND verifies every $ref
+        # resolves. The `minimal` ruleset (see openapi/redocly.yaml)
+        # keeps the gate focused on real spec breakage; editorial style
+        # rules are intentionally off so well-formed specs are not
+        # rejected for, say, missing tag descriptions.
+        # Failures fail the job — see the `openapi` job exit criterion
+        # in docs/PATH-TO-V1.md §v0.4.
+        run: redocly lint --config openapi/redocly.yaml openapi/tensor-wasm-api.yaml
+      - name: Validate legacy OpenAPI JSON (3.0)
+        # The crate-local openapi.json predates the canonical YAML and
+        # is preserved for the API.md cross-link. Validate it with
+        # swagger-cli so any drift from the YAML is caught early.
+        run: swagger-cli validate crates/tensor-wasm-api/openapi.json
+      - name: Run OpenAPI vs live-router round-trip test
+        # Asserts every route in the live axum router has a matching
+        # `paths:` entry in the spec, that the request body for
+        # POST /functions round-trips a real Rust CreateFunctionRequest
+        # value through the documented schema, and that a synthetic
+        # POST /functions round-trip succeeds against the in-process
+        # router. See crates/tensor-wasm-api/tests/openapi_validation_test.rs.
+        run: cargo test -p tensor-wasm-api --test openapi_validation_test --no-default-features

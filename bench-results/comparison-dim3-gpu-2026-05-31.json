@@ -1,0 +1,1 @@
+{"harness":"raw_cuLaunchKernel","device":"NVIDIA GeForce RTX 2060","kernel":"vector_add","n_elems":65536,"grid_x":256,"block_x":256,"samples":100000,"mean_ns":10540.6,"min_ns":3200,"p50_ns":5400,"p95_ns":33500,"p99_ns":49300,"p99_9_ns":129000,"max_ns":657400}

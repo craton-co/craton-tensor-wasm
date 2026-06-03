@@ -1,0 +1,150 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  publish-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install CUDA stub libraries
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+      - name: cargo publish --dry-run (every member)
+        # Order is topological over the internal dependency graph so a real
+        # `cargo publish` (which runs a verification build that compiles test
+        # targets, i.e. dev-dependencies too) finds every internal crate
+        # already on the registry. Key constraints:
+        #   - artifacts before snapshot/jit (both depend on it)
+        #   - tenant before mem (regular dep)
+        #   - snapshot before mem (mem dev-depends on snapshot)
+        #   - mem/jit/wasi-gpu before exec; exec/snapshot/wasi-gpu/jit before api
+        run: |
+          for crate in tensor-wasm-core tensor-wasm-artifacts tensor-wasm-tenant tensor-wasm-snapshot tensor-wasm-jit tensor-wasm-mem tensor-wasm-wasi-gpu tensor-wasm-exec tensor-wasm-api; do
+            echo "::group::cargo publish --dry-run -p $crate"
+            cargo publish --dry-run -p "$crate" --allow-dirty
+            echo "::endgroup::"
+          done
+
+  release-binary:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            bin: tensor-wasm
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            bin: tensor-wasm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            bin: tensor-wasm.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pinned stable rev (was @master)
+        with:
+          toolchain: nightly-2026-04-03
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install CUDA stub libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo mkdir -p /usr/local/cuda/lib64
+          sudo touch /usr/local/cuda/lib64/libcuda.so /usr/local/cuda/lib64/libcudart.so
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build -p tensor-wasm-cli --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          if [ "$VERSION" = "$GITHUB_REF" ]; then
+            # Not a tag build (workflow_dispatch). Use commit SHA so artifacts
+            # are still uniquely named.
+            VERSION="${GITHUB_SHA::8}"
+          fi
+          ARCHIVE="tensor-wasm-${VERSION}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${ARCHIVE}" "${{ matrix.bin }}"
+          (cd dist && shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256")
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $version = $env:GITHUB_REF -replace '^refs/tags/v', ''
+          if ($version -eq $env:GITHUB_REF) {
+            $version = $env:GITHUB_SHA.Substring(0, 8)
+          }
+          $archive = "tensor-wasm-$version-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin }}" -DestinationPath "dist/$archive"
+          $hash = (Get-FileHash "dist/$archive" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Out-File -FilePath "dist/$archive.sha256" -Encoding ascii
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tensor-wasm-${{ matrix.target }}
+          path: dist/
+
+  github-release:
+    needs: [publish-dry-run, release-binary]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: tensor-wasm-*
+          path: dist/
+          merge-multiple: true
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          body_path: CHANGELOG.md
+          generate_release_notes: false
+          draft: false
+          prerelease: false

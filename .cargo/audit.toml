@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Craton Software Company
+#
+# cargo-audit configuration (read by `cargo audit` in .github/workflows/audit.yml,
+# which runs `cargo audit --deny warnings`). cargo-audit does NOT read deny.toml,
+# so the bincode advisory is ignored here as well as in deny.toml — keep the two
+# ignore lists in sync.
+[advisories]
+ignore = [
+    # RUSTSEC-2025-0141 — bincode is unmaintained (the team ceased development
+    # after a doxxing/harassment incident; no safe upgrade exists). It is a
+    # core, non-optional serialization dependency (snapshot payloads, JIT
+    # kernel envelopes). Informational advisory, not a vulnerability. Migration
+    # to a maintained codec is tracked separately — see docs/RISKS.md. Mirrors
+    # the same entry in deny.toml [advisories].ignore.
+    "RUSTSEC-2025-0141",
+]

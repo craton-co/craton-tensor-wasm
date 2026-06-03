@@ -1,0 +1,22 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm-invoke 1  "tensor-wasm-invoke " 
+.SH NAME
+tensor\-wasm\-invoke \- Invoke a previously deployed function by id
+.SH SYNOPSIS
+\fBtensor\-wasm\-invoke\fR <\fB\-\-server\fR> [\fB\-\-args\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIID\fR> 
+.SH DESCRIPTION
+Invoke a previously deployed function by id
+.SH OPTIONS
+.TP
+\fB\-\-server\fR \fI<SERVER>\fR
+Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
+.TP
+\fB\-\-args\fR \fI<ARGS>\fR
+Arguments forwarded to the function, encoded as a JSON array
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIID\fR>
+Identifier of the deployed function to invoke

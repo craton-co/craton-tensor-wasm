@@ -1,0 +1,217 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Craton Software Company
+//
+// wasi:cuda/host@0.2.0 — TensorWasm's explicit GPU kernel-launch API for Wasm
+// guests. The on-the-wire ABI is the function-import form described in
+// `crates/tensor-wasm-wasi-gpu/src/abi.rs`; this WIT is the Component-Model
+// equivalent and is the authoritative description of the interface for
+// tooling that consumes WIT (wit-bindgen, jco, etc.).
+//
+// Keep this file and `crates/tensor-wasm-wasi-gpu/src/abi.rs` in lockstep —
+// every constant, every function signature, every error code must match.
+//
+// Version history:
+// - 0.1.0 (v0.1.0 era): launch rejected non-empty args with
+//   kernel-args-unsupported; the dynamic-argv path was a documented stub.
+// - 0.2.0 (v0.3.x): W1.1 typed-argv lowering landed; kernel-args-unsupported
+//   is reserved for sanity-cap rejections (>4 KiB / >128 entries) only.
+//   `launch` now accepts the tag-then-value wire format described in
+//   `crates/tensor-wasm-wasi-gpu/src/kernel_args.rs`. Wire-incompatible
+//   with 0.1.0 guests that relied on the launch-with-empty-args behavior.
+
+package wasi:cuda@0.2.0;
+
+interface host {
+  /// Negative i32 error codes returned by every host call. Numeric values
+  /// match `tensor_wasm_wasi_gpu::abi::AbiError`.
+  enum abi-error {
+    /// CUDA is not available on this host (no toolkit / no driver).
+    not-available,
+    /// A pointer / length pair pointed outside the caller's linear memory.
+    invalid-pointer,
+    /// Wasi-cuda was passed a kernel-id that is not registered (or that
+    /// belongs to another instance).
+    invalid-kernel,
+    /// `load-ptx` was called with bytes that ptxas rejected.
+    malformed-ptx,
+    /// The CUDA driver returned an error during a launch / sync.
+    launch-failed,
+    /// Resource limits (max kernels per instance, etc.) were exceeded.
+    quota-exceeded,
+    /// Generic internal error.
+    internal,
+    /// Launch grid / block dimensions exceeded hardware caps or were
+    /// non-positive.
+    invalid-dimensions,
+    /// Caller passed a structurally invalid argument that is neither a
+    /// memory-region issue nor a dimensions issue.
+    invalid-args,
+    /// Caller passed a well-formed, in-bounds kernel-argument buffer
+    /// that exceeds the host's sanity caps — total argv bytes greater
+    /// than `MAX_KERNEL_ARGS_BYTES` (4 KiB) or more than
+    /// `MAX_KERNEL_ARGS` (128) tagged records. The W1.1 typed-argv
+    /// lane (see `launch`) accepts arbitrary scalar + pointer argv
+    /// below these caps; this code is reserved for cap busts and is
+    /// kept distinct from `invalid-args` so guests can tell "your
+    /// input shape is too big for the host to accept" from "your
+    /// input bytes are malformed."
+    kernel-args-unsupported,
+    /// A device-memory handle (from `alloc`) passed to `free` /
+    /// `memcpy-h2d` / `memcpy-d2h` is not registered, or belongs to
+    /// another instance. Mirrors `invalid-kernel` for device buffers:
+    /// a guest cannot forge another instance's handle.
+    invalid-handle,
+  }
+
+  /// Opaque handle to a compiled PTX kernel. Scoped to the calling
+  /// instance — reusing a `kernel-id` across instances is rejected with
+  /// `invalid-kernel`.
+  type kernel-id = u64;
+
+  /// Compile a PTX module and return a handle.
+  ///
+  /// `ptx` is the full PTX source, `entry` is the name of the kernel
+  /// entry point symbol inside that source.
+  ///
+  /// Hard caps enforced by the host (see `tensor_wasm_wasi_gpu::abi`):
+  ///   * `MAX_PTX_BYTES` = 8 MiB per call.
+  ///   * `MAX_KERNELS_PER_INSTANCE` = 256 live kernels per instance.
+  ///   * `MAX_TOTAL_PTX_BYTES` = 64 * `MAX_PTX_BYTES` aggregate per
+  ///     instance.
+  /// Exceeding any cap returns `quota-exceeded`.
+  load-ptx: func(ptx: list<u8>, entry: string) -> result<kernel-id, abi-error>;
+
+  /// Launch a previously-loaded kernel.
+  ///
+  /// Grid and block dimensions must be positive and obey the hardware
+  /// caps:
+  ///   * each block dimension <= 1024;
+  ///   * `block-x * block-y * block-z` <= 1024 (threads per block);
+  ///   * each grid dimension <= 2^31 - 1.
+  /// Out-of-range values return `invalid-dimensions` before any driver
+  /// call is made.
+  ///
+  /// `args` is a flat byte buffer carrying the kernel's parameter
+  /// struct in the W1.1 typed-argv wire format: a concatenation of
+  /// `(tag, value)` records with no inter-argument padding. Each
+  /// record begins with a single tag byte that identifies the
+  /// argument type, followed by that type's value bytes in
+  /// little-endian order. The currently defined tags are:
+  ///
+  ///   * `0x01` `i32`  — 4 value bytes
+  ///   * `0x02` `i64`  — 8 value bytes
+  ///   * `0x03` `f32`  — 4 value bytes
+  ///   * `0x04` `f64`  — 8 value bytes
+  ///   * `0x05` `u32`  — 4 value bytes
+  ///   * `0x06` `u64`  — 8 value bytes
+  ///   * `0x07` `ptr`  — 8 value bytes: a `u32` guest-memory offset
+  ///                    followed by a `u32` byte length, both
+  ///                    little-endian. The host bounds-checks the
+  ///                    `[offset, offset + len)` window against the
+  ///                    caller's linear memory and resolves it into
+  ///                    a host pointer before any driver call; under
+  ///                    CUDA Unified Memory that host pointer
+  ///                    doubles as a device address.
+  ///
+  /// The host enforces two sanity caps on `args`:
+  ///   * `MAX_KERNEL_ARGS_BYTES` = 4 KiB total wire-format buffer
+  ///     length;
+  ///   * `MAX_KERNEL_ARGS` = 128 records per launch.
+  /// A buffer that exceeds either cap is rejected with
+  /// `kernel-args-unsupported` before any per-record work. Inside
+  /// the caps the parser is strict: an unknown tag byte or a record
+  /// whose value bytes are truncated against the buffer end returns
+  /// `invalid-args`, and a pointer record whose `[offset, offset +
+  /// len)` window lies outside the caller's linear memory (or whose
+  /// `offset + len` overflows `u32`) returns `invalid-pointer`. The
+  /// outer `(args)` region itself is bounds-checked first, so an
+  /// out-of-bounds buffer surfaces as `invalid-pointer` rather than
+  /// the friendlier per-record errors.
+  ///
+  /// Empty `args` is accepted and corresponds to a zero-parameter
+  /// kernel launch.
+  ///
+  /// See `docs/CUDA-KERNELS.md` for the full developer-facing guide
+  /// (wire-format table, worked examples, performance tips) and
+  /// `crates/tensor-wasm-wasi-gpu/src/kernel_args.rs` for the
+  /// authoritative parser implementation.
+  launch: func(
+    kernel: kernel-id,
+    grid: tuple<u32, u32, u32>,
+    block: tuple<u32, u32, u32>,
+    shared-mem: u32,
+    args: list<u8>,
+  ) -> result<_, abi-error>;
+
+  /// Block until all outstanding GPU work on the calling context has
+  /// finished. On no-CUDA hosts this is a no-op.
+  sync: func() -> result<_, abi-error>;
+
+  /// Opaque handle to an explicit device-memory allocation. Scoped to
+  /// the calling instance — passing a handle that belongs to another
+  /// instance to `free` / `memcpy-h2d` / `memcpy-d2h` is rejected with
+  /// `invalid-handle`.
+  type device-handle = u64;
+
+  /// Allocate an explicit device buffer of `size` bytes and return a
+  /// handle.
+  ///
+  /// Unlike the CUDA Unified Memory pointer arguments accepted by
+  /// `launch` (which require a UVM-capable host), an explicit device
+  /// buffer works on any CUDA host: the guest stages bytes into it with
+  /// `memcpy-h2d`, launches a kernel against the device pointer, then
+  /// reads results back with `memcpy-d2h`.
+  ///
+  /// Hard caps enforced by the host:
+  ///   * `MAX_DEVICE_ALLOC_BYTES` = 256 MiB per call.
+  ///   * `MAX_DEVICE_ALLOCS_PER_INSTANCE` = 4096 live buffers per
+  ///     instance.
+  ///   * `MAX_TOTAL_DEVICE_BYTES` = 16 * `MAX_DEVICE_ALLOC_BYTES`
+  ///     aggregate per instance.
+  /// Exceeding any cap returns `quota-exceeded`. A zero-size request
+  /// returns `invalid-args`.
+  ///
+  /// On no-CUDA hosts the arguments are validated and a handle is
+  /// reserved in the per-instance registry, but no real device memory
+  /// is allocated and the call returns `not-available` — matching the
+  /// `launch` no-CUDA stub.
+  alloc: func(size: u64) -> result<device-handle, abi-error>;
+
+  /// Release a device buffer previously returned by `alloc`. Passing a
+  /// handle that is unknown or belongs to another instance returns
+  /// `invalid-handle`. Double-free returns `invalid-handle`.
+  free: func(handle: device-handle) -> result<_, abi-error>;
+
+  /// Copy `len` bytes from the caller's linear memory at `src-ptr` into
+  /// the device buffer named by `handle`.
+  ///
+  /// The host bounds-checks `[src-ptr, src-ptr + len)` against the
+  /// caller's linear memory (out-of-bounds / overflow returns
+  /// `invalid-pointer`) and checks `len` against the buffer's allocated
+  /// size (a copy past the end returns `invalid-args`). On no-CUDA hosts
+  /// the arguments are validated and the call returns `not-available`.
+  memcpy-h2d: func(handle: device-handle, src-ptr: u32, len: u32) -> result<_, abi-error>;
+
+  /// Copy `len` bytes from the device buffer named by `handle` into the
+  /// caller's linear memory at `dst-ptr`.
+  ///
+  /// The host bounds-checks `[dst-ptr, dst-ptr + len)` against the
+  /// caller's linear memory (out-of-bounds / overflow returns
+  /// `invalid-pointer`) and checks `len` against the buffer's allocated
+  /// size (a copy past the end returns `invalid-args`). On no-CUDA hosts
+  /// the arguments are validated and the call returns `not-available`.
+  memcpy-d2h: func(dst-ptr: u32, handle: device-handle, len: u32) -> result<_, abi-error>;
+
+  /// Most recent error message recorded by any wasi-cuda call on this
+  /// instance, as a UTF-8 string. Empty string means no error recorded.
+  ///
+  /// (The raw ABI splits this into `last-error-len` + `last-error-copy`
+  /// to fit the i32-only function-import shape — the Component-Model
+  /// binding can use a single `string` return because the canonical ABI
+  /// already handles the length-prefix.)
+  last-error: func() -> string;
+}
+
+world tensor-wasm-wasi-cuda {
+  import host;
+}

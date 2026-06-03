@@ -1,0 +1,49 @@
+[package]
+name = "tensor-wasm-exec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Wasmtime + Tokio async execution engine for TensorWasm instances."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-exec"
+readme = "README.md"
+keywords = ["wasm", "wasmtime", "executor", "runtime", "gpu"]
+categories = ["wasm", "concurrency"]
+
+[dependencies]
+async-trait.workspace = true
+tensor-wasm-core = { workspace = true }
+tensor-wasm-jit = { workspace = true }
+tensor-wasm-mem = { workspace = true }
+tensor-wasm-wasi-gpu = { workspace = true }
+blake3.workspace = true
+crossbeam-channel.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+lru.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+wasmparser.workspace = true
+wasmtime = { workspace = true, features = ["pooling-allocator", "memory-protection-keys"] }
+
+[dev-dependencies]
+tokio-test.workspace = true
+tracing-subscriber.workspace = true
+wat.workspace = true
+
+[features]
+# `cuda` enables the real GPU kernel-launch path in `jit_dispatch` (a cache hit
+# launches a compiled kernel instead of signalling deopt). It pulls the CUDA
+# host bridge in `tensor-wasm-wasi-gpu`; requires a CUDA toolkit at build time,
+# so it is opt-in and off by default (plain `cargo build` stays CUDA-free).
+cuda = ["tensor-wasm-wasi-gpu/cuda"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

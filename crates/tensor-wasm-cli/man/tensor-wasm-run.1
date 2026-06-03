@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm-run 1  "tensor-wasm-run " 
+.SH NAME
+tensor\-wasm\-run \- Run a Wasm module locally against the in\-process TensorWasm engine
+.SH SYNOPSIS
+\fBtensor\-wasm\-run\fR [\fB\-\-export\fR] [\fB\-\-args\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIFILE\fR> 
+.SH DESCRIPTION
+Run a Wasm module locally against the in\-process TensorWasm engine
+.SH OPTIONS
+.TP
+\fB\-\-export\fR \fI<EXPORT>\fR [default: main]
+Name of the exported function to call. Defaults to `main`
+.TP
+\fB\-\-args\fR \fI<ARGS>\fR
+Arguments to pass to the export, encoded as a JSON array.
+
+Example: `\-\-args \*(Aq[1.0, 2.0]\*(Aq`. The current executor only invokes `() \-> ()` exports, so the array is parsed and validated but the values are not yet wired into the call site.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIFILE\fR>
+Path to the `.wasm` file to execute

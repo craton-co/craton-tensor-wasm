@@ -1,0 +1,16 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tensor-wasm-metrics 1  "tensor-wasm-metrics " 
+.SH NAME
+tensor\-wasm\-metrics \- Fetch and pretty\-print Prometheus metrics from a TensorWasm server
+.SH SYNOPSIS
+\fBtensor\-wasm\-metrics\fR <\fB\-\-server\fR> [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Fetch and pretty\-print Prometheus metrics from a TensorWasm server
+.SH OPTIONS
+.TP
+\fB\-\-server\fR \fI<SERVER>\fR
+Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help

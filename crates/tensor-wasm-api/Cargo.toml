@@ -1,0 +1,146 @@
+[package]
+name = "tensor-wasm-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "HTTP serverless API gateway (axum)."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-api"
+readme = "README.md"
+keywords = ["wasm", "axum", "gateway", "serverless", "runtime"]
+categories = ["web-programming::http-server", "wasm"]
+
+[lib]
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+tensor-wasm-core = { workspace = true }
+tensor-wasm-exec = { workspace = true }
+# tensor-wasm-snapshot: consumed by the `/snapshot/save` and
+# `/snapshot/restore` routes (M5). The `signed-snapshots` feature is
+# required so the handlers can call `SnapshotWriter::with_hmac_sha256_key`
+# / `SnapshotReader::with_hmac_sha256_key` to sign and verify blobs with
+# the operator-configured `TENSOR_WASM_API_SNAPSHOT_HMAC_KEY`. We pin the
+# legacy v2/v3 inline envelope on the write path (via
+# `SnapshotWriter::with_legacy_envelope`) so the api crate does not pull
+# in the artifact-store machinery; `default-features = false` keeps that
+# dep surface off.
+tensor-wasm-snapshot = { workspace = true, default-features = false, features = ["signed-snapshots"] }
+# tensor-wasm-wasi-gpu: needed by the streaming `/invoke-stream` route to
+# construct a `StreamingContext` whose `mpsc::Sender<Vec<u8>>` is wired
+# into the executor's spawn config (T34). The receiver end stays in the
+# route handler and feeds the SSE / chunked-transfer response body.
+tensor-wasm-wasi-gpu = { workspace = true }
+# tensor-wasm-jit: pulled in only when the `kernel-registry-api` feature
+# is enabled. The api crate uses it solely to expose the `/kernels` HTTP
+# routes (B6.4) — manifest verification, in-memory storage, and the
+# trait surface all live in `tensor-wasm-jit::registry`. The dep is
+# optional so the default build keeps the lean dependency graph the
+# B6.3 scaffold (jit/Cargo.toml) describes; only consumers that flip
+# `--features kernel-registry-api` pull in `hmac`/`sha2`/`serde_json`
+# transitively.
+tensor-wasm-jit = { workspace = true, features = ["kernel-registry"], optional = true }
+base64 = "0.22"
+dashmap.workspace = true
+# futures: needed by the streaming `/invoke-stream` handler to build an
+# `impl Stream<Item = Result<Event, _>>` that axum's `Sse` wraps, and an
+# `impl Stream<Item = Result<Bytes, _>>` that `Body::from_stream` wraps
+# on the non-SSE branch. The dev-dependency line below stays so existing
+# tests that pull in `futures::future` helpers keep working without an
+# `extern crate` shim.
+futures = { workspace = true }
+hyper.workspace = true
+# ipnet: parse the `TENSOR_WASM_API_TRUSTED_XFCC_PROXIES` allowlist as a list
+# of IPv4/IPv6 IPs or CIDR ranges so the audit middleware only consults the
+# `X-Forwarded-Client-Cert` header when the immediate TCP peer is a configured
+# proxy. See `crate::audit::TrustedProxies` and the threat-model comment on
+# `crate::audit::extract_client_cert_subject_gated`. Pinned to the workspace's
+# 2.x minor range; no workspace-level entry because this is the only crate
+# that needs it today.
+ipnet = "2"
+opentelemetry = { workspace = true }
+# opentelemetry_sdk: needed only for `TraceContextPropagator` so the gateway
+# can install the W3C propagator on startup and have the trace context
+# extracted from inbound `traceparent` headers stitch correctly into the
+# tracing span tree. The SDK is already declared in `[workspace.dependencies]`
+# alongside `opentelemetry-otlp`; pulling it in unconditionally here keeps
+# the propagation path enabled without forcing every binary to also enable
+# the OTLP exporter feature on `tensor-wasm-core`.
+opentelemetry_sdk = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+# subtle: constant-time byte comparison for the bearer-token allowlist
+# lookup in `crate::middleware::AuthConfig::scope_for`. The previous
+# `HashMap::get` lookup short-circuits on hash mismatch and then bytes-eq
+# matching entries — both timing-leakable for token discovery. See the
+# `scope_for` docstring for the loop-and-no-break rationale.
+subtle = "2"
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+# tower-http: workspace declaration enables {trace, timeout, cors}. We
+# use axum's native `DefaultBodyLimit::max` for the 64 MiB inbound body
+# cap rather than `tower_http::limit::RequestBodyLimitLayer` (which
+# rewraps the body in `Limited<Body>` and breaks composition with
+# `axum::middleware::from_fn`), so the `limit` feature is intentionally
+# not requested here.
+tower-http = { workspace = true, features = ["trace", "timeout", "cors"] }
+tracing.workspace = true
+tracing-opentelemetry = { workspace = true }
+uuid.workspace = true
+wasmparser.workspace = true
+
+[features]
+default = []
+# Signed kernel registry HTTP surface (B6.4 — roadmap feature #3 server
+# side). When enabled, the api crate compiles the `kernels` module and
+# wires `POST/GET /kernels` + `GET /kernels/{name}/{version}` into the
+# router. The feature gates the optional `tensor-wasm-jit` dep (which
+# itself enables its own `kernel-registry` sub-feature for the manifest
+# verification + InMemoryRegistry impl) so the default build is unaffected
+# — operators that don't need the registry endpoints keep the lean dep
+# graph. See `docs/KERNEL-REGISTRY.md` for the rollout plan.
+kernel-registry-api = ["dep:tensor-wasm-jit"]
+
+[dev-dependencies]
+# futures: now declared as a regular [dependencies] entry above for the
+# streaming `/invoke-stream` handler. The dev-dependency block keeps no
+# duplicate entry — Cargo resolves both `cfg(test)` and `cfg(not(test))`
+# code against the same crate version.
+http-body-util = "0.1"
+# tensor-wasm-jit + blake3: only the kernel-registry-api integration
+# test (tests/kernel_registry_routes.rs) consumes these. The test is
+# itself gated behind `#[cfg(feature = "kernel-registry-api")]`; we
+# pull the jit crate with its `kernel-registry` sub-feature so the
+# `registry` module + `sign_manifest` helper are in scope, and blake3
+# so the test can recompute digests when constructing signed manifests.
+# Cargo deduplicates against the optional `[dependencies]` entry once
+# the api feature is on.
+tensor-wasm-jit = { workspace = true, features = ["kernel-registry"] }
+blake3.workspace = true
+# `temp-env` scopes process env-var mutations to a closure and serialises
+# concurrent users behind an internal Mutex. The header-hardening tests
+# use this for the `TENSOR_WASM_API_REQUIRE_TENANT=1` path (see
+# `tests/header_hardening_test.rs::missing_tenant_when_required`) rather
+# than raw `std::env::set_var` / `remove_var` — the latter became `unsafe`
+# in Rust 2024 and parallel mutation of the process env from tests is
+# undefined behaviour.
+temp-env.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-test.workspace = true
+tower = { workspace = true, features = ["util"] }
+# tracing-subscriber: pulled in for the concurrent-load tracing test
+# (`tests/trace_concurrent_load_test.rs`), which installs a custom
+# `Layer` that counts `on_new_span` callbacks to verify W4.1's
+# `Instrument::instrument` wrap around `tokio::spawn` does not
+# double-instrument the async-invoke job span (audit Problem #11).
+tracing-subscriber = { workspace = true }
+wat.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

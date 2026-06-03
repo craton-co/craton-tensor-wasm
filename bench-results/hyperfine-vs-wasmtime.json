@@ -1,0 +1,31 @@
+{
+  "// generated": "Re-run of the dimension-1 hyperfine comparison after W4.1 tracing + W2.2 audit log + W2.3 HTTP metrics + B1 busy-poll fix landed. See docs/BENCHMARKING.md dimension 1 for methodology and bench-results/cuda-rtx2060-tests.txt for hardware disclosure.",
+  "// host": "Intel 24c/32t, 64 GB RAM, Windows 11, RTX 2060 (idle for this bench since the workload is pure CPU), nightly-2026-04-03",
+  "// workload": "500M-iter integer-add loop, 192-byte .wasm compiled from bench-out/loop_sum.wat via wasm-tools",
+  "// command": "hyperfine --warmup 3 --min-runs 30 ...",
+  "// captured": "2026-05-25 post-B-wave",
+  "// answer": "W4.1 tracing overhead NOT measurable on the CLI path -- `tensor-wasm run` invokes TensorWasmExecutor::spawn_instance directly and never touches the HTTP layer where the W4.1 / W2.2 / W2.3 instrumentation lives. Audit Problem #10 resolved.",
+  "results": [
+    {
+      "command": "tensor-wasm (post-W4.1)",
+      "mean_ms": 490.7,
+      "stddev_ms": 13.2,
+      "user_ms": 453.8,
+      "system_ms": 37.4,
+      "min_ms": 475.2,
+      "max_ms": 549.9,
+      "cv_pct": 2.7
+    },
+    {
+      "command": "wasmtime 45",
+      "mean_ms": 501.2,
+      "stddev_ms": 34.9,
+      "user_ms": 451.1,
+      "system_ms": 46.1,
+      "min_ms": 459.8,
+      "max_ms": 594.6,
+      "cv_pct": 7.0
+    }
+  ],
+  "// vs v0.3.0 baseline": "Pre-W4.1 numbers were tensor-wasm 487.5+-15.5 ms vs wasmtime 464.9+-12.2 ms; ratio 1.05 wasmtime-faster. Today's run: 490.7+-13.2 vs 501.2+-34.9; ratio 1.02 tensor-wasm-faster but CIs overlap. The 3 ms uptick on tensor-wasm side is within noise; the wasmtime number drifted up 36 ms with elevated variance, environmental. Net: the W4.1/W2.2/W2.3 landings did NOT regress the CLI-invocation floor."
+}

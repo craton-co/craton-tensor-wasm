@@ -1,0 +1,48 @@
+---
+# Non-secret environment for tensor-wasm-api.
+#
+# Bearer-token allowlist lives in a Secret, not here. See README.md for the
+# `kubectl create secret generic tensor-wasm-tokens ...` command that the
+# Deployment references via envFrom.
+#
+# The full env-var surface is documented in:
+#   crates/tensor-wasm-api/API.md   (TENSOR_WASM_API_* knobs)
+#   docs/DEPLOYMENT.md              (TENSOR_WASM_LOG, TENSOR_WASM_OTLP_ENDPOINT)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tensor-wasm-config
+  namespace: tensor-wasm
+  labels:
+    app.kubernetes.io/name: tensor-wasm
+    app.kubernetes.io/component: api
+data:
+  # HTTP listen address. The binary defaults to 0.0.0.0:8080 when --addr is
+  # passed on the command line; the env var is the source of truth when the
+  # arg is not present. Keep both in sync if you change one.
+  TENSOR_WASM_API_LISTEN_ADDR: "0.0.0.0:8080"
+
+  # tracing-subscriber EnvFilter directive.
+  TENSOR_WASM_LOG: "info"
+
+  # Per-token rate limit. Both values must be set for the limiter to engage;
+  # see crates/tensor-wasm-api/API.md "Per-token rate limiting".
+  TENSOR_WASM_API_RATE_LIMIT_QPS: "100"
+  TENSOR_WASM_API_RATE_LIMIT_BURST: "200"
+
+  # If "1", every request must carry an X-TensorWasm-Tenant header.
+  # Leave unset (or "0") for the permissive default that maps missing
+  # headers to tenant 0.
+  TENSOR_WASM_API_REQUIRE_TENANT: "0"
+
+  # OpenTelemetry OTLP collector. Unset (empty string) disables OTLP export.
+  # Common values:
+  #   http://otel-collector.observability.svc.cluster.local:4317
+  #   http://jaeger.observability.svc.cluster.local:4317
+  TENSOR_WASM_OTLP_ENDPOINT: ""
+
+  # CUDA target compute capability for JIT-emitted PTX. Only consulted on
+  # GPU-enabled builds; harmless on the host-only image.
+  CUDA_ARCH: "sm_80"
+
+  RUST_BACKTRACE: "1"

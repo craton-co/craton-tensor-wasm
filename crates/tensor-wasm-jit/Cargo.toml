@@ -1,0 +1,268 @@
+[package]
+name = "tensor-wasm-jit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "JIT pipeline: Cranelift detector, IR normalisation, PTX codegen, kernel cache, deopt."
+homepage = "https://github.com/craton-co/craton-tensor-wasm"
+documentation = "https://docs.rs/tensor-wasm-jit"
+readme = "README.md"
+keywords = ["wasm", "jit", "gpu", "cuda", "ptx"]
+categories = ["wasm", "compilers", "concurrency"]
+
+[lib]
+
+[dependencies]
+tensor-wasm-core = { workspace = true }
+# T30: the on-disk L2 kernel cache (`cache::DiskCache`) now layers the v2
+# kernel envelope (TWJIT-KRNL-v2) over the streaming content-addressed
+# `DiskArtifactStore`. This is a hard dependency — the disk cache cannot
+# function without it.
+tensor-wasm-artifacts = { workspace = true }
+blake3.workspace = true
+cranelift-codegen.workspace = true
+dashmap.workspace = true
+lru.workspace = true
+parking_lot.workspace = true
+# Constant-time byte-slice equality for HMAC tag comparison in the on-disk
+# L2 kernel cache (jit S-3). The stdlib `==` on `[u8; N]` short-circuits on
+# the first mismatch, which is a timing oracle for MAC forgery; `subtle`'s
+# `ConstantTimeEq::ct_eq` runs in constant time over the full input.
+subtle = "2"
+# (the lower duplicate entry that B6.3 added with `optional = true` for the
+# kernel-registry feature is removed below — `subtle` is already a hard dep
+# of the disk-cache integrity path, so the registry feature can use it
+# without re-declaring it as optional.)
+# Atomic file writes for the on-disk L2 kernel cache (jit S-3 disk-
+# persistence layer). Reused from the workspace dep added by the snapshot
+# crate.
+tempfile.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wasmparser.workspace = true
+wasm-encoder = { version = "0.218", features = ["wasmparser"] }
+# Data-parallel candidate emit in `rewrite::analyse`. Order is preserved by
+# collecting `(index, Result<…>)` pairs and re-sorting before commit so the
+# rewriter's downstream assumption that `func_infos[i]` matches the i-th
+# `CodeSectionEntry` still holds. See `tests/rewrite_parallel_order.rs`.
+rayon.workspace = true
+# Best-effort memory wiping for the on-disk L2 HMAC key (jit S-3 follow-up).
+# Wraps the existing `[u8; 32]` field in a `Zeroizing` newtype so manual
+# `Drop` is not required and the rest of the code keeps its byte-slice
+# borrow patterns via `Deref`/`DerefMut`.
+zeroize.workspace = true
+# Hex encoding for the on-disk L2 cache path derivation (T20 perf). Used by
+# `DiskCache::path_for` to render the 16-byte cache-key digest and the
+# 8-byte HMAC-key fingerprint as ASCII without per-byte `format!` String
+# allocations on every disk-cache op.
+hex.workspace = true
+
+# pliron — MLIR-style IR framework underpinning cuda-oxide's dialect-mir →
+# dialect-llvm → PTX pipeline (RFC 0001 "Pliron lever and the auto-offload
+# pipeline"). Optional + feature-gated so the default build is unaffected;
+# only `--features cuda-oxide-backend` pulls it in.
+#
+# Supply-chain status: W3.1 (2026-05-27) discovered that pliron is now on
+# crates.io at 0.15.0 — the old RFC 0001 "Pliron is not on crates.io"
+# drawback is no longer accurate (RFC has been amended). We depend on the
+# published crate directly rather than a git rev. The cuda-oxide upstream
+# itself still uses a git pin at v0.14.0 of pliron; we choose the published
+# 0.15.0 for the dependabot/cargo-deny story documented in
+# `docs/REPRODUCIBLE-BUILDS.md`. The cuda-oxide HOST crates
+# (cuda-host/cuda-core/cuda-device/cuda-macros) remain git-only and are the
+# only remaining supply-chain git pin once wave 4 lands.
+pliron = { version = "0.15", optional = true }
+# pliron-llvm — LLVM-dialect ops + textual IR emission for pliron 0.15.
+# Wave 3.3 uses this to lower `twasm.*` ops emitted by `pliron_lowering`
+# into the standard `llvm.*` dialect, which is the last pliron stage
+# before textual LLVM IR + the NVPTX backend (W4.x).
+#
+# IMPORTANT: pliron-llvm 0.15 has a hard transitive dependency on
+# `llvm-sys = "221"`, which requires LLVM 221 to be installed system-wide
+# (via `LLVM_SYS_221_PREFIX`). On a typical dev machine that's not the
+# case, so we gate this dep behind its OWN feature
+# (`pliron-llvm-backend`) instead of riding on `cuda-oxide-backend`. The
+# stage-2 rewrite (twasm.* → llvm.*) is therefore behind that feature;
+# the base `cuda-oxide-backend` build returns
+# `PtxError::NotYetWired("twasm_to_llvm_dialect")` from the stage. W4.x
+# is the layer that pulls in pliron-llvm on a CI image with the LLVM
+# toolchain pre-installed.
+pliron-llvm = { version = "0.15", optional = true }
+
+# Signed kernel registry (roadmap feature #3 scaffold). All four crates
+# are off by default — they only get pulled in when the
+# `kernel-registry` feature is on. `hmac` + `sha2` are pinned to the same
+# versions the snapshot crate already uses for its HMAC-SHA256 signing
+# path (snapshots v3), so cargo can deduplicate. `subtle` matches the
+# 2.x line used by the api crate's constant-time token comparator.
+# `serde` / `serde_json` give us a manifest wire format the v0.4 server
+# endpoint can decode without an additional ser-de helper layer.
+# `zeroize` scrubs the in-memory copy of the HMAC signing key when the
+# registry is dropped — the same scrub-on-Drop guarantee the cli's
+# `load_hmac_key` provides for its on-disk key buffer.
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+# T35 (v0.4): `DiskRegistry` reuses the unified content-addressed signed
+# blob store from `tensor-wasm-artifacts` for persistence. T30 promoted
+# this to a hard dependency (the on-disk L2 kernel cache also layers on
+# it now); see the top-of-section [dependencies] entry. The
+# `kernel-registry` feature still gates the `DiskRegistry` *symbols* but
+# no longer depends on a dep:tensor-wasm-artifacts switch.
+# T35: bincode for `KernelManifest` ↔ on-disk blob serialization. v2 +
+# `serde` so we route through the existing `serde::{Serialize,
+# Deserialize}` derives on `KernelManifest` (same path the snapshot
+# crate uses for its v3 payload encoding).
+bincode = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+wat.workspace = true
+# Property-based tests driving the differential JIT correctness oracle
+# (T38). The `differential_proptest` integration test under `tests/` is
+# gated on the `differential-oracle` feature flag, so this dev-dep only
+# pulls into the build when the oracle harness is exercised.
+proptest = { workspace = true }
+
+[features]
+default = []
+# Auto-offload is a runtime flag now: the pipeline is always compiled; the
+# feature gates additional CUDA-side wiring tested under `--features cuda`.
+auto-offload = []
+# cuda-oxide-backend gates the `pliron_dialect` scaffold module — the v0.5
+# cust-successor lever tracked in `rfcs/0001-cuda-oxide-integration.md`
+# (step 4, "Pliron lever and the auto-offload pipeline"). The feature is
+# deliberately dep-light today: it pulls in `pliron` 0.15 from crates.io
+# (published 2026-05, per W3.1 discovery on 2026-05-27) to land the
+# scaffold trait surface + Cranelift→dialect-mir mapping table the v0.4
+# author needs as a target. Mirrors the `cuda-oxide-backend` feature on
+# `tensor-wasm-mem` so a single `--features cuda-oxide-backend` invocation
+# at the workspace root selects the full opt-in stack.
+#
+# Supply-chain note: W3.1 (2026-05-27) discovered that pliron is now on
+# crates.io at v0.15 — the historical RFC 0001 "Drawbacks" claim that
+# Pliron is git-only is therefore stale (RFC has been amended). The
+# `pliron` dep here is a regular crates.io version requirement, NOT a git
+# pin. The cuda-oxide HOST crates (cuda-host/cuda-core/cuda-device/
+# cuda-macros) remain git-only and arrive in wave 4 with the corresponding
+# `deny.toml` allowlist entries (already pre-declared under [sources]
+# allow-git for forward compatibility).
+cuda-oxide-backend = ["dep:pliron"]
+# pliron-llvm-backend pulls in `pliron-llvm` 0.15 to wire the stage-2
+# `twasm.*` → `llvm.*` rewrite in `pliron_ptx`. Strict superset of
+# `cuda-oxide-backend`. Gated separately because pliron-llvm carries a
+# hard `llvm-sys = "221"` dep that requires a system LLVM 221 install
+# (W4.x's CI image will satisfy this; the default workstation build will
+# not).
+pliron-llvm-backend = ["cuda-oxide-backend", "dep:pliron-llvm"]
+# test-utils exposes the `lowering_test_support` module so external test
+# harnesses (and our own integration tests in `tests/`) can reuse the
+# Cranelift fixture builders. Strictly opt-in — the symbols are NOT part
+# of the stable public surface and are liable to change in any 0.x.y
+# release. The crate's own unit tests see the module via `cfg(test)`;
+# integration tests under `tests/` opt in via the `[[test]]`
+# `required-features` block below. No extra dependencies.
+test-utils = []
+
+# __unstable-test-internals gates `KernelCache::__test_only_insert_unchecked`
+# (jit M2). That fn installs a `CachedKernel` directly into L1 storage,
+# bypassing `put`'s S-3 integrity check, so it MUST NOT be reachable from a
+# default build — a downstream crate could otherwise forge a zero-hash entry
+# and defeat the integrity defence. The double-underscore prefix marks it as
+# unstable, internal, and outside the semver contract. Only the
+# `cache_verify_opt_out` integration test (which needs to install a
+# hand-crafted zero-hash entry to confirm the `verify_on_get=false` path
+# still rejects it on `get`) opts in via its `required-features` block below.
+__unstable-test-internals = []
+
+# differential-oracle gates the `differential` module — the roadmap
+# feature #6 ("differential JIT correctness oracle") scaffold. v0.3.6
+# only compiles the harness types; the v0.4 wiring against the
+# self-hosted CUDA runner brings the real two-path runner. See
+# `docs/DIFFERENTIAL-ORACLE.md` for the implementation plan and the
+# Post-v0.3.6 strategic features section in `docs/PATH-TO-V1.md`.
+differential-oracle = []
+
+# Signed kernel registry (roadmap feature #3 scaffold). When enabled,
+# the `registry` module is compiled and the runtime can resolve PTX
+# kernels published as HMAC-SHA256-signed `KernelManifest` records. v0.3.7
+# only ships the in-memory backend + signing helpers; the on-disk store
+# and the server-side `/kernels` route land in v0.4. See
+# `docs/KERNEL-REGISTRY.md` for the rollout plan and security notes.
+kernel-registry = [
+    "dep:hmac",
+    "dep:sha2",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:bincode",
+]
+
+# Integration test that uses fixtures from `lowering_test_support`. We
+# pin the feature set here so the test only runs when both
+# `cuda-oxide-backend` (which gates all wave-2 lowering modules) AND
+# `test-utils` (which gates the fixture module itself) are enabled.
+# Local invocation:
+#   cargo test -p tensor-wasm-jit \
+#     --features "cuda-oxide-backend test-utils" --test lowering_e2e
+[[test]]
+name = "lowering_e2e"
+path = "tests/lowering_e2e.rs"
+required-features = ["cuda-oxide-backend", "test-utils"]
+
+# T38 proptest harness for `DifferentialOracle`. Gated behind the
+# `differential-oracle` feature so the proptest dep is only pulled in
+# when the harness is exercised. Local invocation:
+#   cargo test -p tensor-wasm-jit \
+#     --features differential-oracle --test differential_proptest
+[[test]]
+name = "differential_proptest"
+path = "tests/differential_proptest.rs"
+required-features = ["differential-oracle"]
+
+# The `verify_on_get` opt-out regression test installs a hand-crafted
+# zero-hash `CachedKernel` via `KernelCache::__test_only_insert_unchecked`
+# to confirm the opt-out path still rejects it on `get` (jit M2). That
+# entry-point is gated behind `__unstable-test-internals`, so this test
+# only compiles when the feature is on. Local invocation:
+#   cargo test -p tensor-wasm-jit \
+#     --features __unstable-test-internals --test cache_verify_opt_out
+[[test]]
+name = "cache_verify_opt_out"
+path = "tests/cache_verify_opt_out.rs"
+required-features = ["__unstable-test-internals"]
+
+[package.metadata.docs.rs]
+# Do NOT use `all-features = true`: the `pliron-llvm-backend` feature pulls in
+# `pliron-llvm` 0.15, which carries a hard transitive dependency on
+# `llvm-sys = "221"`. That requires a system-wide LLVM 221 install (via
+# `LLVM_SYS_221_PREFIX`), which docs.rs's build environment does not provide,
+# so building it there would fail the link step and block all docs for this
+# crate. We therefore enumerate only the docs.rs-safe, pure-Rust features and
+# deliberately omit `pliron-llvm-backend`.
+#
+# Included features and why they're safe:
+#   auto-offload             — pure Rust, no deps.
+#   cuda-oxide-backend       — pulls `pliron` 0.15 (pure-Rust crates.io crate;
+#                              system LLVM is only required by pliron-llvm).
+#   kernel-registry          — pure-Rust crates (hmac, sha2, serde, serde_json,
+#                              bincode); no system libraries.
+#   differential-oracle      — pure Rust, no deps.
+#   test-utils               — pure Rust, no deps.
+#   __unstable-test-internals — pure Rust, no deps.
+#
+# Excluded:
+#   pliron-llvm-backend      — needs system LLVM 221 (llvm-sys = "221"),
+#                              unavailable on docs.rs.
+features = [
+    "auto-offload",
+    "cuda-oxide-backend",
+    "kernel-registry",
+    "differential-oracle",
+    "test-utils",
+    "__unstable-test-internals",
+]
+rustdoc-args = ["--cfg", "docsrs"]
