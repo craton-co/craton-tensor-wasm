@@ -13,16 +13,15 @@
 //! wrap the guest output in the OpenAI response envelope (or stream it
 //! as OpenAI-shape `data:` SSE frames when `stream: true`).
 //!
-//! Legacy `501 Not Implemented` error envelope shape (still emitted by
-//! the deprecated [`OpenAiError::not_yet_wired`] helper for routes that
-//! deliberately remain stubs):
+//! OpenAI-shape error envelope (emitted by [`OpenAiError::invalid_request`],
+//! [`OpenAiError::model_not_found`], and friends):
 //!
 //! ```json
 //! { "error": {
 //!     "message": "...",
-//!     "type":    "not_implemented",
+//!     "type":    "invalid_request_error",
 //!     "param":   null,
-//!     "code":    "openai_not_yet_wired"
+//!     "code":    "openai_invalid_request"
 //! }}
 //! ```
 //!
@@ -207,16 +206,16 @@ pub struct ChatCompletionsRequest {
 pub struct OpenAiErrorBody {
     /// Human-readable error description.
     pub message: String,
-    /// OpenAI-conventional error category (e.g. `invalid_request_error`,
-    /// `not_implemented`). String, not enum, because the OpenAI contract
-    /// itself adds new types over time.
+    /// OpenAI-conventional error category (e.g. `invalid_request_error`).
+    /// String, not enum, because the OpenAI contract itself adds new types
+    /// over time.
     #[serde(rename = "type")]
     pub kind: String,
     /// Name of the request field that triggered the error, if any.
-    /// `null` for whole-request errors (the scaffold's 501).
+    /// `null` for whole-request errors.
     pub param: Option<String>,
-    /// Stable machine-readable code that callers branch on. Scaffold
-    /// returns `openai_not_yet_wired`.
+    /// Stable machine-readable code that callers branch on (e.g.
+    /// `openai_invalid_request`, `openai_model_not_found`).
     pub code: Option<String>,
 }
 
@@ -228,19 +227,6 @@ pub struct OpenAiError {
 }
 
 impl OpenAiError {
-    /// Construct a not-implemented envelope. Used by both scaffold
-    /// handlers to keep the wire output identical.
-    pub fn not_yet_wired(message: impl Into<String>) -> Self {
-        Self {
-            error: OpenAiErrorBody {
-                message: message.into(),
-                kind: "not_implemented".to_string(),
-                param: None,
-                code: Some("openai_not_yet_wired".to_string()),
-            },
-        }
-    }
-
     /// Construct an `invalid_request_error` envelope for malformed input.
     /// `param` should name the field that triggered the error, if known.
     pub fn invalid_request(message: impl Into<String>, param: Option<String>) -> Self {
@@ -370,14 +356,47 @@ fn unix_seconds_now() -> u64 {
     }
 }
 
-/// Build the OpenAI `usage` block. v0.4 ships with zeros because the
-/// gateway does not yet wire a tokenizer; v0.5 lands a real counter
-/// (see `docs/OPENAI-COMPAT.md`).
-fn empty_usage() -> serde_json::Value {
+/// Deterministic, model-agnostic token estimate for a UTF-8 string.
+///
+/// The gateway does not bundle a model-specific BPE vocabulary (each
+/// backing function may use a different tokenizer), so a true token count
+/// is not available at this layer. Instead we report a *stable heuristic*
+/// derived from the OpenAI rule of thumb that English text averages
+/// roughly four characters per token: `tokens ≈ ceil(chars / 4)`, with a
+/// floor of 1 for any non-empty input so a short reply never reports 0.
+///
+/// Properties that make this safe to expose on the wire:
+///
+/// * **Deterministic** — the same input always yields the same count, so
+///   the field is reproducible and testable (no clock / RNG / allocation
+///   dependence).
+/// * **Char-based, not byte-based** — multi-byte UTF-8 (CJK, emoji) is
+///   counted by Unicode scalar, not raw bytes, so the estimate does not
+///   balloon for non-Latin scripts.
+/// * **Never panics, never allocates.**
+///
+/// It is an *estimate*, not a billing-grade count; clients that need exact
+/// accounting must tokenize against the specific model themselves. See
+/// `docs/OPENAI-COMPAT.md` for the rationale and the upgrade path to a
+/// per-model tokenizer.
+fn estimate_tokens(text: &str) -> u64 {
+    let chars = text.chars().count() as u64;
+    if chars == 0 {
+        0
+    } else {
+        // ceil(chars / 4), floored at 1 for any non-empty text.
+        chars.div_ceil(4).max(1)
+    }
+}
+
+/// Build the OpenAI `usage` block from heuristic prompt / completion token
+/// counts (see [`estimate_tokens`]). `total_tokens` is the sum, computed
+/// with a saturating add so a pathologically large pair can never wrap.
+fn usage_block(prompt_tokens: u64, completion_tokens: u64) -> serde_json::Value {
     serde_json::json!({
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "total_tokens": 0,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens.saturating_add(completion_tokens),
     })
 }
 
@@ -640,6 +659,9 @@ async fn run_buffered(
     let executor = state.executor.clone();
     let args = translated.args.clone();
     let function_id = translated.function_id;
+    // Estimate the prompt token count BEFORE moving the prompt into the
+    // staged input bytes below. See `estimate_tokens` for the heuristic.
+    let prompt_tokens = estimate_tokens(&translated.prompt);
     // Stage the assembled prompt so the guest can pull it via
     // `wasi:tensor/host.read-input`. Empty prompts stage nothing (the
     // guest sees `input-len() == 0`).
@@ -688,6 +710,11 @@ async fn run_buffered(
     }
 
     let text = String::from_utf8_lossy(&collected).into_owned();
+    // Heuristic completion-token estimate over the buffered guest output
+    // (see `estimate_tokens`); paired with the `prompt_tokens` computed
+    // before the prompt was staged into the input channel.
+    let completion_tokens = estimate_tokens(&text);
+    let usage = usage_block(prompt_tokens, completion_tokens);
     let response_id = format!("{}{}", object_kind.id_prefix(), Uuid::new_v4());
     let created = unix_seconds_now();
 
@@ -703,7 +730,7 @@ async fn run_buffered(
                 "finish_reason": "stop",
                 "logprobs": serde_json::Value::Null,
             }],
-            "usage": empty_usage(),
+            "usage": usage,
         }),
         OpenAiObject::ChatCompletion => serde_json::json!({
             "id": response_id,
@@ -718,7 +745,7 @@ async fn run_buffered(
                 },
                 "finish_reason": "stop",
             }],
-            "usage": empty_usage(),
+            "usage": usage,
         }),
     };
 
@@ -1079,19 +1106,23 @@ mod tests {
 
     #[test]
     fn openai_error_envelope_serialises_to_openai_shape() {
-        let env = OpenAiError::not_yet_wired("nope");
+        // Pins the four-field OpenAI error wire shape
+        // (`{ error: { message, type, param, code } }`) that SDKs parse
+        // verbatim. Uses a live constructor (`invalid_request`) so the
+        // invariant survives even though the request carries no `param`.
+        let env = OpenAiError::invalid_request("nope", None);
         let v = serde_json::to_value(&env).expect("serialises");
         // Top-level key is `error`.
         let inner = v.get("error").expect("error key present");
         assert_eq!(inner.get("message").and_then(|x| x.as_str()), Some("nope"));
         assert_eq!(
             inner.get("type").and_then(|x| x.as_str()),
-            Some("not_implemented"),
+            Some("invalid_request_error"),
         );
         assert!(inner.get("param").is_some_and(|x| x.is_null()));
         assert_eq!(
             inner.get("code").and_then(|x| x.as_str()),
-            Some("openai_not_yet_wired"),
+            Some("openai_invalid_request"),
         );
     }
 
@@ -1105,5 +1136,60 @@ mod tests {
             Some("invalid_request_error"),
         );
         assert_eq!(inner.get("param").and_then(|x| x.as_str()), Some("model"),);
+    }
+
+    #[test]
+    fn estimate_tokens_empty_is_zero() {
+        assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_floors_short_input_at_one() {
+        // Any non-empty text reports at least one token so a one-word
+        // reply never accounts as zero.
+        assert_eq!(estimate_tokens("a"), 1);
+        assert_eq!(estimate_tokens("abc"), 1);
+        assert_eq!(estimate_tokens("abcd"), 1);
+    }
+
+    #[test]
+    fn estimate_tokens_uses_ceil_of_chars_over_four() {
+        // ceil(5/4) = 2, ceil(8/4) = 2, ceil(9/4) = 3.
+        assert_eq!(estimate_tokens("abcde"), 2);
+        assert_eq!(estimate_tokens("abcdefgh"), 2);
+        assert_eq!(estimate_tokens("abcdefghi"), 3);
+    }
+
+    #[test]
+    fn estimate_tokens_counts_unicode_scalars_not_bytes() {
+        // Four CJK chars are 12 UTF-8 bytes but only four scalars, so the
+        // estimate is ceil(4/4) = 1 — not the byte-based ceil(12/4) = 3.
+        assert_eq!(estimate_tokens("日本語訳"), 1);
+    }
+
+    #[test]
+    fn estimate_tokens_is_deterministic() {
+        let s = "the quick brown fox jumps over the lazy dog";
+        assert_eq!(estimate_tokens(s), estimate_tokens(s));
+    }
+
+    #[test]
+    fn usage_block_sums_total_and_is_wire_shaped() {
+        let v = usage_block(7, 13);
+        assert_eq!(v.get("prompt_tokens").and_then(|x| x.as_u64()), Some(7));
+        assert_eq!(
+            v.get("completion_tokens").and_then(|x| x.as_u64()),
+            Some(13)
+        );
+        assert_eq!(v.get("total_tokens").and_then(|x| x.as_u64()), Some(20));
+    }
+
+    #[test]
+    fn usage_block_total_saturates() {
+        let v = usage_block(u64::MAX, 1);
+        assert_eq!(
+            v.get("total_tokens").and_then(|x| x.as_u64()),
+            Some(u64::MAX)
+        );
     }
 }
