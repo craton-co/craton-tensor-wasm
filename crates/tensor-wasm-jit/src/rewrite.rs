@@ -58,6 +58,7 @@ use tensor_wasm_core::types::TenantId;
 use crate::cache::{CacheKey, CachedKernel, CompiledHandle, KernelCache};
 use crate::clif_lower::lower_block;
 use crate::detector::{classify, BlockIR, DetectorConfig, DetectorVerdict, Op};
+use crate::ir::ElemType;
 use crate::ptx_emit::emit;
 
 /// Default host import module name.
@@ -206,8 +207,43 @@ fn op_to_detector_op(op: &Operator<'_>) -> Op {
         | Loop { .. }
         | Block { .. } => Op::Branch,
         Call { .. } | CallIndirect { .. } | ReturnCall { .. } => Op::Call,
-        F32x4Add | F64x2Add | I32x4Add | I64x2Add | I16x8Add | I8x16Add => Op::V128Add,
-        F32x4Mul | F64x2Mul | I32x4Mul | I64x2Mul | I16x8Mul => Op::V128Mul,
+
+        // jit CRITICAL fix: each SIMD opcode maps to a `V128Add`/`V128Mul`
+        // carrying its true element type AND lane count, rather than
+        // collapsing every shape onto a bare `V128Add` that the emitter
+        // then blindly lowered to `add.f32`.
+        //
+        // FAIL CLOSED: only the element widths the PTX emitter can lower
+        // *end-to-end and correctly* are routed to a SIMD op. The emitter's
+        // load/store/compute model is currently coherent for 4-byte lanes
+        // (`f32` and `i32`); every other width (`f64x2`, `i64x2`, `i16x8`,
+        // `i8x16`) is routed to [`Op::Other`] so the function stays on the
+        // CPU path instead of being miscompiled. As wider emitter support
+        // lands, move the corresponding arms below the `Op::Other` line.
+        F32x4Add => Op::V128Add {
+            lane_ty: ElemType::F32,
+            lanes: 4,
+        },
+        I32x4Add => Op::V128Add {
+            lane_ty: ElemType::I32,
+            lanes: 4,
+        },
+        F32x4Mul => Op::V128Mul {
+            lane_ty: ElemType::F32,
+            lanes: 4,
+        },
+        I32x4Mul => Op::V128Mul {
+            lane_ty: ElemType::I32,
+            lanes: 4,
+        },
+
+        // FAIL CLOSED: element widths the emitter cannot yet lower without
+        // miscompiling are deliberately NOT classified as SIMD. They count
+        // toward `Op::Other` (denominator only), so a function dominated by
+        // them stays on the CPU path. (Previously these were lowered to a
+        // single `add.f32` kernel — a silent miscompile.)
+        F64x2Add | I64x2Add | I16x8Add | I8x16Add | F64x2Mul | I64x2Mul | I16x8Mul => Op::Other,
+
         // Anything else — local.get, drop, const, … — is classified as
         // [`Op::Other`] so the v128 ratio is computed honestly. Previously
         // this fell through to `Op::ScalarAdd`, which inflated the apparent
@@ -487,7 +523,11 @@ fn emit_for_slot(pre: &PreFuncInfo, opts: &RewriteOptions, cache: &KernelCache) 
             .filter(|o| {
                 matches!(
                     o,
-                    Op::V128Add | Op::V128Mul | Op::V128Fma | Op::Load | Op::Store
+                    Op::V128Add { .. }
+                        | Op::V128Mul { .. }
+                        | Op::V128Fma { .. }
+                        | Op::Load
+                        | Op::Store
                 )
             })
             .collect(),

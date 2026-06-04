@@ -8,7 +8,7 @@
 //! second adversary kernel is emitted. The validator rejects anything
 //! that isn't a well-formed PTX identifier before any output is written.
 
-use tensor_wasm_jit::ir::{GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
+use tensor_wasm_jit::ir::{ElemType, GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
 use tensor_wasm_jit::ptx_emit::{emit, is_valid_ptx_identifier, EmitError, MAX_PTX_IDENTIFIER_LEN};
 
 #[test]
@@ -45,7 +45,7 @@ fn validator_rejects_invalid_identifiers() {
 #[test]
 fn emit_rejects_injection_entry() {
     let bp = TensorWasmKernelBlueprint::new(".entry attacker()\n")
-        .push(TensorWasmOp::StoreUnified { lanes: 4 })
+        .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 })
         .with_grid(GridHint {
             total_threads: 1024,
             preferred_block_size: 128,
@@ -57,7 +57,7 @@ fn emit_rejects_injection_entry() {
 #[test]
 fn emit_accepts_canonical_entry() {
     let bp = TensorWasmKernelBlueprint::new("safe_kernel_42")
-        .push(TensorWasmOp::StoreUnified { lanes: 4 })
+        .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 })
         .with_grid(GridHint {
             total_threads: 1024,
             preferred_block_size: 128,

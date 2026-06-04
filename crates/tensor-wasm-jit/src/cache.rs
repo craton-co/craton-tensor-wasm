@@ -1855,7 +1855,7 @@ impl Default for KernelCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{TensorWasmKernelBlueprint, TensorWasmOp};
+    use crate::ir::{ElemType, TensorWasmKernelBlueprint, TensorWasmOp};
     use crate::ptx_emit::EmittedPtx;
     use std::thread;
 
@@ -2006,7 +2006,7 @@ mod tests {
     #[test]
     fn lookup_by_blueprint() {
         let cache = KernelCache::new();
-        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { lanes: 4 });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 });
         let tenant = TenantId(11);
         let key = CacheKey::for_tenant(tenant, bp.fingerprint(), 80);
         cache.put(key, dummy_kernel(bp.fingerprint()));

@@ -44,7 +44,7 @@
 //! }
 //! ```
 
-use crate::ir::{TensorWasmKernelBlueprint, TensorWasmOp};
+use crate::ir::{ElemType, TensorWasmKernelBlueprint, TensorWasmOp};
 
 /// Configuration for the oracle. v0.3.6: defaults are sufficient.
 #[derive(Debug, Clone, Default)]
@@ -476,7 +476,16 @@ pub fn reference_eval(
 
     for op in &bp.ops {
         match op {
-            TensorWasmOp::LoadUnified { lanes } => {
+            TensorWasmOp::LoadUnified { elem, lanes } => {
+                // The reference interpreter models f32 lane semantics only
+                // (it pushes `f32`). Integer / f64 element types are routed
+                // to `UnsupportedOp` so the oracle skips rather than
+                // validating an integer kernel against an f32 model. (The
+                // emitter's element-type fix means such blueprints can now
+                // exist; the f32 oracle simply doesn't cover them yet.)
+                if *elem != ElemType::F32 {
+                    return Err(ReferenceEvalError::UnsupportedOp);
+                }
                 let lanes = *lanes as usize;
                 for _ in 0..lanes {
                     let end = in_cursor
@@ -491,7 +500,10 @@ pub fn reference_eval(
                     in_cursor = end;
                 }
             }
-            TensorWasmOp::StoreUnified { lanes } => {
+            TensorWasmOp::StoreUnified { elem, lanes } => {
+                if *elem != ElemType::F32 {
+                    return Err(ReferenceEvalError::UnsupportedOp);
+                }
                 let lanes = *lanes as usize;
                 // Stores pop in reverse-push order to match the PTX
                 // emitter's `value_stack.pop()` walk.
@@ -503,29 +515,38 @@ pub fn reference_eval(
                     output.extend_from_slice(&v.to_le_bytes());
                 }
             }
-            TensorWasmOp::VecAdd { lanes } => {
+            TensorWasmOp::VecAdd { elem, lanes } => {
                 // Element-wise (lane-aligned) add. Two prior `LoadUnified`
                 // ops push operand vectors contiguously, so the stack is
                 // `[a0..a_{n-1}, b0..b_{n-1}]` with `b` on top. Pair lane `i`
                 // of `a` with lane `i` of `b` — NOT a scalar pop-top-two,
                 // which would cross-pair lanes and feed results back in.
+                if *elem != ElemType::F32 {
+                    return Err(ReferenceEvalError::UnsupportedOp);
+                }
                 let lanes = *lanes as usize;
                 let (a, b) = pop_two_lane_vectors(&mut stack, lanes)?;
                 for i in 0..lanes {
                     stack.push(a[i] + b[i]);
                 }
             }
-            TensorWasmOp::VecMul { lanes } => {
+            TensorWasmOp::VecMul { elem, lanes } => {
+                if *elem != ElemType::F32 {
+                    return Err(ReferenceEvalError::UnsupportedOp);
+                }
                 let lanes = *lanes as usize;
                 let (a, b) = pop_two_lane_vectors(&mut stack, lanes)?;
                 for i in 0..lanes {
                     stack.push(a[i] * b[i]);
                 }
             }
-            TensorWasmOp::VecFma { lanes } => {
+            TensorWasmOp::VecFma { elem, lanes } => {
                 // Lane-aligned `a*b + c` over three operand vectors
                 // (`[a.., b.., c..]`, `c` on top). Single-rounding contract —
                 // mirrors `fma.rn.f32`.
+                if *elem != ElemType::F32 {
+                    return Err(ReferenceEvalError::UnsupportedOp);
+                }
                 let lanes = *lanes as usize;
                 let c = pop_lane_vector(&mut stack, lanes)?;
                 let b = pop_lane_vector(&mut stack, lanes)?;
@@ -926,11 +947,12 @@ mod tests {
     use crate::ir::{GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
 
     fn add_blueprint(lanes: u32) -> TensorWasmKernelBlueprint {
+        let elem = ElemType::F32;
         TensorWasmKernelBlueprint::new("vector_add")
-            .push(TensorWasmOp::LoadUnified { lanes })
-            .push(TensorWasmOp::LoadUnified { lanes })
-            .push(TensorWasmOp::VecAdd { lanes })
-            .push(TensorWasmOp::StoreUnified { lanes })
+            .push(TensorWasmOp::LoadUnified { elem, lanes })
+            .push(TensorWasmOp::LoadUnified { elem, lanes })
+            .push(TensorWasmOp::VecAdd { elem, lanes })
+            .push(TensorWasmOp::StoreUnified { elem, lanes })
             .with_grid(GridHint {
                 total_threads: lanes,
                 preferred_block_size: lanes,
@@ -1070,7 +1092,7 @@ mod tests {
         // returns the v0.3.6 "no-cuda" skip — exactly what the
         // scaffold tests check via `reason.contains("no-cuda")`.
         let bp = TensorWasmKernelBlueprint::new("oracle_fixture")
-            .push(TensorWasmOp::VecAdd { lanes: 4 });
+            .push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 });
         let verdict = DifferentialOracle::new().compare(&bp, &[]);
         match verdict {
             OracleVerdict::Skipped(reason) => {

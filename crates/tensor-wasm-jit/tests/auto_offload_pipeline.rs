@@ -10,22 +10,36 @@ use tensor_wasm_jit::cache::{CacheKey, CachedKernel, CompiledHandle, KernelCache
 use tensor_wasm_jit::clif_lower::lower_block;
 use tensor_wasm_jit::deopt::{DeoptGuard, DeoptReason};
 use tensor_wasm_jit::detector::{classify_default, BlockIR, DetectorVerdict, Op};
+use tensor_wasm_jit::ir::ElemType;
 use tensor_wasm_jit::ptx_emit::emit;
+
+fn fma() -> Op {
+    Op::V128Fma {
+        lane_ty: ElemType::F32,
+        lanes: 4,
+    }
+}
+fn mul() -> Op {
+    Op::V128Mul {
+        lane_ty: ElemType::F32,
+        lanes: 4,
+    }
+}
 
 fn matmul_inner_block() -> BlockIR {
     // 90% v128 with a static loop trip count of 256 — should offload.
     BlockIR::new(
         "matmul_inner",
         vec![
-            Op::V128Fma,
-            Op::V128Fma,
-            Op::V128Fma,
-            Op::V128Fma,
-            Op::V128Fma,
-            Op::V128Fma,
-            Op::V128Fma,
-            Op::V128Fma,
-            Op::V128Mul,
+            fma(),
+            fma(),
+            fma(),
+            fma(),
+            fma(),
+            fma(),
+            fma(),
+            fma(),
+            mul(),
             Op::Store,
         ],
         Some(256),

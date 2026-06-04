@@ -78,7 +78,102 @@ use std::fmt::Write;
 
 use thiserror::Error;
 
-use crate::ir::{TensorWasmKernelBlueprint, TensorWasmOp};
+use crate::ir::{ElemType, TensorWasmKernelBlueprint, TensorWasmOp};
+
+/// PTX register class a SIMD lane is materialised in.
+///
+/// jit CRITICAL fix: integer SIMD lanes go in the `.s32 %r` class and use
+/// typed integer instructions; float lanes stay in the `.f32 %f` class.
+/// Before this, every lane used `%f` + `.f32` ops regardless of element
+/// type, silently miscompiling integer SIMD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegClass {
+    /// `.f32 %f` registers.
+    F32,
+    /// `.s32 %r` registers (32-bit integers).
+    S32,
+}
+
+impl RegClass {
+    /// The register class for a given element type. Only the 4-byte lane
+    /// widths the emitter supports end-to-end reach here (`f32`, `i32`);
+    /// other widths are failed closed upstream in
+    /// `rewrite::op_to_detector_op`, so a wider type defaulting to `S32`
+    /// here is never exercised by the production path.
+    fn for_elem(elem: ElemType) -> Self {
+        if elem.is_float() {
+            RegClass::F32
+        } else {
+            RegClass::S32
+        }
+    }
+
+    /// The `%`-prefix character for this class (`f` or `r`).
+    fn prefix(self) -> char {
+        match self {
+            RegClass::F32 => 'f',
+            RegClass::S32 => 'r',
+        }
+    }
+}
+
+/// A register on the abstract value stack, tagged with its class so the
+/// integer and float paths never alias one another's index space.
+#[derive(Debug, Clone, Copy)]
+struct StackReg {
+    index: u32,
+    class: RegClass,
+}
+
+/// PTX `add` mnemonic for an element type.
+///
+/// Integer add is sign-agnostic in two's complement, so `add.s32` is
+/// correct for both signed and unsigned i32 lanes. Only the widths the
+/// emitter supports end-to-end are accepted; anything else refuses so the
+/// caller deopts rather than emitting a wrong-width instruction.
+fn add_mnemonic(elem: ElemType) -> Result<&'static str, EmitError> {
+    match elem {
+        ElemType::F32 => Ok("add.f32"),
+        ElemType::I32 => Ok("add.s32"),
+        _ => Err(EmitError::NotYetImplemented(
+            "PTX add for this SIMD element width is not yet emittable",
+        )),
+    }
+}
+
+/// PTX `mul` mnemonic for an element type. Integer multiply takes the low
+/// half (`mul.lo.s32`) — the same lane width in, lane width out, matching
+/// WASM `i32x4.mul` semantics.
+fn mul_mnemonic(elem: ElemType) -> Result<&'static str, EmitError> {
+    match elem {
+        ElemType::F32 => Ok("mul.f32"),
+        ElemType::I32 => Ok("mul.lo.s32"),
+        _ => Err(EmitError::NotYetImplemented(
+            "PTX mul for this SIMD element width is not yet emittable",
+        )),
+    }
+}
+
+/// PTX fused-multiply-add mnemonic. Float only (single rounding).
+fn fma_mnemonic(elem: ElemType) -> Result<&'static str, EmitError> {
+    match elem {
+        ElemType::F32 => Ok("fma.rn.f32"),
+        _ => Err(EmitError::NotYetImplemented(
+            "PTX fma for this SIMD element width is not yet emittable",
+        )),
+    }
+}
+
+/// PTX load/store type suffix for an element type. Integer loads/stores use
+/// the bit-width `.u32` form (the bit pattern is type-agnostic at the
+/// memory boundary); floats use `.f32`.
+fn load_store_type(elem: ElemType) -> &'static str {
+    if elem.is_float() {
+        "f32"
+    } else {
+        "u32"
+    }
+}
 
 /// Errors produced by the PTX emitter.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -285,14 +380,19 @@ fn lower_body(
     // Pre-size the value stack to `ops.len()` — each lowered op pushes at
     // most one register, and most pop more than they push, so this is a
     // safe upper bound that avoids grow-by-doubling reallocs on the hot
-    // emit path.
-    let mut value_stack: Vec<u32> = Vec::with_capacity(blueprint.ops.len());
+    // emit path. Each entry carries the register's class so the integer
+    // path (`%r`) and float path (`%f`) never alias.
+    let mut value_stack: Vec<StackReg> = Vec::with_capacity(blueprint.ops.len());
     let mut next_f = 0u32;
-    // Counters for the other reg classes — track high-water mark so the
-    // header `.reg` declarations are exactly sized. `%r0` carries the
-    // element count `n` from the param load in the prologue; nothing else
-    // currently uses the s32 reg class.
-    let max_s32 = 1u32;
+    // Integer compute register counter. Starts at 1: `%r0` is reserved for
+    // the element count `n` loaded in the prologue. The high-water mark
+    // becomes the `.reg .s32 %r<N>` declaration count.
+    //
+    // jit CRITICAL fix: previously the s32 class was fixed at 1 (only `%r0`)
+    // because every op — integer SIMD included — was emitted with `.f32`
+    // ops into the `%f` class, silently miscompiling integer SIMD. Integer
+    // lanes now allocate real `%r` registers and use typed integer ops.
+    let mut next_r = 1u32;
     let mut max_s64 = 2u32; // %rd0 (in_ptr), %rd1 (out_ptr)
     let max_pred = 2u32;
     // EXPERIMENTAL: high-water mark of the `.b32` wmma operand-fragment
@@ -300,62 +400,90 @@ fn lower_body(
     // lowered, in which case the header declares exactly the fragment
     // registers the `wmma.load.a`/`wmma.load.b` ops use.
     let mut max_b32 = 0u32;
-    // Running byte offset into the input / output buffers; advances 4 bytes
-    // per lane (f32 = 4 bytes). Loads consume from `%rd0+in_off`; stores
-    // consume from `%rd1+out_off`. Wraps via wrapping_add — overflow at u32
-    // boundary is theoretical (would require ~4 GiB of args) but explicit.
+    // Running byte offset into the input / output buffers; advances by the
+    // element width per lane (4 B for f32/i32, 8 B for f64/i64, …). Loads
+    // consume from `%rd0+in_off`; stores consume from `%rd1+out_off`.
     let mut in_off: u32 = 0;
     let mut out_off: u32 = 0;
 
-    // Allocate a fresh `%fN` register. Returns `EmitError::TooManyRegisters`
-    // rather than saturating at `u32::MAX` — saturation would alias two
-    // distinct SSA values onto the same physical register (jit L1).
-    let alloc_f = |next_f: &mut u32| -> Result<u32, EmitError> {
-        let r = *next_f;
-        *next_f = next_f.checked_add(1).ok_or(EmitError::TooManyRegisters)?;
+    // Allocate a fresh register in the given class. Returns
+    // `EmitError::TooManyRegisters` rather than saturating at `u32::MAX` —
+    // saturation would alias two distinct SSA values onto the same physical
+    // register (jit L1).
+    let alloc = |class: RegClass, next_f: &mut u32, next_r: &mut u32| -> Result<u32, EmitError> {
+        let counter = match class {
+            RegClass::F32 => next_f,
+            RegClass::S32 => next_r,
+        };
+        let r = *counter;
+        *counter = counter.checked_add(1).ok_or(EmitError::TooManyRegisters)?;
         Ok(r)
     };
     // Pop an operand register off the value stack, or allocate a fresh one
-    // if the stack underflows (an op consuming more than the abstract stack
-    // holds). Threads the fallible allocator through the underflow path.
-    let pop_or_alloc = |value_stack: &mut Vec<u32>, next_f: &mut u32| -> Result<u32, EmitError> {
+    // in `class` if the stack underflows (an op consuming more than the
+    // abstract stack holds). Threads the fallible allocator through the
+    // underflow path.
+    let pop_or_alloc = |value_stack: &mut Vec<StackReg>,
+                        class: RegClass,
+                        next_f: &mut u32,
+                        next_r: &mut u32|
+     -> Result<u32, EmitError> {
         match value_stack.pop() {
-            Some(r) => Ok(r),
-            None => alloc_f(next_f),
+            Some(sr) => Ok(sr.index),
+            None => alloc(class, next_f, next_r),
         }
     };
 
     for op in &blueprint.ops {
         match op {
-            TensorWasmOp::VecAdd { lanes } => {
-                let _ = writeln!(body, "    // vec_add[{}] lanes", lanes);
+            TensorWasmOp::VecAdd { elem, lanes } => {
+                let class = RegClass::for_elem(*elem);
+                let _ = writeln!(body, "    // vec_add.{elem}[{lanes}] lanes");
+                let mnemonic = add_mnemonic(*elem)?;
+                let p = class.prefix();
                 for _ in 0..*lanes {
-                    let b = pop_or_alloc(&mut value_stack, &mut next_f)?;
-                    let a = pop_or_alloc(&mut value_stack, &mut next_f)?;
-                    let dst = alloc_f(&mut next_f)?;
-                    let _ = writeln!(body, "    add.f32 %f{dst}, %f{a}, %f{b};");
-                    value_stack.push(dst);
+                    let b = pop_or_alloc(&mut value_stack, class, &mut next_f, &mut next_r)?;
+                    let a = pop_or_alloc(&mut value_stack, class, &mut next_f, &mut next_r)?;
+                    let dst = alloc(class, &mut next_f, &mut next_r)?;
+                    let _ = writeln!(body, "    {mnemonic} %{p}{dst}, %{p}{a}, %{p}{b};");
+                    value_stack.push(StackReg { index: dst, class });
                 }
             }
-            TensorWasmOp::VecMul { lanes } => {
-                let _ = writeln!(body, "    // vec_mul[{}] lanes", lanes);
+            TensorWasmOp::VecMul { elem, lanes } => {
+                let class = RegClass::for_elem(*elem);
+                let _ = writeln!(body, "    // vec_mul.{elem}[{lanes}] lanes");
+                let mnemonic = mul_mnemonic(*elem)?;
+                let p = class.prefix();
                 for _ in 0..*lanes {
-                    let b = pop_or_alloc(&mut value_stack, &mut next_f)?;
-                    let a = pop_or_alloc(&mut value_stack, &mut next_f)?;
-                    let dst = alloc_f(&mut next_f)?;
-                    let _ = writeln!(body, "    mul.f32 %f{dst}, %f{a}, %f{b};");
-                    value_stack.push(dst);
+                    let b = pop_or_alloc(&mut value_stack, class, &mut next_f, &mut next_r)?;
+                    let a = pop_or_alloc(&mut value_stack, class, &mut next_f, &mut next_r)?;
+                    let dst = alloc(class, &mut next_f, &mut next_r)?;
+                    let _ = writeln!(body, "    {mnemonic} %{p}{dst}, %{p}{a}, %{p}{b};");
+                    value_stack.push(StackReg { index: dst, class });
                 }
             }
-            TensorWasmOp::VecFma { lanes } => {
-                let _ = writeln!(body, "    // vec_fma[{}] lanes", lanes);
+            TensorWasmOp::VecFma { elem, lanes } => {
+                // FMA is a single-rounding float primitive. Integer "fma"
+                // has no single-rounding semantics and the detector never
+                // produces an integer `VecFma`, but refuse defensively
+                // rather than emit a wrong instruction.
+                if !elem.is_float() {
+                    return Err(EmitError::NotYetImplemented(
+                        "integer VecFma has no single-rounding PTX form",
+                    ));
+                }
+                let class = RegClass::for_elem(*elem);
+                let _ = writeln!(body, "    // vec_fma.{elem}[{lanes}] lanes");
+                let mnemonic = fma_mnemonic(*elem)?;
+                let p = class.prefix();
                 for _ in 0..*lanes {
-                    let c = pop_or_alloc(&mut value_stack, &mut next_f)?;
-                    let b = pop_or_alloc(&mut value_stack, &mut next_f)?;
-                    let a = pop_or_alloc(&mut value_stack, &mut next_f)?;
-                    let dst = alloc_f(&mut next_f)?;
-                    let _ = writeln!(body, "    fma.rn.f32 %f{dst}, %f{a}, %f{b}, %f{c};");
-                    value_stack.push(dst);
+                    let c = pop_or_alloc(&mut value_stack, class, &mut next_f, &mut next_r)?;
+                    let b = pop_or_alloc(&mut value_stack, class, &mut next_f, &mut next_r)?;
+                    let a = pop_or_alloc(&mut value_stack, class, &mut next_f, &mut next_r)?;
+                    let dst = alloc(class, &mut next_f, &mut next_r)?;
+                    let _ =
+                        writeln!(body, "    {mnemonic} %{p}{dst}, %{p}{a}, %{p}{b}, %{p}{c};");
+                    value_stack.push(StackReg { index: dst, class });
                 }
             }
             TensorWasmOp::MatMul { m, n, k } => {
@@ -387,37 +515,53 @@ fn lower_body(
                 // structural assertions; it has NOT been run on a GPU.
                 lower_wmma_m16n16k16(&mut body, &mut next_f, &mut max_b32, &mut max_s64)?;
             }
-            TensorWasmOp::LoadUnified { lanes } => {
+            TensorWasmOp::LoadUnified { elem, lanes } => {
+                let class = RegClass::for_elem(*elem);
+                let p = class.prefix();
+                let ld_ty = load_store_type(*elem);
+                let width = elem.byte_width();
                 let _ = writeln!(
                     body,
-                    "    // load_unified[{}] lanes (.lu cache hint) from %rd0+{in_off}",
-                    lanes
+                    "    // load_unified.{elem}[{lanes}] lanes (.lu cache hint) from %rd0+{in_off}"
                 );
                 for _ in 0..*lanes {
-                    let dst = alloc_f(&mut next_f)?;
+                    let dst = alloc(class, &mut next_f, &mut next_r)?;
                     if in_off == 0 {
-                        let _ = writeln!(body, "    ld.global.lu.f32 %f{dst}, [%rd0];");
+                        let _ = writeln!(body, "    ld.global.lu.{ld_ty} %{p}{dst}, [%rd0];");
                     } else {
-                        let _ = writeln!(body, "    ld.global.lu.f32 %f{dst}, [%rd0+{in_off}];");
+                        let _ =
+                            writeln!(body, "    ld.global.lu.{ld_ty} %{p}{dst}, [%rd0+{in_off}];");
                     }
-                    in_off = in_off.wrapping_add(4);
-                    value_stack.push(dst);
+                    // jit CRITICAL fix: advance by the element width, not a
+                    // hard-coded 4. `checked_add` so a pathological lane
+                    // count refuses rather than wrapping the offset and
+                    // aliasing two lanes onto the same byte.
+                    in_off = in_off
+                        .checked_add(width)
+                        .ok_or(EmitError::TooManyRegisters)?;
+                    value_stack.push(StackReg { index: dst, class });
                 }
             }
-            TensorWasmOp::StoreUnified { lanes } => {
+            TensorWasmOp::StoreUnified { elem, lanes } => {
+                let class = RegClass::for_elem(*elem);
+                let p = class.prefix();
+                let ld_ty = load_store_type(*elem);
+                let width = elem.byte_width();
                 let _ = writeln!(
                     body,
-                    "    // store_unified[{}] lanes (.cs cache hint) to %rd1+{out_off}",
-                    lanes
+                    "    // store_unified.{elem}[{lanes}] lanes (.cs cache hint) to %rd1+{out_off}"
                 );
                 for _ in 0..*lanes {
-                    let src = pop_or_alloc(&mut value_stack, &mut next_f)?;
+                    let src = pop_or_alloc(&mut value_stack, class, &mut next_f, &mut next_r)?;
                     if out_off == 0 {
-                        let _ = writeln!(body, "    st.global.cs.f32 [%rd1], %f{src};");
+                        let _ = writeln!(body, "    st.global.cs.{ld_ty} [%rd1], %{p}{src};");
                     } else {
-                        let _ = writeln!(body, "    st.global.cs.f32 [%rd1+{out_off}], %f{src};");
+                        let _ =
+                            writeln!(body, "    st.global.cs.{ld_ty} [%rd1+{out_off}], %{p}{src};");
                     }
-                    out_off = out_off.wrapping_add(4);
+                    out_off = out_off
+                        .checked_add(width)
+                        .ok_or(EmitError::TooManyRegisters)?;
                 }
             }
             TensorWasmOp::Barrier => {
@@ -428,6 +572,7 @@ fn lower_body(
 
     // `.reg .* %x<N>;` requires N >= 1, even if no register is used.
     let max_f = next_f.max(1);
+    let max_s32 = next_r.max(1);
     Ok((body, max_f, max_s32, max_s64, max_pred, max_b32))
 }
 
@@ -588,11 +733,11 @@ pub fn emit_with(
     let mut emitted_budget: u64 = 0;
     for op in &blueprint.ops {
         let lanes = match op {
-            TensorWasmOp::VecAdd { lanes }
-            | TensorWasmOp::VecMul { lanes }
-            | TensorWasmOp::VecFma { lanes }
-            | TensorWasmOp::LoadUnified { lanes }
-            | TensorWasmOp::StoreUnified { lanes } => *lanes,
+            TensorWasmOp::VecAdd { lanes, .. }
+            | TensorWasmOp::VecMul { lanes, .. }
+            | TensorWasmOp::VecFma { lanes, .. }
+            | TensorWasmOp::LoadUnified { lanes, .. }
+            | TensorWasmOp::StoreUnified { lanes, .. } => *lanes,
             // MatMul / Barrier emit a fixed, bounded number of lines and
             // carry no attacker-scalable `lanes` field.
             TensorWasmOp::MatMul { .. } | TensorWasmOp::Barrier => 0,
@@ -697,10 +842,10 @@ mod tests {
     #[test]
     fn vector_add_emits_add_f32() {
         let bp = TensorWasmKernelBlueprint::new("vector_add")
-            .push(TensorWasmOp::LoadUnified { lanes: 4 })
-            .push(TensorWasmOp::LoadUnified { lanes: 4 })
-            .push(TensorWasmOp::VecAdd { lanes: 4 })
-            .push(TensorWasmOp::StoreUnified { lanes: 4 });
+            .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 })
+            .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 })
+            .push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 })
+            .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 });
         let out = emit(&bp).expect("emit");
         assert!(out.text.contains(".target sm_80"));
         assert!(out.text.contains(".visible .entry vector_add"));
@@ -708,6 +853,82 @@ mod tests {
         assert!(out.text.contains("ld.global.lu.f32"));
         assert!(out.text.contains("st.global.cs.f32"));
         assert!(out.text.contains("ret;"));
+    }
+
+    /// jit CRITICAL (finding 1): an `i32x4` blueprint must emit INTEGER PTX
+    /// (`add.s32` into `%r` registers, `.u32` loads/stores), never the
+    /// `add.f32` float kernel the emitter previously produced for every
+    /// SIMD shape. This is the regression test that pins "integer SIMD is
+    /// not lowered to a float kernel".
+    #[test]
+    fn i32x4_add_emits_integer_ops_not_float() {
+        let bp = TensorWasmKernelBlueprint::new("int_add")
+            .push(TensorWasmOp::LoadUnified {
+                elem: ElemType::I32,
+                lanes: 4,
+            })
+            .push(TensorWasmOp::LoadUnified {
+                elem: ElemType::I32,
+                lanes: 4,
+            })
+            .push(TensorWasmOp::VecAdd {
+                elem: ElemType::I32,
+                lanes: 4,
+            })
+            .push(TensorWasmOp::StoreUnified {
+                elem: ElemType::I32,
+                lanes: 4,
+            });
+        let out = emit(&bp).expect("i32x4 must emit");
+        // Integer add into the integer register class.
+        assert!(
+            out.text.contains("add.s32"),
+            "expected integer add, got:\n{}",
+            out.text
+        );
+        // The float add must NOT appear — that was the miscompile.
+        assert!(
+            !out.text.contains("add.f32"),
+            "i32x4.add must not lower to a float kernel:\n{}",
+            out.text
+        );
+        // Integer loads/stores use the `.u32` width form, and the integer
+        // register class `%r` must be declared above the reserved `%r0`.
+        assert!(out.text.contains("ld.global.lu.u32"));
+        assert!(out.text.contains("st.global.cs.u32"));
+        assert!(out.text.contains("%r1"));
+    }
+
+    /// jit CRITICAL (finding 1): `i32x4.mul` emits `mul.lo.s32`, not
+    /// `mul.f32`.
+    #[test]
+    fn i32x4_mul_emits_integer_mul() {
+        let bp = TensorWasmKernelBlueprint::new("int_mul").push(TensorWasmOp::VecMul {
+            elem: ElemType::I32,
+            lanes: 4,
+        });
+        let out = emit(&bp).expect("i32x4 mul must emit");
+        assert!(out.text.contains("mul.lo.s32"));
+        assert!(!out.text.contains("mul.f32"));
+    }
+
+    /// jit CRITICAL (finding 1): the lane count drives how many instruction
+    /// lines are emitted — an f64x2 op (which the emitter does NOT support
+    /// end-to-end) is refused rather than miscompiled, and a non-default
+    /// lane count is honoured exactly for the supported widths.
+    #[test]
+    fn unsupported_element_width_refused_not_miscompiled() {
+        // f64x2 add reaches the emitter only via the public API (the
+        // rewrite path fails it closed upstream). The emitter must refuse
+        // rather than emit `add.f32`.
+        let bp = TensorWasmKernelBlueprint::new("f64_add").push(TensorWasmOp::VecAdd {
+            elem: ElemType::F64,
+            lanes: 2,
+        });
+        assert!(matches!(
+            emit(&bp),
+            Err(EmitError::NotYetImplemented(_))
+        ));
     }
 
     /// MatMul lowering is deferred to v0.4. The emitter must refuse to
@@ -803,10 +1024,10 @@ mod tests {
     #[test]
     fn no_wmma_reg_decl_without_matmul() {
         let bp = TensorWasmKernelBlueprint::new("vector_add")
-            .push(TensorWasmOp::LoadUnified { lanes: 4 })
-            .push(TensorWasmOp::LoadUnified { lanes: 4 })
-            .push(TensorWasmOp::VecAdd { lanes: 4 })
-            .push(TensorWasmOp::StoreUnified { lanes: 4 });
+            .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 })
+            .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 })
+            .push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 })
+            .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 });
         let out = emit(&bp).expect("emit");
         assert!(!out.text.contains("%rb<"));
         assert!(!out.text.contains("wmma."));
@@ -817,13 +1038,13 @@ mod tests {
     #[test]
     fn matmul_in_mixed_stream_also_refused() {
         let bp = TensorWasmKernelBlueprint::new("mixed")
-            .push(TensorWasmOp::LoadUnified { lanes: 4 })
+            .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 })
             .push(TensorWasmOp::MatMul {
                 m: 16,
                 n: 16,
                 k: 16,
             })
-            .push(TensorWasmOp::StoreUnified { lanes: 4 });
+            .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 });
         assert!(matches!(emit(&bp), Err(EmitError::NotYetImplemented(_))));
     }
 
@@ -858,7 +1079,7 @@ mod tests {
 
     #[test]
     fn fma_emits_fma_rn() {
-        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecFma { lanes: 4 });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecFma { elem: ElemType::F32, lanes: 4 });
         let out = emit(&bp).expect("emit");
         assert!(out.text.contains("fma.rn.f32"));
     }
@@ -887,7 +1108,7 @@ mod tests {
     /// add produces `%f0..%fN` with strictly increasing destinations.
     #[test]
     fn register_allocator_assigns_fresh_destination_per_op() {
-        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { lanes: 8 });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 8 });
         let out = emit(&bp).expect("emit");
         // After lowering, we expect at least registers %f0 through %f7 to
         // appear as add destinations. The exact regex match would couple
@@ -915,7 +1136,7 @@ mod tests {
         // 16 lanes of add will need at least 16 fresh registers (plus the
         // operand registers materialised on stack-underflow). The header
         // `.reg .f32 %f<N>` must declare at least N regs.
-        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { lanes: 16 });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 16 });
         let out = emit(&bp).expect("emit");
         // Find the .reg .f32 declaration and parse out the count.
         let count_line = out
@@ -946,7 +1167,7 @@ mod tests {
 
     #[test]
     fn loads_advance_input_offset() {
-        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::LoadUnified { lanes: 3 });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 3 });
         let out = emit(&bp).expect("emit");
         // First lane at [%rd0], next at [%rd0+4], next at [%rd0+8].
         assert!(out.text.contains("[%rd0];"), "first load uses no offset");
@@ -960,11 +1181,15 @@ mod tests {
     /// `lanes`, so without this the emitter would loop `0..u32::MAX`.
     #[test]
     fn oversized_lanes_is_rejected() {
-        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { lanes: u32::MAX });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd {
+            elem: ElemType::F32,
+            lanes: u32::MAX,
+        });
         let err = emit(&bp).expect_err("oversized lanes must be refused");
         assert!(matches!(err, EmitError::EmissionBudgetExceeded { .. }));
         // Just over the per-op cap is also refused.
         let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::LoadUnified {
+            elem: ElemType::F32,
             lanes: MAX_LANES + 1,
         });
         assert!(matches!(
@@ -982,7 +1207,7 @@ mod tests {
         let n_ops = (MAX_EMITTED_OPS / u64::from(MAX_LANES)) as usize + 2;
         let mut bp = TensorWasmKernelBlueprint::new("k");
         for _ in 0..n_ops {
-            bp = bp.push(TensorWasmOp::VecMul { lanes: MAX_LANES });
+            bp = bp.push(TensorWasmOp::VecMul { elem: ElemType::F32, lanes: MAX_LANES });
         }
         assert!(matches!(
             emit(&bp),
@@ -996,15 +1221,15 @@ mod tests {
     #[test]
     fn lanes_at_max_still_emits() {
         let bp =
-            TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { lanes: MAX_LANES });
+            TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: MAX_LANES });
         assert!(emit(&bp).is_ok());
     }
 
     #[test]
     fn stores_advance_output_offset() {
         let bp = TensorWasmKernelBlueprint::new("k")
-            .push(TensorWasmOp::LoadUnified { lanes: 2 })
-            .push(TensorWasmOp::StoreUnified { lanes: 2 });
+            .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 2 })
+            .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 2 });
         let out = emit(&bp).expect("emit");
         assert!(out.text.contains("[%rd1]"));
         assert!(out.text.contains("[%rd1+4]"));

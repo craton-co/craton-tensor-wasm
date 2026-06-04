@@ -19,9 +19,9 @@
 //!
 //! | LoweredOp sequence                          | Blueprint op            |
 //! |---------------------------------------------|-------------------------|
-//! | `Load` + (`AddF` \| `AddI`) + `Store`       | `VecAdd { lanes: 4 }`   |
-//! | `Load` + (`MulF` \| `MulI`) + `Store`       | `VecMul { lanes: 4 }`   |
-//! | `Load` + `Fma` + `Store`                    | `VecFma { lanes: 4 }`   |
+//! | `Load` + (`AddF` \| `AddI`) + `Store`       | `VecAdd { elem: ElemType::F32, lanes: 4 }`   |
+//! | `Load` + (`MulF` \| `MulI`) + `Store`       | `VecMul { elem: ElemType::F32, lanes: 4 }`   |
+//! | `Load` + `Fma` + `Store`                    | `VecFma { elem: ElemType::F32, lanes: 4 }`   |
 //!
 //! Lane count is fixed at `4` (f32x4 / i32x4) for wave 1. Wave 3 will
 //! derive it from the actual vector type carried by the `LoweredOp`s.
@@ -35,12 +35,32 @@
 
 #![cfg(feature = "cuda-oxide-backend")]
 
-use crate::ir::{GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
-use crate::lowered_ir::{LoweredFunction, LoweredOp};
+use crate::ir::{ElemType, GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
+use crate::lowered_ir::{LoweredFunction, LoweredOp, LoweredType};
 
 /// Default lane count for the wave-1 adapter. f32x4 / i32x4. Wave 3
 /// will derive this from the actual vector type the LoweredOps carry.
 const DEFAULT_LANES: u32 = 4;
+
+/// Map a scalar [`LoweredType`] to the blueprint [`ElemType`].
+///
+/// jit CRITICAL fix: the adapter previously discarded the arith op's type
+/// and always built an f32 blueprint, so an integer add lowered to a float
+/// kernel. The element type now flows from the `LoweredOp::Add*`/`Mul*`/`Fma`
+/// type field into the blueprint. Non-scalar / non-emittable types are
+/// failed closed by the caller.
+fn lowered_type_to_elem(ty: &LoweredType) -> Option<ElemType> {
+    match ty {
+        LoweredType::I8 => Some(ElemType::I8),
+        LoweredType::I16 => Some(ElemType::I16),
+        LoweredType::I32 => Some(ElemType::I32),
+        LoweredType::I64 => Some(ElemType::I64),
+        LoweredType::F32 => Some(ElemType::F32),
+        LoweredType::F64 => Some(ElemType::F64),
+        // Ptr / Bool / V128 have no blueprint element-type representation.
+        _ => None,
+    }
+}
 
 /// Errors produced by the LoweredFunction → blueprint adapter.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -146,17 +166,43 @@ pub fn lowered_function_to_blueprint(
         });
     }
 
-    // op[1] must be one of the recognised arith ops.
-    let kernel_op = match &block.ops[1] {
-        LoweredOp::AddF { .. } | LoweredOp::AddI { .. } => TensorWasmOp::VecAdd {
-            lanes: DEFAULT_LANES,
-        },
-        LoweredOp::MulF { .. } | LoweredOp::MulI { .. } => TensorWasmOp::VecMul {
-            lanes: DEFAULT_LANES,
-        },
-        LoweredOp::Fma { .. } => TensorWasmOp::VecFma {
-            lanes: DEFAULT_LANES,
-        },
+    // op[1] must be one of the recognised arith ops. The element type is
+    // derived from the op's `ty` field (jit CRITICAL fix) so an integer add
+    // produces an integer blueprint, not a silently-miscompiled f32 kernel.
+    let unsupported_elem = |ty: &LoweredType| AdapterError::UnmatchedPattern {
+        reason: format!("arith op element type `{ty}` has no blueprint representation"),
+    };
+    let (kernel_op, elem) = match &block.ops[1] {
+        LoweredOp::AddF { ty, .. } | LoweredOp::AddI { ty, .. } => {
+            let elem = lowered_type_to_elem(ty).ok_or_else(|| unsupported_elem(ty))?;
+            (
+                TensorWasmOp::VecAdd {
+                    elem,
+                    lanes: DEFAULT_LANES,
+                },
+                elem,
+            )
+        }
+        LoweredOp::MulF { ty, .. } | LoweredOp::MulI { ty, .. } => {
+            let elem = lowered_type_to_elem(ty).ok_or_else(|| unsupported_elem(ty))?;
+            (
+                TensorWasmOp::VecMul {
+                    elem,
+                    lanes: DEFAULT_LANES,
+                },
+                elem,
+            )
+        }
+        LoweredOp::Fma { ty, .. } => {
+            let elem = lowered_type_to_elem(ty).ok_or_else(|| unsupported_elem(ty))?;
+            (
+                TensorWasmOp::VecFma {
+                    elem,
+                    lanes: DEFAULT_LANES,
+                },
+                elem,
+            )
+        }
         // MatMul detection is deferred to wave 3 — it would need
         // recognising nested loops or wmma tile builders, which the
         // pattern-match approach above is too simple to handle.
@@ -171,14 +217,18 @@ pub fn lowered_function_to_blueprint(
         }
     };
 
+    // Loads/stores adopt the arith op's element type so the whole kernel is
+    // element-type-coherent.
     let blueprint = TensorWasmKernelBlueprint {
         entry: func.name.clone(),
         ops: vec![
             TensorWasmOp::LoadUnified {
+                elem,
                 lanes: DEFAULT_LANES,
             },
             kernel_op,
             TensorWasmOp::StoreUnified {
+                elem,
                 lanes: DEFAULT_LANES,
             },
         ],
@@ -281,9 +331,9 @@ mod tests {
         assert_eq!(
             bp.ops,
             vec![
-                TensorWasmOp::LoadUnified { lanes: 4 },
-                TensorWasmOp::VecAdd { lanes: 4 },
-                TensorWasmOp::StoreUnified { lanes: 4 },
+                TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 },
+                TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 },
+                TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 },
             ]
         );
         assert_eq!(bp.shared_mem_bytes, 0);
@@ -302,7 +352,7 @@ mod tests {
             },
         );
         let bp = lowered_function_to_blueprint(&func).expect("should produce blueprint");
-        assert!(matches!(bp.ops[1], TensorWasmOp::VecAdd { lanes: 4 }));
+        assert!(matches!(bp.ops[1], TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 }));
     }
 
     #[test]
@@ -318,7 +368,7 @@ mod tests {
         );
         let bp = lowered_function_to_blueprint(&func).expect("should produce blueprint");
         assert_eq!(bp.entry, "vector_mul");
-        assert!(matches!(bp.ops[1], TensorWasmOp::VecMul { lanes: 4 }));
+        assert!(matches!(bp.ops[1], TensorWasmOp::VecMul { elem: ElemType::F32, lanes: 4 }));
     }
 
     #[test]
@@ -333,7 +383,7 @@ mod tests {
             },
         );
         let bp = lowered_function_to_blueprint(&func).expect("should produce blueprint");
-        assert!(matches!(bp.ops[1], TensorWasmOp::VecMul { lanes: 4 }));
+        assert!(matches!(bp.ops[1], TensorWasmOp::VecMul { elem: ElemType::F32, lanes: 4 }));
     }
 
     #[test]
@@ -350,7 +400,7 @@ mod tests {
         );
         let bp = lowered_function_to_blueprint(&func).expect("should produce blueprint");
         assert_eq!(bp.entry, "vector_fma");
-        assert!(matches!(bp.ops[1], TensorWasmOp::VecFma { lanes: 4 }));
+        assert!(matches!(bp.ops[1], TensorWasmOp::VecFma { elem: ElemType::F32, lanes: 4 }));
     }
 
     #[test]

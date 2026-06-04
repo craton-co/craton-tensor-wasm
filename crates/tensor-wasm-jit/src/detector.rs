@@ -16,15 +16,40 @@
 
 use std::fmt;
 
+use crate::ir::ElemType;
+
 /// Instruction kinds the detector recognises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
-    /// 128-bit SIMD add (any element width).
-    V128Add,
-    /// 128-bit SIMD multiply.
-    V128Mul,
-    /// 128-bit SIMD fused-multiply-add.
-    V128Fma,
+    /// 128-bit SIMD add. Carries the per-lane element type and the true
+    /// lane count decoded from the WASM opcode.
+    ///
+    /// jit CRITICAL fix: previously `F32x4Add | I32x4Add | I16x8Add | …`
+    /// all collapsed onto a bare `V128Add` that lost both the element type
+    /// and the real lane count, and the downstream emitter unconditionally
+    /// emitted `add.f32` — silently miscompiling integer / f64 SIMD. The
+    /// element type and lane count now travel from the opcode through to the
+    /// PTX emitter.
+    V128Add {
+        /// Per-lane element type.
+        lane_ty: ElemType,
+        /// Number of lanes (4 for `*x4`, 2 for `*x2`, 8 for `*x8`, …).
+        lanes: u32,
+    },
+    /// 128-bit SIMD multiply (carries element type + lane count, as `V128Add`).
+    V128Mul {
+        /// Per-lane element type.
+        lane_ty: ElemType,
+        /// Number of lanes.
+        lanes: u32,
+    },
+    /// 128-bit SIMD fused-multiply-add (carries element type + lane count).
+    V128Fma {
+        /// Per-lane element type.
+        lane_ty: ElemType,
+        /// Number of lanes.
+        lanes: u32,
+    },
     /// Scalar arithmetic add.
     ScalarAdd,
     /// Scalar arithmetic multiply.
@@ -48,16 +73,22 @@ pub enum Op {
 impl Op {
     /// True if this op operates on `v128` SIMD values.
     pub fn is_v128(self) -> bool {
-        matches!(self, Op::V128Add | Op::V128Mul | Op::V128Fma)
+        matches!(
+            self,
+            Op::V128Add { .. } | Op::V128Mul { .. } | Op::V128Fma { .. }
+        )
     }
 }
 
 impl fmt::Display for Op {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Op::V128Add { lane_ty, lanes } => return write!(f, "v128.add.{lane_ty}x{lanes}"),
+            Op::V128Mul { lane_ty, lanes } => return write!(f, "v128.mul.{lane_ty}x{lanes}"),
+            Op::V128Fma { lane_ty, lanes } => return write!(f, "v128.fma.{lane_ty}x{lanes}"),
+            _ => {}
+        }
         let s = match self {
-            Op::V128Add => "v128.add",
-            Op::V128Mul => "v128.mul",
-            Op::V128Fma => "v128.fma",
             Op::ScalarAdd => "scalar.add",
             Op::ScalarMul => "scalar.mul",
             Op::Load => "load",
@@ -65,6 +96,7 @@ impl fmt::Display for Op {
             Op::Branch => "branch",
             Op::Call => "call",
             Op::Other => "other",
+            Op::V128Add { .. } | Op::V128Mul { .. } | Op::V128Fma { .. } => unreachable!(),
         };
         f.write_str(s)
     }
@@ -248,19 +280,31 @@ mod tests {
         BlockIR::new(name, ops, loop_n)
     }
 
+    /// Test-helper f32x4 SIMD ops (the production default shape).
+    fn add() -> Op {
+        Op::V128Add {
+            lane_ty: ElemType::F32,
+            lanes: 4,
+        }
+    }
+    fn mul() -> Op {
+        Op::V128Mul {
+            lane_ty: ElemType::F32,
+            lanes: 4,
+        }
+    }
+    fn fma() -> Op {
+        Op::V128Fma {
+            lane_ty: ElemType::F32,
+            lanes: 4,
+        }
+    }
+
     #[test]
     fn mixed_v128_ratio_below_threshold_is_kept_on_cpu() {
         let b = block(
             "vector_add_loop",
-            vec![
-                Op::Load,
-                Op::Load,
-                Op::V128Add,
-                Op::V128Add,
-                Op::V128Add,
-                Op::V128Add,
-                Op::Store,
-            ],
+            vec![Op::Load, Op::Load, add(), add(), add(), add(), Op::Store],
             Some(128),
         );
         // 4/7 = 57% — under threshold. Need >80%.
@@ -272,15 +316,15 @@ mod tests {
         let b = block(
             "matmul_inner",
             vec![
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Mul,
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                mul(),
                 Op::Store,
             ],
             Some(512),
@@ -296,18 +340,18 @@ mod tests {
             vec![
                 Op::Load,
                 Op::Load,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
-                Op::V128Fma,
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                fma(),
+                fma(),
                 Op::Store,
             ],
             Some(256),
@@ -322,14 +366,14 @@ mod tests {
             "vector_mul",
             vec![
                 Op::Load,
-                Op::V128Mul,
-                Op::V128Mul,
-                Op::V128Mul,
-                Op::V128Mul,
-                Op::V128Add,
-                Op::V128Add,
-                Op::V128Add,
-                Op::V128Add,
+                mul(),
+                mul(),
+                mul(),
+                mul(),
+                add(),
+                add(),
+                add(),
+                add(),
                 Op::Store,
             ],
             Some(1024),
@@ -342,7 +386,7 @@ mod tests {
     fn dynamic_loop_not_offloaded_even_if_v128_heavy() {
         let b = block(
             "dynamic_loop",
-            vec![Op::V128Add; 16],
+            vec![add(); 16],
             None, // unknown trip count
         );
         assert_eq!(classify_default(&b), DetectorVerdict::KeepOnCpu);
@@ -352,7 +396,7 @@ mod tests {
     fn tiny_loop_not_offloaded() {
         let b = block(
             "tiny",
-            vec![Op::V128Add; 16],
+            vec![add(); 16],
             Some(8), // trip < threshold (64)
         );
         assert_eq!(classify_default(&b), DetectorVerdict::KeepOnCpu);
@@ -377,20 +421,36 @@ mod tests {
 
     #[test]
     fn op_is_v128_taxonomy() {
-        assert!(Op::V128Add.is_v128());
-        assert!(Op::V128Mul.is_v128());
-        assert!(Op::V128Fma.is_v128());
+        assert!(add().is_v128());
+        assert!(mul().is_v128());
+        assert!(fma().is_v128());
+        // Element type does not change the taxonomy classification.
+        assert!(Op::V128Add {
+            lane_ty: ElemType::I32,
+            lanes: 4
+        }
+        .is_v128());
         assert!(!Op::ScalarAdd.is_v128());
         assert!(!Op::Load.is_v128());
     }
 
     #[test]
-    fn config_threshold_tunable() {
-        let b = block(
-            "borderline",
-            vec![Op::V128Add, Op::V128Add, Op::Load],
-            Some(128),
+    fn op_display_carries_element_type() {
+        assert_eq!(add().to_string(), "v128.add.f32x4");
+        assert_eq!(
+            Op::V128Mul {
+                lane_ty: ElemType::I32,
+                lanes: 4
+            }
+            .to_string(),
+            "v128.mul.i32x4"
         );
+        assert_eq!(Op::Load.to_string(), "load");
+    }
+
+    #[test]
+    fn config_threshold_tunable() {
+        let b = block("borderline", vec![add(), add(), Op::Load], Some(128));
         // 2/3 = 67% — below default 80% threshold.
         assert_eq!(classify_default(&b), DetectorVerdict::KeepOnCpu);
         // Lower the threshold to 60% — now it's offloaded.

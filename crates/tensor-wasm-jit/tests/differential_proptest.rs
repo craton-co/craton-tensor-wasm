@@ -33,7 +33,7 @@ use tensor_wasm_jit::differential::{
     check_wmma_structure, conv2d_reference, matmul_reference, reference_eval, BlueprintKind,
     DifferentialOracle, Dtype, OracleVerdict, Tolerance, ToleranceTable,
 };
-use tensor_wasm_jit::ir::{GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
+use tensor_wasm_jit::ir::{ElemType, GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
 use tensor_wasm_jit::ptx_emit::{emit, emit_with, EmitConfig};
 
 // ---------------------------------------------------------------------
@@ -88,12 +88,15 @@ fn conv2d_inputs() -> impl Strategy<Value = (usize, usize, usize, usize, Vec<f32
 // ---------------------------------------------------------------------
 
 /// Vector-add blueprint: load A, load B, add lane-wise, store result.
+/// The differential oracle models f32 lane semantics, so this fixture
+/// stays f32.
 fn vector_add_blueprint(lanes: u32) -> TensorWasmKernelBlueprint {
+    let elem = ElemType::F32;
     TensorWasmKernelBlueprint::new("vector_add")
-        .push(TensorWasmOp::LoadUnified { lanes })
-        .push(TensorWasmOp::LoadUnified { lanes })
-        .push(TensorWasmOp::VecAdd { lanes })
-        .push(TensorWasmOp::StoreUnified { lanes })
+        .push(TensorWasmOp::LoadUnified { elem, lanes })
+        .push(TensorWasmOp::LoadUnified { elem, lanes })
+        .push(TensorWasmOp::VecAdd { elem, lanes })
+        .push(TensorWasmOp::StoreUnified { elem, lanes })
         .with_grid(GridHint {
             total_threads: lanes.max(1),
             preferred_block_size: lanes.clamp(1, 128),
@@ -114,21 +117,27 @@ fn matmul_blueprint(m: u32, n: u32, k: u32) -> TensorWasmKernelBlueprint {
 /// the rewriter's lowering of a sliding-window MAC. `BlueprintKind::
 /// classify` returns `Conv2d` for this shape.
 fn conv2d_blueprint(window_lanes: u32) -> TensorWasmKernelBlueprint {
+    let elem = ElemType::F32;
     TensorWasmKernelBlueprint::new("conv2d")
         .push(TensorWasmOp::Barrier)
         .push(TensorWasmOp::LoadUnified {
+            elem,
             lanes: window_lanes,
         })
         .push(TensorWasmOp::LoadUnified {
+            elem,
             lanes: window_lanes,
         })
         .push(TensorWasmOp::LoadUnified {
+            elem,
             lanes: window_lanes,
         })
         .push(TensorWasmOp::VecFma {
+            elem,
             lanes: window_lanes,
         })
         .push(TensorWasmOp::StoreUnified {
+            elem,
             lanes: window_lanes,
         })
 }

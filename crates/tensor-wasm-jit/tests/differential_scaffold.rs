@@ -14,10 +14,13 @@
 use tensor_wasm_jit::differential::{
     DifferentialOracle, OracleConfig, OracleDivergence, OracleVerdict,
 };
-use tensor_wasm_jit::ir::{TensorWasmKernelBlueprint, TensorWasmOp};
+use tensor_wasm_jit::ir::{ElemType, TensorWasmKernelBlueprint, TensorWasmOp};
 
 fn fixture_blueprint() -> TensorWasmKernelBlueprint {
-    TensorWasmKernelBlueprint::new("oracle_fixture").push(TensorWasmOp::VecAdd { lanes: 4 })
+    TensorWasmKernelBlueprint::new("oracle_fixture").push(TensorWasmOp::VecAdd {
+        elem: ElemType::F32,
+        lanes: 4,
+    })
 }
 
 #[test]
