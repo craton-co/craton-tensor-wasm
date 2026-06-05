@@ -2006,7 +2006,10 @@ mod tests {
     #[test]
     fn lookup_by_blueprint() {
         let cache = KernelCache::new();
-        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd {
+            elem: ElemType::F32,
+            lanes: 4,
+        });
         let tenant = TenantId(11);
         let key = CacheKey::for_tenant(tenant, bp.fingerprint(), 80);
         cache.put(key, dummy_kernel(bp.fingerprint()));
@@ -2018,6 +2021,39 @@ mod tests {
         assert!(
             cache.get_for(TenantId(12), &bp, 80).is_none(),
             "different tenant is a miss — keys are tenant-scoped"
+        );
+    }
+
+    /// jit HIGH (finding 2): a kernel cached under an `f32x4.add` blueprint
+    /// must NOT be returned for an `i32x4.add` blueprint. Before the
+    /// element-type fix both blueprints fingerprinted identically, so the
+    /// integer lookup would HIT the float kernel — cross-kernel cache
+    /// aliasing serving a miscompiled kernel. The lookup now misses, which
+    /// drives a correct (integer) emit.
+    #[test]
+    fn element_type_is_not_cache_aliased() {
+        let cache = KernelCache::new();
+        let tenant = TenantId(7);
+        let f32_bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd {
+            elem: ElemType::F32,
+            lanes: 4,
+        });
+        let i32_bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd {
+            elem: ElemType::I32,
+            lanes: 4,
+        });
+        // Distinct cache keys (the rewrite-time pre-population keys on this).
+        assert_ne!(f32_bp.fingerprint(), i32_bp.fingerprint());
+
+        // Populate ONLY the f32 kernel.
+        let key = CacheKey::for_tenant(tenant, f32_bp.fingerprint(), 80);
+        cache.put(key, dummy_kernel(f32_bp.fingerprint()));
+
+        // The f32 lookup hits; the i32 lookup must MISS (no aliasing).
+        assert!(cache.get_for(tenant, &f32_bp, 80).is_some());
+        assert!(
+            cache.get_for(tenant, &i32_bp, 80).is_none(),
+            "i32x4.add must not alias the f32x4.add cache slot"
         );
     }
 
