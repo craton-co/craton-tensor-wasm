@@ -426,31 +426,17 @@ fn memory_attempt(
     // success/failure — the memory lowering may have advanced both
     // partway through.
     *builder.next_value_id_mut() = next_id_local;
-    // Reseed the builder's stack-slot map by inserting any new entries
-    // back. (We could use `bind_value`-style API but there isn't one
-    // for stack slots; calling `get_or_alloc_stack_slot` would advance
-    // the value counter again, so we go through the public API on each
-    // entry: only entries the memory lowering added are new.)
+    // jit HIGH fix (finding 3): reinsert EVERY entry of the local
+    // stack-slot map back into the builder via `bind_stack_slot`. Before
+    // this, entries the memory lowering allocated were silently dropped, so
+    // a later `stack_load`/`stack_store` of the same slot would miss the
+    // builder map and allocate a fresh alloca pointer — splitting one
+    // logical stack slot into several distinct allocas. `bind_stack_slot`
+    // does NOT advance the value-id counter (the id was already allocated
+    // against the same shared counter we wrote back above), so re-binding
+    // is idempotent and id-stable.
     for (ss, id) in stack_slot_map {
-        if builder.lookup_stack_slot(ss).is_none() {
-            // Bind into the builder via a manual fixup. There's no
-            // `bind_stack_slot` accessor, so we use the closest thing:
-            // `get_or_alloc_stack_slot` allocates a fresh id, which is
-            // wrong. Instead we have to fall back to manipulating
-            // through the read-only accessor — except that's a
-            // contradiction. The practical resolution: wave-1 tests
-            // don't exercise repeated stack-slot lowerings across
-            // multiple driver passes, so a one-pass driver doesn't need
-            // to round-trip the stack-slot map. We log to tracing and
-            // continue.
-            tracing::debug!(
-                target = "tensor_wasm_jit::lowering_driver",
-                stack_slot = ?ss,
-                lowered_id = id,
-                "memory lowering allocated a stack slot; \
-                 builder stack-slot map will not be updated in wave-2 driver",
-            );
-        }
+        builder.bind_stack_slot(ss, id);
     }
 
     match result {

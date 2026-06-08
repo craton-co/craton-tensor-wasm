@@ -205,6 +205,32 @@ impl LoweringBuilder {
         self.value_map.insert(v, id)
     }
 
+    /// Bind a Cranelift [`cl::StackSlot`] to a specific (already-allocated)
+    /// alloca-pointer [`LoweredValueId`], returning the previous binding if
+    /// any (mirroring [`HashMap::insert`]).
+    ///
+    /// jit HIGH fix (finding 3): the W2.4 driver lifts the builder's
+    /// stack-slot map out into a local `&mut HashMap` so it can hand a
+    /// `&mut` to the memory-lowering context. Without a way to write
+    /// entries back, every new stack slot allocated during memory lowering
+    /// was DROPPED on return — so a later `stack_load`/`stack_store` of the
+    /// same slot would call [`Self::get_or_alloc_stack_slot`], miss, and
+    /// allocate a *fresh* alloca pointer, splitting one logical slot into
+    /// several distinct allocas (a miscompile). The driver now reinserts
+    /// each entry of the local map through this method after lowering, so
+    /// repeated references to one slot resolve to the same alloca id.
+    ///
+    /// Unlike [`Self::get_or_alloc_stack_slot`], this does **not** advance
+    /// the value-id counter — the id was already allocated by the memory
+    /// lowering against the same shared counter.
+    pub fn bind_stack_slot(
+        &mut self,
+        ss: cl::StackSlot,
+        id: LoweredValueId,
+    ) -> Option<LoweredValueId> {
+        self.stack_slot_map.insert(ss, id)
+    }
+
     /// Mutable access to the inner `value_map`.
     ///
     /// Provided for compatibility with the wave-1 per-family lowerings
@@ -436,6 +462,39 @@ mod tests {
         assert_eq!(bld.lookup_value(v(0)), None);
         assert_eq!(bld.lookup_stack_slot(s0), Some(1));
         assert_eq!(bld.stack_slot_map().len(), 2);
+    }
+
+    /// jit HIGH fix (finding 3): `bind_stack_slot` writes an explicit id
+    /// without advancing the value counter, and a re-bind of the same slot
+    /// is id-stable. This is what lets the driver reinsert the local
+    /// stack-slot map after memory lowering so repeated references to one
+    /// slot resolve to the same alloca pointer.
+    #[test]
+    fn bind_stack_slot_is_id_stable_and_does_not_advance_counter() {
+        let mut bld = LoweringBuilder::new();
+        let s0 = ss(0);
+
+        // Pretend memory lowering allocated id 0 for s0 against the shared
+        // counter (advance it once to mirror that).
+        assert_eq!(bld.alloc_value(), 0);
+        let prev = bld.bind_stack_slot(s0, 0);
+        assert_eq!(prev, None, "first bind has no previous value");
+        assert_eq!(bld.lookup_stack_slot(s0), Some(0));
+
+        // bind_stack_slot must NOT touch the value counter.
+        assert_eq!(
+            bld.alloc_value(),
+            1,
+            "bind_stack_slot must not advance the value-id counter"
+        );
+
+        // Re-binding the same slot to the same id is idempotent and returns
+        // the previous id (so the driver's reinsert loop is safe to run
+        // even when the entry already existed).
+        let prev2 = bld.bind_stack_slot(s0, 0);
+        assert_eq!(prev2, Some(0));
+        assert_eq!(bld.lookup_stack_slot(s0), Some(0));
+        assert_eq!(bld.stack_slot_map().len(), 1);
     }
 
     #[test]
