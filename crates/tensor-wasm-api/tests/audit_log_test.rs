@@ -29,7 +29,8 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tensor_wasm_api::{
     build_router_with_audit, AppState, AuditConfig, AuditRecord, AuditSink, AuthConfig, CorsConfig,
-    NoopSink, RateLimitConfig, RateLimiter, TenantConfig, TokenScope, HEADER_TENANT,
+    NoopSink, RateLimitConfig, RateLimiter, TenantConfig, TokenScope, HEADER_REQUEST_ID,
+    HEADER_TENANT,
 };
 use tensor_wasm_core::types::TenantId;
 use tower::ServiceExt;
@@ -343,4 +344,68 @@ async fn invoke_async_emits_audit_record() {
     assert_eq!(v["action"], "invoke_function_async");
     assert_eq!(v["outcome"]["status_code"], 202);
     assert_eq!(v["resource"]["tenant_id"], 1);
+}
+
+/// The audit middleware stamps an `X-Request-Id` response header carrying
+/// the same correlation id it records on the audit line, so a client can
+/// quote it to support and the operator can grep the exact record.
+#[tokio::test]
+async fn state_mutating_response_carries_request_id_header_matching_record() {
+    let (router, sink) = router_with_audit(&[("scoped", TokenScope::all())]);
+
+    let wasm_bytes = wat::parse_str(r#"(module (func (export "_start")))"#).expect("WAT parses");
+    let wasm_b64 = BASE64.encode(&wasm_bytes);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/functions")
+        .header("authorization", "Bearer scoped")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "name": "t", "wasm_b64": wasm_b64 })).unwrap(),
+        ))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.expect("deploy");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The header is present and a syntactically valid UUID.
+    let header_value = resp
+        .headers()
+        .get(HEADER_REQUEST_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("missing {HEADER_REQUEST_ID} response header"));
+    assert!(
+        uuid::Uuid::parse_str(&header_value).is_ok(),
+        "{HEADER_REQUEST_ID} must be a UUID, got {header_value}",
+    );
+
+    // It correlates with the id recorded on the matching audit line.
+    let records = sink.snapshot();
+    assert_eq!(records.len(), 1, "exactly one record per POST /functions");
+    let recorded = records[0].request_id.to_string();
+    assert_eq!(
+        header_value, recorded,
+        "X-Request-Id header must equal the audit record's request_id",
+    );
+}
+
+/// Read-only routes are filtered out before the audit middleware body runs,
+/// so they do NOT receive the audit-stamped `X-Request-Id` header. This
+/// pins the boundary: the header rides on the audit path, not every route.
+#[tokio::test]
+async fn read_only_route_does_not_carry_audit_request_id_header() {
+    let (router, _sink) = router_with_audit(&[("scoped", TokenScope::all())]);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .header("authorization", "Bearer scoped")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.expect("healthz");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get(HEADER_REQUEST_ID).is_none(),
+        "read-only routes must not carry the audit X-Request-Id header",
+    );
 }
