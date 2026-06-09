@@ -53,6 +53,8 @@
 
 #![cfg(feature = "cuda-oxide-backend")]
 
+use std::collections::HashMap;
+
 use cranelift_codegen::ir::{Block, Function, Inst, Opcode};
 
 /// A reason a Cranelift instruction cannot be lowered to a
@@ -139,6 +141,49 @@ pub enum RejectReason {
     /// 3+ will distinguish device-internal calls (legal: lowered to
     /// `func.call`) from host round-trips (illegal: rejected).
     HostCall(&'static str),
+
+    /// Any floating-point opcode (`fadd`, `fmul`, `fdiv`, `fma`, `sqrt`,
+    /// `fcmp`, the float conversions, …).
+    ///
+    /// jit MED fix (finding 4): the reject-list previously admitted
+    /// non-saturating FP ops. PTX default rounding (`add.rn.f32` etc.) is
+    /// bit-exact IEEE for the basic ops, but the broader strict-FP scope
+    /// (NaN payload propagation, denormal-as-zero behaviour, transcendental
+    /// approximations) is NOT yet proven equivalent to the Wasm/CPU
+    /// reference across this lowering path. Until a differential proof of
+    /// bit-exact rounding lands, ALL float opcodes are rejected so a float
+    /// function deopts to the CPU path rather than risk silent numerical
+    /// divergence. (The basic-op subset can be re-admitted once the
+    /// differential oracle proves equivalence — narrow this then.)
+    FloatOp(&'static str),
+
+    /// Integer divide / remainder (`sdiv`, `udiv`, `srem`, `urem`).
+    ///
+    /// jit MED fix (finding 4): Wasm `i32.div_u` etc. TRAP on divide-by-
+    /// zero (and signed div traps on `INT_MIN / -1` overflow). PTX `div`
+    /// has undefined behaviour on divide-by-zero — it does not trap. Until
+    /// the lowering emits an explicit divisor-zero guard that reproduces
+    /// the Wasm trap, integer div/rem is rejected so it stays on the CPU
+    /// path rather than producing a non-trapping (wrong) result on the GPU.
+    IntDivRem(&'static str),
+
+    /// A control-flow back-edge: a branch whose target is a block at or
+    /// before the branching block in layout order (i.e. a loop).
+    ///
+    /// jit MED fix (finding 4): the wave-2 lowering does not yet model loop
+    /// carried dependencies / convergence on the GPU, so any function
+    /// containing a loop back-edge is rejected. Straight-line and
+    /// forward-only (if/else, switch) control flow remains admissible.
+    BackEdge(&'static str),
+
+    /// An explicit trap or unreachable (`trap`, `trapz`, `trapnz`,
+    /// `resumable_trap`, `debugtrap`; Wasm `unreachable` lowers to `trap`).
+    ///
+    /// jit MED fix (finding 4): PTX has no equivalent of the Wasm trap
+    /// machinery (which unwinds back into the host with a trap code). A
+    /// function that can trap mid-kernel cannot be faithfully offloaded, so
+    /// it is rejected.
+    Trap(&'static str),
 }
 
 impl RejectReason {
@@ -154,7 +199,11 @@ impl RejectReason {
             | Self::GcOp(m)
             | Self::MemoryResize(m)
             | Self::LargeMemcpy(m)
-            | Self::HostCall(m) => m,
+            | Self::HostCall(m)
+            | Self::FloatOp(m)
+            | Self::IntDivRem(m)
+            | Self::BackEdge(m)
+            | Self::Trap(m) => m,
         }
     }
 }
@@ -187,9 +236,19 @@ pub struct Rejection {
 /// iterator exposes.
 pub fn scan_function(func: &Function) -> Vec<Rejection> {
     let mut rejections = Vec::new();
+    let block_order = block_layout_order(func);
     for block in func.layout.blocks() {
+        let block_idx = block_order.get(&block).copied().unwrap_or(usize::MAX);
         for inst in func.layout.block_insts(block) {
             if let Some(reason) = classify_opcode(func.dfg.insts[inst].opcode()) {
+                rejections.push(Rejection {
+                    inst,
+                    block,
+                    reason,
+                });
+            } else if let Some(reason) = back_edge_reason(func, inst, block_idx, &block_order) {
+                // jit MED fix (finding 4): a branch whose target is at or
+                // before this block in layout order is a loop back-edge.
                 rejections.push(Rejection {
                     inst,
                     block,
@@ -208,9 +267,18 @@ pub fn scan_function(func: &Function) -> Vec<Rejection> {
 /// list. Equivalent to `scan_function(func).into_iter().next()` but does
 /// not walk the rest of the function once a rejection is found.
 pub fn check_function(func: &Function) -> Option<Rejection> {
+    let block_order = block_layout_order(func);
     for block in func.layout.blocks() {
+        let block_idx = block_order.get(&block).copied().unwrap_or(usize::MAX);
         for inst in func.layout.block_insts(block) {
             if let Some(reason) = classify_opcode(func.dfg.insts[inst].opcode()) {
+                return Some(Rejection {
+                    inst,
+                    block,
+                    reason,
+                });
+            }
+            if let Some(reason) = back_edge_reason(func, inst, block_idx, &block_order) {
                 return Some(Rejection {
                     inst,
                     block,
@@ -220,6 +288,59 @@ pub fn check_function(func: &Function) -> Option<Rejection> {
         }
     }
     None
+}
+
+/// Assign each block its position in layout order. A branch to a block
+/// whose index is `<=` the branching block's index is a back-edge (loop).
+fn block_layout_order(func: &Function) -> HashMap<Block, usize> {
+    func.layout
+        .blocks()
+        .enumerate()
+        .map(|(idx, block)| (block, idx))
+        .collect()
+}
+
+/// If `inst` is a branch with a destination at or before `block_idx` in
+/// layout order, return a [`RejectReason::BackEdge`]. Returns `None` for
+/// non-branch instructions and purely forward branches.
+///
+/// jit MED fix (finding 4): the wave-2 lowering does not model loop-carried
+/// dependencies, so any loop (detected here as a back-edge) is rejected.
+fn back_edge_reason(
+    func: &Function,
+    inst: Inst,
+    block_idx: usize,
+    block_order: &HashMap<Block, usize>,
+) -> Option<RejectReason> {
+    let data = &func.dfg.insts[inst];
+    let opcode = data.opcode();
+    if !opcode.is_branch() {
+        return None;
+    }
+    let mut is_back_edge = false;
+    for block_call in data.branch_destination(&func.dfg.jump_tables) {
+        let target = block_call.block(&func.dfg.value_lists);
+        if let Some(&target_idx) = block_order.get(&target) {
+            if target_idx <= block_idx {
+                is_back_edge = true;
+            }
+        }
+    }
+    if is_back_edge {
+        Some(RejectReason::BackEdge(branch_mnemonic(opcode)))
+    } else {
+        None
+    }
+}
+
+/// Static mnemonic for a branch opcode (diagnostics only).
+fn branch_mnemonic(op: Opcode) -> &'static str {
+    match op {
+        Opcode::Jump => "jump",
+        Opcode::Brif => "brif",
+        Opcode::BrTable => "br_table",
+        _ => "branch",
+    }
 }
 
 /// Map a Cranelift [`Opcode`] to a [`RejectReason`] if it is on the
@@ -258,9 +379,96 @@ fn classify_opcode(op: Opcode) -> Option<RejectReason> {
         Opcode::ReturnCall => Some(RejectReason::HostCall("return_call")),
         Opcode::ReturnCallIndirect => Some(RejectReason::HostCall("return_call_indirect")),
 
+        // Integer divide / remainder — see RejectReason::IntDivRem. These
+        // trap on divide-by-zero in Wasm but PTX `div`/`rem` do not, so
+        // they are rejected until the trap is emulated (jit MED finding 4).
+        Opcode::Sdiv => Some(RejectReason::IntDivRem("sdiv")),
+        Opcode::Udiv => Some(RejectReason::IntDivRem("udiv")),
+        Opcode::Srem => Some(RejectReason::IntDivRem("srem")),
+        Opcode::Urem => Some(RejectReason::IntDivRem("urem")),
+
+        // Trap / unreachable — see RejectReason::Trap. No PTX equivalent of
+        // the Wasm trap unwind (jit MED finding 4). `unreachable` lowers to
+        // `trap` in Cranelift, so this also covers Wasm `unreachable`.
+        Opcode::Trap => Some(RejectReason::Trap("trap")),
+        Opcode::Trapz => Some(RejectReason::Trap("trapz")),
+        Opcode::Trapnz => Some(RejectReason::Trap("trapnz")),
+        Opcode::Debugtrap => Some(RejectReason::Trap("debugtrap")),
+
+        // All floating-point opcodes — see RejectReason::FloatOp. Rejected
+        // wholesale until bit-exact PTX rounding equivalence is proven by
+        // the differential oracle (jit MED finding 4). The two saturating
+        // conversions keep their more specific `StrictFp` reason above for
+        // diagnostic continuity; everything else float lands here.
+        op if is_float_opcode(op) => Some(RejectReason::FloatOp(float_mnemonic(op))),
+
         // Everything else is provisionally admissible; the per-family
         // lowerings may still reject in their own pass.
         _ => None,
+    }
+}
+
+/// True for any floating-point Cranelift opcode the wave-2 reject-list
+/// refuses (jit MED finding 4). Kept as an explicit allow/deny list rather
+/// than a type-based check because `classify_opcode` only has the opcode in
+/// hand (the scanners deliberately avoid touching value types for speed).
+fn is_float_opcode(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::Fadd
+            | Opcode::Fsub
+            | Opcode::Fmul
+            | Opcode::Fdiv
+            | Opcode::Fma
+            | Opcode::Fneg
+            | Opcode::Fabs
+            | Opcode::Fcopysign
+            | Opcode::Fmin
+            | Opcode::Fmax
+            | Opcode::Sqrt
+            | Opcode::Ceil
+            | Opcode::Floor
+            | Opcode::Trunc
+            | Opcode::Nearest
+            | Opcode::Fcmp
+            | Opcode::Fpromote
+            | Opcode::Fdemote
+            | Opcode::FcvtFromSint
+            | Opcode::FcvtFromUint
+            | Opcode::FcvtToSint
+            | Opcode::FcvtToUint
+    )
+}
+
+/// Static mnemonic for a float opcode that `is_float_opcode` accepts.
+/// Falls back to a generic `"float_op"` label for any opcode not
+/// individually named — the reject decision is what matters, the mnemonic
+/// is only for diagnostics.
+fn float_mnemonic(op: Opcode) -> &'static str {
+    match op {
+        Opcode::Fadd => "fadd",
+        Opcode::Fsub => "fsub",
+        Opcode::Fmul => "fmul",
+        Opcode::Fdiv => "fdiv",
+        Opcode::Fma => "fma",
+        Opcode::Fneg => "fneg",
+        Opcode::Fabs => "fabs",
+        Opcode::Fcopysign => "fcopysign",
+        Opcode::Fmin => "fmin",
+        Opcode::Fmax => "fmax",
+        Opcode::Sqrt => "sqrt",
+        Opcode::Ceil => "ceil",
+        Opcode::Floor => "floor",
+        Opcode::Trunc => "trunc",
+        Opcode::Nearest => "nearest",
+        Opcode::Fcmp => "fcmp",
+        Opcode::Fpromote => "fpromote",
+        Opcode::Fdemote => "fdemote",
+        Opcode::FcvtFromSint => "fcvt_from_sint",
+        Opcode::FcvtFromUint => "fcvt_from_uint",
+        Opcode::FcvtToSint => "fcvt_to_sint",
+        Opcode::FcvtToUint => "fcvt_to_uint",
+        _ => "float_op",
     }
 }
 
@@ -616,5 +824,160 @@ mod tests {
     #[test]
     fn offset_field_is_irrelevant_to_detection() {
         let _ = Offset32::new(0);
+    }
+
+    // ---- jit MED fix (finding 4): float / div-rem / trap / back-edge ----
+
+    /// All floating-point arithmetic is rejected with `FloatOp` until
+    /// bit-exact PTX rounding is proven.
+    #[test]
+    fn float_arith_is_rejected() {
+        for (opcode, mnemonic) in [
+            (Opcode::Fadd, "fadd"),
+            (Opcode::Fmul, "fmul"),
+            (Opcode::Fdiv, "fdiv"),
+        ] {
+            let (mut func, block) = empty_func();
+            append(
+                &mut func,
+                block,
+                InstructionData::Binary {
+                    opcode,
+                    args: [dummy_val(), dummy_val()],
+                },
+            );
+            let first = check_function(&func).expect("float op must be rejected");
+            assert_eq!(first.reason, RejectReason::FloatOp(mnemonic));
+        }
+    }
+
+    /// Float unary ops (`sqrt`) are rejected too.
+    #[test]
+    fn float_sqrt_is_rejected() {
+        let (mut func, block) = empty_func();
+        append(
+            &mut func,
+            block,
+            InstructionData::Unary {
+                opcode: Opcode::Sqrt,
+                arg: dummy_val(),
+            },
+        );
+        let first = check_function(&func).expect("sqrt must be rejected");
+        assert_eq!(first.reason, RejectReason::FloatOp("sqrt"));
+    }
+
+    /// Integer divide / remainder is rejected until divide-by-zero trap
+    /// emulation lands.
+    #[test]
+    fn int_div_rem_is_rejected() {
+        for (opcode, mnemonic) in [
+            (Opcode::Sdiv, "sdiv"),
+            (Opcode::Udiv, "udiv"),
+            (Opcode::Srem, "srem"),
+            (Opcode::Urem, "urem"),
+        ] {
+            let (mut func, block) = empty_func();
+            append(
+                &mut func,
+                block,
+                InstructionData::Binary {
+                    opcode,
+                    args: [dummy_val(), dummy_val()],
+                },
+            );
+            let first = check_function(&func).expect("int div/rem must be rejected");
+            assert_eq!(first.reason, RejectReason::IntDivRem(mnemonic));
+        }
+    }
+
+    /// `iadd` (a non-trapping integer op) stays admissible — the div/rem
+    /// reject must not over-reach to all integer arithmetic.
+    #[test]
+    fn plain_iadd_still_admissible() {
+        let (mut func, block) = empty_func();
+        append(
+            &mut func,
+            block,
+            InstructionData::Binary {
+                opcode: Opcode::Iadd,
+                args: [dummy_val(), dummy_val()],
+            },
+        );
+        assert_eq!(check_function(&func), None);
+    }
+
+    /// `trap` and friends are rejected.
+    #[test]
+    fn trap_is_rejected() {
+        let (mut func, block) = empty_func();
+        append(
+            &mut func,
+            block,
+            InstructionData::Trap {
+                opcode: Opcode::Trap,
+                code: cranelift_codegen::ir::TrapCode::User(1),
+            },
+        );
+        let first = check_function(&func).expect("trap must be rejected");
+        assert_eq!(first.reason, RejectReason::Trap("trap"));
+    }
+
+    /// A loop back-edge (a `jump` whose target is the entry block, which is
+    /// at or before the branching block in layout order) is rejected; a
+    /// forward jump is NOT.
+    #[test]
+    fn loop_back_edge_is_rejected_forward_jump_is_not() {
+        use cranelift_codegen::ir::BlockCall;
+
+        // Build entry -> body, with body jumping BACK to entry (a loop).
+        let mut func = Function::with_name_signature(
+            UserFuncName::user(0, 0),
+            Signature::new(CallConv::SystemV),
+        );
+        let entry = func.dfg.make_block();
+        let body = func.dfg.make_block();
+        func.layout.append_block(entry);
+        func.layout.append_block(body);
+
+        // entry: jump body  (forward — admissible)
+        let fwd_call = BlockCall::new(body, &[], &mut func.dfg.value_lists);
+        let fwd = func.dfg.make_inst(InstructionData::Jump {
+            opcode: Opcode::Jump,
+            destination: fwd_call,
+        });
+        func.layout.append_inst(fwd, entry);
+
+        // body: jump entry  (back-edge — rejected)
+        let back_call = BlockCall::new(entry, &[], &mut func.dfg.value_lists);
+        let back = func.dfg.make_inst(InstructionData::Jump {
+            opcode: Opcode::Jump,
+            destination: back_call,
+        });
+        func.layout.append_inst(back, body);
+
+        let rejections = scan_function(&func);
+        assert_eq!(
+            rejections.len(),
+            1,
+            "exactly the back-edge is rejected, not the forward jump"
+        );
+        assert!(matches!(rejections[0].reason, RejectReason::BackEdge(_)));
+        assert_eq!(rejections[0].block, body);
+    }
+
+    /// A self-loop (`jump` to the block's own block) is a back-edge.
+    #[test]
+    fn self_loop_is_back_edge() {
+        use cranelift_codegen::ir::BlockCall;
+        let (mut func, block) = empty_func();
+        let call = BlockCall::new(block, &[], &mut func.dfg.value_lists);
+        let jmp = func.dfg.make_inst(InstructionData::Jump {
+            opcode: Opcode::Jump,
+            destination: call,
+        });
+        func.layout.append_inst(jmp, block);
+        let first = check_function(&func).expect("self-loop must be rejected");
+        assert!(matches!(first.reason, RejectReason::BackEdge(_)));
     }
 }
