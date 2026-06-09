@@ -716,6 +716,90 @@ impl RateLimiter {
             self.per_tenant_buckets.remove(&key);
         }
     }
+
+    /// Default idle TTL for [`sweep_idle`](Self::sweep_idle): a bucket not
+    /// touched within this window is considered cold and reclaimed. Ten
+    /// minutes is comfortably longer than any realistic refill horizon — a
+    /// bucket that has not seen a request in ten minutes has long since
+    /// refilled to full burst, so dropping it changes nothing the next
+    /// request would not have reset anyway.
+    pub const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(600);
+
+    /// Reclaim cold buckets that have not been accessed within
+    /// [`DEFAULT_IDLE_TTL`](Self::DEFAULT_IDLE_TTL).
+    ///
+    /// Convenience wrapper over [`sweep_idle_with_ttl`](Self::sweep_idle_with_ttl)
+    /// using the default TTL and the limiter's own clock. Intended to be
+    /// driven from a periodic background task (e.g. a tokio interval on the
+    /// server) so steady-state memory does not grow with the *historical*
+    /// count of distinct `(token, tenant)` pairs — only the *currently
+    /// active* set. The per-token LRU cap
+    /// ([`evict_lru_tenant_if_at_cap`](Self::evict_lru_tenant_if_at_cap))
+    /// bounds a single hostile token's fan-out; this TTL sweep additionally
+    /// bounds the *long-tail accumulation* of many tokens each touching a
+    /// few tenants once and never again.
+    ///
+    /// Returns the number of buckets removed.
+    pub fn sweep_idle(&self) -> usize {
+        self.sweep_idle_with_ttl(Self::DEFAULT_IDLE_TTL)
+    }
+
+    /// Reclaim every bucket (in both the per-token and per-`(token, tenant)`
+    /// maps) whose `last_access` is older than `ttl` relative to the
+    /// limiter's clock `now`.
+    ///
+    /// ## Safety of eviction
+    ///
+    /// Dropping a bucket merely discards rate-limiter bookkeeping (a `f64`
+    /// balance plus two `Instant`s). The next request for an evicted
+    /// `(token, tenant)` rebuilds it at full burst — strictly *more*
+    /// permissive, never a correctness or security regression. We only ever
+    /// remove buckets that have been idle for `ttl`, so a freshly refilled
+    /// hot bucket is never reclaimed out from under live traffic.
+    ///
+    /// ## Concurrency
+    ///
+    /// `DashMap::retain` holds only a per-shard lock while iterating, so the
+    /// sweep never blocks the whole map and never holds a lock across an
+    /// `.await` (it is fully synchronous). A bucket that a concurrent
+    /// request touches mid-sweep simply updates its `last_access` and, on
+    /// the next shard visit, is seen as fresh and kept. The brief window in
+    /// which a bucket is reclaimed and immediately re-minted by a racing
+    /// request is benign for the same full-burst reason above.
+    ///
+    /// Returns the number of buckets removed across both maps.
+    pub fn sweep_idle_with_ttl(&self, ttl: Duration) -> usize {
+        let now = self.clock.now();
+        let is_idle = |state: &Mutex<BucketState>| -> bool {
+            // A poisoned mutex still yields the inner state; treat its
+            // `last_access` the same as a healthy lock so a single panicked
+            // critical section cannot pin a bucket in memory forever.
+            let last_access = state
+                .lock()
+                .map(|s| s.last_access)
+                .unwrap_or_else(|p| p.into_inner().last_access);
+            now.saturating_duration_since(last_access) >= ttl
+        };
+
+        let mut removed = 0usize;
+        self.buckets.retain(|_k, v| {
+            if is_idle(v) {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        self.per_tenant_buckets.retain(|_k, v| {
+            if is_idle(v) {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
 }
 
 /// Per-layer decision returned by `refill_and_decide`.
@@ -1147,5 +1231,90 @@ mod tests {
         for (i, (status, _)) in results.iter().enumerate() {
             assert_eq!(*status, StatusCode::NO_CONTENT, "request {i}");
         }
+    }
+
+    /// Build a both-layer-active limiter sharing the supplied clock. Used by
+    /// the TTL-sweep tests so both the per-token and per-`(token, tenant)`
+    /// maps get populated.
+    fn sweep_limiter(clock: Arc<ManualClock>) -> RateLimiter {
+        RateLimiter::with_clock(
+            RateLimitConfig {
+                qps: 10,
+                burst: 10,
+                per_tenant_default: PerTenantRateLimitConfig {
+                    burst: 10,
+                    qps: 10.0,
+                },
+            },
+            clock,
+        )
+    }
+
+    /// A bucket idle for longer than the TTL is reclaimed from both maps.
+    #[test]
+    fn sweep_idle_reclaims_cold_buckets() {
+        let clock = Arc::new(ManualClock::new());
+        let limiter = sweep_limiter(clock.clone());
+        let tok = TokenId::from_bearer("cold");
+
+        let _ = limiter.try_admit(tok, TenantId(7));
+        // One per-token bucket + one per-(token, tenant) bucket exist now.
+        assert_eq!(limiter.buckets.len(), 1);
+        assert_eq!(limiter.per_tenant_buckets.len(), 1);
+
+        // Advance past the TTL so both buckets are cold, then sweep.
+        clock.advance(Duration::from_secs(1));
+        let removed = limiter.sweep_idle_with_ttl(Duration::from_millis(500));
+        assert_eq!(removed, 2, "both the token and per-tenant buckets are cold");
+        assert_eq!(limiter.buckets.len(), 0);
+        assert_eq!(limiter.per_tenant_buckets.len(), 0);
+    }
+
+    /// A bucket touched within the TTL window is kept.
+    #[test]
+    fn sweep_idle_keeps_fresh_buckets() {
+        let clock = Arc::new(ManualClock::new());
+        let limiter = sweep_limiter(clock.clone());
+        let tok = TokenId::from_bearer("warm");
+
+        let _ = limiter.try_admit(tok, TenantId(1));
+        // Only a small advance — well within the TTL — so nothing is cold.
+        clock.advance(Duration::from_millis(100));
+        let removed = limiter.sweep_idle_with_ttl(Duration::from_secs(60));
+        assert_eq!(removed, 0, "fresh buckets must survive the sweep");
+        assert_eq!(limiter.buckets.len(), 1);
+        assert_eq!(limiter.per_tenant_buckets.len(), 1);
+    }
+
+    /// The sweep reclaims only the cold subset, leaving recently-touched
+    /// buckets in place.
+    #[test]
+    fn sweep_idle_is_selective() {
+        let clock = Arc::new(ManualClock::new());
+        let limiter = sweep_limiter(clock.clone());
+        let cold = TokenId::from_bearer("cold-token");
+        let warm = TokenId::from_bearer("warm-token");
+
+        // `cold` is touched once, long ago.
+        let _ = limiter.try_admit(cold, TenantId(1));
+        clock.advance(Duration::from_secs(10));
+        // `warm` is touched just before the sweep.
+        let _ = limiter.try_admit(warm, TenantId(2));
+
+        // TTL of 5s: `cold` (10s idle) goes, `warm` (0s idle) stays. Two
+        // buckets removed (the cold token's per-token + per-tenant entries).
+        let removed = limiter.sweep_idle_with_ttl(Duration::from_secs(5));
+        assert_eq!(removed, 2, "only the cold token's two buckets are reclaimed");
+        assert!(
+            limiter.per_tenant_buckets.contains_key(&(warm, TenantId(2))),
+            "warm token's bucket must survive",
+        );
+        assert!(
+            !limiter.per_tenant_buckets.contains_key(&(cold, TenantId(1))),
+            "cold token's bucket must be gone",
+        );
+        // A subsequent request for the evicted (cold) pair rebuilds the
+        // bucket at full burst — strictly more permissive, never a regression.
+        assert_eq!(limiter.try_admit(cold, TenantId(1)), AdmitResult::Admit);
     }
 }
