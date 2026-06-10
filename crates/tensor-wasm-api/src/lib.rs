@@ -125,6 +125,7 @@ pub use routes::{
 pub use server::{
     build_router, build_router_with_audit, build_router_with_config, build_router_with_full_config,
     build_router_with_kernel_publish_tokens, build_router_with_trusted_proxies, serve,
+    ENV_METRICS_TOKEN,
 };
 pub use token_scope::{
     parse_token_entry, parse_tokens_env, ParsedTokens, ScopeParseError, TenantScope, TokenScope,
