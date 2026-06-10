@@ -766,6 +766,7 @@ mod tests {
         // VMin first, so the converter trips before reaching Return.
         b0.ops.push(LoweredOp::VMin {
             lane_ty: LoweredType::I32,
+            signed: true,
             lhs: 1,
             rhs: 2,
             result: 3,

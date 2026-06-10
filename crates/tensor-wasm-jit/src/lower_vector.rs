@@ -145,15 +145,49 @@ pub fn lower_vector_inst(
             let lhs = map_value(value_map, args[0])?;
             let rhs = map_value(value_map, args[1])?;
             let result = fresh_id(next_value_id);
+            // jit MED fix (finding 5): carry signedness so `umin`/`umax`
+            // are not silently lowered as signed `min`/`max`. Float
+            // min/max have no signedness; `signed = true` by convention
+            // (the downstream emitter ignores it for float lanes).
             match opcode {
-                Opcode::Fmin | Opcode::Smin | Opcode::Umin => Some(LoweredOp::VMin {
+                Opcode::Fmin => Some(LoweredOp::VMin {
                     lane_ty,
+                    signed: true,
                     lhs,
                     rhs,
                     result,
                 }),
-                Opcode::Fmax | Opcode::Smax | Opcode::Umax => Some(LoweredOp::VMax {
+                Opcode::Smin => Some(LoweredOp::VMin {
                     lane_ty,
+                    signed: true,
+                    lhs,
+                    rhs,
+                    result,
+                }),
+                Opcode::Umin => Some(LoweredOp::VMin {
+                    lane_ty,
+                    signed: false,
+                    lhs,
+                    rhs,
+                    result,
+                }),
+                Opcode::Fmax => Some(LoweredOp::VMax {
+                    lane_ty,
+                    signed: true,
+                    lhs,
+                    rhs,
+                    result,
+                }),
+                Opcode::Smax => Some(LoweredOp::VMax {
+                    lane_ty,
+                    signed: true,
+                    lhs,
+                    rhs,
+                    result,
+                }),
+                Opcode::Umax => Some(LoweredOp::VMax {
+                    lane_ty,
+                    signed: false,
                     lhs,
                     rhs,
                     result,
@@ -334,11 +368,14 @@ mod tests {
         match op {
             LoweredOp::VMin {
                 lane_ty,
+                signed,
                 lhs,
                 rhs,
                 result,
             } => {
                 assert_eq!(lane_ty, LoweredType::F32);
+                // Float min has no signedness; convention is `true`.
+                assert!(signed);
                 assert_eq!(lhs, 0);
                 assert_eq!(rhs, 1);
                 assert_eq!(result, 2);
@@ -363,6 +400,7 @@ mod tests {
         ));
     }
 
+    /// jit MED fix (finding 5): `smin` lowers to a SIGNED VMin.
     #[test]
     fn smin_vector_lowers_to_vmin_with_signed_lane() {
         let (mut func, params) = skeleton(&[types::I32X4, types::I32X4]);
@@ -373,9 +411,48 @@ mod tests {
             op,
             LoweredOp::VMin {
                 lane_ty: LoweredType::I32,
+                signed: true,
                 ..
             }
         ));
+    }
+
+    /// jit MED fix (finding 5): `umin` lowers to an UNSIGNED VMin — the
+    /// distinction `smin`/`umin` was previously LOST (both became `VMin`
+    /// with no signedness, so `umin` miscompiled to a signed `min`).
+    #[test]
+    fn umin_vector_lowers_to_unsigned_vmin() {
+        let (mut func, params) = skeleton(&[types::I32X4, types::I32X4]);
+        let (inst, _) = push_binary(&mut func, Opcode::Umin, params[0], params[1], types::I32X4);
+        let (map, mut next) = seed_map(&params);
+        let op = lower_vector_inst(inst, &func, &map, &mut next).expect("must lower");
+        assert!(matches!(
+            op,
+            LoweredOp::VMin {
+                lane_ty: LoweredType::I32,
+                signed: false,
+                ..
+            }
+        ));
+    }
+
+    /// jit MED fix (finding 5): `smin` and `umin` on the SAME lane type
+    /// now produce distinguishable ops (the regression this finding fixes).
+    #[test]
+    fn smin_and_umin_are_distinguishable() {
+        let (mut sf, sp) = skeleton(&[types::I32X4, types::I32X4]);
+        let (si, _) = push_binary(&mut sf, Opcode::Smin, sp[0], sp[1], types::I32X4);
+        let (smap, mut sn) = seed_map(&sp);
+        let s = lower_vector_inst(si, &sf, &smap, &mut sn).expect("smin");
+
+        let (mut uf, up) = skeleton(&[types::I32X4, types::I32X4]);
+        let (ui, _) = push_binary(&mut uf, Opcode::Umin, up[0], up[1], types::I32X4);
+        let (umap, mut un) = seed_map(&up);
+        let u = lower_vector_inst(ui, &uf, &umap, &mut un).expect("umin");
+
+        let s_signed = matches!(s, LoweredOp::VMin { signed: true, .. });
+        let u_unsigned = matches!(u, LoweredOp::VMin { signed: false, .. });
+        assert!(s_signed && u_unsigned, "smin must be signed, umin unsigned");
     }
 
     #[test]
@@ -388,6 +465,7 @@ mod tests {
             op,
             LoweredOp::VMax {
                 lane_ty: LoweredType::I16,
+                signed: false,
                 ..
             }
         ));
@@ -403,6 +481,7 @@ mod tests {
             op,
             LoweredOp::VMax {
                 lane_ty: LoweredType::I8,
+                signed: true,
                 ..
             }
         ));
@@ -418,6 +497,7 @@ mod tests {
             op,
             LoweredOp::VMin {
                 lane_ty: LoweredType::I64,
+                signed: false,
                 ..
             }
         ));

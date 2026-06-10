@@ -367,6 +367,18 @@ pub enum LoweredOp {
     VMin {
         /// Per-lane type.
         lane_ty: LoweredType,
+        /// Signedness of the comparison for INTEGER lanes.
+        ///
+        /// jit MED fix (finding 5): Cranelift's `smin` (signed) and `umin`
+        /// (unsigned) previously both collapsed onto `VMin` with no
+        /// signedness, so an unsigned min would lower to a signed PTX `min`
+        /// (`min.s32` vs `min.u32`) — a miscompile for operands straddling
+        /// the sign boundary. `signed` now carries the distinction.
+        ///
+        /// For FLOAT lanes (`lane_ty.is_float()`) this field is ignored
+        /// (float min/max has no signedness); the lowering sets it to
+        /// `true` for floats by convention.
+        signed: bool,
         /// Left operand vector.
         lhs: LoweredValueId,
         /// Right operand vector.
@@ -378,6 +390,10 @@ pub enum LoweredOp {
     VMax {
         /// Per-lane type.
         lane_ty: LoweredType,
+        /// Signedness of the comparison for INTEGER lanes (see
+        /// [`LoweredOp::VMin`] — jit MED fix finding 5). Ignored for float
+        /// lanes.
+        signed: bool,
         /// Left operand vector.
         lhs: LoweredValueId,
         /// Right operand vector.
