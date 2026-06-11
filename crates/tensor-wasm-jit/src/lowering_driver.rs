@@ -376,68 +376,29 @@ fn memory_attempt(
     builder: &mut LoweringBuilder,
     location: InstLocation,
 ) -> Result<Option<Vec<LoweredOp>>, LoweringError> {
-    // The memory family's context borrows `value_map` immutably and
-    // `stack_slot_map` + `next_value_id` mutably. We can't construct it
-    // from a `&mut LoweringBuilder` directly because the borrow checker
-    // can't see that the three accessors are disjoint. Workaround: copy
-    // out the counter into a local, fish out the three pieces by hand,
-    // then re-assemble.
-    let mut next_id_local: LoweredValueId = *builder.next_value_id_mut();
-
-    // SAFETY: split-borrow workaround. We snapshot the value_map into
-    // an owned clone so the memory context can borrow it immutably
-    // without keeping any borrow on `builder` itself open. The
-    // `stack_slot_map` lives inside the builder; we take it temporarily
-    // by `std::mem::take`, run the lowering against it, then put it
-    // back. This avoids the `&mut self` aliasing issue without unsafe
-    // code.
-    //
-    // The clone is cheap for the small functions wave-1 targets; if
-    // profiling later shows it dominates, the builder can grow a
-    // dedicated split-borrow accessor.
-    let value_map_snapshot = builder.value_map().clone();
-
-    // Temporarily lift the stack-slot map out of the builder so we can
-    // hand a `&mut` to the memory context. The builder's own
-    // `stack_slot_map()` accessor returns `&` only, so this is the
-    // simplest way to satisfy the `MemLowerContext` shape without
-    // adding a new accessor to `LoweringBuilder` (the constraint says
-    // "modify only `lowering_driver.rs`").
-    let mut stack_slot_map: HashMap<cl::StackSlot, LoweredValueId> = builder
-        .stack_slot_map()
-        .iter()
-        .map(|(k, v)| (*k, *v))
-        .collect();
-
+    // jit MED fix (finding 6): use the builder's split-borrow accessor
+    // instead of cloning the whole `value_map` on every memory
+    // instruction. The previous code cloned `value_map` (O(values)) once
+    // per memory instruction (O(memory-instructions)) — i.e. O(V·M) total —
+    // and lifted the stack-slot map into a local that then had to be
+    // reinserted (jit finding 3's workaround). With the split borrow the
+    // memory context borrows the live maps directly: no per-instruction
+    // allocation, and any stack slot the memory lowering allocates is
+    // written straight into the builder's own map, so the one-slot-one-
+    // alloca property (jit finding 3) holds with no reinsert step.
     let result = {
+        let (value_map, stack_slot_map, next_value_id) = builder.split_borrow_for_memory();
         let mut ctx = MemLowerContext {
             // The wave-1 memory lowering does not actually read this
             // field yet; 0 is a placeholder. Wave 2's kernel-arg
             // refinement will populate it properly.
             linear_memory_base: 0,
-            value_map: &value_map_snapshot,
-            stack_slot_map: &mut stack_slot_map,
-            next_value_id: &mut next_id_local,
+            value_map,
+            stack_slot_map,
+            next_value_id,
         };
         lower_memory_inst(inst, func, &mut ctx)
     };
-
-    // Write back the counter and the stack-slot map regardless of
-    // success/failure — the memory lowering may have advanced both
-    // partway through.
-    *builder.next_value_id_mut() = next_id_local;
-    // jit HIGH fix (finding 3): reinsert EVERY entry of the local
-    // stack-slot map back into the builder via `bind_stack_slot`. Before
-    // this, entries the memory lowering allocated were silently dropped, so
-    // a later `stack_load`/`stack_store` of the same slot would miss the
-    // builder map and allocate a fresh alloca pointer — splitting one
-    // logical stack slot into several distinct allocas. `bind_stack_slot`
-    // does NOT advance the value-id counter (the id was already allocated
-    // against the same shared counter we wrote back above), so re-binding
-    // is idempotent and id-stable.
-    for (ss, id) in stack_slot_map {
-        builder.bind_stack_slot(ss, id);
-    }
 
     match result {
         Ok(some_ops) => Ok(some_ops),

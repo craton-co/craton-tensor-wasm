@@ -268,6 +268,35 @@ impl LoweringBuilder {
     pub fn stack_slot_map(&self) -> &HashMap<cl::StackSlot, LoweredValueId> {
         &self.stack_slot_map
     }
+
+    /// Split-borrow accessor for the memory-lowering family.
+    ///
+    /// Returns `(&value_map, &mut stack_slot_map, &mut next_value_id)` in a
+    /// single call so the caller gets disjoint borrows of three distinct
+    /// fields — exactly the shape `MemLowerContext` needs (value map read,
+    /// stack-slot map + counter mutated).
+    ///
+    /// jit MED fix (finding 6): the W2.4 driver previously CLONED the whole
+    /// `value_map` on every memory instruction (`builder.value_map().clone()`)
+    /// because the borrow checker couldn't see the three accessors were
+    /// disjoint — making the driver O(V·M) (values × memory instructions).
+    /// This method performs the field split once, in safe code, so the
+    /// memory context borrows the live map directly with no per-instruction
+    /// allocation.
+    #[allow(clippy::type_complexity)]
+    pub fn split_borrow_for_memory(
+        &mut self,
+    ) -> (
+        &HashMap<cl::Value, LoweredValueId>,
+        &mut HashMap<cl::StackSlot, LoweredValueId>,
+        &mut LoweredValueId,
+    ) {
+        (
+            &self.value_map,
+            &mut self.stack_slot_map,
+            &mut self.next_value_id,
+        )
+    }
 }
 
 impl Default for LoweringBuilder {
@@ -495,6 +524,31 @@ mod tests {
         assert_eq!(prev2, Some(0));
         assert_eq!(bld.lookup_stack_slot(s0), Some(0));
         assert_eq!(bld.stack_slot_map().len(), 1);
+    }
+
+    /// jit MED fix (finding 6): the split-borrow accessor hands out the
+    /// LIVE maps + counter (no clone). A mutation through the returned
+    /// `&mut`s is visible on the builder afterwards, and the value map is
+    /// borrowed in place (so the driver no longer clones it per memory
+    /// instruction).
+    #[test]
+    fn split_borrow_for_memory_exposes_live_state() {
+        let mut bld = LoweringBuilder::new();
+        bld.bind_value(v(0), 7);
+
+        {
+            let (value_map, stack_slot_map, next_value_id) = bld.split_borrow_for_memory();
+            // The value map is the live one (read-only here).
+            assert_eq!(value_map.get(&v(0)), Some(&7));
+            // Mutate the stack-slot map and counter through the split
+            // borrow — exactly what the memory context does.
+            stack_slot_map.insert(ss(0), *next_value_id);
+            *next_value_id += 1;
+        }
+
+        // Mutations are visible on the builder (proving no clone was made).
+        assert_eq!(bld.lookup_stack_slot(ss(0)), Some(0));
+        assert_eq!(bld.alloc_value(), 1, "counter advanced through split borrow");
     }
 
     #[test]
