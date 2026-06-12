@@ -67,10 +67,16 @@ fn lookup_value(value_map: &HashMap<Value, LoweredValueId>, v: Value) -> Option<
 }
 
 /// Allocate a fresh [`LoweredValueId`] and advance the cursor.
-fn alloc_result(next_value_id: &mut LoweredValueId) -> LoweredValueId {
+///
+/// jit LOW fix (finding 7): standardize on `checked_add(1)?` (the
+/// `lower_arith` idiom). `saturating_add` previously capped at `u32::MAX`,
+/// which silently aliased two distinct SSA values onto the same id once the
+/// counter saturated — a miscompile. Overflow now returns `None`, which the
+/// caller `?`-propagates into a structured lowering miss.
+fn alloc_result(next_value_id: &mut LoweredValueId) -> Option<LoweredValueId> {
     let id = *next_value_id;
-    *next_value_id = next_value_id.saturating_add(1);
-    id
+    *next_value_id = next_value_id.checked_add(1)?;
+    Some(id)
 }
 
 /// Lower a single Cranelift instruction to a conversion-family
@@ -136,7 +142,7 @@ pub fn lower_conv_inst(
             let cond = lookup_value(value_map, cond_v)?;
             let then_id = lookup_value(value_map, then_v)?;
             let else_id = lookup_value(value_map, else_v)?;
-            let result = alloc_result(next_value_id);
+            let result = alloc_result(next_value_id)?;
 
             Some(LoweredOp::Select {
                 ty,
@@ -157,7 +163,7 @@ pub fn lower_conv_inst(
             let to_ty = cranelift_type_to_lowered(func.dfg.value_type(result_v))?;
 
             let src = lookup_value(value_map, src_v)?;
-            let result = alloc_result(next_value_id);
+            let result = alloc_result(next_value_id)?;
 
             Some(LoweredOp::Bitcast {
                 from_ty,
@@ -183,7 +189,7 @@ pub fn lower_conv_inst(
             }
 
             let src = lookup_value(value_map, src_v)?;
-            let result = alloc_result(next_value_id);
+            let result = alloc_result(next_value_id)?;
 
             Some(LoweredOp::TruncI {
                 from_ty,
@@ -207,7 +213,7 @@ pub fn lower_conv_inst(
             }
 
             let src = lookup_value(value_map, src_v)?;
-            let result = alloc_result(next_value_id);
+            let result = alloc_result(next_value_id)?;
 
             Some(LoweredOp::ExtendU {
                 from_ty,
@@ -231,7 +237,7 @@ pub fn lower_conv_inst(
             }
 
             let src = lookup_value(value_map, src_v)?;
-            let result = alloc_result(next_value_id);
+            let result = alloc_result(next_value_id)?;
 
             Some(LoweredOp::ExtendS {
                 from_ty,

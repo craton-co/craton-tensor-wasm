@@ -61,6 +61,17 @@ pub enum MemLowerError {
     /// captured for triage.
     #[error("memory lowering: unsupported Cranelift type `{0}`")]
     UnsupportedType(String),
+
+    /// The SSA value-id counter overflowed `u32::MAX` (a single function
+    /// exceeded ~4 billion lowered values).
+    ///
+    /// jit LOW fix (finding 7): `fresh_id` previously used `wrapping_add`,
+    /// which silently wrapped the counter back to 0 on overflow — aliasing
+    /// new SSA values onto already-used ids and miscompiling the function.
+    /// It now uses `checked_add(1)` and surfaces this structured error
+    /// instead, matching the `lower_arith` family's fail-closed posture.
+    #[error("memory lowering: SSA value-id counter overflowed u32::MAX")]
+    SsaOverflow,
 }
 
 /// Context threaded through the memory-family lowering.
@@ -100,10 +111,16 @@ pub struct MemLowerContext<'a> {
 impl<'a> MemLowerContext<'a> {
     /// Allocate and return the next fresh [`LoweredValueId`], advancing
     /// the caller's counter.
-    pub fn fresh_id(&mut self) -> LoweredValueId {
+    ///
+    /// jit LOW fix (finding 7): standardize on `checked_add(1)` (the
+    /// `lower_arith` idiom) and return a structured
+    /// [`MemLowerError::SsaOverflow`] on overflow rather than `wrapping_add`,
+    /// which silently aliased fresh ids onto already-used ones once the
+    /// counter wrapped.
+    pub fn fresh_id(&mut self) -> Result<LoweredValueId, MemLowerError> {
         let id = *self.next_value_id;
-        *self.next_value_id = id.wrapping_add(1);
-        id
+        *self.next_value_id = id.checked_add(1).ok_or(MemLowerError::SsaOverflow)?;
+        Ok(id)
     }
 
     /// Look up the [`LoweredValueId`] for a Cranelift value, returning
@@ -154,7 +171,7 @@ pub fn lower_memory_inst(
             let base = ctx.lookup_value(*arg)?;
             let result_val = func.dfg.first_result(inst);
             let ty = cranelift_type_to_lowered(func.dfg.value_type(result_val))?;
-            let result_id = ctx.fresh_id();
+            let result_id = ctx.fresh_id()?;
             // Caller is expected to record `result_val -> result_id` in
             // its value_map after this function returns. We do not do it
             // here because `value_map` is borrowed immutably.
@@ -193,8 +210,8 @@ pub fn lower_memory_inst(
             let mut emitted = Vec::with_capacity(2);
             let result_val = func.dfg.first_result(inst);
             let ty = cranelift_type_to_lowered(func.dfg.value_type(result_val))?;
-            let alloca_ptr = ensure_stack_alloca(*stack_slot, func, ty.clone(), ctx, &mut emitted);
-            let result_id = ctx.fresh_id();
+            let alloca_ptr = ensure_stack_alloca(*stack_slot, func, ty.clone(), ctx, &mut emitted)?;
+            let result_id = ctx.fresh_id()?;
             emitted.push(LoweredOp::Load {
                 ty,
                 base: alloca_ptr,
@@ -212,7 +229,7 @@ pub fn lower_memory_inst(
             let value = ctx.lookup_value(*arg)?;
             let ty = cranelift_type_to_lowered(func.dfg.value_type(*arg))?;
             let mut emitted = Vec::with_capacity(2);
-            let alloca_ptr = ensure_stack_alloca(*stack_slot, func, ty.clone(), ctx, &mut emitted);
+            let alloca_ptr = ensure_stack_alloca(*stack_slot, func, ty.clone(), ctx, &mut emitted)?;
             emitted.push(LoweredOp::Store {
                 ty,
                 value,
@@ -239,19 +256,19 @@ fn ensure_stack_alloca(
     ty: LoweredType,
     ctx: &mut MemLowerContext<'_>,
     out: &mut Vec<LoweredOp>,
-) -> LoweredValueId {
+) -> Result<LoweredValueId, MemLowerError> {
     if let Some(existing) = ctx.stack_slot_map.get(&stack_slot) {
-        return *existing;
+        return Ok(*existing);
     }
     let bytes = func.sized_stack_slots[stack_slot].size;
-    let ptr_id = ctx.fresh_id();
+    let ptr_id = ctx.fresh_id()?;
     out.push(LoweredOp::StackAlloc {
         ty,
         bytes,
         result: ptr_id,
     });
     ctx.stack_slot_map.insert(stack_slot, ptr_id);
-    ptr_id
+    Ok(ptr_id)
 }
 
 /// Translate a Cranelift [`ir::Type`] to a [`LoweredType`] for the
@@ -345,6 +362,34 @@ mod tests {
             other => panic!("expected Load, got {other:?}"),
         }
         assert_eq!(next_id, 201);
+    }
+
+    /// jit LOW fix (finding 7): when the SSA value-id counter is at
+    /// `u32::MAX`, allocating a fresh id for a load result must return the
+    /// structured `SsaOverflow` error rather than wrapping the counter back
+    /// to 0 (which would alias the new value onto id 0).
+    #[test]
+    fn fresh_id_overflow_is_structured_error_not_wrap() {
+        let (mut func, base_v, _val_v, value_map) = skeleton();
+        let inst = func.dfg.make_inst(InstructionData::Load {
+            opcode: Opcode::Load,
+            arg: base_v,
+            flags: MemFlags::new(),
+            offset: Offset32::new(0),
+        });
+        func.dfg.make_inst_results(inst, types::I32);
+
+        let mut stack_map = HashMap::new();
+        let mut next_id: LoweredValueId = u32::MAX;
+        let mut ctx = MemLowerContext {
+            linear_memory_base: 100,
+            value_map: &value_map,
+            stack_slot_map: &mut stack_map,
+            next_value_id: &mut next_id,
+        };
+        let err = lower_memory_inst(inst, &func, &mut ctx)
+            .expect_err("counter at u32::MAX must overflow, not wrap");
+        assert_eq!(err, MemLowerError::SsaOverflow);
     }
 
     #[test]

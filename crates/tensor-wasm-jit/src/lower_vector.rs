@@ -87,10 +87,17 @@ fn vector_lane_type(ty: ir::Type) -> Option<LoweredType> {
 /// The counter is the caller's monotonic id source — the same one used by
 /// the sibling `lower_*` families so SSA ids stay unique inside the
 /// resulting [`crate::lowered_ir::LoweredFunction`].
-fn fresh_id(next: &mut LoweredValueId) -> LoweredValueId {
+///
+/// jit LOW fix (finding 7): returns `None` on counter overflow rather than
+/// panicking (`.expect(...)`). All `lower_*` families now standardize on
+/// `checked_add(1)?` so a single function exceeding `u32::MAX` SSA values
+/// surfaces as a structured lowering miss (the caller propagates `None`,
+/// which the driver maps to a `LoweringError`) instead of crashing the
+/// process.
+fn fresh_id(next: &mut LoweredValueId) -> Option<LoweredValueId> {
     let id = *next;
-    *next = next.checked_add(1).expect("LoweredValueId overflow");
-    id
+    *next = next.checked_add(1)?;
+    Some(id)
 }
 
 /// Resolve a Cranelift [`ir::Value`] to its [`LoweredValueId`].
@@ -144,7 +151,7 @@ pub fn lower_vector_inst(
             let lane_ty = vector_lane_type(result_ty)?;
             let lhs = map_value(value_map, args[0])?;
             let rhs = map_value(value_map, args[1])?;
-            let result = fresh_id(next_value_id);
+            let result = fresh_id(next_value_id)?;
             // jit MED fix (finding 5): carry signedness so `umin`/`umax`
             // are not silently lowered as signed `min`/`max`. Float
             // min/max have no signedness; `signed = true` by convention
@@ -206,7 +213,7 @@ pub fn lower_vector_inst(
                 let result_ty = func.dfg.value_type(result_value);
                 let lane_ty = vector_lane_type(result_ty)?;
                 let src = map_value(value_map, *arg)?;
-                let result = fresh_id(next_value_id);
+                let result = fresh_id(next_value_id)?;
                 Some(LoweredOp::VSplat {
                     lane_ty,
                     src,
@@ -226,7 +233,7 @@ pub fn lower_vector_inst(
                     return None;
                 }
                 let src = map_value(value_map, *arg)?;
-                let result = fresh_id(next_value_id);
+                let result = fresh_id(next_value_id)?;
                 Some(LoweredOp::VAllTrue { src, result })
             }
             Opcode::VanyTrue => {
@@ -235,7 +242,7 @@ pub fn lower_vector_inst(
                     return None;
                 }
                 let src = map_value(value_map, *arg)?;
-                let result = fresh_id(next_value_id);
+                let result = fresh_id(next_value_id)?;
                 Some(LoweredOp::VAnyTrue { src, result })
             }
             _ => None,
@@ -258,7 +265,7 @@ pub fn lower_vector_inst(
             let cond = map_value(value_map, args[0])?;
             let then_v = map_value(value_map, args[1])?;
             let else_v = map_value(value_map, args[2])?;
-            let result = fresh_id(next_value_id);
+            let result = fresh_id(next_value_id)?;
             Some(LoweredOp::VSelect {
                 lane_ty,
                 cond,

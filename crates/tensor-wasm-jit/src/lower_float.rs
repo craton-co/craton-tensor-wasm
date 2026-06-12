@@ -116,9 +116,12 @@ pub fn lower_float_inst(
 
     let args = func.dfg.inst_args(inst);
     let result = *next_value_id;
-    *next_value_id = next_value_id
-        .checked_add(1)
-        .expect("LoweredValueId overflow: a single function exceeded u32::MAX SSA values");
+    // jit LOW fix (finding 7): standardize on `checked_add(1)?` (the
+    // `lower_arith` idiom) instead of `.expect(...)`. A function exceeding
+    // `u32::MAX` SSA values now surfaces as a structured lowering miss
+    // (`None`, mapped to a `LoweringError` by the driver) rather than
+    // panicking the process.
+    *next_value_id = next_value_id.checked_add(1)?;
 
     let lowered = match opcode {
         Opcode::Fadd => LoweredOp::AddF {
