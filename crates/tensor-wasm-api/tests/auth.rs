@@ -201,3 +201,62 @@ async fn dev_mode_no_auth_required() {
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// Auth-on-every-route matrix: with an allowlist configured, EVERY protected
+/// route must reject a request that carries no `Authorization` header with
+/// `401 unauthorized` — before any handler / tenant / rate-limit logic runs.
+///
+/// This guards against the "forgot to wire bearer_auth onto a new route"
+/// class of regression: a route mounted outside the protected stack would
+/// admit unauthenticated callers and surface a non-401 status (404 / 405 /
+/// 400 / 503), failing the assertion. The probe routes (`/healthz`,
+/// `/metrics`) are deliberately `security: []` and are covered by their own
+/// dedicated tests above, so they are excluded here.
+///
+/// A fixed sample UUID is substituted into the `:id` templates; the value is
+/// irrelevant because auth runs before the handler ever resolves the id.
+#[tokio::test]
+async fn every_protected_route_requires_auth_when_allowlist_configured() {
+    const SAMPLE_ID: &str = "00000000-0000-4000-8000-00000000abcd";
+
+    // (method, uri) for every protected route mounted by the production
+    // router (see `server::build_router_full`). Feature-gated kernel routes
+    // (`--features kernel-registry-api`) are intentionally not listed here —
+    // they have dedicated coverage in `tests/kernel_registry_authz.rs`.
+    let routes: &[(Method, String)] = &[
+        (Method::POST, "/functions".to_string()),
+        (Method::DELETE, format!("/functions/{SAMPLE_ID}")),
+        (Method::POST, format!("/functions/{SAMPLE_ID}/invoke")),
+        (Method::POST, format!("/functions/{SAMPLE_ID}/invoke-async")),
+        (Method::POST, format!("/functions/{SAMPLE_ID}/invoke-stream")),
+        (Method::POST, "/snapshot/save".to_string()),
+        (Method::POST, "/snapshot/restore".to_string()),
+        (Method::GET, format!("/jobs/{SAMPLE_ID}")),
+        (Method::POST, "/v1/completions".to_string()),
+        (Method::POST, "/v1/chat/completions".to_string()),
+    ];
+
+    for (method, uri) in routes {
+        // Fresh router per row so a spent concurrency permit or audit state
+        // from one row cannot influence the next.
+        let router = router_with_tokens(&["foo", "bar"]);
+        let req = Request::builder()
+            .method(method.clone())
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} must return 401 with no token when an allowlist is configured",
+        );
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(
+            body.pointer("/error/kind").and_then(Value::as_str),
+            Some("unauthorized"),
+            "{method} {uri} must surface the unauthorized envelope: got {body}",
+        );
+    }
+}
