@@ -206,7 +206,13 @@ fn op_to_detector_op(op: &Operator<'_>) -> Op {
         | Else
         | Loop { .. }
         | Block { .. } => Op::Branch,
-        Call { .. } | CallIndirect { .. } | ReturnCall { .. } => Op::Call,
+        // jit LOW fix (finding 8): `ReturnCallIndirect` belongs in the
+        // `Op::Call` arm alongside the other call forms — previously it fell
+        // through to `Op::Other`, undercounting the call density of a
+        // function whose tail call is indirect.
+        Call { .. } | CallIndirect { .. } | ReturnCall { .. } | ReturnCallIndirect { .. } => {
+            Op::Call
+        }
 
         // jit CRITICAL fix: each SIMD opcode maps to a `V128Add`/`V128Mul`
         // carrying its true element type AND lane count, rather than
@@ -1184,6 +1190,79 @@ mod tests {
 
     /// A trivial module with a single noop function — should NOT be swapped.
     const NOOP_WAT: &str = r#"(module (func (export "noop")))"#;
+
+    /// jit CRITICAL fix (finding 1): each SIMD opcode maps to a SIMD op
+    /// carrying its true element type and lane count; widths the emitter
+    /// cannot lower end-to-end fail closed to `Op::Other` (kept on CPU).
+    #[test]
+    fn op_to_detector_op_threads_element_type_and_fails_closed() {
+        use wasmparser::Operator;
+        // f32x4 / i32x4 are emittable → carry their element type + lanes.
+        assert_eq!(
+            op_to_detector_op(&Operator::F32x4Add),
+            Op::V128Add {
+                lane_ty: ElemType::F32,
+                lanes: 4
+            }
+        );
+        assert_eq!(
+            op_to_detector_op(&Operator::I32x4Add),
+            Op::V128Add {
+                lane_ty: ElemType::I32,
+                lanes: 4
+            }
+        );
+        assert_eq!(
+            op_to_detector_op(&Operator::I32x4Mul),
+            Op::V128Mul {
+                lane_ty: ElemType::I32,
+                lanes: 4
+            }
+        );
+        // i32x4.add is NOT classified as a float op — the headline fix.
+        assert_ne!(
+            op_to_detector_op(&Operator::I32x4Add),
+            Op::V128Add {
+                lane_ty: ElemType::F32,
+                lanes: 4
+            }
+        );
+        // FAIL CLOSED: widths the emitter cannot lower coherently stay on
+        // the CPU path (Op::Other), never miscompiled to an f32 kernel.
+        for op in [
+            Operator::F64x2Add,
+            Operator::I64x2Add,
+            Operator::I16x8Add,
+            Operator::I8x16Add,
+            Operator::F64x2Mul,
+            Operator::I16x8Mul,
+        ] {
+            assert_eq!(
+                op_to_detector_op(&op),
+                Op::Other,
+                "non-emittable SIMD width must fail closed to Op::Other, got a SIMD op"
+            );
+        }
+    }
+
+    /// jit LOW fix (finding 8): `return_call_indirect` classifies as a call,
+    /// not `Op::Other`.
+    #[test]
+    fn op_to_detector_op_return_call_indirect_is_a_call() {
+        use wasmparser::Operator;
+        assert_eq!(
+            op_to_detector_op(&Operator::ReturnCallIndirect {
+                type_index: 0,
+                table_index: 0,
+            }),
+            Op::Call
+        );
+        // The other call forms still classify as calls too.
+        assert_eq!(
+            op_to_detector_op(&Operator::ReturnCall { function_index: 0 }),
+            Op::Call
+        );
+    }
 
     fn noop_module_swaps_nothing_inner() {
         let wasm = wat::parse_str(NOOP_WAT).unwrap();
