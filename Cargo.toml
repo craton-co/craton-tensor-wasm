@@ -77,7 +77,7 @@ ptx-builder = "0.5"
 # `cuda-12000` selects CUDA 12.0+ headers (matches the toolkit on the S22
 # runner). Currently behind the per-crate `cudarc-backend` feature flag while
 # the cust → cudarc migration spike (see `docs/CUDARC-SPIKE.md`) lands.
-cudarc = { version = "0.13", default-features = false, features = ["driver", "cuda-12000"] }
+cudarc = { version = "0.19", default-features = false, features = ["driver", "cuda-12000"] }
 
 # cuda-oxide — NVIDIA Labs' new Rust-to-CUDA compiler + host runtime
 # (repo: github.com/NVlabs/cuda-oxide), the planned v0.5 cust successor per
