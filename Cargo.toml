@@ -127,7 +127,7 @@ zstd = "0.13"
 
 # Concurrency utilities
 dashmap = "6"
-lru = "0.12"
+lru = "0.18"
 parking_lot = "0.12"
 once_cell = "1"
 crossbeam-channel = "0.5"
