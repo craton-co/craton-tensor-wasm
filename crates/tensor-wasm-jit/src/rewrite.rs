@@ -723,6 +723,20 @@ fn build_trampoline(
         .checked_add(results_layout.total_bytes)
         .ok_or_else(|| RewriteError::Trampoline("scratch size overflow".into()))?;
 
+    // jit LOW fix (finding 9): the trampoline emits `scratch_size`,
+    // `args_layout.total_bytes`, and `results_layout.total_bytes` as
+    // `i32.const` operands via `as i32`. A `u32` value above `i32::MAX`
+    // would wrap to a NEGATIVE i32, so the host alloc/free/dispatch
+    // imports would receive a bogus (negative) size. Validate the total —
+    // which dominates the two halves (`args`/`results` are each ≤
+    // `scratch_size`) — fits in a non-negative i32 and refuse the swap
+    // otherwise so the function stays on the CPU path.
+    if scratch_size > i32::MAX as u32 {
+        return Err(RewriteError::Trampoline(format!(
+            "scratch size {scratch_size} exceeds i32::MAX; trampoline cannot encode it"
+        )));
+    }
+
     // Two i32 locals: scratch_ptr (idx = params.len()) and rc (idx =
     // params.len() + 1) for the dispatch return-code trap below.
     let scratch_local_idx: u32 = params.len() as u32;
@@ -1446,6 +1460,30 @@ mod tests {
         let err = build_trampoline(0, &imports, &[wasmparser::ValType::V128], &[])
             .expect_err("must refuse v128 param");
         assert!(matches!(err, RewriteError::Trampoline(_)));
+    }
+
+    /// jit LOW fix (finding 9): a trampoline whose packed scratch region is
+    /// comfortably within `i32::MAX` builds normally — the new size guard
+    /// must not over-reject legitimate signatures. (The over-`i32::MAX`
+    /// path is not directly reachable through `build_trampoline` because it
+    /// would require a single function signature totalling >2 GiB of packed
+    /// scalar arguments, which exceeds Wasm's parameter-count limits; the
+    /// guard exists as defence-in-depth against the `as i32` truncation of
+    /// `scratch_size` / `total_bytes` at the `i32.const` emission sites.)
+    #[test]
+    fn build_trampoline_within_i32_max_builds() {
+        let imports = DispatchImports {
+            dispatch: 0,
+            alloc: 1,
+            free: 2,
+        };
+        // A wide-but-legal signature: many 8-byte params. Total scratch is
+        // tiny relative to i32::MAX, so the guard passes.
+        let params = vec![wasmparser::ValType::I64; 32];
+        let results = vec![wasmparser::ValType::F64; 8];
+        let f = build_trampoline(0xABCD, &imports, &params, &results)
+            .expect("within-i32::MAX trampoline must build");
+        assert!(f.byte_len() > 0);
     }
 
     #[test]
