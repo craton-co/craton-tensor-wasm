@@ -104,6 +104,14 @@ default = []
 # verification + InMemoryRegistry impl) so the default build is unaffected
 # — operators that don't need the registry endpoints keep the lean dep
 # graph. See `docs/KERNEL-REGISTRY.md` for the rollout plan.
+#
+# CI / feature matrix: the integration tests for these routes
+# (`tests/kernel_registry_routes.rs` and `tests/kernel_registry_authz.rs`)
+# are gated behind `#![cfg(feature = "kernel-registry-api")]`, so they
+# compile to nothing — and run ZERO tests, with no skip signal — on the
+# default build. CI MUST therefore include a feature-enabled job
+# (`cargo test -p tensor-wasm-api --features kernel-registry-api`, or
+# `--all-features`) so this coverage actually executes.
 kernel-registry-api = ["dep:tensor-wasm-jit"]
 
 [dev-dependencies]

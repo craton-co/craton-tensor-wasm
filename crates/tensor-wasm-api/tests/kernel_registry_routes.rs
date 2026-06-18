@@ -17,6 +17,17 @@
 //! 6. `resolve_existing_returns_manifest_and_ptx`
 //! 7. `resolve_missing_returns_404`
 //! 8. `routes_return_503_when_registry_not_configured`
+//!
+//! ## CI / feature matrix
+//!
+//! This whole file is gated behind `#![cfg(feature = "kernel-registry-api")]`,
+//! so on the default build it compiles to nothing and runs zero tests
+//! **without any signal that coverage was skipped**. To exercise it, CI MUST
+//! include a job that runs the crate with the feature enabled, e.g.
+//! `cargo test -p tensor-wasm-api --features kernel-registry-api` (or
+//! `--all-features`). The companion authz coverage lives in
+//! `tests/kernel_registry_authz.rs` under the same gate. See the
+//! `kernel-registry-api` entry in `crates/tensor-wasm-api/Cargo.toml`.
 
 #![cfg(feature = "kernel-registry-api")]
 
