@@ -126,11 +126,7 @@ impl BlockIR {
 
     /// Fraction of the block that is v128 ops (between 0.0 and 1.0).
     pub fn v128_ratio(&self) -> f32 {
-        if self.ops.is_empty() {
-            return 0.0;
-        }
-        let v128 = self.ops.iter().filter(|o| o.is_v128()).count();
-        v128 as f32 / self.ops.len() as f32
+        v128_ratio_of(&self.ops)
     }
 }
 
@@ -163,9 +159,19 @@ impl Default for DetectorConfig {
 
 /// Inspect a [`BlockIR`] and return a [`DetectorVerdict`].
 pub fn classify(block: &BlockIR, cfg: &DetectorConfig) -> DetectorVerdict {
-    let ratio = block.v128_ratio();
-    let trip_ok = block
-        .loop_trip_count
+    classify_ops(&block.ops, block.loop_trip_count, cfg)
+}
+
+/// Classify directly from an op slice + trip count, without requiring an
+/// owned [`BlockIR`].
+///
+/// jit PERF fix (finding 11): the rewriter previously CLONED the whole
+/// `detector_ops` vector just to wrap it in a throwaway [`BlockIR`] for
+/// [`classify`], then moved the original vector into its per-function slot.
+/// Classifying over a borrowed slice removes that per-function clone.
+pub fn classify_ops(ops: &[Op], loop_trip_count: Option<u64>, cfg: &DetectorConfig) -> DetectorVerdict {
+    let ratio = v128_ratio_of(ops);
+    let trip_ok = loop_trip_count
         .map(|n| n >= cfg.min_trip_count)
         .unwrap_or(false);
     if ratio >= cfg.v128_ratio_threshold && trip_ok {
@@ -173,6 +179,16 @@ pub fn classify(block: &BlockIR, cfg: &DetectorConfig) -> DetectorVerdict {
     } else {
         DetectorVerdict::KeepOnCpu
     }
+}
+
+/// Fraction of `ops` that are v128 ops (0.0 for an empty slice). Shared by
+/// [`BlockIR::v128_ratio`] and [`classify_ops`].
+fn v128_ratio_of(ops: &[Op]) -> f32 {
+    if ops.is_empty() {
+        return 0.0;
+    }
+    let v128 = ops.iter().filter(|o| o.is_v128()).count();
+    v128 as f32 / ops.len() as f32
 }
 
 /// Convenience: classify with default config.

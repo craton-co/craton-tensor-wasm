@@ -57,7 +57,7 @@ use tensor_wasm_core::types::TenantId;
 
 use crate::cache::{CacheKey, CachedKernel, CompiledHandle, KernelCache};
 use crate::clif_lower::lower_block;
-use crate::detector::{classify, BlockIR, DetectorConfig, DetectorVerdict, Op};
+use crate::detector::{classify_ops, BlockIR, DetectorConfig, DetectorVerdict, Op};
 use crate::ir::ElemType;
 use crate::ptx_emit::emit;
 
@@ -409,12 +409,11 @@ fn analyse(
                 // misleads the detector into approving cold straight-line
                 // code.
                 let trip_guess = if saw_loop { Some(128) } else { None };
-                let classify_block = BlockIR::new(
-                    format!("func{func_index_in_global_space}"),
-                    detector_ops.clone(),
-                    trip_guess,
-                );
-                let verdict = classify(&classify_block, &opts.detector);
+                // jit PERF fix (finding 11): classify over the borrowed op
+                // slice instead of cloning `detector_ops` into a throwaway
+                // `BlockIR`. The original vector is moved into the
+                // per-function slot below unchanged.
+                let verdict = classify_ops(&detector_ops, trip_guess, &opts.detector);
                 let op_count = detector_ops.len();
                 // Signature check is parse-time pure: it only reads
                 // `types[type_index]`. Captured here so the parallel emit

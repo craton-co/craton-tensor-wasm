@@ -630,6 +630,18 @@ pub struct DiskRegistry {
     /// alongside its `ContentHash` so listings need not re-fetch and
     /// re-decompress each blob — see [`KeymapEntry`].
     keymap: Arc<DashMap<(String, String, u32), KeymapEntry>>,
+    /// Secondary index: `(name, version) → sorted Vec<sm_version>`.
+    ///
+    /// jit PERF fix (finding 11): [`KernelRegistry::get`] resolves
+    /// `(name, version)` to the highest available `sm_version`. The previous
+    /// implementation scanned the ENTIRE keymap with
+    /// `iter().filter(...).max_by_key(...)` — O(N) in the total number of
+    /// registered `(name, version, sm)` triples on every resolve. This
+    /// index lets `get` look up the candidate sm-versions for a single
+    /// `(name, version)` directly and read the max off the (kept-sorted)
+    /// tail, turning the hot lookup into an O(1) map probe plus an O(1)
+    /// `last()`. Kept in lock-step with `keymap` on every insert.
+    sm_index: Arc<DashMap<(String, String), Vec<u32>>>,
     /// Manifest signature key. Held in [`zeroize::Zeroizing`] so the
     /// scrub-on-Drop guarantees from the snapshot signing path apply
     /// here too — the secret does not linger in the heap arena after
@@ -640,6 +652,30 @@ pub struct DiskRegistry {
     /// `None` = permissive (any signed publisher is accepted), `Some`
     /// = strict allowlist.
     publisher_allowlist: Option<HashSet<String>>,
+}
+
+/// Insert `sm` into the `(name, version) → sorted [sm]` secondary index,
+/// keeping the per-key list sorted ascending and de-duplicated.
+///
+/// jit PERF fix (finding 11): the list is kept sorted so
+/// [`KernelRegistry::get`] can read the highest sm-version off the tail in
+/// O(1). Insertion is O(log k + k) in the (tiny) number of sm-versions per
+/// `(name, version)` — negligible next to the artifact-store write it
+/// accompanies, and a one-time cost paid only on publish / restart-recovery,
+/// not on the hot resolve path.
+fn index_sm_version(
+    index: &DashMap<(String, String), Vec<u32>>,
+    name: String,
+    version: String,
+    sm: u32,
+) {
+    let mut entry = index.entry((name, version)).or_default();
+    match entry.binary_search(&sm) {
+        // Already present (publish rejects duplicate triples upstream, but
+        // restart-recovery can re-see one if a blob is double-listed).
+        Ok(_) => {}
+        Err(pos) => entry.insert(pos, sm),
+    }
 }
 
 impl DiskRegistry {
@@ -662,6 +698,7 @@ impl DiskRegistry {
     pub fn open(dir: PathBuf, hmac_key: [u8; 32]) -> Result<Self, RegistryError> {
         let artifact_store = DiskArtifactStore::new(dir, hmac_key);
         let keymap: Arc<DashMap<(String, String, u32), KeymapEntry>> = Arc::new(DashMap::new());
+        let sm_index: Arc<DashMap<(String, String), Vec<u32>>> = Arc::new(DashMap::new());
 
         // Restart-recovery: walk every blob in the store, decode it,
         // re-verify the manifest signature under the same hmac_key,
@@ -727,12 +764,15 @@ impl DiskRegistry {
             // and resolves avoid a redundant decode/verify (see
             // `KeymapEntry`). `manifest` has just passed the v2 HMAC
             // check above.
+            let (name, version, sm) = (k.0.clone(), k.1.clone(), k.2);
             keymap.insert(k, KeymapEntry { hash, manifest });
+            index_sm_version(&sm_index, name, version, sm);
         }
 
         Ok(Self {
             artifact_store,
             keymap,
+            sm_index,
             hmac_key: zeroize::Zeroizing::new(hmac_key),
             publisher_allowlist: None,
         })
@@ -817,6 +857,7 @@ impl DiskRegistry {
             .artifact_store
             .put(&bytes)
             .map_err(|e| RegistryError::Storage(e.to_string()))?;
+        let (name, version, sm) = (key.0.clone(), key.1.clone(), key.2);
         self.keymap.insert(
             key,
             KeymapEntry {
@@ -824,6 +865,10 @@ impl DiskRegistry {
                 manifest: cached_manifest,
             },
         );
+        // jit PERF fix (finding 11): keep the secondary `(name, version) →
+        // [sm]` index in lock-step with the keymap so `get` resolves the
+        // highest sm in O(1) instead of an O(N) keymap scan.
+        index_sm_version(&self.sm_index, name, version, sm);
         Ok(())
     }
 
@@ -894,24 +939,28 @@ impl KernelRegistry for DiskRegistry {
         // `KernelRegistry::get` and call `list_paginated` to discover
         // the matrix.
         //
-        // FINDING (MEDIUM correctness): this previously used `.find(...)`,
-        // which returns the first entry in DashMap bucket-iteration
-        // order. That order is non-deterministic across restarts, so the
-        // same `(name, version)` could resolve to a DIFFERENT sm_version
-        // build between runs — serving a kernel compiled for the wrong
-        // compute capability. `max_by_key` on `kv.key().2` (the
-        // sm_version) makes the choice deterministic and matches the
-        // doc contract ("the highest sm_version").
+        // FINDING (MEDIUM correctness): we resolve to the entry with the
+        // maximum `sm_version` (deterministic across restarts, unlike the
+        // old DashMap-iteration-order `.find(...)`), matching the doc
+        // contract ("the highest sm_version").
         //
-        // We materialise the matching `ContentHash` (a `Copy` value)
-        // rather than holding the DashMap iterator across the
-        // artifact-store get — long-held DashMap entries block writers.
-        let hit: Option<ContentHash> = self
-            .keymap
-            .iter()
-            .filter(|kv| kv.key().0 == name && kv.key().1 == version)
-            .max_by_key(|kv| kv.key().2)
-            .map(|kv| kv.value().hash);
+        // jit PERF fix (finding 11): use the `(name, version) → [sm]`
+        // secondary index instead of an O(N) keymap scan. The index keeps
+        // the sm-version list sorted ascending, so the highest sm is the
+        // last element — an O(1) read after an O(1) map probe. We then look
+        // up the exact `(name, version, sm)` triple in the keymap and copy
+        // out its `ContentHash` (a `Copy` value) rather than holding a
+        // DashMap iterator across the artifact-store get (long-held entries
+        // block writers).
+        let best_sm: Option<u32> = self
+            .sm_index
+            .get(&(name.to_string(), version.to_string()))
+            .and_then(|entry| entry.value().last().copied());
+        let hit: Option<ContentHash> = best_sm.and_then(|sm| {
+            self.keymap
+                .get(&(name.to_string(), version.to_string(), sm))
+                .map(|kv| kv.value().hash)
+        });
         let hash = match hit {
             Some(h) => h,
             None => {
@@ -1038,6 +1087,37 @@ mod tests {
             "get must resolve the highest sm_version"
         );
         assert_eq!(got.1, "// ptx for sm_90\n");
+    }
+
+    /// jit PERF fix (finding 11): the `(name, version) → [sm]` secondary
+    /// index must be rebuilt on restart-recovery (`open`) so a reopened
+    /// registry still resolves the highest sm_version via the index, not
+    /// just a freshly-published one.
+    #[test]
+    fn disk_sm_index_survives_restart() {
+        let key = [0x37u8; 32];
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        {
+            let reg = DiskRegistry::open(tmp.path().to_path_buf(), key).expect("open");
+            for sm in [75u32, 86, 80] {
+                let ptx = format!("// ptx for sm_{sm}\n");
+                let m = signed_manifest_sm("conv.f32", "2.1.0", sm, &ptx, &key);
+                KernelRegistry::publish(&reg, m, ptx).expect("publish");
+            }
+        }
+        // Reopen: the index is rebuilt from the on-disk blobs in `open`.
+        let reopened = DiskRegistry::open(tmp.path().to_path_buf(), key).expect("reopen");
+        let got = KernelRegistry::get(&reopened, "conv.f32", "2.1.0").expect("get after restart");
+        assert_eq!(
+            got.0.sm_version, 86,
+            "reopened registry must still resolve the highest sm_version via the rebuilt index"
+        );
+        assert_eq!(got.1, "// ptx for sm_86\n");
+        // A name/version that was never published still misses.
+        assert!(matches!(
+            KernelRegistry::get(&reopened, "conv.f32", "9.9.9"),
+            Err(RegistryError::NotFound(_))
+        ));
     }
 
     #[test]
