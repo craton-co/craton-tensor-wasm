@@ -65,12 +65,15 @@ const PTR_TY: cranelift_codegen::ir::Type = types::I64;
 /// }
 /// ```
 ///
-/// This is the smallest function shape that exercises both the memory
-/// family (Load + Store) and the float family (AddF) in the same block,
-/// and confirms the driver wires their `LoweredValueId`s together via the
-/// shared value map.
+/// jit fix (findings 4 + 10): with the reject-list now WIRED into
+/// `lower_function`, a function containing ANY float opcode (`fadd` here)
+/// is refused up front — bit-exact PTX rounding equivalence has not been
+/// proven, so floats deopt to the CPU path rather than risk silent
+/// numerical divergence. This test (formerly asserting a successful
+/// `[Load, Load, AddF, Store, Return]` lowering) now pins the rejection:
+/// the float kernel must NOT reach the per-family lowerings.
 #[test]
-fn vector_add_kernel_lowers_to_load_load_addf_store_return() {
+fn float_vector_add_kernel_is_rejected_by_preflight() {
     let mut sig = Signature::new(CallConv::SystemV);
     // (out, a, b) — three pointer-shaped params, no returns.
     sig.params.push(AbiParam::new(PTR_TY));
@@ -117,79 +120,17 @@ fn vector_add_kernel_lowers_to_load_load_addf_store_return() {
     );
     cursor.ins().return_(&[]);
 
-    let lowered = lower_function(&func).expect("vector_add must lower");
-
-    // Signature: 3 I64 params, 0 returns.
-    assert_eq!(
-        lowered.signature.params,
-        vec![LoweredType::I64, LoweredType::I64, LoweredType::I64],
-        "expected 3 pointer-shaped params lowered as I64",
-    );
-    assert!(
-        lowered.signature.returns.is_empty(),
-        "vector_add returns void",
-    );
-
-    // One block, well-formed.
-    assert_eq!(lowered.blocks.len(), 1, "single-block function");
-    assert!(lowered.is_well_formed(), "function must be well-formed");
-    let lblock = &lowered.blocks[0];
-    assert!(lblock.is_well_formed(), "block must end in a terminator");
-    assert_eq!(lblock.id, lowered.entry, "entry id matches the only block");
-
-    // Block params lowered 1:1 with the signature shape.
-    assert_eq!(lblock.params.len(), 3, "three block params");
-    for (_, ty) in &lblock.params {
-        assert_eq!(*ty, LoweredType::I64);
-    }
-
-    // The driver may insert intermediate ops between the headline ones
-    // (e.g. a StackAlloc for stack-slot loads); for plain pointer
-    // load/store it does not. We assert the *ordered subsequence*
-    // `[Load, Load, AddF, Store, Return]` rather than strict equality so
-    // future driver refinements that add diagnostic no-ops don't break
-    // the test, but we also check the total count matches what we
-    // currently emit (5) to catch silent extra-op regressions.
-    assert_eq!(
-        lblock.ops.len(),
-        5,
-        "expected exactly 5 ops; got {:?}",
-        lblock.ops,
-    );
-
-    match &lblock.ops[0] {
-        LoweredOp::Load { ty, .. } => assert_eq!(*ty, LoweredType::F32),
-        other => panic!("op[0] expected Load, got {other:?}"),
-    }
-    match &lblock.ops[1] {
-        LoweredOp::Load { ty, .. } => assert_eq!(*ty, LoweredType::F32),
-        other => panic!("op[1] expected Load, got {other:?}"),
-    }
-    match &lblock.ops[2] {
-        LoweredOp::AddF { ty, lhs, rhs, .. } => {
-            assert_eq!(*ty, LoweredType::F32);
-            // The fadd operands must be the result ids of the two loads
-            // — confirms the driver wired the value map across families.
-            let load0_result = lblock.ops[0].result().expect("load has a result");
-            let load1_result = lblock.ops[1].result().expect("load has a result");
-            assert_eq!(*lhs, load0_result, "fadd lhs == load0 result");
-            assert_eq!(*rhs, load1_result, "fadd rhs == load1 result");
+    // The reject-list preflight refuses the `fadd` before any per-family
+    // lowering runs.
+    let err = lower_function(&func).expect_err("float kernel must be rejected by the preflight");
+    match err {
+        LoweringError::Rejected { reason, .. } => {
+            assert!(
+                reason.contains("FloatOp") || reason.contains("fadd"),
+                "expected a FloatOp rejection, got: {reason}"
+            );
         }
-        other => panic!("op[2] expected AddF, got {other:?}"),
-    }
-    match &lblock.ops[3] {
-        LoweredOp::Store { ty, value, .. } => {
-            assert_eq!(*ty, LoweredType::F32);
-            let fadd_result = lblock.ops[2].result().expect("fadd has a result");
-            assert_eq!(*value, fadd_result, "store value == fadd result");
-        }
-        other => panic!("op[3] expected Store, got {other:?}"),
-    }
-    match &lblock.ops[4] {
-        LoweredOp::Return { values } => {
-            assert!(values.is_empty(), "void return carries no values");
-        }
-        other => panic!("op[4] expected Return, got {other:?}"),
+        other => panic!("expected LoweringError::Rejected, got {other:?}"),
     }
 }
 
@@ -219,12 +160,12 @@ fn scalar_iadd_lowers_via_public_driver_api() {
 
 // ---- 3. fma shape --------------------------------------------------------
 
-/// Drive a `fn(f32, f32, f32) -> f32 { fma; return }` shape through the
-/// driver. Exercises the float family's ternary form (`Opcode::Fma`,
-/// `InstructionData::Ternary`) and confirms the resulting `LoweredOp::Fma`
-/// carries the three operand ids and a result id distinct from the inputs.
+/// jit fix (findings 4 + 10): an `fma` (a float opcode) is now refused by
+/// the wired reject-list preflight. Formerly this test asserted a
+/// successful `Fma + Return` lowering; it now pins the rejection (floats
+/// stay on the CPU path until bit-exact PTX rounding is proven).
 #[test]
-fn scalar_fma_lowers_to_fma_and_return() {
+fn scalar_fma_is_rejected_by_preflight() {
     let mut sig = Signature::new(CallConv::SystemV);
     sig.params.push(AbiParam::new(types::F32));
     sig.params.push(AbiParam::new(types::F32));
@@ -255,45 +196,16 @@ fn scalar_fma_lowers_to_fma_and_return() {
         cursor.ins().return_(&[v_result]);
     }
 
-    let lowered = lower_function(&func).expect("fma must lower");
-
-    assert_eq!(
-        lowered.signature.params,
-        vec![LoweredType::F32, LoweredType::F32, LoweredType::F32],
-    );
-    assert_eq!(lowered.signature.returns, vec![LoweredType::F32]);
-    assert_eq!(lowered.blocks.len(), 1);
-    let block = &lowered.blocks[0];
-    assert_eq!(block.ops.len(), 2, "Fma + Return");
-    match &block.ops[0] {
-        LoweredOp::Fma {
-            ty,
-            a,
-            b,
-            c,
-            result,
-        } => {
-            assert_eq!(*ty, LoweredType::F32);
-            // The three operand ids must be pairwise distinct and the
-            // result must be a fresh id not equal to any of them.
-            assert_ne!(a, b);
-            assert_ne!(b, c);
-            assert_ne!(a, c);
-            assert_ne!(result, a);
-            assert_ne!(result, b);
-            assert_ne!(result, c);
+    let err = lower_function(&func).expect_err("fma kernel must be rejected by the preflight");
+    match err {
+        LoweringError::Rejected { reason, .. } => {
+            assert!(
+                reason.contains("FloatOp") || reason.contains("fma"),
+                "expected a FloatOp rejection, got: {reason}"
+            );
         }
-        other => panic!("expected LoweredOp::Fma, got {other:?}"),
+        other => panic!("expected LoweringError::Rejected, got {other:?}"),
     }
-    match &block.ops[1] {
-        LoweredOp::Return { values } => {
-            // Return value must be the fma result.
-            let fma_result = block.ops[0].result().expect("fma has a result");
-            assert_eq!(values, &vec![fma_result]);
-        }
-        other => panic!("expected Return, got {other:?}"),
-    }
-    assert!(lowered.is_well_formed());
 }
 
 // ---- 4. Multi-block: brif diamond ----------------------------------------

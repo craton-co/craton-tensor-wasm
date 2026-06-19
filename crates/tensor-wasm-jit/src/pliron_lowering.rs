@@ -167,6 +167,44 @@ pub struct CondBrOp;
 #[pliron_op(name = "twasm.return", format, verifier = "succ")]
 pub struct ReturnOp;
 
+// jit fix (finding 10): additional LLVM-free `twasm.*` ops. These cover
+// integer/structural `LoweredOp` variants whose lowering needs only pliron
+// op definitions (no system LLVM / `pliron-llvm-backend`), so they are
+// wired here rather than left as `NotYetWired`. The float and vector
+// variants stay unwired (the former are reject-listed upstream; the latter
+// need a `twasm.vector` type pliron 0.15 does not ship — see the module
+// docs and the `NotYetWired` arms below).
+
+/// Conditional select (`twasm.select`). Maps from [`LoweredOp::Select`].
+/// Operands `[cond, then_v, else_v]`, one result.
+#[pliron_op(name = "twasm.select", format, verifier = "succ")]
+pub struct SelectOp;
+
+/// Bit reinterpretation (`twasm.bitcast`). Maps from [`LoweredOp::Bitcast`].
+/// One operand, one result of the destination type.
+#[pliron_op(name = "twasm.bitcast", format, verifier = "succ")]
+pub struct BitcastOp;
+
+/// Integer truncation (`twasm.trunci`). Maps from [`LoweredOp::TruncI`].
+#[pliron_op(name = "twasm.trunci", format, verifier = "succ")]
+pub struct TruncIOp;
+
+/// Zero-extending integer widening (`twasm.extui`). Maps from
+/// [`LoweredOp::ExtendU`].
+#[pliron_op(name = "twasm.extui", format, verifier = "succ")]
+pub struct ExtendUOp;
+
+/// Sign-extending integer widening (`twasm.extsi`). Maps from
+/// [`LoweredOp::ExtendS`].
+#[pliron_op(name = "twasm.extsi", format, verifier = "succ")]
+pub struct ExtendSOp;
+
+/// Stack allocation (`twasm.alloca`). Maps from [`LoweredOp::StackAlloc`].
+/// Zero operands, one pointer-typed result. The element type and byte size
+/// are recorded as attributes (see [`set_stack_alloc_attrs`]).
+#[pliron_op(name = "twasm.alloca", format, verifier = "succ")]
+pub struct AllocaOp;
+
 // ---------------------------------------------------------------------------
 // Error type.
 // ---------------------------------------------------------------------------
@@ -242,6 +280,36 @@ fn translate_type(
         LoweredType::V128 { .. } => Err(PlironConversionError::NotYetWired {
             variant: "LoweredType::V128",
         }),
+    }
+}
+
+/// Attribute key under which the byte offset of a `twasm.load` /
+/// `twasm.store` is recorded.
+const TWASM_OFFSET_ATTR: &str = "twasm.byte_offset";
+
+/// Record a load/store byte offset on the `twasm.load` / `twasm.store`
+/// operation `op`.
+///
+/// jit fix (finding 10): the wave-1 `LoweredOp::Load` / `Store` byte offset
+/// was previously DROPPED (the `offset: _` match), so a non-zero offset
+/// produced a load/store against the wrong address — a silent miscompile.
+/// We now persist the offset on the op as a `builtin.string` attribute
+/// (the `twasm.*` ops carry no dedicated offset operand/attr schema yet, so
+/// a string attribute is the schema-free way to thread it through to the
+/// downstream `twasm.* → llvm.*` rewrite, where it folds into an LLVM GEP).
+///
+/// A zero offset is recorded too so the attribute is always present and the
+/// downstream rewrite can read it unconditionally. The offset is stored as
+/// its decimal text; the downstream consumer parses it back with
+/// `str::parse::<i32>()`.
+fn set_load_store_offset(ctx: &mut Context, op: Ptr<Operation>, offset: i32) {
+    // `Identifier::try_new` only fails on a malformed identifier; the
+    // constant key here is a valid identifier, so the `Ok` path always
+    // taken. We fall back to skipping the annotation (rather than
+    // panicking) on the impossible error path.
+    if let Ok(key) = pliron::identifier::Identifier::try_new(TWASM_OFFSET_ATTR.to_string()) {
+        let attr = pliron::builtin::attributes::StringAttr::new(offset.to_string());
+        op.deref_mut(ctx).attributes.set(key, attr);
     }
 }
 
@@ -466,12 +534,20 @@ fn emit_op(
         LoweredOp::Load {
             ty,
             base,
-            offset: _,
+            offset,
             result,
         } => {
-            // `offset` is not yet encoded on the pliron op — until we add
-            // a `twasm.load` attribute schema the offset is implicit zero.
-            // Future agents wire it as an IntegerAttr (W3.3 TODO).
+            // jit fix (finding 10): the byte offset is now HANDLED rather
+            // than silently dropped. Previously `offset: _` discarded a
+            // non-zero offset and emitted a load from `base+0` — a silent
+            // miscompile reading the wrong address. The `twasm.load` op
+            // carries no offset attribute schema yet, so the offset is
+            // recorded on the op via [`set_load_store_offset`] when it is
+            // non-zero, and the zero case (what the wave-1 pointer-load
+            // driver produces) emits exactly as before. The non-zero path
+            // is preserved on the op for the downstream `twasm.* → llvm.*`
+            // rewrite (which will fold it into an LLVM GEP); it is NOT
+            // dropped.
             let base_v = state.get_value(*base)?;
             let result_ty = translate_type(ctx, ty)?;
             let pop = Operation::new(
@@ -482,6 +558,7 @@ fn emit_op(
                 vec![],
                 0,
             );
+            set_load_store_offset(ctx, pop, *offset);
             pop.insert_at_back(bb, ctx);
             let v = pop.deref(ctx).get_result(0);
             state.map_value(*result, v);
@@ -491,8 +568,10 @@ fn emit_op(
             ty: _,
             value,
             base,
-            offset: _,
+            offset,
         } => {
+            // jit fix (finding 10): record the store offset on the op
+            // (same rationale as Load above) rather than dropping it.
             let v = state.get_value(*value)?;
             let base_v = state.get_value(*base)?;
             let pop = Operation::new(
@@ -503,6 +582,7 @@ fn emit_op(
                 vec![],
                 0,
             );
+            set_load_store_offset(ctx, pop, *offset);
             pop.insert_at_back(bb, ctx);
             Ok(())
         }
@@ -581,9 +661,90 @@ fn emit_op(
         LoweredOp::Fma { .. } => Err(PlironConversionError::NotYetWired { variant: "Fma" }),
         LoweredOp::FNeg { .. } => Err(PlironConversionError::NotYetWired { variant: "FNeg" }),
         LoweredOp::FAbs { .. } => Err(PlironConversionError::NotYetWired { variant: "FAbs" }),
-        LoweredOp::StackAlloc { .. } => Err(PlironConversionError::NotYetWired {
-            variant: "StackAlloc",
-        }),
+        // ---- LLVM-free ops wired in jit finding 10 ---------------------
+        LoweredOp::StackAlloc { ty, bytes, result } => {
+            // Zero operands → one pointer-typed result. The element type +
+            // byte size ride as attributes (the result type is the pointer
+            // width per `translate_type(Ptr)`).
+            let ptr_ty = translate_type(ctx, &LoweredType::Ptr)?;
+            let pop = Operation::new(
+                ctx,
+                <AllocaOp as Op>::get_concrete_op_info(),
+                vec![ptr_ty],
+                vec![],
+                vec![],
+                0,
+            );
+            set_stack_alloc_attrs(ctx, pop, ty, *bytes);
+            pop.insert_at_back(bb, ctx);
+            let v = pop.deref(ctx).get_result(0);
+            state.map_value(*result, v);
+            Ok(())
+        }
+        LoweredOp::Select {
+            ty,
+            cond,
+            then_v,
+            else_v,
+            result,
+        } => {
+            let cond_v = state.get_value(*cond)?;
+            let then_val = state.get_value(*then_v)?;
+            let else_val = state.get_value(*else_v)?;
+            let result_ty = translate_type(ctx, ty)?;
+            let pop = Operation::new(
+                ctx,
+                <SelectOp as Op>::get_concrete_op_info(),
+                vec![result_ty],
+                vec![cond_v, then_val, else_val],
+                vec![],
+                0,
+            );
+            pop.insert_at_back(bb, ctx);
+            let v = pop.deref(ctx).get_result(0);
+            state.map_value(*result, v);
+            Ok(())
+        }
+        LoweredOp::Bitcast {
+            to_ty, src, result, ..
+        } => emit_unary_cast::<BitcastOp>(ctx, state, bb, to_ty, *src, *result),
+        LoweredOp::TruncI {
+            to_ty, src, result, ..
+        } => emit_unary_cast::<TruncIOp>(ctx, state, bb, to_ty, *src, *result),
+        LoweredOp::ExtendU {
+            to_ty, src, result, ..
+        } => emit_unary_cast::<ExtendUOp>(ctx, state, bb, to_ty, *src, *result),
+        LoweredOp::ExtendS {
+            to_ty, src, result, ..
+        } => emit_unary_cast::<ExtendSOp>(ctx, state, bb, to_ty, *src, *result),
+
+        // ---- Still NotYetWired -----------------------------------------
+        //
+        // These remain unwired and DOCUMENTED as such:
+        //
+        // * `DivS`/`DivU`/`RemS`/`RemU` — integer div/rem trap on
+        //   divide-by-zero in Wasm; the reject-list refuses them upstream
+        //   (jit finding 4), so they cannot reach a real lowering until the
+        //   trap is emulated. Left unwired deliberately.
+        // * `DivF`/`Fma`/`FNeg`/`FAbs` — all float; reject-listed upstream
+        //   (jit finding 4) until bit-exact PTX rounding is proven.
+        // * `Switch` — needs an LLVM `switch` terminator with a case table;
+        //   the `twasm.*` dialect has no switch-with-cases op yet and the
+        //   real lowering is the LLVM-backed path (gated, needs LLVM 221).
+        // * `VMin`/`VMax`/`VSplat`/`VSelect`/`VAllTrue`/`VAnyTrue` — all
+        //   require a `twasm.vector<N x T>` type that pliron 0.15's builtin
+        //   dialect does not ship (see `translate_type`'s `V128` arm). A
+        //   future agent adds the type via `pliron_type`, then these wire
+        //   like the scalar ops above. NOT an LLVM dependency, but a
+        //   dialect-type prerequisite this change deliberately scopes out.
+        LoweredOp::DivS { .. } => Err(PlironConversionError::NotYetWired { variant: "DivS" }),
+        LoweredOp::DivU { .. } => Err(PlironConversionError::NotYetWired { variant: "DivU" }),
+        LoweredOp::RemS { .. } => Err(PlironConversionError::NotYetWired { variant: "RemS" }),
+        LoweredOp::RemU { .. } => Err(PlironConversionError::NotYetWired { variant: "RemU" }),
+        LoweredOp::DivF { .. } => Err(PlironConversionError::NotYetWired { variant: "DivF" }),
+        LoweredOp::Fma { .. } => Err(PlironConversionError::NotYetWired { variant: "Fma" }),
+        LoweredOp::FNeg { .. } => Err(PlironConversionError::NotYetWired { variant: "FNeg" }),
+        LoweredOp::FAbs { .. } => Err(PlironConversionError::NotYetWired { variant: "FAbs" }),
         LoweredOp::Switch { .. } => Err(PlironConversionError::NotYetWired { variant: "Switch" }),
         LoweredOp::VMin { .. } => Err(PlironConversionError::NotYetWired { variant: "VMin" }),
         LoweredOp::VMax { .. } => Err(PlironConversionError::NotYetWired { variant: "VMax" }),
@@ -595,11 +756,48 @@ fn emit_op(
         LoweredOp::VAnyTrue { .. } => Err(PlironConversionError::NotYetWired {
             variant: "VAnyTrue",
         }),
-        LoweredOp::Select { .. } => Err(PlironConversionError::NotYetWired { variant: "Select" }),
-        LoweredOp::Bitcast { .. } => Err(PlironConversionError::NotYetWired { variant: "Bitcast" }),
-        LoweredOp::TruncI { .. } => Err(PlironConversionError::NotYetWired { variant: "TruncI" }),
-        LoweredOp::ExtendU { .. } => Err(PlironConversionError::NotYetWired { variant: "ExtendU" }),
-        LoweredOp::ExtendS { .. } => Err(PlironConversionError::NotYetWired { variant: "ExtendS" }),
+    }
+}
+
+/// Helper: emit a one-operand, one-result cast op of concrete pliron-Op
+/// type `O` whose result type is `to_ty`. Shared by Bitcast / TruncI /
+/// ExtendU / ExtendS (jit finding 10) — all single-source conversions.
+fn emit_unary_cast<O: Op>(
+    ctx: &mut Context,
+    state: &mut ConversionState,
+    bb: Ptr<BasicBlock>,
+    to_ty: &LoweredType,
+    src: LoweredValueId,
+    result: LoweredValueId,
+) -> Result<(), PlironConversionError> {
+    let src_v = state.get_value(src)?;
+    let result_ty = translate_type(ctx, to_ty)?;
+    let pop = Operation::new(
+        ctx,
+        <O as Op>::get_concrete_op_info(),
+        vec![result_ty],
+        vec![src_v],
+        vec![],
+        0,
+    );
+    pop.insert_at_back(bb, ctx);
+    let v = pop.deref(ctx).get_result(0);
+    state.map_value(result, v);
+    Ok(())
+}
+
+/// Record the element type + byte size of a `twasm.alloca` as string
+/// attributes (jit finding 10). The `twasm.alloca` op carries no dedicated
+/// schema for these yet, so — like the load/store offset — they ride as
+/// `builtin.string` attributes for the downstream rewrite to consume.
+fn set_stack_alloc_attrs(ctx: &mut Context, op: Ptr<Operation>, ty: &LoweredType, bytes: u32) {
+    if let Ok(key) = pliron::identifier::Identifier::try_new("twasm.alloca_bytes".to_string()) {
+        let attr = pliron::builtin::attributes::StringAttr::new(bytes.to_string());
+        op.deref_mut(ctx).attributes.set(key, attr);
+    }
+    if let Ok(key) = pliron::identifier::Identifier::try_new("twasm.alloca_elem".to_string()) {
+        let attr = pliron::builtin::attributes::StringAttr::new(format!("{ty}"));
+        op.deref_mut(ctx).attributes.set(key, attr);
     }
 }
 
@@ -750,6 +948,127 @@ mod tests {
         assert_eq!(entry_ops.len(), 2);
         let first_id = Operation::get_opid(entry_ops[0], &ctx);
         assert_eq!(first_id.to_string(), "twasm.addf");
+    }
+
+    /// jit fix (finding 10): a `Load` with a non-zero byte offset must
+    /// convert to a `twasm.load` op that CARRIES the offset attribute
+    /// (previously the offset was silently dropped, reading the wrong
+    /// address).
+    #[test]
+    fn load_offset_is_recorded_not_dropped() {
+        let mut ctx = Context::new();
+        // fn(ptr) -> i32 { v = load.i32 base + 16; return v }
+        let mut f = LoweredFunction::new(
+            "load_off",
+            LoweredSignature {
+                params: vec![LoweredType::Ptr],
+                returns: vec![LoweredType::I32],
+            },
+        );
+        let mut b0 = LoweredBlock::new(0);
+        b0.params = vec![(1, LoweredType::Ptr)];
+        b0.ops.push(LoweredOp::Load {
+            ty: LoweredType::I32,
+            base: 1,
+            offset: 16,
+            result: 2,
+        });
+        b0.ops.push(LoweredOp::Return { values: vec![2] });
+        f.blocks.push(b0);
+        f.entry = 0;
+
+        let op = lowered_function_to_pliron(&mut ctx, &f).expect("load+return must convert");
+        let region = op.deref(&ctx).get_region(0);
+        let entry = region.deref(&ctx).get_head().expect("entry block");
+        let entry_ops: Vec<_> = entry.deref(&ctx).iter(&ctx).collect();
+        let load_op = entry_ops[0];
+        assert_eq!(Operation::get_opid(load_op, &ctx).to_string(), "twasm.load");
+
+        // The byte offset must be recorded on the op (not dropped).
+        let key = pliron::identifier::Identifier::try_new(TWASM_OFFSET_ATTR.to_string()).unwrap();
+        let recorded = load_op
+            .deref(&ctx)
+            .attributes
+            .get::<pliron::builtin::attributes::StringAttr>(&key)
+            .map(|a| String::from(a.clone()));
+        assert_eq!(
+            recorded.as_deref(),
+            Some("16"),
+            "load offset 16 must be recorded on the twasm.load op, got {recorded:?}"
+        );
+    }
+
+    /// jit fix (finding 10): `Select` is now wired (was `NotYetWired`).
+    #[test]
+    fn select_is_wired() {
+        let mut ctx = Context::new();
+        // fn(i32 cond, i32 a, i32 b) -> i32 { select cond,a,b; return }
+        let mut f = LoweredFunction::new(
+            "sel",
+            LoweredSignature {
+                params: vec![LoweredType::Bool, LoweredType::I32, LoweredType::I32],
+                returns: vec![LoweredType::I32],
+            },
+        );
+        let mut b0 = LoweredBlock::new(0);
+        b0.params = vec![
+            (1, LoweredType::Bool),
+            (2, LoweredType::I32),
+            (3, LoweredType::I32),
+        ];
+        b0.ops.push(LoweredOp::Select {
+            ty: LoweredType::I32,
+            cond: 1,
+            then_v: 2,
+            else_v: 3,
+            result: 4,
+        });
+        b0.ops.push(LoweredOp::Return { values: vec![4] });
+        f.blocks.push(b0);
+        f.entry = 0;
+
+        let op = lowered_function_to_pliron(&mut ctx, &f).expect("select must convert");
+        let region = op.deref(&ctx).get_region(0);
+        let entry = region.deref(&ctx).get_head().expect("entry block");
+        let entry_ops: Vec<_> = entry.deref(&ctx).iter(&ctx).collect();
+        assert_eq!(
+            Operation::get_opid(entry_ops[0], &ctx).to_string(),
+            "twasm.select"
+        );
+    }
+
+    /// jit fix (finding 10): the integer cast ops (`ExtendU` here) are
+    /// wired (were `NotYetWired`).
+    #[test]
+    fn integer_extend_is_wired() {
+        let mut ctx = Context::new();
+        let mut f = LoweredFunction::new(
+            "ext",
+            LoweredSignature {
+                params: vec![LoweredType::I32],
+                returns: vec![LoweredType::I64],
+            },
+        );
+        let mut b0 = LoweredBlock::new(0);
+        b0.params = vec![(1, LoweredType::I32)];
+        b0.ops.push(LoweredOp::ExtendU {
+            from_ty: LoweredType::I32,
+            to_ty: LoweredType::I64,
+            src: 1,
+            result: 2,
+        });
+        b0.ops.push(LoweredOp::Return { values: vec![2] });
+        f.blocks.push(b0);
+        f.entry = 0;
+
+        let op = lowered_function_to_pliron(&mut ctx, &f).expect("extend must convert");
+        let region = op.deref(&ctx).get_region(0);
+        let entry = region.deref(&ctx).get_head().expect("entry block");
+        let entry_ops: Vec<_> = entry.deref(&ctx).iter(&ctx).collect();
+        assert_eq!(
+            Operation::get_opid(entry_ops[0], &ctx).to_string(),
+            "twasm.extui"
+        );
     }
 
     #[test]

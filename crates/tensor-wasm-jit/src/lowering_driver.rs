@@ -99,24 +99,24 @@ pub fn lower_function(func: &cl::Function) -> Result<LoweredFunction, LoweringEr
             },
         })?;
 
-    // ---- 2. Reject-list integration (W2.1 placeholder) ---------------
+    // ---- 2. Reject-list preflight ------------------------------------
     //
-    // The task brief calls for `crate::reject_list::check_function(func)`.
-    // The `reject_list` module is still a wave-2 placeholder (W2.1 has not
-    // landed yet); when it lands, uncomment the block below. Skipping the
-    // call here is safe: the wave-1 per-family lowerings already return
-    // `None` for opcodes they don't recognise, which the driver maps to
-    // `UnsupportedOpcode`. The reject-list is a *cheaper* upfront check,
-    // not a soundness one.
-    //
-    // ```ignore
-    // if let Some(rejection) = crate::reject_list::check_function(func) {
-    //     return Err(LoweringError::Rejected {
-    //         reason: format!("{:?}", rejection.reason),
-    //         location: InstLocation::new(rejection.block, 0),
-    //     });
-    // }
-    // ```
+    // jit fix (finding 10): the reject-list is now WIRED into every
+    // `lower_function` entry path, not a commented-out placeholder. This
+    // guarantees no function reaches the per-family lowerings (and the PTX
+    // emit / GPU launch behind them) without first passing the reject-list:
+    // floats, integer div/rem, loop back-edges, trap/unreachable, atomics,
+    // and host calls are refused up front (see `crate::reject_list`). The
+    // per-family lowerings remain a second line of defence (they return
+    // `None` for opcodes they don't recognise), but the reject-list is the
+    // single chokepoint that closes the "an entry path bypasses the
+    // soundness gate" hole.
+    if let Some(rejection) = crate::reject_list::check_function(func) {
+        return Err(LoweringError::Rejected {
+            reason: format!("{:?}", rejection.reason),
+            location: InstLocation::new(rejection.block, 0),
+        });
+    }
 
     // ---- 3. Pre-allocate block ids in layout order -------------------
     let mut builder = LoweringBuilder::new();
