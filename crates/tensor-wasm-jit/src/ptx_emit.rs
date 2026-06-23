@@ -117,14 +117,6 @@ impl RegClass {
     }
 }
 
-/// A register on the abstract value stack, tagged with its class so the
-/// integer and float paths never alias one another's index space.
-#[derive(Debug, Clone, Copy)]
-struct StackReg {
-    index: u32,
-    class: RegClass,
-}
-
 /// PTX `add` mnemonic for an element type.
 ///
 /// Integer add is sign-agnostic in two's complement, so `add.s32` is
@@ -380,9 +372,11 @@ fn lower_body(
     // Pre-size the value stack to `ops.len()` — each lowered op pushes at
     // most one register, and most pop more than they push, so this is a
     // safe upper bound that avoids grow-by-doubling reallocs on the hot
-    // emit path. Each entry carries the register's class so the integer
-    // path (`%r`) and float path (`%f`) never alias.
-    let mut value_stack: Vec<StackReg> = Vec::with_capacity(blueprint.ops.len());
+    // emit path. The stack holds register *indices*; the register class is
+    // implicit per block — `clif_lower::infer_block_shape` guarantees a
+    // block is element-type-homogeneous, so every stacked register belongs
+    // to that block's single class (`%f` for float, `%r` for integer).
+    let mut value_stack: Vec<u32> = Vec::with_capacity(blueprint.ops.len());
     let mut next_f = 0u32;
     // Integer compute register counter. Starts at 1: `%r0` is reserved for
     // the element count `n` loaded in the prologue. The high-water mark
@@ -423,13 +417,13 @@ fn lower_body(
     // in `class` if the stack underflows (an op consuming more than the
     // abstract stack holds). Threads the fallible allocator through the
     // underflow path.
-    let pop_or_alloc = |value_stack: &mut Vec<StackReg>,
+    let pop_or_alloc = |value_stack: &mut Vec<u32>,
                         class: RegClass,
                         next_f: &mut u32,
                         next_r: &mut u32|
      -> Result<u32, EmitError> {
         match value_stack.pop() {
-            Some(sr) => Ok(sr.index),
+            Some(idx) => Ok(idx),
             None => alloc(class, next_f, next_r),
         }
     };
@@ -446,7 +440,7 @@ fn lower_body(
                     let a = pop_or_alloc(&mut value_stack, class, &mut next_f, &mut next_r)?;
                     let dst = alloc(class, &mut next_f, &mut next_r)?;
                     let _ = writeln!(body, "    {mnemonic} %{p}{dst}, %{p}{a}, %{p}{b};");
-                    value_stack.push(StackReg { index: dst, class });
+                    value_stack.push(dst);
                 }
             }
             TensorWasmOp::VecMul { elem, lanes } => {
@@ -459,7 +453,7 @@ fn lower_body(
                     let a = pop_or_alloc(&mut value_stack, class, &mut next_f, &mut next_r)?;
                     let dst = alloc(class, &mut next_f, &mut next_r)?;
                     let _ = writeln!(body, "    {mnemonic} %{p}{dst}, %{p}{a}, %{p}{b};");
-                    value_stack.push(StackReg { index: dst, class });
+                    value_stack.push(dst);
                 }
             }
             TensorWasmOp::VecFma { elem, lanes } => {
@@ -483,7 +477,7 @@ fn lower_body(
                     let dst = alloc(class, &mut next_f, &mut next_r)?;
                     let _ =
                         writeln!(body, "    {mnemonic} %{p}{dst}, %{p}{a}, %{p}{b}, %{p}{c};");
-                    value_stack.push(StackReg { index: dst, class });
+                    value_stack.push(dst);
                 }
             }
             TensorWasmOp::MatMul { m, n, k } => {
@@ -539,7 +533,7 @@ fn lower_body(
                     in_off = in_off
                         .checked_add(width)
                         .ok_or(EmitError::TooManyRegisters)?;
-                    value_stack.push(StackReg { index: dst, class });
+                    value_stack.push(dst);
                 }
             }
             TensorWasmOp::StoreUnified { elem, lanes } => {
@@ -1079,7 +1073,10 @@ mod tests {
 
     #[test]
     fn fma_emits_fma_rn() {
-        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecFma { elem: ElemType::F32, lanes: 4 });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecFma {
+            elem: ElemType::F32,
+            lanes: 4,
+        });
         let out = emit(&bp).expect("emit");
         assert!(out.text.contains("fma.rn.f32"));
     }
@@ -1108,7 +1105,10 @@ mod tests {
     /// add produces `%f0..%fN` with strictly increasing destinations.
     #[test]
     fn register_allocator_assigns_fresh_destination_per_op() {
-        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 8 });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd {
+            elem: ElemType::F32,
+            lanes: 8,
+        });
         let out = emit(&bp).expect("emit");
         // After lowering, we expect at least registers %f0 through %f7 to
         // appear as add destinations. The exact regex match would couple
@@ -1136,7 +1136,10 @@ mod tests {
         // 16 lanes of add will need at least 16 fresh registers (plus the
         // operand registers materialised on stack-underflow). The header
         // `.reg .f32 %f<N>` must declare at least N regs.
-        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 16 });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd {
+            elem: ElemType::F32,
+            lanes: 16,
+        });
         let out = emit(&bp).expect("emit");
         // Find the .reg .f32 declaration and parse out the count.
         let count_line = out
@@ -1167,7 +1170,10 @@ mod tests {
 
     #[test]
     fn loads_advance_input_offset() {
-        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 3 });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::LoadUnified {
+            elem: ElemType::F32,
+            lanes: 3,
+        });
         let out = emit(&bp).expect("emit");
         // First lane at [%rd0], next at [%rd0+4], next at [%rd0+8].
         assert!(out.text.contains("[%rd0];"), "first load uses no offset");
@@ -1220,8 +1226,10 @@ mod tests {
     /// what is over budget.
     #[test]
     fn lanes_at_max_still_emits() {
-        let bp =
-            TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: MAX_LANES });
+        let bp = TensorWasmKernelBlueprint::new("k").push(TensorWasmOp::VecAdd {
+            elem: ElemType::F32,
+            lanes: MAX_LANES,
+        });
         assert!(emit(&bp).is_ok());
     }
 

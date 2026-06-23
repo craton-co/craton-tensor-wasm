@@ -169,7 +169,11 @@ pub fn classify(block: &BlockIR, cfg: &DetectorConfig) -> DetectorVerdict {
 /// `detector_ops` vector just to wrap it in a throwaway [`BlockIR`] for
 /// [`classify`], then moved the original vector into its per-function slot.
 /// Classifying over a borrowed slice removes that per-function clone.
-pub fn classify_ops(ops: &[Op], loop_trip_count: Option<u64>, cfg: &DetectorConfig) -> DetectorVerdict {
+pub fn classify_ops(
+    ops: &[Op],
+    loop_trip_count: Option<u64>,
+    cfg: &DetectorConfig,
+) -> DetectorVerdict {
     let ratio = v128_ratio_of(ops);
     let trip_ok = loop_trip_count
         .map(|n| n >= cfg.min_trip_count)
