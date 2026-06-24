@@ -1091,8 +1091,10 @@ mod tests {
         // runnable by the reference interpreter, so the oracle
         // returns the v0.3.6 "no-cuda" skip — exactly what the
         // scaffold tests check via `reason.contains("no-cuda")`.
-        let bp = TensorWasmKernelBlueprint::new("oracle_fixture")
-            .push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 });
+        let bp = TensorWasmKernelBlueprint::new("oracle_fixture").push(TensorWasmOp::VecAdd {
+            elem: ElemType::F32,
+            lanes: 4,
+        });
         let verdict = DifferentialOracle::new().compare(&bp, &[]);
         match verdict {
             OracleVerdict::Skipped(reason) => {

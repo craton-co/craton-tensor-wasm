@@ -331,9 +331,18 @@ mod tests {
         assert_eq!(
             bp.ops,
             vec![
-                TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 },
-                TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 },
-                TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 },
+                TensorWasmOp::LoadUnified {
+                    elem: ElemType::F32,
+                    lanes: 4
+                },
+                TensorWasmOp::VecAdd {
+                    elem: ElemType::F32,
+                    lanes: 4
+                },
+                TensorWasmOp::StoreUnified {
+                    elem: ElemType::F32,
+                    lanes: 4
+                },
             ]
         );
         assert_eq!(bp.shared_mem_bytes, 0);
@@ -352,7 +361,13 @@ mod tests {
             },
         );
         let bp = lowered_function_to_blueprint(&func).expect("should produce blueprint");
-        assert!(matches!(bp.ops[1], TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 }));
+        assert!(matches!(
+            bp.ops[1],
+            TensorWasmOp::VecAdd {
+                elem: ElemType::F32,
+                lanes: 4
+            }
+        ));
     }
 
     #[test]
@@ -368,7 +383,13 @@ mod tests {
         );
         let bp = lowered_function_to_blueprint(&func).expect("should produce blueprint");
         assert_eq!(bp.entry, "vector_mul");
-        assert!(matches!(bp.ops[1], TensorWasmOp::VecMul { elem: ElemType::F32, lanes: 4 }));
+        assert!(matches!(
+            bp.ops[1],
+            TensorWasmOp::VecMul {
+                elem: ElemType::F32,
+                lanes: 4
+            }
+        ));
     }
 
     #[test]
@@ -383,7 +404,13 @@ mod tests {
             },
         );
         let bp = lowered_function_to_blueprint(&func).expect("should produce blueprint");
-        assert!(matches!(bp.ops[1], TensorWasmOp::VecMul { elem: ElemType::F32, lanes: 4 }));
+        assert!(matches!(
+            bp.ops[1],
+            TensorWasmOp::VecMul {
+                elem: ElemType::F32,
+                lanes: 4
+            }
+        ));
     }
 
     #[test]
@@ -400,7 +427,13 @@ mod tests {
         );
         let bp = lowered_function_to_blueprint(&func).expect("should produce blueprint");
         assert_eq!(bp.entry, "vector_fma");
-        assert!(matches!(bp.ops[1], TensorWasmOp::VecFma { elem: ElemType::F32, lanes: 4 }));
+        assert!(matches!(
+            bp.ops[1],
+            TensorWasmOp::VecFma {
+                elem: ElemType::F32,
+                lanes: 4
+            }
+        ));
     }
 
     #[test]

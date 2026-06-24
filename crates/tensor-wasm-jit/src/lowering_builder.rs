@@ -548,7 +548,11 @@ mod tests {
 
         // Mutations are visible on the builder (proving no clone was made).
         assert_eq!(bld.lookup_stack_slot(ss(0)), Some(0));
-        assert_eq!(bld.alloc_value(), 1, "counter advanced through split borrow");
+        assert_eq!(
+            bld.alloc_value(),
+            1,
+            "counter advanced through split borrow"
+        );
     }
 
     #[test]

@@ -475,8 +475,7 @@ fn lower_body(
                     let b = pop_or_alloc(&mut value_stack, class, &mut next_f, &mut next_r)?;
                     let a = pop_or_alloc(&mut value_stack, class, &mut next_f, &mut next_r)?;
                     let dst = alloc(class, &mut next_f, &mut next_r)?;
-                    let _ =
-                        writeln!(body, "    {mnemonic} %{p}{dst}, %{p}{a}, %{p}{b}, %{p}{c};");
+                    let _ = writeln!(body, "    {mnemonic} %{p}{dst}, %{p}{a}, %{p}{b}, %{p}{c};");
                     value_stack.push(dst);
                 }
             }
@@ -550,8 +549,10 @@ fn lower_body(
                     if out_off == 0 {
                         let _ = writeln!(body, "    st.global.cs.{ld_ty} [%rd1], %{p}{src};");
                     } else {
-                        let _ =
-                            writeln!(body, "    st.global.cs.{ld_ty} [%rd1+{out_off}], %{p}{src};");
+                        let _ = writeln!(
+                            body,
+                            "    st.global.cs.{ld_ty} [%rd1+{out_off}], %{p}{src};"
+                        );
                     }
                     out_off = out_off
                         .checked_add(width)
@@ -836,10 +837,22 @@ mod tests {
     #[test]
     fn vector_add_emits_add_f32() {
         let bp = TensorWasmKernelBlueprint::new("vector_add")
-            .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 })
-            .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 })
-            .push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 })
-            .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 });
+            .push(TensorWasmOp::LoadUnified {
+                elem: ElemType::F32,
+                lanes: 4,
+            })
+            .push(TensorWasmOp::LoadUnified {
+                elem: ElemType::F32,
+                lanes: 4,
+            })
+            .push(TensorWasmOp::VecAdd {
+                elem: ElemType::F32,
+                lanes: 4,
+            })
+            .push(TensorWasmOp::StoreUnified {
+                elem: ElemType::F32,
+                lanes: 4,
+            });
         let out = emit(&bp).expect("emit");
         assert!(out.text.contains(".target sm_80"));
         assert!(out.text.contains(".visible .entry vector_add"));
@@ -919,10 +932,7 @@ mod tests {
             elem: ElemType::F64,
             lanes: 2,
         });
-        assert!(matches!(
-            emit(&bp),
-            Err(EmitError::NotYetImplemented(_))
-        ));
+        assert!(matches!(emit(&bp), Err(EmitError::NotYetImplemented(_))));
     }
 
     /// MatMul lowering is deferred to v0.4. The emitter must refuse to
@@ -1018,10 +1028,22 @@ mod tests {
     #[test]
     fn no_wmma_reg_decl_without_matmul() {
         let bp = TensorWasmKernelBlueprint::new("vector_add")
-            .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 })
-            .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 })
-            .push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 })
-            .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 });
+            .push(TensorWasmOp::LoadUnified {
+                elem: ElemType::F32,
+                lanes: 4,
+            })
+            .push(TensorWasmOp::LoadUnified {
+                elem: ElemType::F32,
+                lanes: 4,
+            })
+            .push(TensorWasmOp::VecAdd {
+                elem: ElemType::F32,
+                lanes: 4,
+            })
+            .push(TensorWasmOp::StoreUnified {
+                elem: ElemType::F32,
+                lanes: 4,
+            });
         let out = emit(&bp).expect("emit");
         assert!(!out.text.contains("%rb<"));
         assert!(!out.text.contains("wmma."));
@@ -1032,13 +1054,19 @@ mod tests {
     #[test]
     fn matmul_in_mixed_stream_also_refused() {
         let bp = TensorWasmKernelBlueprint::new("mixed")
-            .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 })
+            .push(TensorWasmOp::LoadUnified {
+                elem: ElemType::F32,
+                lanes: 4,
+            })
             .push(TensorWasmOp::MatMul {
                 m: 16,
                 n: 16,
                 k: 16,
             })
-            .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 });
+            .push(TensorWasmOp::StoreUnified {
+                elem: ElemType::F32,
+                lanes: 4,
+            });
         assert!(matches!(emit(&bp), Err(EmitError::NotYetImplemented(_))));
     }
 
@@ -1213,7 +1241,10 @@ mod tests {
         let n_ops = (MAX_EMITTED_OPS / u64::from(MAX_LANES)) as usize + 2;
         let mut bp = TensorWasmKernelBlueprint::new("k");
         for _ in 0..n_ops {
-            bp = bp.push(TensorWasmOp::VecMul { elem: ElemType::F32, lanes: MAX_LANES });
+            bp = bp.push(TensorWasmOp::VecMul {
+                elem: ElemType::F32,
+                lanes: MAX_LANES,
+            });
         }
         assert!(matches!(
             emit(&bp),
@@ -1236,8 +1267,14 @@ mod tests {
     #[test]
     fn stores_advance_output_offset() {
         let bp = TensorWasmKernelBlueprint::new("k")
-            .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 2 })
-            .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 2 });
+            .push(TensorWasmOp::LoadUnified {
+                elem: ElemType::F32,
+                lanes: 2,
+            })
+            .push(TensorWasmOp::StoreUnified {
+                elem: ElemType::F32,
+                lanes: 2,
+            });
         let out = emit(&bp).expect("emit");
         assert!(out.text.contains("[%rd1]"));
         assert!(out.text.contains("[%rd1+4]"));

@@ -391,7 +391,10 @@ mod tests {
         assert_eq!(a.fingerprint(), b.fingerprint());
         assert_eq!(a.fingerprint128(), b.fingerprint128());
         // The 64-bit key is the low half of the 128-bit fingerprint.
-        assert_eq!(a.fingerprint() as u128, a.fingerprint128() & u64::MAX as u128);
+        assert_eq!(
+            a.fingerprint() as u128,
+            a.fingerprint128() & u64::MAX as u128
+        );
     }
 
     #[test]

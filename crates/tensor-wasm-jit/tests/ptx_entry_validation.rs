@@ -45,7 +45,10 @@ fn validator_rejects_invalid_identifiers() {
 #[test]
 fn emit_rejects_injection_entry() {
     let bp = TensorWasmKernelBlueprint::new(".entry attacker()\n")
-        .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 })
+        .push(TensorWasmOp::StoreUnified {
+            elem: ElemType::F32,
+            lanes: 4,
+        })
         .with_grid(GridHint {
             total_threads: 1024,
             preferred_block_size: 128,
@@ -57,7 +60,10 @@ fn emit_rejects_injection_entry() {
 #[test]
 fn emit_accepts_canonical_entry() {
     let bp = TensorWasmKernelBlueprint::new("safe_kernel_42")
-        .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 })
+        .push(TensorWasmOp::StoreUnified {
+            elem: ElemType::F32,
+            lanes: 4,
+        })
         .with_grid(GridHint {
             total_threads: 1024,
             preferred_block_size: 128,

@@ -44,10 +44,22 @@ fn run_ptxas_or_skip(ptx: &str, label: &str) {
 #[test]
 fn emitted_vector_add_validates_with_ptxas() {
     let bp = TensorWasmKernelBlueprint::new("vector_add")
-        .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 })
-        .push(TensorWasmOp::LoadUnified { elem: ElemType::F32, lanes: 4 })
-        .push(TensorWasmOp::VecAdd { elem: ElemType::F32, lanes: 4 })
-        .push(TensorWasmOp::StoreUnified { elem: ElemType::F32, lanes: 4 })
+        .push(TensorWasmOp::LoadUnified {
+            elem: ElemType::F32,
+            lanes: 4,
+        })
+        .push(TensorWasmOp::LoadUnified {
+            elem: ElemType::F32,
+            lanes: 4,
+        })
+        .push(TensorWasmOp::VecAdd {
+            elem: ElemType::F32,
+            lanes: 4,
+        })
+        .push(TensorWasmOp::StoreUnified {
+            elem: ElemType::F32,
+            lanes: 4,
+        })
         .with_grid(GridHint {
             total_threads: 1024,
             preferred_block_size: 128,
