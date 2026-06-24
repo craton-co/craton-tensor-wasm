@@ -17,15 +17,27 @@
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use tensor_wasm_jit::ir::{GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
+use tensor_wasm_jit::ir::{ElemType, GridHint, TensorWasmKernelBlueprint, TensorWasmOp};
 use tensor_wasm_jit::ptx_emit::emit;
 
 fn vector_add_blueprint(lanes: u32) -> TensorWasmKernelBlueprint {
     TensorWasmKernelBlueprint::new("vector_add")
-        .push(TensorWasmOp::LoadUnified { lanes })
-        .push(TensorWasmOp::LoadUnified { lanes })
-        .push(TensorWasmOp::VecAdd { lanes })
-        .push(TensorWasmOp::StoreUnified { lanes })
+        .push(TensorWasmOp::LoadUnified {
+            elem: ElemType::F32,
+            lanes,
+        })
+        .push(TensorWasmOp::LoadUnified {
+            elem: ElemType::F32,
+            lanes,
+        })
+        .push(TensorWasmOp::VecAdd {
+            elem: ElemType::F32,
+            lanes,
+        })
+        .push(TensorWasmOp::StoreUnified {
+            elem: ElemType::F32,
+            lanes,
+        })
         .with_grid(GridHint {
             total_threads: 1024,
             preferred_block_size: 128,
@@ -42,17 +54,29 @@ fn matmul_blueprint() -> TensorWasmKernelBlueprint {
     // kernel so the bench remains representative for S13's cache hit/
     // miss measurements.
     let mut bp = TensorWasmKernelBlueprint::new("matmul_16x16x16")
-        .push(TensorWasmOp::LoadUnified { lanes: 4 })
-        .push(TensorWasmOp::LoadUnified { lanes: 4 });
-    for _ in 0..16 {
-        bp = bp.push(TensorWasmOp::VecFma { lanes: 4 });
-    }
-    bp.push(TensorWasmOp::StoreUnified { lanes: 4 })
-        .with_grid(GridHint {
-            total_threads: 4096,
-            preferred_block_size: 128,
+        .push(TensorWasmOp::LoadUnified {
+            elem: ElemType::F32,
+            lanes: 4,
         })
-        .with_shared_mem(8 * 1024)
+        .push(TensorWasmOp::LoadUnified {
+            elem: ElemType::F32,
+            lanes: 4,
+        });
+    for _ in 0..16 {
+        bp = bp.push(TensorWasmOp::VecFma {
+            elem: ElemType::F32,
+            lanes: 4,
+        });
+    }
+    bp.push(TensorWasmOp::StoreUnified {
+        elem: ElemType::F32,
+        lanes: 4,
+    })
+    .with_grid(GridHint {
+        total_threads: 4096,
+        preferred_block_size: 128,
+    })
+    .with_shared_mem(8 * 1024)
 }
 
 fn conv2d_blueprint() -> TensorWasmKernelBlueprint {
@@ -64,10 +88,16 @@ fn conv2d_blueprint() -> TensorWasmKernelBlueprint {
         })
         .with_shared_mem(16 * 1024);
     for _ in 0..9 {
-        bp = bp.push(TensorWasmOp::VecFma { lanes: 4 });
+        bp = bp.push(TensorWasmOp::VecFma {
+            elem: ElemType::F32,
+            lanes: 4,
+        });
     }
     bp.push(TensorWasmOp::Barrier)
-        .push(TensorWasmOp::StoreUnified { lanes: 4 })
+        .push(TensorWasmOp::StoreUnified {
+            elem: ElemType::F32,
+            lanes: 4,
+        })
 }
 
 fn bench_emit_text(c: &mut Criterion) {

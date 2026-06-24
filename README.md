@@ -8,7 +8,7 @@
 
 > A GPU-accelerated serverless WebAssembly runtime.
 
-**Status: v0.3.7 — released 2026-05-28.** Consolidates the implementable
+**Status: v0.3.8 — released 2026-06-24.** Consolidates the implementable
 items from the v0.2 / v0.3 / v0.4 PATH-TO-V1 milestones into a single
 shipped version.
 
@@ -20,19 +20,19 @@ cold-starts, and OpenTelemetry tracing wired end-to-end.
 
 ## Status
 
-**v0.3.7** — auth, observability, ops, and supply-chain hardening shipped.
+**v0.3.8** — auth, observability, ops, and supply-chain hardening shipped.
 The host-only execution path is solid (a broad unit + integration suite
 across all 11 crates, all green on a CUDA-free developer laptop). CUDA-bound paths (real
 `cudaMallocManaged`, real PTX `ptxas` validation, real kernel launches)
 are gated behind `--features unified-memory` and exercised by the CUDA
 self-hosted runner once it lands (see `docs/CUDARC-SPIKE.md` for the
-concrete compile-friction status as of the 0.3.7 cut). See
+concrete compile-friction status as of the 0.3.8 cut). See
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) and
 [`bench-results/tail-latency.json`](bench-results/tail-latency.json) for
 the host-path bench numbers; GPU-side figures there are modeled estimates
 (clearly marked) until the S22 CUDA runner lands.
 
-What 0.3.7 ships on top of 0.1.0:
+What 0.3.8 ships on top of 0.1.0:
 
 - **Auth & multi-tenancy.** Per-tenant scoped bearer tokens (W2.1) with
   `tenant_scope_denied` 403s; structured audit log opt-in via
@@ -138,12 +138,12 @@ Operational capabilities that ship on by default (no feature flag):
 | Per-token rate limit | `TENSOR_WASM_API_RATE_LIMIT_QPS`, `_BURST` | W1.4. Retires the global concurrency cap. |
 | HTTP request metrics | always on | W2.3. `tensor_wasm_http_requests_total`, duration histogram, in-flight gauge. |
 | `build_info` metric | always on | W4.9. Version, git commit, enabled features as labels. |
-| OpenAI-compatible inference gateway (`/v1/completions`, `/v1/chat/completions`) | always on | Wired to internal invoke as of 0.3.7 (T41); the 501 scaffold shell is gone. Resolves `model` → function via `TENSOR_WASM_API_OPENAI_MODEL_MAP`, buffered or SSE. See [`docs/OPENAI-COMPAT.md`](docs/OPENAI-COMPAT.md). |
+| OpenAI-compatible inference gateway (`/v1/completions`, `/v1/chat/completions`) | always on | Wired to internal invoke as of 0.3.8 (T41); the 501 scaffold shell is gone. Resolves `model` → function via `TENSOR_WASM_API_OPENAI_MODEL_MAP`, buffered or SSE. See [`docs/OPENAI-COMPAT.md`](docs/OPENAI-COMPAT.md). |
 
-### v0.3.7 strategic features
+### v0.3.8 strategic features
 
 Eight of the thirteen post-v0.3.6 strategic features were scoped into
-v0.3.7. A late-cycle wire-up wave (T30, T33–T41) closed most of them
+v0.3.8. A late-cycle wire-up wave (T30, T33–T41) closed most of them
 in-place — they are wired through the invoke / HTTP / store paths
 today, not deferred. The remaining items ship a stable Rust + CLI
 surface with parts of the production wire still landing. Each row
@@ -161,7 +161,7 @@ for the exact per-task status.
 | Per-tenant GPU memory quotas | `tensor-wasm-tenant` | In-process accounting landed; driver-level `cuMemPool` pin added (T39) behind `--features gpu-mem-pool`. | [`docs/GPU-QUOTAS.md`](docs/GPU-QUOTAS.md) |
 | Unified content-addressed artifact store | `tensor-wasm-artifacts` | Landed — `DiskArtifactStore` fully implemented and now backs snapshots (T40) and the JIT disk cache (T30). | [`docs/ARTIFACT-STORE.md`](docs/ARTIFACT-STORE.md) |
 
-The full v0.3.7 landings list is in
+The full v0.3.8 landings list is in
 [`CHANGELOG.md`](CHANGELOG.md#037---2026-05-28).
 
 Full taxonomy: [`docs/BUILD.md`](docs/BUILD.md).

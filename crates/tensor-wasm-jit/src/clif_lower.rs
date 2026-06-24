@@ -95,7 +95,7 @@ fn infer_block_shape(block: &BlockIR) -> Result<(ElemType, u32), LowerError> {
 ///
 /// The mapping is intentionally narrow. Each SIMD op carries its element
 /// type and lane count through to the blueprint; load/store ops adopt the
-/// block's inferred SIMD element type (see [`infer_block_shape`]):
+/// block's inferred SIMD element type (see `infer_block_shape`):
 ///
 /// | Source                                       | Target                                  |
 /// |----------------------------------------------|-----------------------------------------|

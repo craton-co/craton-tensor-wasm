@@ -14,6 +14,7 @@
 //! the rewrite pipeline in `tensor_wasm_jit::rewrite`.
 
 use tensor_wasm_jit::detector::{classify, BlockIR, DetectorConfig, DetectorVerdict, Op};
+use tensor_wasm_jit::ir::ElemType;
 use tracing::{debug, info, instrument};
 use wasmparser::{Operator, Parser, Payload};
 
@@ -62,8 +63,24 @@ fn op_to_detector_op(op: &Operator<'_>) -> Op {
         | Loop { .. }
         | Block { .. } => Op::Branch,
         Call { .. } | CallIndirect { .. } | ReturnCall { .. } => Op::Call,
-        F32x4Add | F64x2Add | I32x4Add | I64x2Add | I16x8Add | I8x16Add => Op::V128Add,
-        F32x4Mul | F64x2Mul | I32x4Mul | I64x2Mul | I16x8Mul => Op::V128Mul,
+        F32x4Add => Op::V128Add {
+            lane_ty: ElemType::F32,
+            lanes: 4,
+        },
+        I32x4Add => Op::V128Add {
+            lane_ty: ElemType::I32,
+            lanes: 4,
+        },
+        F32x4Mul => Op::V128Mul {
+            lane_ty: ElemType::F32,
+            lanes: 4,
+        },
+        I32x4Mul => Op::V128Mul {
+            lane_ty: ElemType::I32,
+            lanes: 4,
+        },
+        // Fail-closed: widths the emitter cannot yet lower correctly stay on the CPU path.
+        F64x2Add | I64x2Add | I16x8Add | I8x16Add | F64x2Mul | I64x2Mul | I16x8Mul => Op::Other,
         _ => Op::Other,
     }
 }
