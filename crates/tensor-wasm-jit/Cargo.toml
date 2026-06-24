@@ -43,7 +43,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wasmparser.workspace = true
-wasm-encoder = { version = "0.218", features = ["wasmparser"] }
+wasm-encoder = { version = "0.250", features = ["wasmparser"] }
 # Data-parallel candidate emit in `rewrite::analyse`. Order is preserved by
 # collecting `(index, Result<…>)` pairs and re-sorting before commit so the
 # rewriter's downstream assumption that `func_infos[i]` matches the i-th
