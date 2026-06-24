@@ -20,7 +20,7 @@ blake3 = { workspace = true }
 # HMAC-SHA256 — matches the snapshot writer's `signed-snapshots` trailer
 # format so the two stores share a verifiable signature primitive.
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 # Constant-time signature comparison — defends the verifier against the
 # byte-by-byte timing oracle that `==` on `[u8; 32]` would expose.
 subtle = "2"
