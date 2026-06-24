@@ -647,20 +647,6 @@ fn emit_op(
             Ok(())
         }
 
-        // ---- Not yet wired ---------------------------------------------
-        //
-        // Each of these is a no-op for the W3.2 pass — the W3.3+ author
-        // adds a matching arm (and probably a new `pliron_op`-wired
-        // struct above). The variant name is grep-able against
-        // `LoweredOp` in `lowered_ir.rs`.
-        LoweredOp::DivS { .. } => Err(PlironConversionError::NotYetWired { variant: "DivS" }),
-        LoweredOp::DivU { .. } => Err(PlironConversionError::NotYetWired { variant: "DivU" }),
-        LoweredOp::RemS { .. } => Err(PlironConversionError::NotYetWired { variant: "RemS" }),
-        LoweredOp::RemU { .. } => Err(PlironConversionError::NotYetWired { variant: "RemU" }),
-        LoweredOp::DivF { .. } => Err(PlironConversionError::NotYetWired { variant: "DivF" }),
-        LoweredOp::Fma { .. } => Err(PlironConversionError::NotYetWired { variant: "Fma" }),
-        LoweredOp::FNeg { .. } => Err(PlironConversionError::NotYetWired { variant: "FNeg" }),
-        LoweredOp::FAbs { .. } => Err(PlironConversionError::NotYetWired { variant: "FAbs" }),
         // ---- LLVM-free ops wired in jit finding 10 ---------------------
         LoweredOp::StackAlloc { ty, bytes, result } => {
             // Zero operands → one pointer-typed result. The element type +
