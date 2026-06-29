@@ -675,25 +675,6 @@ impl ApiError {
         }
     }
 
-    /// Construct a `501 Not Implemented` with the given `kind` and `message`.
-    ///
-    /// Used by the snapshot routes (M5) for the parts of full
-    /// live-instance snapshot / restore that still need executor support:
-    /// `/snapshot/save` signs and returns a snapshot blob built from the
-    /// function's deployed bytes (the HMAC envelope layer is fully wired),
-    /// but capturing a *running* instance's linear / GPU memory needs a
-    /// `TensorWasmExecutor` capture hook that does not exist yet — that
-    /// capability surfaces `501 not_implemented` rather than silently
-    /// returning an empty or misleading capture. The `(501, kind)` pair is
-    /// the documented contract; clients should NOT retry.
-    pub fn not_implemented(kind: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_IMPLEMENTED,
-            kind: kind.into(),
-            message: message.into(),
-        }
-    }
-
     /// Construct a `413 Payload Too Large` with `kind = "body_too_large"`.
     ///
     /// Returned when an inbound request body exceeds the global
@@ -2544,9 +2525,9 @@ pub async fn snapshot_save(
 /// This handler restores and authenticates the snapshot *envelope* and
 /// returns its verified provenance. Reconstituting a *running* instance
 /// from the captured memory needs a `TensorWasmExecutor` restore hook that
-/// does not exist yet; that capability surfaces `501 not_implemented` when
-/// requested. Verifying the blob and recovering its metadata — the part
-/// that exercises the HMAC key end-to-end — works today.
+/// does not exist yet; until that lands, the route only verifies the blob
+/// and recovers its metadata — the part that exercises the HMAC key
+/// end-to-end — and never attempts a live-instance restore.
 #[tracing::instrument(
     name = "http.snapshot_restore",
     skip(state, auth, payload),

@@ -16,7 +16,7 @@
 //!   "created": <unix-seconds>,
 //!   "model": "<echoed>",
 //!   "choices": [{ "text": "hello", "index": 0, "finish_reason": "stop", "logprobs": null }],
-//!   "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+//!   "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 }
 //! }
 //! ```
 
@@ -157,17 +157,20 @@ async fn completions_returns_openai_text_completion_envelope() {
         Some("stop"),
     );
 
-    // usage block (zeros until v0.5 wires a tokenizer).
+    // usage block: deterministic heuristic estimate (ceil(chars / 4),
+    // floored at 1 for non-empty text — see `openai::estimate_tokens`).
+    // Prompt "Say hello" is 9 chars => ceil(9/4) = 3 tokens; the guest
+    // emits "hello" (5 chars) => ceil(5/4) = 2 tokens; total = 5.
     let usage = body
         .get("usage")
         .and_then(Value::as_object)
         .unwrap_or_else(|| panic!("missing usage object: {body}"));
-    assert_eq!(usage.get("prompt_tokens").and_then(Value::as_u64), Some(0));
+    assert_eq!(usage.get("prompt_tokens").and_then(Value::as_u64), Some(3));
     assert_eq!(
         usage.get("completion_tokens").and_then(Value::as_u64),
-        Some(0),
+        Some(2),
     );
-    assert_eq!(usage.get("total_tokens").and_then(Value::as_u64), Some(0));
+    assert_eq!(usage.get("total_tokens").and_then(Value::as_u64), Some(5));
 }
 
 #[tokio::test]
