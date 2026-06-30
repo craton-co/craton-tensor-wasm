@@ -274,6 +274,24 @@ pub async fn http_metrics_middleware(req: Request, next: Next) -> Response {
         return next.run(req).await;
     };
 
+    // PERF: each request allocates owned `String`s for the route / method /
+    // status label values (`method.to_string()`, the `route.clone()` /
+    // `method.clone()` below, and `status` further down) plus the label
+    // structs. This is one `String` alloc per label per request and shows
+    // up under high QPS. It is *blocked on an upstream limitation*, not an
+    // oversight: `prometheus-client`'s `EncodeLabelSet` / `Family` API keys
+    // its internal map on an *owned* label set (the `Eq + Hash + Clone`
+    // bound is on the owned value), so a borrowed `&'static str` /
+    // `Cow<'static, str>` label set cannot be used as the lookup key
+    // without a `clone()` to satisfy the map anyway. `route` is already a
+    // `&'static str` template (no alloc), but `method` and `status` must be
+    // materialized as owned values for the `HttpRequestLabels` /
+    // `HttpInFlightLabels` types defined in `tensor-wasm-core::metrics`.
+    // Eliminating the alloc requires either interning method/status into a
+    // fixed `&'static str` set (HTTP methods + status codes are a closed
+    // set) in `tensor-wasm-core`, or upstream `prometheus-client` support
+    // for borrowed label lookup. Tracked for a follow-up; left as-is here
+    // because the fix lives in another crate.
     let route = route_label(&req, &cfg.routes);
     let method = req.method().as_str().to_string();
     let in_flight_labels = HttpInFlightLabels::new(route.clone(), method.clone());
