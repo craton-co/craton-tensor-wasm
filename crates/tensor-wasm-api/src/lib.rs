@@ -91,7 +91,7 @@ pub mod trace_propagation;
 pub use audit::{
     audit_log_middleware, AuditAction, AuditActor, AuditActorKind, AuditConfig, AuditOutcome,
     AuditRecord, AuditResource, AuditSink, FileJsonSink, NoopSink, StdoutJsonSink, TokenScopeView,
-    TrustedProxies, ENV_AUDIT_LOG, ENV_TRUSTED_XFCC_PROXIES, HEADER_XFCC,
+    TrustedProxies, ENV_AUDIT_LOG, ENV_TRUSTED_XFCC_PROXIES, HEADER_REQUEST_ID, HEADER_XFCC,
 };
 pub use config::{
     AppConfig, ConfigError, HexParseReason, ENV_SNAPSHOT_HMAC_KEY, ENV_SNAPSHOT_REQUIRE_SIGNATURE,
