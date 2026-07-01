@@ -707,6 +707,14 @@ pub(crate) fn default_actor() -> AuditActor {
 /// front of the gateway. See `docs/deployment/mtls.md` §4.4.
 pub const HEADER_XFCC: &str = "X-Forwarded-Client-Cert";
 
+/// Response header carrying the per-request correlation id stamped by the
+/// audit middleware (the same [`Uuid`] recorded on the [`AuditRecord`]).
+/// Clients echo this value back to support when reporting an issue so the
+/// operator can pinpoint the exact audit-log line — see
+/// [`audit_log_middleware`]. The hyphenated `X-Request-Id` spelling is the
+/// de-facto convention shared by most proxies and tracing tools.
+pub const HEADER_REQUEST_ID: &str = "x-request-id";
+
 /// Environment variable carrying a comma-separated allowlist of IPv4/IPv6
 /// addresses or CIDR ranges whose `X-Forwarded-Client-Cert` headers the
 /// audit middleware will trust. Empty / unset = **never trust XFCC** (the
@@ -1103,8 +1111,22 @@ pub async fn audit_log_middleware(
     let peer_addr = connect_info.map(|sa| sa.to_string());
 
     let start = Instant::now();
-    let response = next.run(req).await;
+    let mut response = next.run(req).await;
     let elapsed = start.elapsed();
+
+    // Echo the correlation id back to the client as `X-Request-Id` so a
+    // caller can quote it to support and the operator can grep the exact
+    // audit-log line. A `Uuid`'s hyphenated form is always valid header
+    // ASCII; the `if let` guards the (impossible) parse failure rather than
+    // unwrapping. We only set the header when the handler did not already
+    // emit one, so an inner layer that stamps its own id wins.
+    if !response.headers().contains_key(HEADER_REQUEST_ID) {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&request_id.to_string()) {
+            response
+                .headers_mut()
+                .insert(HEADER_REQUEST_ID, value);
+        }
+    }
 
     let status_code = response.status().as_u16();
     let error_kind = response
