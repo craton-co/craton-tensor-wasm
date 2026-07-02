@@ -881,7 +881,25 @@ fn build_router_full(
 /// (`crate::audit::TrustedProxies`) depends on that peer information to
 /// decide whether to honour the `X-Forwarded-Client-Cert` header.
 pub async fn serve(state: Arc<AppState>, addr: SocketAddr) -> anyhow::Result<()> {
-    let router = build_router(state);
+    // Assemble the same env-driven config as `build_router`, but keep a
+    // clonable handle to the limiter so we can drive a periodic idle-bucket
+    // sweep alongside the listener. `RateLimiter` is `Clone` and shares its
+    // `DashMap`s via `Arc`, so the handle and the router-owned copy operate
+    // on the same buckets.
+    let auth = AuthConfig::from_env();
+    let tenant = TenantConfig::from_env();
+    let limiter = RateLimiter::new(RateLimitConfig::from_env());
+    let audit = AuditConfig::from_env();
+    let cors = CorsConfig::from_env();
+    let state = apply_app_config_from_env(state);
+
+    // Spawn the cold-bucket TTL sweep unless the limiter is disabled (no
+    // buckets are ever minted in that case, so the sweep would be inert).
+    if !limiter.is_disabled() {
+        spawn_rate_limit_idle_sweep(limiter.clone());
+    }
+
+    let router = build_router_with_audit(state, auth, tenant, limiter, audit, cors);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(target: "tensor_wasm_api::server", %addr, "tensor-wasm-api listening");
     axum::serve(
@@ -890,6 +908,37 @@ pub async fn serve(state: Arc<AppState>, addr: SocketAddr) -> anyhow::Result<()>
     )
     .await?;
     Ok(())
+}
+
+/// Interval between cold-bucket TTL sweeps of the rate limiter. Set to half
+/// the limiter's [`DEFAULT_IDLE_TTL`](RateLimiter::DEFAULT_IDLE_TTL) so an
+/// idle bucket is reclaimed within roughly one TTL of going cold without
+/// scanning the maps more often than necessary.
+const RATE_LIMIT_SWEEP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(RateLimiter::DEFAULT_IDLE_TTL.as_secs() / 2);
+
+/// Spawn a detached background task that periodically reclaims cold rate-
+/// limiter buckets (see [`RateLimiter::sweep_idle`]). The task lives for the
+/// process lifetime; it holds only a clonable `RateLimiter` handle and never
+/// blocks the request path. A non-zero removal count is logged at `debug`.
+fn spawn_rate_limit_idle_sweep(limiter: RateLimiter) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RATE_LIMIT_SWEEP_INTERVAL);
+        // Skip the immediate first tick so the sweep does not run before any
+        // bucket could plausibly be idle.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let removed = limiter.sweep_idle();
+            if removed > 0 {
+                tracing::debug!(
+                    target: "tensor_wasm_api::rate_limit",
+                    removed,
+                    "swept idle rate-limiter buckets",
+                );
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
