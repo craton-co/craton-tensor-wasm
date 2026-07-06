@@ -475,3 +475,111 @@ fn authorization_with_embedded_nul_rejected() {
         bare_nul,
     );
 }
+
+// ---------------------------------------------------------------------------
+// api S-3 — duplicate `Authorization` headers are rejected end-to-end.
+// ---------------------------------------------------------------------------
+//
+// `HeaderMap::get` returns only the FIRST `Authorization` occurrence, so a
+// buggy or hostile client sending two headers would silently get one value
+// accepted and the other invisible — and some proxies concatenate the two
+// with a comma, which round-trips unpredictably through the bearer parser.
+// `bearer_auth` refuses outright before reading either value, surfacing
+// `400 bad_request`. This is the end-to-end counterpart to the unit-level
+// `auth_count > 1` check in `middleware.rs`.
+
+#[tokio::test]
+async fn duplicate_authorization_header_rejected() {
+    // Allowlist a token so we are NOT in dev mode (dev mode short-circuits
+    // before the duplicate-header check runs).
+    let auth = AuthConfig::from_tokens(["legit-token"]);
+    let router = auth_router(auth);
+
+    // `Request::builder().header(...)` appends rather than replaces, so two
+    // calls produce a `HeaderMap` carrying two `Authorization` entries —
+    // exactly the surface the S-3 guard defends against. We send two
+    // *individually valid* bearer values so the rejection can only come
+    // from the duplicate-count check, not from a malformed single value.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/probe")
+        .header(axum::http::header::AUTHORIZATION, "Bearer legit-token")
+        .header(axum::http::header::AUTHORIZATION, "Bearer legit-token")
+        .body(Body::empty())
+        .unwrap();
+    // Sanity-check the test setup really produced two headers (so the test
+    // cannot pass for the wrong reason if the builder semantics change).
+    assert_eq!(
+        req.headers()
+            .get_all(axum::http::header::AUTHORIZATION)
+            .iter()
+            .count(),
+        2,
+        "test setup must produce two Authorization headers",
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(
+        error_kind(&body),
+        Some("bad_request"),
+        "duplicate Authorization headers must surface as bad_request: got {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// header-hardening — the length cap short-circuits BEFORE the constant-time
+// compare loop.
+// ---------------------------------------------------------------------------
+//
+// The existing `oversized_authorization_header_rejected` test sends an
+// oversized value that would never match the allowlist anyway, so it pins
+// the *outcome* (`invalid_auth`) but not the *ordering*. This test sharpens
+// the ordering claim: it builds a header whose prefix is the EXACT valid
+// token, padded beyond the cap. If the cap fires first (the hardened order)
+// the response is `401 invalid_auth`; if the constant-time compare ran first
+// it would instead reach the allowlist loop and — because the padded value
+// is no longer byte-equal to the token — surface the distinct
+// `401 unauthorized`. Asserting `invalid_auth` therefore proves the cap
+// short-circuits the request before any `ct_eq` comparison runs.
+
+#[tokio::test]
+async fn auth_header_cap_short_circuits_before_constant_time_compare() {
+    const TOKEN: &str = "legit-token";
+    let auth = AuthConfig::from_tokens([TOKEN]);
+    let router = auth_router(auth);
+
+    // "Bearer legit-token" + enough padding to push the whole value past
+    // MAX_AUTH_HEADER_BYTES. The valid-token prefix is deliberate: it is
+    // the case where an ordering bug would be most tempting (a naive
+    // implementation might `starts_with`-match and admit), and it makes the
+    // `invalid_auth` vs `unauthorized` distinction the sole discriminator
+    // between "cap ran first" and "compare ran first".
+    let padding = "x".repeat(MAX_AUTH_HEADER_BYTES);
+    let header_value_str = format!("Bearer {TOKEN}{padding}");
+    assert!(
+        header_value_str.len() > MAX_AUTH_HEADER_BYTES,
+        "test setup must exceed MAX_AUTH_HEADER_BYTES ({} bytes); got {} bytes",
+        MAX_AUTH_HEADER_BYTES,
+        header_value_str.len(),
+    );
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/probe")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_bytes(header_value_str.as_bytes())
+                .expect("ASCII bytes parse into HeaderValue"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(
+        error_kind(&body),
+        Some("invalid_auth"),
+        "the length cap must reject (invalid_auth) BEFORE the constant-time \
+         compare loop (which would surface unauthorized): got {body}"
+    );
+}
