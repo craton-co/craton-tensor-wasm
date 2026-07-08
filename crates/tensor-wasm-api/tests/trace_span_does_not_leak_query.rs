@@ -35,7 +35,7 @@
 #![allow(clippy::expect_used)]
 
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -46,7 +46,6 @@ use tracing::span;
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
 /// A single captured field on a span: the field name and its
@@ -128,23 +127,29 @@ where
     }
 }
 
-/// Install our capturing subscriber globally exactly once per
-/// process. `tracing::subscriber::set_global_default` panics on
-/// re-installation, so we guard with `Once` to keep the test robust
-/// against parallel test scheduling.
-fn install_capturing_subscriber(captured: Arc<Mutex<Vec<CapturedField>>>) {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let layer = CapturingLayer { captured };
-        let subscriber = tracing_subscriber::registry().with(layer);
-        // `try_init` rather than `init`: a sibling test may have
-        // already installed a different subscriber in this process
-        // (the test harness shares one). When that happens we lose
-        // visibility, which the assertions below detect explicitly
-        // (the captured Vec stays empty) and tolerate by reporting a
-        // soft skip — see the helper comments in each test.
-        let _ = subscriber.try_init();
-    });
+/// Install our capturing subscriber as the **thread-local** default for
+/// the duration of the returned guard.
+///
+/// We deliberately use [`tracing::subscriber::set_default`] (thread-local)
+/// rather than `set_global_default` / `try_init` (process-global). The
+/// global path is set-once-per-process: under the shared test harness only
+/// the first test to install wins, and every other test silently captures
+/// nothing — which used to force a vacuous "soft skip" that let the leak
+/// assertions pass without ever running. A thread-local default is private
+/// to the calling test's thread, so EVERY test reliably observes its own
+/// spans and the assertions are never skipped.
+///
+/// `#[tokio::test]` defaults to the current-thread runtime, so the whole
+/// test future runs on the thread that holds the guard; the thread-local
+/// subscriber therefore stays active across every `.await` in the test.
+/// The caller MUST hold the returned guard for the entire request flow.
+#[must_use]
+fn install_capturing_subscriber(
+    captured: Arc<Mutex<Vec<CapturedField>>>,
+) -> tracing::subscriber::DefaultGuard {
+    let layer = CapturingLayer { captured };
+    let subscriber = tracing_subscriber::registry().with(layer);
+    tracing::subscriber::set_default(subscriber)
 }
 
 /// Spin up the production router with default state — same helper
@@ -176,12 +181,10 @@ async fn span_attributes_do_not_contain_query_string_secrets() {
     const TOKEN_VALUE: &str = "ABC123";
 
     let captured: Arc<Mutex<Vec<CapturedField>>> = Arc::new(Mutex::new(Vec::new()));
-    install_capturing_subscriber(Arc::clone(&captured));
-
-    // Snapshot the pre-existing captured count so a sibling test
-    // running in parallel can't pollute our assertion window. Any
-    // record we look at is taken from `pre_len..` only.
-    let pre_len = captured.lock().expect("lock").len();
+    // Hold the thread-local subscriber guard for the whole test — see
+    // `install_capturing_subscriber`. Dropping it restores the previous
+    // default, so we keep it bound until the assertions finish.
+    let _guard = install_capturing_subscriber(Arc::clone(&captured));
 
     let router = dev_router();
     let req = Request::builder()
@@ -194,21 +197,19 @@ async fn span_attributes_do_not_contain_query_string_secrets() {
     let resp = router.oneshot(req).await.expect("router runs");
     assert_eq!(resp.status(), StatusCode::OK, "healthz must succeed");
 
-    let snap = snapshot(&captured);
-    let load_obs: Vec<&CapturedField> = snap.iter().skip(pre_len).collect();
-
-    // Soft-skip when the global subscriber was claimed by another
-    // test that didn't install our layer — we recorded nothing, so
-    // we have no leak to assert against. This keeps the test green
-    // under parallel scheduling without giving up the assertion when
-    // we DO get the subscriber.
-    if load_obs.is_empty() {
-        eprintln!(
-            "trace_span_does_not_leak_query: no spans captured \
-             (another test owns the global subscriber); skipping assertion"
-        );
-        return;
-    }
+    // The thread-local subscriber is private to this test, so everything
+    // captured belongs to this request — no `pre_len` windowing needed.
+    let load_obs: Vec<CapturedField> = snapshot(&captured);
+    // Non-vacuous: with our own subscriber active we MUST have captured at
+    // least one span field. A regression that drops the trace layer (or a
+    // future change that breaks the thread-local install) surfaces here
+    // rather than letting the leak assertions pass over an empty set.
+    assert!(
+        !load_obs.is_empty(),
+        "no spans captured under our own thread-local subscriber — the \
+         trace layer or the subscriber install regressed",
+    );
+    let load_obs: Vec<&CapturedField> = load_obs.iter().collect();
 
     // Walk every captured field. NONE of them, on any span, on any
     // field name, may contain the secret tokens we planted. This is
@@ -258,9 +259,9 @@ async fn span_attributes_bound_oversized_traceparent_header() {
     let attacker_tp: String = "A".repeat(65_536);
 
     let captured: Arc<Mutex<Vec<CapturedField>>> = Arc::new(Mutex::new(Vec::new()));
-    install_capturing_subscriber(Arc::clone(&captured));
-
-    let pre_len = captured.lock().expect("lock").len();
+    // Thread-local subscriber guard, held for the whole test (see the first
+    // test for the rationale on `set_default` vs the global path).
+    let _guard = install_capturing_subscriber(Arc::clone(&captured));
 
     let router = dev_router();
     let req = Request::builder()
@@ -282,16 +283,14 @@ async fn span_attributes_bound_oversized_traceparent_header() {
         .expect("router::oneshot infallible");
     let _ = resp.status();
 
+    // Private thread-local subscriber: every captured field is ours.
     let snap = snapshot(&captured);
-    let load_obs: Vec<&CapturedField> = snap.iter().skip(pre_len).collect();
-
-    if load_obs.is_empty() {
-        eprintln!(
-            "trace_span_does_not_leak_query: no spans captured \
-             (another test owns the global subscriber); skipping assertion"
-        );
-        return;
-    }
+    let load_obs: Vec<&CapturedField> = snap.iter().collect();
+    assert!(
+        !load_obs.is_empty(),
+        "no spans captured under our own thread-local subscriber — the \
+         trace layer or the subscriber install regressed",
+    );
 
     // Find every captured `traceparent` field and assert the bound.
     let tp_obs: Vec<&CapturedField> = load_obs
