@@ -50,7 +50,7 @@
 #![allow(clippy::expect_used)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -62,7 +62,6 @@ use tracing::span;
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
 /// Span name the production trace layer opens for every inbound
@@ -73,10 +72,9 @@ use tracing_subscriber::Layer;
 const HTTP_REQUEST_SPAN: &str = "http.request";
 
 /// `tracing_subscriber::Layer` that counts how many `on_new_span`
-/// callbacks fire for the documented `http.request` span. The counter
-/// is process-global because the subscriber install is process-global;
-/// each test snapshots the pre-call count, runs the request, and asserts
-/// the delta.
+/// callbacks fire for the documented `http.request` span. The counter is
+/// per-test (owned by the thread-local subscriber installed below), so two
+/// tests running in parallel never share a count.
 struct CountingLayer {
     http_request_spans: Arc<AtomicUsize>,
 }
@@ -92,28 +90,30 @@ where
     }
 }
 
-/// Install the counting subscriber globally exactly once per process.
+/// Install the counting subscriber as the **thread-local** default for the
+/// duration of the returned guard, and hand back the span counter.
 ///
-/// `tracing::subscriber::set_global_default` (which `try_init` calls
-/// internally) panics on re-installation. The `Once` guard plus
-/// `try_init` keeps the test robust against parallel scheduling and
-/// against a sibling test that already claimed the global subscriber
-/// (in which case our layer is not active and the counter stays at
-/// zero — the test detects that explicitly via the positive-control
-/// branch below and reports a soft skip).
-fn install_counting_subscriber() -> Arc<AtomicUsize> {
-    static INIT: Once = Once::new();
-    static COUNTER: std::sync::OnceLock<Arc<AtomicUsize>> = std::sync::OnceLock::new();
-    let counter = COUNTER
-        .get_or_init(|| Arc::new(AtomicUsize::new(0)))
-        .clone();
-    INIT.call_once(|| {
-        let layer = CountingLayer {
-            http_request_spans: Arc::clone(&counter),
-        };
-        let _ = tracing_subscriber::registry().with(layer).try_init();
-    });
-    counter
+/// We use [`tracing::subscriber::set_default`] (thread-local) rather than
+/// the process-global `set_global_default` / `try_init`. The global path is
+/// set-once-per-process: under the shared test harness only the first test
+/// to install wins, and every other test's counter stays at zero — which
+/// used to trigger a vacuous "soft skip" (the `after_allow == positive_baseline`
+/// branch) that let the load-bearing assertion never run. A thread-local
+/// default is private to this test's thread, so the counter always reflects
+/// THIS test's requests and the skip path is gone.
+///
+/// `#[tokio::test]` defaults to the current-thread runtime, so the whole
+/// test future runs on the thread holding the guard; the caller MUST hold
+/// the guard for the entire request flow.
+#[must_use]
+fn install_counting_subscriber() -> (tracing::subscriber::DefaultGuard, Arc<AtomicUsize>) {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let layer = CountingLayer {
+        http_request_spans: Arc::clone(&counter),
+    };
+    let subscriber = tracing_subscriber::registry().with(layer);
+    let guard = tracing::subscriber::set_default(subscriber);
+    (guard, counter)
 }
 
 #[tokio::test]
@@ -123,7 +123,9 @@ async fn host_validate_rejects_before_trace_layer_allocates_span() {
     // with a non-empty value. `temp_env::with_vars_async` serialises
     // env mutations across the test binary so a parallel sibling test
     // cannot race on the variable.
-    let counter = install_counting_subscriber();
+    // Hold the thread-local subscriber guard for the whole test; dropping
+    // it at the end of the function restores the previous default.
+    let (_guard, counter) = install_counting_subscriber();
     temp_env::async_with_vars([(ENV_TRUSTED_HOSTS, Some("api.example.com"))], async {
         let router = build_router_with_config(
             Arc::new(AppState::default()),
@@ -159,13 +161,6 @@ async fn host_validate_rejects_before_trace_layer_allocates_span() {
         // re-order the rejection short-circuits the chain at
         // the OUTER edge of common_layers, before the trace
         // layer is ever entered, so the delta must be 0.
-        //
-        // Soft-skip when our layer is not the active subscriber
-        // (a sibling test in this binary claimed the global
-        // first). The positive-control branch below detects this
-        // by observing zero spans for the allowed request and
-        // skips the whole assertion block.
-        let positive_baseline = after_reject;
         let allowed = Request::builder()
             .method(Method::GET)
             .uri("/healthz")
@@ -180,18 +175,22 @@ async fn host_validate_rejects_before_trace_layer_allocates_span() {
         );
         let after_allow = counter.load(Ordering::Relaxed);
 
-        if after_allow == positive_baseline {
-            eprintln!(
-                "host_validate_runs_before_trace_layer: counting \
-                     subscriber not active (another test owns the \
-                     global); skipping span-count assertion",
-            );
-            return;
-        }
+        // Positive control as a HARD assertion (no soft skip): our
+        // thread-local subscriber is always active, so the allowed
+        // request MUST have opened exactly one `http.request` span.
+        // A zero here means the subscriber install or the trace layer
+        // regressed — fail loudly rather than skipping.
+        assert_eq!(
+            after_allow - after_reject,
+            1,
+            "allowed request must open exactly one http.request span \
+                 (saw delta={}) — our thread-local subscriber should always \
+                 be active",
+            after_allow - after_reject,
+        );
 
-        // Allowed request DID open an http.request span: our
-        // layer is active. Now the load-bearing assertion: the
-        // rejected request must have opened ZERO spans.
+        // Load-bearing assertion: the rejected request must have
+        // opened ZERO spans.
         assert_eq!(
             after_reject - baseline,
             0,
@@ -200,17 +199,6 @@ async fn host_validate_rejects_before_trace_layer_allocates_span() {
                  host_validate must sit OUTSIDE trace_layer_with_propagation \
                  so hostile probes never burn trace budget",
             after_reject - baseline,
-        );
-        // And the allowed request opened exactly one. We assert
-        // exactly-one (not at-least-one) to guard against a
-        // future regression that double-instruments the request
-        // flow.
-        assert_eq!(
-            after_allow - after_reject,
-            1,
-            "allowed request must open exactly one http.request span \
-                 (saw delta={})",
-            after_allow - after_reject,
         );
     })
     .await;
