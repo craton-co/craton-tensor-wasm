@@ -116,6 +116,14 @@ pub const DEFAULT_ROUTE_ALLOWLIST: &[&str] = &[
     "/functions/:id/invoke",
     "/functions/:id/invoke-async",
     "/functions/:id/invoke-stream",
+    // Snapshot save / restore (M5). Both are POST routes in the
+    // write-class sub-router; listed here so their metrics resolve to the
+    // route template instead of collapsing to `"unknown"`. See
+    // `crates/tensor-wasm-api/src/routes.rs` (`snapshot_save` /
+    // `snapshot_restore`) for the handlers and `build_router_full` for the
+    // mount.
+    "/snapshot/save",
+    "/snapshot/restore",
     "/jobs/:id",
     // OpenAI-compat shim (B4.9). Scaffold routes that return 501 today
     // and wire model → function translation in v0.4. See
