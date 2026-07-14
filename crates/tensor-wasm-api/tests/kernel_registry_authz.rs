@@ -28,6 +28,15 @@
 //! [`build_router_with_kernel_publish_tokens`] so the publish-tokens
 //! allowlist is explicit and parallel tests do not race on
 //! `TENSOR_WASM_API_KERNEL_PUBLISH_TOKENS`.
+//!
+//! ## CI / feature matrix
+//!
+//! This file is gated behind `#![cfg(feature = "kernel-registry-api")]`, so
+//! it runs zero tests on the default build with no skipped-coverage signal.
+//! CI MUST run a feature-enabled job
+//! (`cargo test -p tensor-wasm-api --features kernel-registry-api`, or
+//! `--all-features`) to exercise this T1 authz contract. See the
+//! `kernel-registry-api` entry in `crates/tensor-wasm-api/Cargo.toml`.
 
 #![cfg(feature = "kernel-registry-api")]
 
