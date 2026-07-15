@@ -125,6 +125,30 @@ fn is_hex_digit(b: u8) -> bool {
     b.is_ascii_digit() || matches!(b, b'a'..=b'f' | b'A'..=b'F')
 }
 
+/// Returns `true` if `c` is a token-boundary punctuation symbol that
+/// [`redact`] treats as a delimiter (in addition to ASCII whitespace).
+///
+/// Sensitive shapes routinely arrive wrapped in or joined by punctuation —
+/// `(/dev/shm/x)`, `addr=0x7ffe`, the comma-joined `a,/dev/shm/x`. Splitting
+/// the scan on these characters (and copying them through verbatim) means each
+/// path / pointer / hex run is examined on its own rather than buried inside a
+/// larger token whose leading byte is ordinary text, which previously let the
+/// sensitive fragment slip through unmasked.
+fn is_token_separator(c: u8) -> bool {
+    matches!(c, b'[' | b']' | b'(' | b')' | b'{' | b'}' | b'=' | b',' | b';')
+}
+
+/// Returns `true` if `c` is trailing/leading punctuation that
+/// [`redact_token`] peels off a candidate token before applying the shape
+/// rules. Mirrors the trailing-trim set so a sensitive token wrapped in
+/// punctuation on *either* side (`'/dev/shm/x'`, `"0x7ffe"`) is still masked.
+fn is_peelable_punct(c: char) -> bool {
+    matches!(
+        c,
+        ':' | ',' | ';' | '.' | '(' | ')' | '[' | ']' | '{' | '}' | '\'' | '"' | '`'
+    )
+}
+
 /// Masks pointer-, path-, and long-hex-shaped tokens in `s`, returning a new
 /// `String`. See [`TensorWasmError::redacted_inner`] for the exact rules; this
 /// is the hand-rolled, dependency-free scanner backing that accessor.
@@ -133,16 +157,22 @@ fn redact(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < bytes.len() {
-        // Tokens are delimited by ASCII whitespace; copy whitespace verbatim
-        // so the redacted text keeps the original layout.
-        if bytes[i].is_ascii_whitespace() {
+        // Tokens are delimited by ASCII whitespace OR a token-separator
+        // punctuation symbol (`[](){}=,;`); copy any such delimiter through
+        // verbatim so the redacted text keeps the original layout and so a
+        // sensitive run joined to ordinary text by punctuation (`addr=0x7ffe`,
+        // `(/dev/shm/x)`, `a,/dev/shm/x`) is examined on its own.
+        if bytes[i].is_ascii_whitespace() || is_token_separator(bytes[i]) {
             out.push(bytes[i] as char);
             i += 1;
             continue;
         }
-        // Find the end of the current whitespace-delimited token.
+        // Find the end of the current token (run of non-delimiter bytes).
         let start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && !is_token_separator(bytes[i])
+        {
             i += 1;
         }
         let token = &s[start..i];
@@ -151,22 +181,22 @@ fn redact(s: &str) -> String {
     out
 }
 
-/// Redacts a single whitespace-delimited token, preserving trailing ASCII
-/// punctuation (`:`, `,`, `;`, `.`, closing brackets/quotes) so a masked
-/// token embedded in prose keeps its surrounding punctuation.
+/// Redacts a single token, preserving the ASCII punctuation that wraps it on
+/// *either* side (`:`, `,`, `;`, `.`, brackets/braces/parens, quotes) so a
+/// masked token embedded in prose keeps its surrounding punctuation. The
+/// leading peel mirrors the trailing peel so a sensitive run wrapped on the
+/// left (`'/dev/shm/x`, `"0x7ffe`) is still recognised by the shape rules.
 fn redact_token(token: &str) -> String {
     const MASK: &str = "<redacted>";
 
     // Peel trailing punctuation off so e.g. `0x1234,` masks the address but
     // keeps the comma.
-    let trimmed = token.trim_end_matches(|c: char| {
-        matches!(
-            c,
-            ':' | ',' | ';' | '.' | ')' | ']' | '}' | '\'' | '"' | '`'
-        )
-    });
-    let suffix = &token[trimmed.len()..];
-    let core = trimmed;
+    let after_trailing = token.trim_end_matches(is_peelable_punct);
+    let suffix = &token[after_trailing.len()..];
+    // Peel leading punctuation off symmetrically so e.g. `'/dev/shm/x` masks
+    // the path but keeps the opening quote.
+    let core = after_trailing.trim_start_matches(is_peelable_punct);
+    let prefix = &after_trailing[..after_trailing.len() - core.len()];
 
     if core.is_empty() {
         return token.to_string();
@@ -193,7 +223,7 @@ fn redact_token(token: &str) -> String {
         || (core.len() >= LONG_HEX_THRESHOLD && bytes.iter().all(|&b| is_hex_digit(b)));
 
     if masked {
-        format!("{MASK}{suffix}")
+        format!("{prefix}{MASK}{suffix}")
     } else {
         token.to_string()
     }
@@ -444,8 +474,13 @@ impl TensorWasmError {
     ///   swallowed. Note that any `0x`-prefixed run, however short, is masked
     ///   by the pointer rule above.
     ///
-    /// A token is delimited by ASCII whitespace; punctuation immediately
-    /// adjacent to a token (a trailing `:` or `,`) is preserved. The masking is
+    /// A token is delimited by ASCII whitespace *or* a token-separator
+    /// punctuation symbol (`[](){}=,;`), so a sensitive run wrapped in or
+    /// joined to ordinary text by punctuation (`(/dev/shm/x)`, `addr=0x7ffe`,
+    /// `a,/dev/shm/x`) is examined on its own rather than buried inside a
+    /// larger token. Punctuation immediately adjacent to a token on either
+    /// side (a leading or trailing `:` `,` quote / bracket) is peeled off
+    /// before the shape rules run and re-emitted around the mask. The masking is
     /// deliberately conservative — it is a defence-in-depth aid for operator
     /// logs, **not** a guarantee that the result is safe for tenant-facing
     /// output. Anything shown to end-users must still go through the opaque
