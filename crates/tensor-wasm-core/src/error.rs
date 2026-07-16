@@ -214,11 +214,17 @@ fn redact_token(token: &str) -> String {
             && bytes[2..].iter().all(|&b| is_hex_digit(b)))
         // Unix-style path: starts with `/` and contains another `/`.
         || (bytes[0] == b'/' && core[1..].contains('/'))
-        // Windows-style path: drive letter + `:\` + body.
+        // Windows drive path: drive letter + `:` + a separator (`\` or `/`)
+        // + body. Accepts both the backslash form (`C:\Users\...`) and the
+        // forward-slash form (`C:/Users/...`) that Rust / many tools emit.
         || (core.len() > 3
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
-            && bytes[2] == b'\\')
+            && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        // Windows UNC path: leading `\\` followed by a server/share body
+        // (`\\server\share\...`). Requires at least one byte after the `\\`
+        // so a bare `\\` is left intact.
+        || (core.len() > 2 && bytes[0] == b'\\' && bytes[1] == b'\\')
         // Long bare hex run (>= threshold digits, no `0x` prefix).
         || (core.len() >= LONG_HEX_THRESHOLD && bytes.iter().all(|&b| is_hex_digit(b)));
 
@@ -465,8 +471,10 @@ impl TensorWasmError {
     /// * **Unix-style paths** — a run beginning with `/` that contains at least
     ///   one more `/` (`/dev/shm/tenant`, `/tmp/mod.wasm`). A lone `/` (e.g. a
     ///   division operator in a diagnostic) is left intact.
-    /// * **Windows-style paths** — a drive letter followed by `:\` and a path
-    ///   body (`C:\Users\...`).
+    /// * **Windows-style paths** — a drive letter followed by `:` and a
+    ///   separator (`\` *or* `/`) and a path body (`C:\Users\...`,
+    ///   `C:/Users/...`), or a UNC path with a leading `\\` and a
+    ///   server/share body (`\\server\share\...`).
     /// * **Long bare hex tokens** — a run of 16 or more hex digits *without* a
     ///   `0x` prefix (e.g. a 64-bit address printed bare, or a hash). The
     ///   16-digit floor keeps short bare-hex / decimal literals that appear in
