@@ -546,9 +546,35 @@ static TENANT_LABEL_INTERN: OnceLock<Mutex<HashMap<u64, &'static str>>> = OnceLo
 /// leak guard).
 fn intern_tenant_id(id: u64) -> Option<&'static str> {
     let cache = TENANT_LABEL_INTERN.get_or_init(|| Mutex::new(HashMap::new()));
-    // Poisoning is benign here — the cache holds only `&'static str` and a
-    // panic mid-insert cannot leave it logically corrupt — so recover the
-    // guard rather than propagating.
+
+    // First, a short critical section: hit on the already-interned id, or bail
+    // out if the cache is at capacity. The lock is NOT held across the
+    // `format!` + `Box::leak` below, matching this function's doc contract.
+    {
+        // Poisoning is benign here — the cache holds only `&'static str` and a
+        // panic mid-insert cannot leave it logically corrupt — so recover the
+        // guard rather than propagating.
+        let map = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&s) = map.get(&id) {
+            return Some(s);
+        }
+        if map.len() >= TENANT_LABEL_INTERN_CAP {
+            return None;
+        }
+    }
+
+    // Mint the rendering with the lock released. `Box::leak` is intentional:
+    // each rendering lives for the lifetime of the process and the total leaked
+    // memory is bounded by `TENANT_LABEL_INTERN_CAP` small strings (cf.
+    // `StatusTable`).
+    let candidate: &'static str = Box::leak(format!("T#{id}").into_boxed_str());
+
+    // Re-acquire and re-check: a concurrent caller may have interned this id
+    // (or filled the last capacity slot) while the lock was released. If so,
+    // return the winner's pointer; our freshly-leaked `candidate` is abandoned
+    // — that is a one-time, bounded leak under contention, never a per-call or
+    // double-insert leak. Re-checking capacity here keeps the cap an exact
+    // ceiling even when multiple threads race past the first check.
     let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&s) = map.get(&id) {
         return Some(s);
@@ -556,12 +582,8 @@ fn intern_tenant_id(id: u64) -> Option<&'static str> {
     if map.len() >= TENANT_LABEL_INTERN_CAP {
         return None;
     }
-    // `Box::leak` is intentional: each rendering lives for the lifetime of
-    // the process and the total leaked memory is bounded by
-    // `TENANT_LABEL_INTERN_CAP` small strings (cf. `StatusTable`).
-    let s: &'static str = Box::leak(format!("T#{id}").into_boxed_str());
-    map.insert(id, s);
-    Some(s)
+    map.insert(id, candidate);
+    Some(candidate)
 }
 
 /// Label set for `tensor_wasm_build_info`.
