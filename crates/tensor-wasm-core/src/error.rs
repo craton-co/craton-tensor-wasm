@@ -107,6 +107,14 @@ fn is_retryable_io_kind(kind: io::ErrorKind) -> bool {
             | io::ErrorKind::TimedOut
             | io::ErrorKind::Interrupted
             | io::ErrorKind::WriteZero
+            // The connection-reset family is INTENTIONALLY retryable: in this
+            // workspace `Io(_)` reaches a peer-dropped connection only on the
+            // snapshot-fetch / collector-export client paths, where the peer
+            // (object store, OTLP collector) commonly recycles idle keep-alive
+            // sockets and a fresh connection succeeds. It is deliberately NOT
+            // treated as a hard server fault. If a future caller surfaces a
+            // *client-initiated* reset (where retrying would loop), split that
+            // path before relying on this classification.
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::BrokenPipe
@@ -777,6 +785,46 @@ mod tests {
             e.is_retryable(),
             "Io(WouldBlock) must be classified as retryable",
         );
+    }
+
+    #[test]
+    fn is_retryable_io_kind_pins_retryable_family() {
+        // Pin the exact retryable I/O set so a future edit that adds/removes a
+        // kind is a conscious, reviewed change. These map to `503` (the API
+        // layer retries) rather than a hard `500`/`4xx`.
+        for kind in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WriteZero,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            assert!(
+                is_retryable_io_kind(kind),
+                "{kind:?} must be classified as retryable",
+            );
+        }
+    }
+
+    #[test]
+    fn is_retryable_io_kind_pins_hard_miss_kinds() {
+        // Hard-miss kinds must NOT be retryable: retrying fails identically and
+        // would spin the CLI's retry loop / return `503` for a permanent error.
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AlreadyExists,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                !is_retryable_io_kind(kind),
+                "{kind:?} must NOT be classified as retryable",
+            );
+        }
     }
 
     #[test]
