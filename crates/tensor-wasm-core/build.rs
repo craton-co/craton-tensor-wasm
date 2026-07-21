@@ -27,10 +27,23 @@ use std::env;
 use std::process::Command;
 
 fn main() {
-    // A new commit (HEAD moves) should re-trigger this script so the
-    // baked-in SHA stays accurate. We rerun on `.git/HEAD` rather than
-    // every file under `.git/`; that captures `git commit`, `git checkout`,
-    // and `git reset` without rebuilding on every dangling reflog edit.
+    // Best-effort re-trigger so the baked-in SHA tracks HEAD: we watch
+    // `.git/HEAD` rather than every file under `.git/`, which catches the
+    // common `git checkout` / branch-switch case without rebuilding on every
+    // dangling reflog edit.
+    //
+    // This is intentionally NOT exhaustive. `.git/HEAD` is the symbolic ref,
+    // not the commit it resolves to, so several SHA-changing operations leave
+    // it byte-identical and do NOT re-trigger this script:
+    //   * `git commit --amend` (and any new commit on the *current* branch —
+    //     the branch ref under `.git/refs/heads/<branch>` moves, `HEAD` does
+    //     not);
+    //   * a ref update written into `.git/packed-refs` rather than a loose
+    //     ref file;
+    //   * a `worktree` / detached layout where the ref lives elsewhere.
+    // In those cases the stale SHA clears on the next clean rebuild. Watching
+    // the resolved ref robustly would mean parsing `HEAD` here, which is more
+    // machinery than this best-effort build-info label warrants.
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=build.rs");
 
