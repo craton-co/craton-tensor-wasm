@@ -243,6 +243,88 @@ fn redact_token(token: &str) -> String {
     }
 }
 
+/// 64-bit FNV-1a offset basis. Used by [`fnv1a`] to seed the digest backing
+/// [`ErrorId`]. FNV-1a is chosen over `DefaultHasher` because it is
+/// deterministic and process-independent — the same error content must mint
+/// the same [`ErrorId`] across every node so a tenant-facing 4xx body can be
+/// pivoted to operator logs on a *different* host.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+/// 64-bit FNV-1a prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Deterministic, process-independent 64-bit FNV-1a digest of `bytes`.
+///
+/// Deliberately *not* `std::collections::hash_map::DefaultHasher` — that hasher
+/// is randomly seeded per process (and its algorithm is unspecified), so it
+/// cannot mint a stable id that two different hosts agree on. FNV-1a is a tiny,
+/// well-defined, dependency-free function whose output depends only on the
+/// input bytes, which is exactly what cross-node correlation requires.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// An opaque, correlation-friendly identifier for a [`TensorWasmError`].
+///
+/// Rendered as a fixed-width lowercase-hex token (e.g. `err_1a2b3c4d5e6f7a8b`).
+/// The id is **deterministically derived** from the error's
+/// [`kind`](TensorWasmError::kind) and its inner diagnostic content via a
+/// process-independent FNV-1a digest — it is *not* a random per-instance nonce
+/// and carries no timestamp or counter. Two errors with identical kind and
+/// content therefore share an id, by design: the id exists so a tenant-facing
+/// 4xx response body (which embeds the id via
+/// [`TensorWasmError::display_with_id`]) can be pivoted to the matching
+/// operator log line (which records the same id alongside the unredacted
+/// detail) — possibly on a different node — *without* the 4xx body ever
+/// exposing the sensitive inner string.
+///
+/// The id space is opaque: callers MUST treat the value as a correlation token
+/// only and MUST NOT parse it, reverse it, or infer the underlying error
+/// content from it. It is safe to surface in tenant-facing output — it reveals
+/// nothing beyond "two responses came from the same error shape".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ErrorId(u64);
+
+impl ErrorId {
+    /// The raw 64-bit digest behind this id. Exposed for callers that want to
+    /// key a map or metric on the id without going through its hex `Display`.
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ErrorId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Fixed-width 16-hex-digit rendering with an `err_` sigil so the token
+        // is recognisable in a log grep and never collides with a bare hex
+        // address. Width is pinned so the token length is stable across ids.
+        write!(f, "err_{:016x}", self.0)
+    }
+}
+
+/// A [`Display`](std::fmt::Display) wrapper that renders a [`TensorWasmError`]'s
+/// sanitised message followed by its [`ErrorId`], for use in tenant-facing 4xx
+/// response bodies. Produced by [`TensorWasmError::display_with_id`].
+///
+/// The wrapped error's own `Display` is left untouched (so existing callers and
+/// the `error_display_does_not_leak` regression test keep their exact output);
+/// this wrapper is the opt-in, id-bearing render.
+#[derive(Debug, Clone, Copy)]
+pub struct DisplayWithId<'a>(&'a TensorWasmError);
+
+impl std::fmt::Display for DisplayWithId<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `{}` on the inner error uses its sanitised, leak-safe `Display`; the
+        // appended id is opaque and safe to expose. Together they let a tenant
+        // quote the id to support and an operator pivot it to the full detail.
+        write!(f, "{} [{}]", self.0, self.0.error_id())
+    }
+}
+
 /// The unified error type for every TensorWasm crate.
 ///
 /// Variants are deliberately broad — host-level code matches on the variant to
@@ -519,6 +601,146 @@ impl TensorWasmError {
             TensorWasmError::Serialization(_) => "serialization",
             TensorWasmError::SnapshotTooOld { .. } => "snapshot_too_old",
         }
+    }
+
+    /// Returns an opaque, correlation-friendly [`ErrorId`] for this error.
+    ///
+    /// The id is **deterministically derived** from [`kind`](Self::kind) and
+    /// the error's content (the inner vendor string for the string-carrying
+    /// variants, the structured fields for the rest) via the
+    /// process-independent [`fnv1a`] digest — it is not a random nonce. Two
+    /// errors with the same kind and content share an id by design.
+    ///
+    /// The id is surfaced to tenants in the 4xx body via
+    /// [`display_with_id`](Self::display_with_id) and to operators alongside
+    /// the unredacted detail via [`redacted_inner_with_id`](Self::redacted_inner_with_id)
+    /// (and may simply be re-derived by calling this method on the same error
+    /// in a `tracing` span), so a 4xx response can be pivoted to the matching
+    /// operator log line — possibly on a different node — without the 4xx body
+    /// ever leaking the inner string.
+    ///
+    /// The digest is seeded with `kind()` and a single separator byte so two
+    /// variants that happen to carry the same field bytes (e.g. a `CudaError`
+    /// and a `WasmTrap` with identical inner text) still mint distinct ids.
+    pub fn error_id(&self) -> ErrorId {
+        // Build a small, allocation-light content rendering, then digest
+        // `kind() || 0x1f || content`. The `0x1f` (ASCII unit separator) byte
+        // cannot appear in `kind()` (a fixed `[a-z_]` set), so it unambiguously
+        // delimits the kind from the content and prevents cross-variant
+        // collisions.
+        use std::fmt::Write as _;
+        let mut buf = String::new();
+        buf.push_str(self.kind());
+        buf.push('\u{1f}');
+        match self {
+            TensorWasmError::CudaError(s)
+            | TensorWasmError::WasmTrap(s)
+            | TensorWasmError::WasmCompile(s)
+            | TensorWasmError::Serialization(s) => buf.push_str(s),
+            TensorWasmError::MemoryExhausted { requested, limit } => {
+                let _ = write!(buf, "{requested}/{limit}");
+            }
+            TensorWasmError::GpuMemoryExhausted {
+                requested,
+                limit,
+                current,
+            } => {
+                let _ = write!(buf, "{requested}/{limit}/{current}");
+            }
+            TensorWasmError::KernelTimeout {
+                elapsed_ms,
+                deadline_ms,
+            } => {
+                let _ = write!(buf, "{elapsed_ms}/{deadline_ms}");
+            }
+            TensorWasmError::TenantIsolationViolation {
+                tenant_id,
+                resource,
+            } => {
+                let _ = write!(buf, "{}/{resource}", tenant_id.get());
+            }
+            TensorWasmError::Io(err) => {
+                buf.push_str(io_kind_name(err));
+            }
+            TensorWasmError::SnapshotTooOld {
+                created_unix_ms,
+                now_unix_ms,
+                max_age_ms,
+            } => {
+                let _ = write!(buf, "{created_unix_ms}/{now_unix_ms}/{max_age_ms}");
+            }
+        }
+        ErrorId(fnv1a(buf.as_bytes()))
+    }
+
+    /// Returns a [`Display`](std::fmt::Display) adapter that renders the
+    /// error's sanitised message followed by its [`ErrorId`], suitable for a
+    /// tenant-facing 4xx response body (e.g. `"wasm trap [err_1a2b3c4d5e6f7a8b]"`).
+    ///
+    /// The bare [`Display`](std::fmt::Display) impl is intentionally left
+    /// unchanged (so existing callers and the leak regression tests keep their
+    /// exact output); this adapter is the opt-in render that embeds the
+    /// pivotable id. The id portion is opaque and safe to expose — only the
+    /// inner vendor string is sensitive, and that is never included here.
+    pub fn display_with_id(&self) -> DisplayWithId<'_> {
+        DisplayWithId(self)
+    }
+
+    /// Like [`redacted_inner`](Self::redacted_inner) but pairs the redacted
+    /// string with this error's [`ErrorId`], so an operator log line carries
+    /// both the (defence-in-depth masked) detail and the same id a tenant
+    /// received via [`display_with_id`](Self::display_with_id).
+    ///
+    /// Returns `None` for the variants without an inner vendor string, exactly
+    /// mirroring [`redacted_inner`](Self::redacted_inner) / [`inner`](Self::inner).
+    /// Callers that want the id for a *structured* variant (which has no inner
+    /// string to redact) should call [`error_id`](Self::error_id) directly.
+    pub fn redacted_inner_with_id(&self) -> Option<(ErrorId, String)> {
+        self.redacted_inner().map(|r| (self.error_id(), r))
+    }
+}
+
+/// Validate a GPU allocation against a per-tenant byte cap.
+///
+/// Returns `Ok(())` if adding `requested` bytes to the tenant's `current`
+/// reservation stays within `cap`, and
+/// `Err(TensorWasmError::GpuMemoryExhausted { .. })` otherwise. The returned
+/// error carries `requested`, `limit` (`= cap`), and `current` so the rejection
+/// is fully self-describing for dashboards and tenant-facing responses.
+///
+/// The check is overflow-safe: the prospective new total `current + requested`
+/// is computed with [`u64::checked_add`], and an arithmetic overflow (which can
+/// only happen for absurd inputs near [`u64::MAX`]) is itself treated as
+/// exceeding the cap rather than wrapping to a small value and spuriously
+/// admitting the allocation.
+///
+/// This is the single shared quota predicate the allocator path
+/// (`tensor-wasm-mem`) and the tenant accounting layer (`tensor-wasm-tenant`)
+/// can both call, so the "would this allocation breach the cap?" decision —
+/// and the error it produces on rejection — lives in exactly one place.
+///
+/// ```
+/// use tensor_wasm_core::error::{check_allocation, TensorWasmError};
+/// // 100 already used, asking for 50 more, cap 200 -> fits.
+/// assert!(check_allocation(100, 50, 200).is_ok());
+/// // 100 used + 150 requested = 250 > 200 -> rejected.
+/// assert!(matches!(
+///     check_allocation(100, 150, 200),
+///     Err(TensorWasmError::GpuMemoryExhausted { .. })
+/// ));
+/// ```
+pub fn check_allocation(current: u64, requested: u64, cap: u64) -> Result<(), TensorWasmError> {
+    let fits = current
+        .checked_add(requested)
+        .is_some_and(|new_total| new_total <= cap);
+    if fits {
+        Ok(())
+    } else {
+        Err(TensorWasmError::GpuMemoryExhausted {
+            requested,
+            limit: cap,
+            current,
+        })
     }
 }
 
@@ -936,5 +1158,119 @@ mod tests {
         let io = TensorWasmError::Io(io::Error::other("/secret/path"));
         assert!(mem.redacted_inner().is_none());
         assert!(io.redacted_inner().is_none());
+    }
+
+    #[test]
+    fn error_id_is_deterministic_and_content_sensitive() {
+        // Same kind + same content -> same id (so a 4xx body and an operator
+        // log line, possibly on different nodes, agree).
+        let a = TensorWasmError::CudaError("ctx lost".into());
+        let b = TensorWasmError::CudaError("ctx lost".into());
+        assert_eq!(a.error_id(), b.error_id());
+        // Different content -> different id.
+        let c = TensorWasmError::CudaError("ctx not current".into());
+        assert_ne!(a.error_id(), c.error_id());
+    }
+
+    #[test]
+    fn error_id_distinguishes_variants_with_identical_content() {
+        // The `kind() || 0x1f || content` seeding means a CudaError and a
+        // WasmTrap carrying byte-identical inner text still mint distinct ids.
+        let cuda = TensorWasmError::CudaError("boom".into());
+        let trap = TensorWasmError::WasmTrap("boom".into());
+        assert_ne!(cuda.error_id(), trap.error_id());
+    }
+
+    #[test]
+    fn error_id_display_is_fixed_width_opaque_token() {
+        let e = TensorWasmError::WasmTrap("x".into());
+        let id = e.error_id().to_string();
+        // `err_` sigil + 16 lowercase hex digits.
+        assert!(id.starts_with("err_"), "expected err_ sigil, got: {id}");
+        assert_eq!(id.len(), "err_".len() + 16, "id must be fixed width: {id}");
+        assert!(
+            id["err_".len()..].bytes().all(|b| b.is_ascii_hexdigit()),
+            "id body must be hex: {id}",
+        );
+    }
+
+    #[test]
+    fn display_with_id_appends_id_without_leaking_inner() {
+        // The id-bearing tenant render must carry the sanitised message and the
+        // opaque id, but NEVER the sensitive inner string.
+        let e = TensorWasmError::CudaError("ctx not current at 0x7ffe0000".into());
+        let rendered = e.display_with_id().to_string();
+        assert!(
+            rendered.starts_with("cuda driver call failed"),
+            "must lead with the sanitised Display: {rendered}",
+        );
+        assert!(
+            rendered.contains(&e.error_id().to_string()),
+            "must embed the error id: {rendered}",
+        );
+        assert!(
+            !rendered.contains("0x7ffe0000"),
+            "must NOT leak the inner vendor string: {rendered}",
+        );
+        // The bare Display impl stays unchanged (backward compatible).
+        assert_eq!(format!("{e}"), "cuda driver call failed");
+    }
+
+    #[test]
+    fn redacted_inner_with_id_pairs_id_and_redaction() {
+        let e = TensorWasmError::WasmCompile("bad module at /dev/shm/tenant-7/mod.wasm".into());
+        let (id, redacted) = e
+            .redacted_inner_with_id()
+            .expect("vendor variant yields Some");
+        assert_eq!(id, e.error_id());
+        assert!(redacted.contains("<redacted>"), "expected mask: {redacted}");
+        assert!(
+            !redacted.contains("/dev/shm/tenant-7"),
+            "path must be masked: {redacted}",
+        );
+        // Structured variants have no inner string to redact -> None.
+        let mem = TensorWasmError::MemoryExhausted {
+            requested: 1,
+            limit: 1,
+        };
+        assert!(mem.redacted_inner_with_id().is_none());
+    }
+
+    #[test]
+    fn check_allocation_admits_within_cap() {
+        assert!(check_allocation(100, 50, 200).is_ok());
+        // Exactly at the cap is admitted (the new total equals the cap).
+        assert!(check_allocation(150, 50, 200).is_ok());
+        // Zero request always fits when already within cap.
+        assert!(check_allocation(200, 0, 200).is_ok());
+    }
+
+    #[test]
+    fn check_allocation_rejects_over_cap_with_fields() {
+        let err = check_allocation(100, 150, 200)
+            .expect_err("100 + 150 = 250 > 200 must be rejected");
+        match err {
+            TensorWasmError::GpuMemoryExhausted {
+                requested,
+                limit,
+                current,
+            } => {
+                assert_eq!(requested, 150);
+                assert_eq!(limit, 200);
+                assert_eq!(current, 100);
+            }
+            other => panic!("expected GpuMemoryExhausted, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_allocation_treats_overflow_as_over_cap() {
+        // `current + requested` overflows u64; the checked add must reject
+        // rather than wrap to a small value and spuriously admit.
+        let err = check_allocation(u64::MAX, 1, u64::MAX);
+        assert!(
+            matches!(err, Err(TensorWasmError::GpuMemoryExhausted { .. })),
+            "arithmetic overflow must be treated as exceeding the cap",
+        );
     }
 }

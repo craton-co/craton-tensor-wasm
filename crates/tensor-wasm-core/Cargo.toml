@@ -46,6 +46,9 @@ temp-env = "0.3"
 [package.metadata.docs.rs]
 # docs.rs builds the documentation with every Cargo feature enabled so the
 # OTLP entry points show up alongside the always-available ones. The `--cfg
-# docsrs` flag enables `#[doc(cfg(...))]` annotations once they're added.
+# docsrs` flag turns on the `#[cfg_attr(docsrs, doc(cfg(feature = "otlp")))]`
+# annotations now present on the public `otlp`-gated surface
+# (`telemetry::init_with_otlp`, `telemetry::OtlpInitError`), so those items
+# render with a "this is supported on feature otlp only" banner.
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
