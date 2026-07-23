@@ -544,12 +544,29 @@ static TENANT_LABEL_INTERN: OnceLock<Mutex<HashMap<u64, &'static str>>> = OnceLo
 /// [`TENANT_LABEL_INTERN_CAP`] distinct ids AND `id` is not already cached,
 /// signalling the caller to fall back to a per-call format (the unbounded-
 /// leak guard).
+///
+/// Thin wrapper over [`intern_tenant_id_in`] bound to the process-global
+/// cache and cap. The parameterised form exists so tests can drive a
+/// small-cap instance and exercise the at-capacity fallback branch without
+/// having to insert thousands of entries into the global slot.
 fn intern_tenant_id(id: u64) -> Option<&'static str> {
     let cache = TENANT_LABEL_INTERN.get_or_init(|| Mutex::new(HashMap::new()));
+    intern_tenant_id_in(cache, TENANT_LABEL_INTERN_CAP, id)
+}
 
+/// Core intern logic, parameterised over the backing `cache` and the
+/// capacity `cap`, so a unit test can instantiate a fresh small-cap cache and
+/// observe the `None` (at-capacity) fallback deterministically.
+///
+/// The lock is NOT held across the `format!` + `Box::leak`, matching the
+/// doc contract on [`intern_tenant_id`].
+fn intern_tenant_id_in(
+    cache: &Mutex<HashMap<u64, &'static str>>,
+    cap: usize,
+    id: u64,
+) -> Option<&'static str> {
     // First, a short critical section: hit on the already-interned id, or bail
-    // out if the cache is at capacity. The lock is NOT held across the
-    // `format!` + `Box::leak` below, matching this function's doc contract.
+    // out if the cache is at capacity.
     {
         // Poisoning is benign here — the cache holds only `&'static str` and a
         // panic mid-insert cannot leave it logically corrupt — so recover the
@@ -558,15 +575,14 @@ fn intern_tenant_id(id: u64) -> Option<&'static str> {
         if let Some(&s) = map.get(&id) {
             return Some(s);
         }
-        if map.len() >= TENANT_LABEL_INTERN_CAP {
+        if map.len() >= cap {
             return None;
         }
     }
 
     // Mint the rendering with the lock released. `Box::leak` is intentional:
     // each rendering lives for the lifetime of the process and the total leaked
-    // memory is bounded by `TENANT_LABEL_INTERN_CAP` small strings (cf.
-    // `StatusTable`).
+    // memory is bounded by `cap` small strings (cf. `StatusTable`).
     let candidate: &'static str = Box::leak(format!("T#{id}").into_boxed_str());
 
     // Re-acquire and re-check: a concurrent caller may have interned this id
@@ -579,7 +595,7 @@ fn intern_tenant_id(id: u64) -> Option<&'static str> {
     if let Some(&s) = map.get(&id) {
         return Some(s);
     }
-    if map.len() >= TENANT_LABEL_INTERN_CAP {
+    if map.len() >= cap {
         return None;
     }
     map.insert(id, candidate);
@@ -1744,13 +1760,40 @@ mod tests {
     fn intern_tenant_id_falls_back_at_capacity() {
         // SECURITY (finding: unbounded leak guard): once the cache is full,
         // a not-yet-seen id is NOT interned (returns `None`), so a tenant-id
-        // flood cannot leak unbounded `&'static str`s. We can't fill the real
-        // 4096-cap global cheaply in a unit test, so assert the cap is the
-        // documented bound and that an already-interned id keeps resolving.
+        // flood cannot leak unbounded `&'static str`s. Driving a fresh,
+        // small-cap cache via the parameterised `intern_tenant_id_in` lets us
+        // hit the at-capacity branch deterministically without inserting
+        // thousands of entries into the global slot.
         assert_eq!(TENANT_LABEL_INTERN_CAP, 4096);
+        let cache: Mutex<HashMap<u64, &'static str>> = Mutex::new(HashMap::new());
+        // cap = 2: first two distinct ids intern, third is rejected.
+        assert_eq!(intern_tenant_id_in(&cache, 2, 1), Some("T#1"));
+        assert_eq!(intern_tenant_id_in(&cache, 2, 2), Some("T#2"));
+        assert_eq!(
+            intern_tenant_id_in(&cache, 2, 3),
+            None,
+            "a not-yet-seen id past capacity must return None",
+        );
+        // An already-interned id still resolves even at capacity (it's a hit,
+        // not an insert).
+        assert_eq!(
+            intern_tenant_id_in(&cache, 2, 1),
+            Some("T#1"),
+            "a cached id must resolve regardless of remaining capacity",
+        );
+        // Repeat hits hand back the same interned pointer (not a fresh leak).
+        let a = intern_tenant_id_in(&cache, 2, 2).expect("cached");
+        let b = intern_tenant_id_in(&cache, 2, 2).expect("cached");
+        assert!(std::ptr::eq(a, b), "repeat hits must share one pointer");
+    }
+
+    #[test]
+    fn intern_tenant_id_global_wrapper_resolves() {
+        // The global wrapper delegates to `intern_tenant_id_in` with the
+        // process cache + `TENANT_LABEL_INTERN_CAP`; a fresh id resolves and
+        // is idempotent.
         let first = intern_tenant_id(99_002);
         assert_eq!(first, Some("T#99002"));
-        // Idempotent: a cached id resolves regardless of remaining capacity.
         assert_eq!(intern_tenant_id(99_002), Some("T#99002"));
     }
 

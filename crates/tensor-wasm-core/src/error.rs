@@ -1273,4 +1273,154 @@ mod tests {
             "arithmetic overflow must be treated as exceeding the cap",
         );
     }
+
+    // --- direct redact() shape coverage ----------------------------------
+    //
+    // These drive the standalone `redact` scanner so the punctuation-split
+    // and leading-peel behaviour (and the forward-slash / UNC Windows rules)
+    // are pinned independently of any error variant.
+
+    #[test]
+    fn redact_masks_parenthesised_unix_path() {
+        // `(/dev/shm/x)` — the path is wrapped in parens; with parens as token
+        // separators the inner path is examined on its own and masked.
+        let r = redact("opened (/dev/shm/tenant-7/mod.wasm) ok");
+        assert!(
+            !r.contains("/dev/shm/tenant-7"),
+            "parenthesised path must be masked: {r}",
+        );
+        assert!(r.contains("<redacted>"), "expected mask: {r}");
+        // The surrounding parens survive.
+        assert!(r.contains('(') && r.contains(')'), "parens must survive: {r}");
+    }
+
+    #[test]
+    fn redact_masks_equals_joined_pointer() {
+        // `addr=0x7ffe0000` — `=` joins a label to a pointer; the pointer must
+        // be masked, the `addr=` kept.
+        let r = redact("addr=0x7ffe0000");
+        assert!(!r.contains("0x7ffe0000"), "pointer must be masked: {r}");
+        assert!(r.starts_with("addr="), "label must survive: {r}");
+        assert!(r.contains("<redacted>"), "expected mask: {r}");
+    }
+
+    #[test]
+    fn redact_masks_comma_joined_path() {
+        // `a,/dev/shm/x` — comma-joined; the path component is masked, the
+        // leading `a` and comma survive.
+        let r = redact("a,/dev/shm/secret/key");
+        assert!(!r.contains("/dev/shm/secret"), "path must be masked: {r}");
+        assert!(r.starts_with("a,"), "prefix must survive: {r}");
+        assert!(r.contains("<redacted>"), "expected mask: {r}");
+    }
+
+    #[test]
+    fn redact_masks_quote_wrapped_pointer() {
+        // Leading-peel: a pointer wrapped in single quotes is recognised even
+        // though `'` is not a token separator.
+        let r = redact("'0x7ffe0000'");
+        assert!(!r.contains("0x7ffe0000"), "pointer must be masked: {r}");
+        assert!(r.contains("<redacted>"), "expected mask: {r}");
+        // Both quotes are re-emitted around the mask.
+        assert_eq!(r.matches('\'').count(), 2, "both quotes must survive: {r}");
+    }
+
+    #[test]
+    fn redact_masks_forward_slash_windows_drive_path() {
+        // `C:/Users/...` — forward-slash Windows drive form.
+        let r = redact("read C:/Users/op/secret.json failed");
+        assert!(!r.contains("C:/Users"), "forward-slash drive path: {r}");
+        assert!(r.contains("<redacted>"), "expected mask: {r}");
+    }
+
+    #[test]
+    fn redact_masks_unc_path() {
+        // `\\server\share\...` — UNC path.
+        let r = redact(r"copy from \\fileserver\share\secret.bin done");
+        assert!(!r.contains("fileserver"), "UNC server must be masked: {r}");
+        assert!(r.contains("<redacted>"), "expected mask: {r}");
+    }
+
+    #[test]
+    fn redact_does_not_panic_on_utf8_tokens() {
+        // Multi-byte UTF-8 inside a token must not panic the byte-indexed
+        // scanner (the path/pointer rules only index `core[1..]` / `bytes[..]`
+        // after an ASCII guard byte). Mixed scripts + an embedded pointer.
+        let input = "café 路径=0xdeadBEEF naïve ∑ 北京/上海";
+        let r = redact(input);
+        // The pointer is still masked despite the surrounding UTF-8.
+        assert!(!r.contains("0xdeadBEEF"), "pointer must be masked: {r}");
+        // Non-path UTF-8 prose is preserved.
+        assert!(r.contains("café") && r.contains("naïve"), "prose kept: {r}");
+    }
+
+    #[test]
+    fn redact_keeps_single_component_path_and_lone_slash() {
+        // A lone `/` (division) and a single-segment `/path` (one slash only)
+        // are intentionally left intact — masking them would destroy useful
+        // operator detail and the rules are deliberately conservative.
+        assert_eq!(redact("3 / 4"), "3 / 4");
+        assert_eq!(redact("/single"), "/single");
+    }
+
+    // --- Display field rendering for structured variants ------------------
+
+    #[test]
+    fn display_snapshot_too_old_renders_all_fields() {
+        let e = TensorWasmError::SnapshotTooOld {
+            created_unix_ms: 1_000,
+            now_unix_ms: 9_999,
+            max_age_ms: 5_000,
+        };
+        let s = e.to_string();
+        assert!(s.contains("1000"), "created field missing: {s}");
+        assert!(s.contains("9999"), "now field missing: {s}");
+        assert!(s.contains("5000"), "max_age field missing: {s}");
+    }
+
+    #[test]
+    fn display_gpu_memory_exhausted_renders_all_fields() {
+        let e = TensorWasmError::GpuMemoryExhausted {
+            requested: 4096,
+            limit: 8192,
+            current: 6000,
+        };
+        let s = e.to_string();
+        assert!(s.contains("4096"), "requested field missing: {s}");
+        assert!(s.contains("8192"), "limit field missing: {s}");
+        assert!(s.contains("6000"), "current field missing: {s}");
+    }
+
+    // --- Io retryable family at the variant level ------------------------
+
+    #[test]
+    fn io_retryable_family_via_error_variant() {
+        // Drive the full retryable I/O family through `TensorWasmError::Io`'s
+        // `is_retryable()` so the variant-level wiring (not just the private
+        // classifier) is pinned.
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WriteZero,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::WouldBlock,
+        ] {
+            let e = TensorWasmError::Io(io::Error::from(kind));
+            assert!(e.is_retryable(), "Io({kind:?}) must be retryable");
+        }
+    }
+
+    #[test]
+    fn io_hard_miss_family_via_error_variant_not_retryable() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AlreadyExists,
+        ] {
+            let e = TensorWasmError::Io(io::Error::from(kind));
+            assert!(!e.is_retryable(), "Io({kind:?}) must NOT be retryable");
+        }
+    }
 }
