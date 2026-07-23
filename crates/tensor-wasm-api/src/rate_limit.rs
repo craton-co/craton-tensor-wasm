@@ -734,7 +734,7 @@ impl RateLimiter {
     /// server) so steady-state memory does not grow with the *historical*
     /// count of distinct `(token, tenant)` pairs — only the *currently
     /// active* set. The per-token LRU cap
-    /// ([`evict_lru_tenant_if_at_cap`](Self::evict_lru_tenant_if_at_cap))
+    /// (`evict_lru_tenant_if_at_cap`)
     /// bounds a single hostile token's fan-out; this TTL sweep additionally
     /// bounds the *long-tail accumulation* of many tokens each touching a
     /// few tenants once and never again.
@@ -1304,13 +1304,20 @@ mod tests {
         // TTL of 5s: `cold` (10s idle) goes, `warm` (0s idle) stays. Two
         // buckets removed (the cold token's per-token + per-tenant entries).
         let removed = limiter.sweep_idle_with_ttl(Duration::from_secs(5));
-        assert_eq!(removed, 2, "only the cold token's two buckets are reclaimed");
+        assert_eq!(
+            removed, 2,
+            "only the cold token's two buckets are reclaimed"
+        );
         assert!(
-            limiter.per_tenant_buckets.contains_key(&(warm, TenantId(2))),
+            limiter
+                .per_tenant_buckets
+                .contains_key(&(warm, TenantId(2))),
             "warm token's bucket must survive",
         );
         assert!(
-            !limiter.per_tenant_buckets.contains_key(&(cold, TenantId(1))),
+            !limiter
+                .per_tenant_buckets
+                .contains_key(&(cold, TenantId(1))),
             "cold token's bucket must be gone",
         );
         // A subsequent request for the evicted (cold) pair rebuilds the

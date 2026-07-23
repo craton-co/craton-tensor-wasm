@@ -1122,9 +1122,7 @@ pub async fn audit_log_middleware(
     // emit one, so an inner layer that stamps its own id wins.
     if !response.headers().contains_key(HEADER_REQUEST_ID) {
         if let Ok(value) = axum::http::HeaderValue::from_str(&request_id.to_string()) {
-            response
-                .headers_mut()
-                .insert(HEADER_REQUEST_ID, value);
+            response.headers_mut().insert(HEADER_REQUEST_ID, value);
         }
     }
 
