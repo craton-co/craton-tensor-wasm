@@ -228,7 +228,10 @@ async fn every_protected_route_requires_auth_when_allowlist_configured() {
         (Method::DELETE, format!("/functions/{SAMPLE_ID}")),
         (Method::POST, format!("/functions/{SAMPLE_ID}/invoke")),
         (Method::POST, format!("/functions/{SAMPLE_ID}/invoke-async")),
-        (Method::POST, format!("/functions/{SAMPLE_ID}/invoke-stream")),
+        (
+            Method::POST,
+            format!("/functions/{SAMPLE_ID}/invoke-stream"),
+        ),
         (Method::POST, "/snapshot/save".to_string()),
         (Method::POST, "/snapshot/restore".to_string()),
         (Method::GET, format!("/jobs/{SAMPLE_ID}")),

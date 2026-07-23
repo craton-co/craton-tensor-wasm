@@ -143,7 +143,10 @@ fn is_hex_digit(b: u8) -> bool {
 /// larger token whose leading byte is ordinary text, which previously let the
 /// sensitive fragment slip through unmasked.
 fn is_token_separator(c: u8) -> bool {
-    matches!(c, b'[' | b']' | b'(' | b')' | b'{' | b'}' | b'=' | b',' | b';')
+    matches!(
+        c,
+        b'[' | b']' | b'(' | b')' | b'{' | b'}' | b'=' | b',' | b';'
+    )
 }
 
 /// Returns `true` if `c` is trailing/leading punctuation that
@@ -177,10 +180,7 @@ fn redact(s: &str) -> String {
         }
         // Find the end of the current token (run of non-delimiter bytes).
         let start = i;
-        while i < bytes.len()
-            && !bytes[i].is_ascii_whitespace()
-            && !is_token_separator(bytes[i])
-        {
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !is_token_separator(bytes[i]) {
             i += 1;
         }
         let token = &s[start..i];
@@ -608,7 +608,7 @@ impl TensorWasmError {
     /// The id is **deterministically derived** from [`kind`](Self::kind) and
     /// the error's content (the inner vendor string for the string-carrying
     /// variants, the structured fields for the rest) via the
-    /// process-independent [`fnv1a`] digest — it is not a random nonce. Two
+    /// process-independent `fnv1a` digest — it is not a random nonce. Two
     /// errors with the same kind and content share an id by design.
     ///
     /// The id is surfaced to tenants in the 4xx body via
@@ -1247,8 +1247,8 @@ mod tests {
 
     #[test]
     fn check_allocation_rejects_over_cap_with_fields() {
-        let err = check_allocation(100, 150, 200)
-            .expect_err("100 + 150 = 250 > 200 must be rejected");
+        let err =
+            check_allocation(100, 150, 200).expect_err("100 + 150 = 250 > 200 must be rejected");
         match err {
             TensorWasmError::GpuMemoryExhausted {
                 requested,
@@ -1291,7 +1291,10 @@ mod tests {
         );
         assert!(r.contains("<redacted>"), "expected mask: {r}");
         // The surrounding parens survive.
-        assert!(r.contains('(') && r.contains(')'), "parens must survive: {r}");
+        assert!(
+            r.contains('(') && r.contains(')'),
+            "parens must survive: {r}"
+        );
     }
 
     #[test]

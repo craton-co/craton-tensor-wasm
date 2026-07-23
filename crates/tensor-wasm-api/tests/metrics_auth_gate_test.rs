@@ -46,7 +46,12 @@ async fn get_metrics(router: &axum::Router, auth_header: Option<&str>) -> Status
         builder = builder.header("authorization", value);
     }
     let req = builder.body(Body::empty()).expect("request builds");
-    router.clone().oneshot(req).await.expect("router serves").status()
+    router
+        .clone()
+        .oneshot(req)
+        .await
+        .expect("router serves")
+        .status()
 }
 
 /// With the token configured, a scrape carrying NO `Authorization` header
