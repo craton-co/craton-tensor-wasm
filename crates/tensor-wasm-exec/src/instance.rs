@@ -16,6 +16,7 @@
 //! invokes exported functions.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tensor_wasm_core::types::{InstanceId, TenantId};
@@ -80,6 +81,26 @@ pub struct InstanceState {
     /// `None` means "no hard cap" — the callback yields cooperatively
     /// forever (used only if no cap of any kind applies).
     pub hard_deadline: Option<Instant>,
+    /// Cooperative cancellation flag consulted by the epoch-deadline
+    /// callback alongside [`Self::hard_deadline`].
+    ///
+    /// [`TensorWasmExecutor::terminate`](crate::executor::TensorWasmExecutor::terminate)
+    /// flips this to `true` (and sets `hard_deadline = Some(now)`) so the
+    /// next epoch tick traps an in-flight, possibly deadline-less call —
+    /// closing the gap where `terminate` could only remove the registry
+    /// entry and free the admission slot, but could not interrupt a guest
+    /// already executing inside `call_async` (the per-instance mutex is held
+    /// across that await, so the registry removal alone never reached the
+    /// running fiber).
+    ///
+    /// Held as an `Arc<AtomicBool>` so a clone can live in the registry
+    /// value beside the `Arc<Mutex<…>>`: `terminate` flips the flag WITHOUT
+    /// taking the per-instance mutex (which the in-flight call holds), and
+    /// the epoch callback reads it lock-free from the per-store payload. A
+    /// freshly-spawned instance starts un-cancelled; the flag is one-shot
+    /// (terminate is terminal — an instance is never resurrected) so it is
+    /// never reset.
+    pub(crate) cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Total kernel dispatches issued by this instance (cumulative).
     pub kernel_dispatches: AtomicU64,
     /// Total bytes of GPU memory this instance has allocated.
@@ -150,6 +171,7 @@ impl InstanceState {
             deadline: None,
             deadline_duration: None,
             hard_deadline: None,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             kernel_dispatches: AtomicU64::new(0),
             gpu_bytes_allocated: AtomicU64::new(0),
             limiter: TensorWasmResourceLimiter::new(usize::MAX),
@@ -246,6 +268,23 @@ impl InstanceState {
             Some(at) => Instant::now() >= at,
             None => false,
         }
+    }
+
+    /// True iff [`TensorWasmExecutor::terminate`](crate::executor::TensorWasmExecutor::terminate)
+    /// has flipped the cooperative-cancellation flag. Consulted by the epoch
+    /// callback alongside [`Self::hard_deadline_elapsed`] so a `terminate`
+    /// traps an in-flight (and possibly deadline-less) call at the next
+    /// epoch tick instead of merely de-registering it.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Clone the shared cancellation handle so the executor can stash it in
+    /// the registry value (beside the `Arc<Mutex<…>>`) and flip it from
+    /// `terminate` WITHOUT acquiring the per-instance mutex the in-flight
+    /// call holds across `call_async`.
+    pub(crate) fn cancel_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.cancelled)
     }
 
     /// Record the per-call deadline duration so subsequent calls can re-arm
