@@ -114,7 +114,17 @@ fn arm_cooperative_epoch(store: &mut Store<InstanceState>, first_ticks: u64) {
     // re-arms are driven by the value the callback returns.
     store.set_epoch_deadline(first_ticks);
     store.epoch_deadline_callback(|ctx| {
-        if ctx.data().hard_deadline_elapsed() {
+        if ctx.data().is_cancelled() {
+            // HIGH finding 1: `terminate` flipped the cooperative-cancellation
+            // flag (and set `hard_deadline = now`). Trap the guest at this
+            // epoch tick so an in-flight, possibly deadline-less call is
+            // interrupted instead of running until it returns of its own
+            // accord. The error string mirrors the hard-deadline trap; the
+            // surrounding `call_export_with_args` propagates it as
+            // `ExecError::Wasmtime` (no deadline crossed, so it is not
+            // reclassified as a timeout).
+            Err(wasmtime::Error::msg("instance terminated"))
+        } else if ctx.data().hard_deadline_elapsed() {
             // HARD deadline crossed: trap, terminating the guest. Mirrors the
             // historical `epoch_deadline_trap` behaviour. The executor's
             // timeout classification keys off the wall clock, not this string.
@@ -709,11 +719,46 @@ impl ResourceLimiter for TensorWasmResourceLimiter {
     }
 }
 
+/// Registry value held against each live [`InstanceId`].
+///
+/// Bundles the per-instance `Arc<Mutex<TensorWasmInstance>>` with three
+/// pieces of metadata cached at register time so the hot lifecycle paths
+/// (`terminate`, `detach_pooled_instance`, the per-call result projection)
+/// never have to take the per-instance mutex just to read them:
+///
+///   * `tenant_id` (PERF finding 6): `terminate` / `detach` decrement the
+///     per-tenant fairness counter from a plain field instead of locking the
+///     mutex — which an in-flight call may be holding across `call_async`.
+///   * `cancelled` (HIGH finding 1): the shared cooperative-cancellation
+///     flag the epoch callback consults. `terminate` flips it WITHOUT the
+///     mutex so a running, deadline-less call is trapped at the next epoch
+///     tick rather than merely de-registered.
+///   * `export_arity` (PERF finding 6): per-export declared result counts,
+///     cached at register time so `call_export_with_args` skips the
+///     per-call `Func::ty` allocation on repeat invocations.
+#[derive(Clone)]
+struct RegistryEntry {
+    /// The live instance, behind the per-instance serialising mutex.
+    handle: Arc<Mutex<TensorWasmInstance>>,
+    /// Owning tenant, cached so `terminate` / `detach` need no lock to
+    /// decrement the per-tenant count (PERF finding 6).
+    tenant_id: TenantId,
+    /// Cooperative-cancellation handle shared with the per-store
+    /// [`InstanceState::cancelled`]. `terminate` flips it lock-free
+    /// (HIGH finding 1).
+    cancelled: Arc<AtomicBool>,
+    /// Per-export declared result arity, populated lazily on first call and
+    /// reused thereafter so the typed/dynamic branch in
+    /// `call_export_with_args` avoids the per-call `Func::ty` allocation
+    /// (PERF finding 6).
+    export_arity: Arc<dashmap::DashMap<String, usize>>,
+}
+
 /// The async executor.
 #[derive(Clone)]
 pub struct TensorWasmExecutor {
     engine: Arc<TensorWasmEngine>,
-    instances: Arc<DashMap<InstanceId, Arc<Mutex<TensorWasmInstance>>>>,
+    instances: Arc<DashMap<InstanceId, RegistryEntry>>,
     next_instance_id: Arc<AtomicU64>,
     /// Per-engine compiled-module cache keyed by the full 256-bit BLAKE3
     /// digest of the wasm bytes. Avoids re-running Cranelift on every
@@ -1722,9 +1767,21 @@ impl TensorWasmExecutor {
         // host imports observing `caller.data().instance_id` see the
         // same value the caller holds.
         inst.store.data_mut().instance_id = id;
+        // Capture the metadata the registry value caches BEFORE the instance
+        // is moved into the mutex: the owning tenant (PERF finding 6 — read
+        // lock-free by `terminate` / `detach`) and the cooperative-cancellation
+        // handle (HIGH finding 1 — flipped lock-free by `terminate`). Reading
+        // them here is free; we already hold the only reference to `inst`.
+        let tenant_id = inst.store.data().tenant_id;
+        let cancelled = inst.store.data().cancel_handle();
         match self.instances.entry(id) {
             Entry::Vacant(v) => {
-                v.insert(Arc::new(Mutex::new(inst)));
+                v.insert(RegistryEntry {
+                    handle: Arc::new(Mutex::new(inst)),
+                    tenant_id,
+                    cancelled,
+                    export_arity: Arc::new(dashmap::DashMap::new()),
+                });
             }
             Entry::Occupied(_) => {
                 warn!(
@@ -1761,7 +1818,7 @@ impl TensorWasmExecutor {
         &self,
         id: InstanceId,
     ) -> Option<TensorWasmInstance> {
-        let (_, handle) = self.instances.remove(&id)?;
+        let (_, entry) = self.instances.remove(&id)?;
         // Decrement the "active_instances" gauge: this is the moment the
         // instance leaves the externally-visible registry. The
         // `instance_spawns_total` counter is intentionally not paired
@@ -1770,23 +1827,17 @@ impl TensorWasmExecutor {
         if let Some(m) = &self.metrics {
             m.active_instances().dec();
         }
-        // Capture the owning tenant id BEFORE we attempt `try_unwrap`, while
-        // we can still cheaply read it. We need it on the try_unwrap-failure
-        // branch below to decrement the per-tenant fairness counter (the
-        // engine-wide slot release alone used to leave the per-tenant count
-        // leaked). Only read it when a per-tenant cap is configured —
-        // otherwise `tenant_counts` is never populated and we skip the
-        // per-instance lock entirely, exactly mirroring `terminate`'s
-        // discipline. The lock here is uncontended on the common path (we hold
-        // the only handle after the `DashMap::remove` above); a racing
-        // in-flight call would briefly hold it, which is correct — we want the
-        // post-call tenant. We drop the lock guard before `try_unwrap` so we
-        // are not ourselves holding a strong borrow that would defeat it.
+        // PERF finding 6: the owning tenant is cached on the registry value at
+        // register time, so we read it from a plain field instead of locking
+        // the per-instance mutex (which a racing in-flight call holds across
+        // `call_async`). Only needed when a per-tenant cap is configured —
+        // otherwise `tenant_counts` is never populated, mirroring `terminate`.
         let owning_tenant = if self.engine.config().max_instances_per_tenant.is_some() {
-            Some(handle.lock().await.tenant_id())
+            Some(entry.tenant_id)
         } else {
             None
         };
+        let handle = entry.handle;
         // Unwrap the Arc<Mutex<_>>: we need the sole strong reference to move
         // the instance out into the warm channel.
         //
@@ -2102,12 +2153,17 @@ impl TensorWasmExecutor {
         export: &str,
         args: &[WasmArg],
     ) -> Result<serde_json::Value, ExecError> {
-        let handle = self
+        // Clone the registry value (all `Arc` clones — cheap) so we hold the
+        // per-instance handle and the cached export-arity map across the await
+        // without keeping the `DashMap` shard locked.
+        let entry = self
             .instances
             .get(&id)
             .ok_or(ExecError::NotFound(id))?
             .value()
             .clone();
+        let handle = entry.handle;
+        let export_arity = entry.export_arity;
         let mut guard = handle.lock().await;
         // Re-arm the deadline at the start of each call.
         //
@@ -2177,8 +2233,23 @@ impl TensorWasmExecutor {
         // dynamic `Func::call_async` path with `&[Val]` IO buffers (params
         // may legitimately be empty); the result vec is pre-sized to the
         // export's declared result arity so wasmtime can write into it.
-        let func_ty = func.ty(&guard.store);
-        let call_outcome = if args.is_empty() && func_ty.results().len() == 0 {
+        //
+        // PERF finding 6: the declared result arity is the only thing this
+        // branch needs from `Func::ty`, and a module's export signatures are
+        // immutable for the instance's life. `Func::ty` allocates a fresh
+        // `FuncType` (a `Vec` of param + result value types) on every call;
+        // we cache the result count per export on the registry value so
+        // repeat invocations skip that allocation. The first call for a given
+        // export pays the `Func::ty` once and memoises; the value is stable.
+        let results_len = match export_arity.get(export).map(|v| *v.value()) {
+            Some(n) => n,
+            None => {
+                let n = func.ty(&guard.store).results().len();
+                export_arity.insert(export.to_string(), n);
+                n
+            }
+        };
+        let call_outcome = if args.is_empty() && results_len == 0 {
             match func.typed::<(), ()>(&guard.store) {
                 Ok(typed) => typed
                     .call_async(&mut guard.store, ())
@@ -2192,7 +2263,7 @@ impl TensorWasmExecutor {
             // every slot before returning. The element count must match
             // the export's declared result arity exactly or wasmtime
             // returns an error.
-            let mut results: Vec<Val> = vec![Val::I32(0); func_ty.results().len()];
+            let mut results: Vec<Val> = vec![Val::I32(0); results_len];
             match func
                 .call_async(&mut guard.store, &params, &mut results)
                 .await
@@ -2230,7 +2301,23 @@ impl TensorWasmExecutor {
     #[instrument(skip(self), fields(instance = %id))]
     pub async fn terminate(&self, id: InstanceId) -> Result<(), ExecError> {
         match self.instances.remove(&id) {
-            Some((_, handle)) => {
+            Some((_, entry)) => {
+                // HIGH finding 1: flip the cooperative-cancellation flag so an
+                // in-flight, possibly deadline-less call is TRAPPED at the next
+                // epoch tick instead of merely being de-registered. The flag is
+                // an `Arc<AtomicBool>` shared with the per-store
+                // `InstanceState::cancelled`; we set it lock-free, WITHOUT
+                // touching the per-instance mutex — which the running call holds
+                // across its `call_async` await. The epoch callback checks
+                // `is_cancelled()` first on every trip, so once the background
+                // ticker advances the epoch the guest unwinds with an
+                // "instance terminated" trap. Removing the registry entry (above)
+                // and freeing the admission slot (below) closes the leak; the
+                // flag closes the run-time interruption gap the previous
+                // implementation could not. `Release` so the trap-side
+                // `Acquire` load observes the flip. Idempotent: a double
+                // terminate would already be `NotFound` at the `remove`.
+                entry.cancelled.store(true, Ordering::Release);
                 // Release the admission slot reserved at spawn time
                 // (exec S-10). The decrement only runs on successful
                 // removal — a `NotFound` terminate must not free a
@@ -2240,17 +2327,12 @@ impl TensorWasmExecutor {
                 // Mirror the engine-wide release on the per-tenant count
                 // (fairness cap). Only taken when a per-tenant cap is
                 // configured — otherwise `tenant_counts` is never populated
-                // and we skip the per-instance lock entirely, preserving the
-                // historical lock-free terminate path. When the cap IS active,
-                // read the owning tenant off the now-removed instance and
-                // decrement its slot, pruning the map entry at zero. Locking
-                // the per-instance mutex to read the tenant is uncontended on
-                // the common path (the registry held the only handle); a
-                // racing in-flight call would briefly hold it, which is
-                // correct — we want the post-call tenant.
+                // and we skip the decrement entirely. PERF finding 6: the
+                // owning tenant is cached on the registry value at register
+                // time, so we read it from a plain field — no per-instance
+                // lock (which a racing in-flight call would be holding).
                 if self.engine.config().max_instances_per_tenant.is_some() {
-                    let tenant = handle.lock().await.tenant_id();
-                    decrement_tenant_count(&self.tenant_counts, tenant);
+                    decrement_tenant_count(&self.tenant_counts, entry.tenant_id);
                 }
                 if let Some(m) = &self.metrics {
                     m.instance_terminations_total().inc();
@@ -2391,17 +2473,14 @@ impl TensorWasmExecutor {
         // time); the cancellation race the guard defends against only opens
         // once we enter the `call_export_with_args` await below.
         let tenant_rollback = if self.engine.config().max_instances_per_tenant.is_some() {
-            // Read the owning tenant off the already-registered instance under
-            // its per-instance lock (uncontended on the common path). If the
-            // id is unknown the call below will return `NotFound` and there is
-            // nothing to roll back, so a `None` here is harmless.
-            match self.instances.get(&id).map(|h| h.value().clone()) {
-                Some(handle) => {
-                    let tenant = handle.lock().await.tenant_id();
-                    Some((Arc::clone(&self.tenant_counts), tenant))
-                }
-                None => None,
-            }
+            // PERF finding 6: the owning tenant is cached on the registry value
+            // at register time, so we read it from a plain field — no
+            // per-instance lock. If the id is unknown the call below returns
+            // `NotFound` and there is nothing to roll back, so a `None` here is
+            // harmless.
+            self.instances
+                .get(&id)
+                .map(|e| (Arc::clone(&self.tenant_counts), e.value().tenant_id))
         } else {
             None
         };
@@ -2438,7 +2517,7 @@ impl TensorWasmExecutor {
 /// because the original `&self` reference is consumed by the
 /// `call_export` await this guard wraps.
 struct AutoTerminateGuard {
-    instances: Arc<DashMap<InstanceId, Arc<Mutex<TensorWasmInstance>>>>,
+    instances: Arc<DashMap<InstanceId, RegistryEntry>>,
     instance_count: Arc<AtomicUsize>,
     metrics: Option<TensorWasmMetrics>,
     id: InstanceId,
@@ -2463,7 +2542,14 @@ impl Drop for AutoTerminateGuard {
         // Sync remove: we cannot await in Drop. The async `terminate`
         // method does exactly the same work plus a debug! log, so this
         // is a faithful sync mirror.
-        if self.instances.remove(&self.id).is_some() {
+        if let Some((_, entry)) = self.instances.remove(&self.id) {
+            // HIGH finding 1 (mirror of `terminate`): flip the cooperative-
+            // cancellation flag so a guest still executing inside the cancelled
+            // `call_export_with_args` future is trapped at the next epoch tick,
+            // not merely de-registered. (Future-drop alone already unwinds the
+            // fiber at its next yield; this is the lock-free belt-and-suspenders
+            // that also covers a guest parked between yields.)
+            entry.cancelled.store(true, Ordering::Release);
             self.instance_count.fetch_sub(1, Ordering::AcqRel);
             // exec H2: mirror the per-tenant decrement the async `terminate`
             // path performs. Without this a cancelled/dropped invoke future
