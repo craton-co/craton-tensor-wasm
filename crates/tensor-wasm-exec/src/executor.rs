@@ -1287,6 +1287,27 @@ impl TensorWasmExecutor {
         }
     }
 
+    /// The effective per-call wall-clock budget for a call whose per-call
+    /// deadline is `per_call`, reconciled with the engine-wide
+    /// [`EngineConfig::max_call_duration`](crate::engine::EngineConfig::max_call_duration)
+    /// ceiling (MED finding).
+    ///
+    /// Returns the *minimum* of the two when both are set (a per-call deadline
+    /// can only tighten, never loosen, the engine ceiling); whichever is set
+    /// when only one is; and `None` only when BOTH are `None` — i.e. a
+    /// deadline-less spawn on an engine that has opted out of the
+    /// `max_call_duration` cap, the sole "run until it returns" case. This is
+    /// the single source of truth the spawn path and the per-call re-arm both
+    /// consult so they agree on when a call traps.
+    fn effective_call_budget(&self, per_call: Option<Duration>) -> Option<Duration> {
+        match (per_call, self.engine.config().max_call_duration) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
     /// Compile `wasm` via wasmtime, caching the result so repeat calls with
     /// the same bytes return without re-running Cranelift. Cache key is the
     /// full 32-byte BLAKE3 digest of the wasm bytes — stable across runs
@@ -1740,10 +1761,17 @@ impl TensorWasmExecutor {
         // yield, and therefore stay cancellable, instead of running an entire
         // epoch sentinel's worth of ticks before its first yield point.
         store.set_epoch_deadline(epoch_deadline_ticks.min(COOPERATIVE_YIELD_TICKS));
-        let post_start_hard_deadline = match cfg.deadline {
-            Some(_) => store.data().deadline,
-            None => None,
-        };
+        // MED finding: the post-start hard deadline is the per-call deadline
+        // when one is configured, otherwise the engine-wide
+        // `max_call_duration` ceiling — so a `deadline: None` spawn is bounded
+        // rather than yielding forever. `effective_call_budget` returns the
+        // minimum of the two (either being `None` drops out), and `None` only
+        // when BOTH are unset (the opt-out: genuinely unbounded). This is the
+        // budget the FIRST call inherits; `call_export_with_args` re-arms it
+        // per call so back-to-back invocations each get a fresh window.
+        let post_start_hard_deadline = self
+            .effective_call_budget(cfg.deadline)
+            .map(|d| Instant::now() + d);
         store.data_mut().hard_deadline = post_start_hard_deadline;
         Ok(TensorWasmInstance::new(store, instance))
     }
@@ -2181,7 +2209,13 @@ impl TensorWasmExecutor {
         // window (and honest numbers if it does time out).
         let call_start = Instant::now();
         let configured_deadline = guard.store.data().deadline_duration;
-        if let Some(d) = configured_deadline {
+        // MED finding: the effective wall-clock budget for THIS call is the
+        // per-call deadline reconciled with the engine-wide
+        // `max_call_duration` ceiling. For a deadline-less spawn this is the
+        // engine ceiling — so the call is bounded rather than able to run
+        // forever — and `None` only when BOTH are unset (the explicit opt-out).
+        let effective_budget = self.effective_call_budget(configured_deadline);
+        if let Some(d) = effective_budget {
             let new_deadline = call_start + d;
             guard.store.data_mut().deadline = Some(new_deadline);
             // Re-arm the HARD-deadline instant the cooperative epoch callback
@@ -2190,10 +2224,12 @@ impl TensorWasmExecutor {
             // governs when a runaway guest traps. The callback installed at
             // spawn (`arm_cooperative_epoch`) persists across calls; only the
             // instant it consults and the relative tick count are re-armed.
+            // For a deadline-less spawn `d` is the engine ceiling, so even a
+            // `deadline: None` call now traps once it elapses.
             guard.store.data_mut().hard_deadline = Some(new_deadline);
             let tick = self.engine.config().epoch_tick;
             // Re-arm at the cooperative cadence (never beyond this call's
-            // deadline window). The cooperative epoch callback installed at
+            // budget window). The cooperative epoch callback installed at
             // spawn yields `Pending` at each trip and traps only once
             // `hard_deadline` (re-armed to `new_deadline` above) elapses — so
             // the relative ticks here govern only the yield cadence, while the
@@ -2202,6 +2238,14 @@ impl TensorWasmExecutor {
             // cancellable on future-drop) throughout the call.
             let call_ticks = duration_to_epoch_ticks(d, tick).min(COOPERATIVE_YIELD_TICKS);
             guard.store.set_epoch_deadline(call_ticks);
+        } else {
+            // No per-call deadline AND no engine ceiling: genuinely unbounded.
+            // Clear any stale absolute deadline so the timeout classification
+            // below does not misfire, and leave the cooperative callback
+            // yielding forever (the historical opt-out behaviour). The guest
+            // stays cancellable on future-drop / `terminate`.
+            guard.store.data_mut().deadline = None;
+            guard.store.data_mut().hard_deadline = None;
         }
         // Re-arm the cooperative-scheduler context's wall-clock origin
         // in lockstep with the deadline above. Without this, a guest
@@ -2213,7 +2257,13 @@ impl TensorWasmExecutor {
         // ignores `started_at`).
         guard.store.data_mut().rearm_scheduler();
         let deadline_at = guard.store.data().deadline;
-        let configured_deadline_ms = configured_deadline
+        // Report the EFFECTIVE budget (per-call deadline reconciled with the
+        // engine ceiling) in any resulting `TimeoutContext`, so a trap on a
+        // deadline-less call surfaces the engine ceiling that actually bounded
+        // it rather than `0` (MED finding). `0` only when the call is
+        // genuinely unbounded (no per-call deadline and no engine ceiling),
+        // in which case `deadline_at` is `None` and no timeout is classified.
+        let configured_deadline_ms = effective_budget
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
         let wasmtime_instance = *guard.wasmtime_instance();
