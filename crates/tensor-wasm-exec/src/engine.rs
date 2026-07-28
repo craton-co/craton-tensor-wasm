@@ -23,6 +23,13 @@ use wasmtime::{
 /// Default epoch tick. Matches the plan's 10 ms cadence.
 const DEFAULT_EPOCH_TICK: Duration = Duration::from_millis(10);
 
+/// Default engine-wide wall-clock ceiling applied to every call
+/// ([`EngineConfig::max_call_duration`]). Bounds a deadline-less
+/// (`SpawnConfig { deadline: None, .. }`) call so it cannot run forever
+/// (MED finding). 5 minutes is well above any legitimate single kernel
+/// invocation we expect while still trapping a runaway compute-bound guest.
+const DEFAULT_MAX_CALL_DURATION: Duration = Duration::from_secs(300);
+
 /// Explicit ceiling on the wasm operand/value stack a single call may use,
 /// in bytes (LOW/hardening finding). Wasmtime applies a default stack ceiling
 /// today, but pinning it here makes the resource contract independent of any
@@ -182,6 +189,30 @@ pub struct EngineConfig {
     /// tenant. `None` (the default) disables the per-tenant cap — only the
     /// engine-wide `max_instances` applies.
     pub max_instances_per_tenant: Option<usize>,
+    /// Engine-wide wall-clock ceiling applied to **every** call, including
+    /// those on instances spawned WITHOUT a per-call
+    /// [`SpawnConfig::deadline`](crate::executor::SpawnConfig::deadline)
+    /// (MED finding).
+    ///
+    /// Analogous to [`MAX_START_FN_DURATION`](crate::executor::MAX_START_FN_DURATION)
+    /// for the start phase: without it a `deadline: None` spawn left the
+    /// post-start cooperative epoch callback yielding *forever*, so a
+    /// compute-bound deadline-less guest could run unbounded wall-clock time
+    /// (it stayed cancellable on future-drop, but nothing ever TRAPPED it of
+    /// its own accord). With this cap, `deadline: None` means "engine default
+    /// ceiling", never "infinite": the executor seeds the per-store
+    /// `hard_deadline` to `now + max_call_duration` for a deadline-less call
+    /// so the epoch callback traps once it elapses.
+    ///
+    /// When a per-call `deadline` IS set, the effective ceiling is the
+    /// *minimum* of the two — a per-call deadline can only tighten, never
+    /// loosen, the engine ceiling. `None` here restores the historical
+    /// "deadline-less runs until it returns" behaviour (no engine-imposed
+    /// wall-clock bound on a no-deadline call); production callers should
+    /// keep the default ceiling. The interruption still requires the epoch
+    /// ticker to be running (the same admission check as a per-call
+    /// deadline).
+    pub max_call_duration: Option<Duration>,
 }
 
 impl EngineConfig {
@@ -237,6 +268,12 @@ impl Default for EngineConfig {
             // No per-tenant fairness cap by default — only the engine-wide
             // `max_instances` ceiling applies.
             max_instances_per_tenant: None,
+            // Engine-wide wall-clock ceiling on EVERY call, so a
+            // `deadline: None` spawn is bounded rather than able to run
+            // forever (MED finding). 5 minutes is generous for a long ML
+            // kernel while still bounding the worst case; operators who want
+            // genuinely unbounded deadline-less calls can set this to `None`.
+            max_call_duration: Some(DEFAULT_MAX_CALL_DURATION),
         }
     }
 }
@@ -519,6 +556,9 @@ mod tests {
         assert_eq!(c.epoch_tick, Duration::from_millis(10));
         assert!(c.component_model);
         assert!(matches!(c.backend, MemoryBackend::UnifiedBuffer));
+        // MED finding: a wall-clock ceiling is applied to every call by
+        // default so a deadline-less spawn is bounded, not infinite.
+        assert_eq!(c.max_call_duration, Some(Duration::from_secs(300)));
     }
 
     #[test]
