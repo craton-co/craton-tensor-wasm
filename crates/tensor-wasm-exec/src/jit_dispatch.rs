@@ -16,9 +16,15 @@
 //! ```
 //!
 //! - Looks up the cached kernel by `(fp_lo|fp_hi as u64, sm_version)`.
-//! - On a cache hit under `--features cuda`: launches the real compiled
-//!   kernel against the guest scratch region and returns `0`
-//!   ([`DISPATCH_OK`]).
+//! - On a cache hit under `--features cuda`: compiles the cached PTX, resolves
+//!   the entry symbol from the PTX text, verifies the guest scratch region is
+//!   GPU-managed memory, and LAUNCHES the kernel against it (args at
+//!   `scratch`, results at `scratch + alen`), returning `0` ([`DISPATCH_OK`])
+//!   only on a successful launch + synchronize. If the launch is NOT possible
+//!   (no entry symbol in the PTX, PTX compile failure, non-managed scratch
+//!   pointer, or a launch/sync error) it DEOPTs with [`DISPATCH_CACHE_MISS`]
+//!   rather than reporting a false `DISPATCH_OK` — the trampoline then traps
+//!   the guest, exactly as a genuine miss would (MED finding 3).
 //! - On a cache hit WITHOUT CUDA: there is no kernel to run, so the dispatch
 //!   deliberately deopts — it emits a `tracing::warn!` and returns
 //!   [`DISPATCH_CACHE_MISS`] (the same code the genuine miss path uses)
@@ -398,19 +404,50 @@ where
             }
 
             // Hold onto the cached kernel for the lifetime of the dispatch so
-            // it can't be evicted mid-launch (relevant for the CUDA path).
+            // it can't be evicted mid-launch. The CUDA path below consumes it
+            // (`launch_cached_kernel(&cached, ..)`); on the no-CUDA path it has
+            // no further use, so bind it to `_` to keep the strong reference
+            // alive without an unused-variable warning.
+            #[cfg(not(feature = "cuda"))]
             let _ = &cached;
 
             #[cfg(feature = "cuda")]
             {
-                // CUDA path: a cache hit means a real compiled kernel is
-                // available. Launch it against the guest's scratch region and
-                // report `DISPATCH_OK` on success. (Kernel launch wiring lives
-                // behind `--features cuda`; the marshalling contract — args at
-                // `scratch`, results at `scratch + alen` — is identical to the
-                // no-CUDA reference path that the e2e test substitutes.)
-                let _ = (&mut *mem, scratch, alen, rlen, &cached);
-                DISPATCH_OK
+                // CUDA path (MED finding 3): a cache hit means a real kernel
+                // is available, so we LAUNCH it against the guest's scratch
+                // region rather than reporting a hollow `DISPATCH_OK`. The
+                // scratch base host pointer doubles as a device pointer because
+                // `--features cuda` deployments back guest linear memory with
+                // the unified-memory `MemoryCreator` (`cuMemAllocManaged`);
+                // `launch_cached_kernel` verifies that managed-memory property
+                // before launching so an embedder running CUDA against plain
+                // host-heap memory DEOPTs instead of raising a sticky
+                // `CUDA_ERROR_ILLEGAL_ADDRESS` that would poison the shared
+                // context. The marshalling contract — args at `scratch`,
+                // results at `scratch + alen` — matches the no-CUDA reference
+                // dispatch the e2e test substitutes.
+                //
+                // On ANY failure to launch (no entry symbol in the PTX, PTX
+                // compile error, non-managed scratch pointer, launch/sync
+                // error) we return `DISPATCH_CACHE_MISS` — the SAME deopt
+                // signal the cache-miss and no-CUDA paths use, which the
+                // rewrite trampoline turns into a wasm trap. We NEVER report a
+                // false `DISPATCH_OK` for a launch that did not actually run.
+                let scratch_base: *mut u8 = mem.as_mut_ptr();
+                match launch_cached_kernel(&cached, scratch_base, scratch, alen, rlen) {
+                    Ok(()) => DISPATCH_OK,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "tensor_wasm_exec::jit_dispatch",
+                            fingerprint = fp,
+                            tenant = %tenant_id,
+                            error = %e,
+                            "JIT dispatch: kernel launch not possible; signalling \
+                             deopt (cache-miss code) instead of reporting a false OK"
+                        );
+                        DISPATCH_CACHE_MISS
+                    }
+                }
             }
 
             #[cfg(not(feature = "cuda"))]
@@ -451,6 +488,185 @@ where
             }
         },
     )?;
+    Ok(())
+}
+
+/// Extract the kernel entry-point symbol name from emitted PTX.
+///
+/// The PTX emitter writes a single `.visible .entry NAME(` directive (see
+/// `tensor_wasm_jit::ptx_emit`); the cache stores only the
+/// [`EmittedPtx`](tensor_wasm_jit::ptx_emit::EmittedPtx) text, NOT the
+/// originating blueprint's `entry` field, so we recover the symbol by
+/// scanning the PTX. Returns the name (the run of identifier characters
+/// following `.entry`) or `None` if no entry directive is present (a kernel
+/// we therefore cannot launch — the caller DEOPTs).
+///
+/// Used only on the `--features cuda` launch path; kept module-level (not
+/// cuda-gated) so its unit test runs on every build.
+fn ptx_entry_name(ptx: &str) -> Option<&str> {
+    // Locate `.entry`, then skip whitespace to the symbol. We match
+    // `.entry` rather than `.visible .entry` so a `.weak`/`.extern` linkage
+    // qualifier variant still resolves; the emitter only ever emits one
+    // entry, so the first match is the kernel.
+    let after = ptx.find(".entry").map(|i| &ptx[i + ".entry".len()..])?;
+    let after = after.trim_start();
+    // PTX identifiers are `[A-Za-z0-9_$]+` and the name runs up to the `(` of
+    // the parameter list (or any non-identifier byte).
+    let end = after
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(after.len());
+    if end == 0 {
+        None
+    } else {
+        Some(&after[..end])
+    }
+}
+
+/// Launch the cached kernel against the guest scratch region (MED finding 3).
+///
+/// `scratch_base` is the host base pointer of the guest's linear memory; on a
+/// `--features cuda` deployment that memory is `cuMemAllocManaged`-backed, so
+/// `scratch_base + scratch` is simultaneously a valid DEVICE pointer the
+/// kernel can read/write in place (args at `scratch`, results at
+/// `scratch + alen`). The kernel is launched with three parameters in the
+/// order `(scratch_device_ptr: *mut u8, args_len: u32, results_len: u32)`,
+/// matching the ABI the rewrite trampoline marshals into.
+///
+/// Returns `Err(reason)` — and the caller DEOPTs — on every condition where a
+/// correct launch is not possible: no entry symbol in the PTX, PTX compile
+/// failure, a scratch pointer that is NOT GPU-managed memory (which would
+/// otherwise raise a sticky `CUDA_ERROR_ILLEGAL_ADDRESS` poisoning the shared
+/// context), or a launch / synchronize error. It NEVER returns `Ok(())` for a
+/// kernel that did not actually run, so the dispatch path can map `Ok` to a
+/// genuine `DISPATCH_OK`.
+///
+/// # Safety / threading
+///
+/// Runs synchronously inside the wasmtime fiber (the dispatch import is a
+/// sync `func_wrap`). It binds the process-wide primary CUDA context to the
+/// calling thread via [`tensor_wasm_wasi_gpu::cuda_ctx::ensure_current_context`]
+/// — the SAME discipline the wasi-cuda launch path uses — before any driver
+/// call, then blocks on `cuStreamSynchronize` for the kernel to complete
+/// (synchronous dispatch semantics).
+#[cfg(feature = "cuda")]
+fn launch_cached_kernel(
+    cached: &tensor_wasm_jit::cache::CachedKernel,
+    scratch_base: *mut u8,
+    scratch: usize,
+    alen: usize,
+    rlen: usize,
+) -> Result<(), String> {
+    use cust::stream::{Stream, StreamFlags};
+    use cust::sys as cuda_sys;
+
+    // Bind the primary context to THIS fiber thread before any driver call.
+    tensor_wasm_wasi_gpu::cuda_ctx::ensure_current_context()
+        .map_err(|e| format!("CUDA context bind failed: {e}"))?;
+
+    // Recover the entry symbol from the cached PTX text (the cache does not
+    // retain the blueprint's `entry` field). No entry => not launchable.
+    let entry = ptx_entry_name(&cached.ptx.text)
+        .ok_or_else(|| "PTX carries no `.entry` directive; cannot resolve kernel".to_string())?
+        .to_string();
+
+    // Compile PTX → module here (the cache's `CompiledHandle` is empty — the
+    // JIT cache stores PTX text, not loaded modules). `Module::from_ptx`
+    // hands the PTX to the driver's JIT (`cuModuleLoadDataEx`).
+    let module = cust::module::Module::from_ptx(cached.ptx.text.as_str(), &[])
+        .map_err(|e| format!("Module::from_ptx({entry}) failed: {e:?}"))?;
+    let func = module
+        .get_function(&entry)
+        .map_err(|e| format!("get_function({entry}) failed: {e:?}"))?;
+
+    // The scratch base host pointer doubles as a device pointer ONLY when the
+    // guest memory is managed (unified) memory. Verify before launching so an
+    // embedder running `--features cuda` against plain host-heap linear memory
+    // DEOPTs rather than dereferencing a host address on the GPU and raising a
+    // sticky `CUDA_ERROR_ILLEGAL_ADDRESS` that poisons the process-shared
+    // context for every tenant. (Same enforcement the wasi-cuda launch path
+    // applies to every pointer argument.)
+    //
+    // SAFETY: `scratch_device` was bounds-checked into the guest's live linear
+    // memory by the caller (`end <= mem.len()`). `cuPointerGetAttribute` only
+    // reads driver bookkeeping for the address; it never dereferences it.
+    let scratch_device = scratch_base.wrapping_add(scratch);
+    let mut is_managed: std::os::raw::c_int = 0;
+    let res = unsafe {
+        cuda_sys::cuPointerGetAttribute(
+            &mut is_managed as *mut std::os::raw::c_int as *mut std::ffi::c_void,
+            cuda_sys::CUpointer_attribute_enum::CU_POINTER_ATTRIBUTE_IS_MANAGED,
+            scratch_device as cuda_sys::CUdeviceptr,
+        )
+    };
+    if res != cuda_sys::CUresult::CUDA_SUCCESS || is_managed == 0 {
+        return Err(format!(
+            "scratch pointer is not GPU-addressable (cuPointerGetAttribute \
+             IS_MANAGED -> {res:?}, is_managed={is_managed}); back guest linear \
+             memory with the unified-memory MemoryCreator"
+        ));
+    }
+
+    // Kernel ABI: (scratch_device_ptr, args_len, results_len). The PTX
+    // parameter block reads the scratch pointer (args at offset 0, results at
+    // offset `alen`) plus the two lengths. We build the `void**` storage by
+    // hand so the call site stays untyped (the kernel signature is the
+    // rewriter's contract, not statically known here).
+    let mut p_ptr: *mut std::ffi::c_void = scratch_device as *mut std::ffi::c_void;
+    let mut p_alen: u32 = u32::try_from(alen).unwrap_or(u32::MAX);
+    let mut p_rlen: u32 = u32::try_from(rlen).unwrap_or(u32::MAX);
+    let mut params: [*mut std::ffi::c_void; 3] = [
+        &mut p_ptr as *mut _ as *mut std::ffi::c_void,
+        &mut p_alen as *mut _ as *mut std::ffi::c_void,
+        &mut p_rlen as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    // Launch geometry from the cached blueprint (`(block_dim, grid_dim)`),
+    // floored at 1 so a zero hint still launches a single thread.
+    let (block_hint, grid_hint) = cached.ptx.launch_geometry;
+    let block_x = block_hint.max(1);
+    let grid_x = grid_hint.max(1);
+
+    let stream = Stream::new(StreamFlags::NON_BLOCKING, None)
+        .map_err(|e| format!("Stream::new failed: {e:?}"))?;
+
+    // SAFETY: launching a kernel is inherently unsafe — the host cannot prove
+    // the PTX signature matches the `params` we built. The rewriter owns that
+    // contract. We guarantee (a) the scratch pointer is managed device memory
+    // (checked above), (b) the module/function/stream are live for the call
+    // (held in locals across it), and (c) `params` outlives the launch (it is
+    // dropped only after the synchronize below). `to_raw()` / `as_inner()` are
+    // the stable cust 0.3 raw-handle accessors the wasi-cuda path also uses.
+    let launch_status = unsafe {
+        cuda_sys::cuLaunchKernel(
+            func.to_raw(),
+            grid_x,
+            1,
+            1,
+            block_x,
+            1,
+            1,
+            0,
+            stream.as_inner(),
+            params.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if launch_status != cuda_sys::CUresult::CUDA_SUCCESS {
+        return Err(format!("cuLaunchKernel failed with status {launch_status:?}"));
+    }
+
+    // Synchronous dispatch: block the fiber until the kernel completes so the
+    // results region is populated before the trampoline reads it back. The
+    // context is already current on this thread (bound above).
+    stream
+        .synchronize()
+        .map_err(|e| format!("stream synchronize failed: {e:?}"))?;
+
+    // `func` borrows `module`, and `module` (the loaded kernel) must outlive the
+    // launch + synchronize above. We do NOT `drop(module)` explicitly — that
+    // would conflict with `func`'s outstanding borrow. Both drop here at
+    // end-of-scope in reverse declaration order (`func` first, then `module`),
+    // which is exactly the order the borrow requires.
     Ok(())
 }
 
@@ -533,13 +749,19 @@ mod tests {
         cache
     }
 
-    /// Expected dispatch return code for a cache HIT under the default
-    /// (no-CUDA) build vs. the `--features cuda` build. On no-CUDA there is no
-    /// real kernel to run, so the stub deopts with the cache-miss code (a trap
-    /// at the trampoline) rather than echoing input as `DISPATCH_OK`.
-    #[cfg(feature = "cuda")]
-    const HIT_CODE: i32 = DISPATCH_OK;
-    #[cfg(not(feature = "cuda"))]
+    /// Expected dispatch return code for a cache HIT against the STUB PTX
+    /// these tests install (`"// stub"`, which carries no `.entry` directive).
+    ///
+    /// On no-CUDA there is no kernel to run, so the dispatch deopts with the
+    /// cache-miss code (a trap at the trampoline) rather than echoing input as
+    /// `DISPATCH_OK`. Under `--features cuda` the dispatch now attempts a REAL
+    /// launch (MED finding 3): the stub PTX has no entry symbol, so
+    /// `launch_cached_kernel` cannot resolve a kernel and DEOPTs with the same
+    /// cache-miss code — it must NEVER report a false `DISPATCH_OK` for a kernel
+    /// that did not actually run. (A genuine launch round-trip is exercised by
+    /// `end_to_end_add_returns_sum`, which substitutes a custom dispatch import
+    /// that performs the computation, bypassing this stub path.) So both builds
+    /// expect the deopt code here.
     const HIT_CODE: i32 = DISPATCH_CACHE_MISS;
 
     #[test]
@@ -931,5 +1153,27 @@ mod tests {
         assert!(p1 > 0, "first alloc must succeed, got {p1}");
         assert!(p2 > 0, "second alloc must succeed, got {p2}");
         assert_ne!(p1, p2, "successive allocs must hand out distinct pointers");
+    }
+
+    /// MED finding 3: the CUDA launch path recovers the kernel entry symbol by
+    /// scanning the cached PTX (which does not retain the blueprint's `entry`
+    /// field). `ptx_entry_name` must pull the name out of a `.visible .entry`
+    /// directive, stop at the parameter-list `(`, and return `None` for PTX
+    /// with no entry — the signal that DEOPTs the launch rather than reporting
+    /// a false OK. This guard runs on every build (the parser is not
+    /// cuda-gated) so the no-entry/stub-PTX deopt contract stays covered even
+    /// without a GPU.
+    #[test]
+    fn ptx_entry_name_extracts_symbol() {
+        let ptx = "//\n.version 8.0\n.target sm_80\n.visible .entry vector_add(\n\
+                   .param .u64 p0\n) { ret; }\n";
+        assert_eq!(super::ptx_entry_name(ptx), Some("vector_add"));
+
+        // Name immediately followed by `(` (no space) still resolves.
+        assert_eq!(super::ptx_entry_name(".entry k$0(.param"), Some("k$0"));
+
+        // No entry directive (the stub-PTX case) => not launchable.
+        assert_eq!(super::ptx_entry_name("// stub, no entry"), None);
+        assert_eq!(super::ptx_entry_name(""), None);
     }
 }
