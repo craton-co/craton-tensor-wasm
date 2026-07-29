@@ -31,6 +31,12 @@ tokio.workspace = true
 tracing.workspace = true
 wasmparser.workspace = true
 wasmtime = { workspace = true, features = ["pooling-allocator", "memory-protection-keys"] }
+# CUDA driver bindings, pulled in only under `--features cuda` so the real
+# JIT-dispatch kernel-launch path (jit_dispatch.rs, MED finding 3) can compile
+# PTX (`Module::from_ptx`) and call `cuLaunchKernel`. Off by default — plain
+# `cargo build` stays CUDA-free. Mirrors the workspace `cust` pin already used
+# by `tensor-wasm-wasi-gpu`, whose `cuda_ctx::ensure_current_context` we reuse.
+cust = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-test.workspace = true
@@ -40,9 +46,11 @@ wat.workspace = true
 [features]
 # `cuda` enables the real GPU kernel-launch path in `jit_dispatch` (a cache hit
 # launches a compiled kernel instead of signalling deopt). It pulls the CUDA
-# host bridge in `tensor-wasm-wasi-gpu`; requires a CUDA toolkit at build time,
-# so it is opt-in and off by default (plain `cargo build` stays CUDA-free).
-cuda = ["tensor-wasm-wasi-gpu/cuda"]
+# host bridge in `tensor-wasm-wasi-gpu` AND the `cust` driver bindings this
+# crate uses directly to compile PTX and launch the kernel; requires a CUDA
+# toolkit at build time, so it is opt-in and off by default (plain `cargo build`
+# stays CUDA-free).
+cuda = ["dep:cust", "tensor-wasm-wasi-gpu/cuda"]
 
 [package.metadata.docs.rs]
 all-features = true
