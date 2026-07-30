@@ -335,6 +335,21 @@ pub enum ExecError {
     /// deadline contract.
     #[error("epoch ticker not running — refusing spawn with deadline; call `engine.spawn_epoch_ticker()` first")]
     EpochTickerNotRunning,
+    /// A guest export returned a value type the executor cannot represent
+    /// in its JSON result projection (LOW finding).
+    ///
+    /// `call_export_with_args` projects each returned [`wasmtime::Val`] into a
+    /// [`serde_json::Value`]: the four numeric core types (`i32`/`i64`/
+    /// `f32`/`f64`) map to JSON numbers, but `v128` and the reference types
+    /// (`funcref`/`externref`/`anyref`) have no faithful JSON encoding.
+    /// Previously they were silently collapsed to JSON `null`, masking a
+    /// genuine signature mismatch (a guest returning a `v128` looked like a
+    /// guest returning nothing). We now fail with this typed error instead so
+    /// the caller learns the export's return type is unsupported rather than
+    /// receiving a misleading `null`. Carries the offending value-type name
+    /// (e.g. `"v128"`) for diagnostics.
+    #[error("export returned an unsupported value type: {0}")]
+    UnsupportedReturnType(&'static str),
 }
 
 /// Payload for [`ExecError::Timeout`]. Carries the real elapsed and deadline
@@ -434,6 +449,16 @@ impl From<ExecError> for tensor_wasm_core::error::TensorWasmError {
                 // remedy is operational (start the ticker) rather than
                 // anything the caller can retry.
                 TensorWasmError::WasmCompile("epoch ticker not running".into())
+            }
+            ExecError::UnsupportedReturnType(kind) => {
+                // The guest ran fine but returned a value the host cannot
+                // project into JSON. It is a contract mismatch between the
+                // export's signature and this transport, not a trap or a
+                // resource failure — surface it as a serialization-class
+                // error carrying the offending type name.
+                TensorWasmError::Serialization(
+                    format!("unsupported export return type: {kind}").into(),
+                )
             }
         }
     }
@@ -602,27 +627,23 @@ impl WasmArg {
 /// Render a wasmtime [`Val`] as the closest-fitting [`serde_json::Value`].
 ///
 /// `i32`/`i64` become JSON numbers (integer); `f32`/`f64` become JSON
-/// numbers (floating-point); other value types — `v128`, references —
-/// degrade to a JSON `null` so callers see a stable shape rather than a
-/// runtime error. Used by [`TensorWasmExecutor::call_export_with_args`]
-/// to project the wasmtime result slice into a JSON array.
-fn val_to_json(v: &Val) -> serde_json::Value {
+/// numbers (floating-point). Other value types — `v128` and the reference
+/// types — have no faithful JSON encoding, so rather than silently collapse
+/// them to `null` (LOW finding: that masked a genuine return-type mismatch —
+/// a `v128` return looked identical to a void return) we fail with a typed
+/// [`ExecError::UnsupportedReturnType`] carrying the offending type name.
+/// Used by [`TensorWasmExecutor::call_export_with_args`] to project the
+/// wasmtime result slice into a JSON array.
+fn val_to_json(v: &Val) -> Result<serde_json::Value, ExecError> {
     match v {
-        Val::I32(n) => serde_json::json!(*n),
-        Val::I64(n) => serde_json::json!(*n),
-        Val::F32(bits) => serde_json::json!(f32::from_bits(*bits)),
-        Val::F64(bits) => serde_json::json!(f64::from_bits(*bits)),
-        // Unsupported value types fall through as JSON null rather than
-        // erroring — keeps the response shape predictable for callers that
-        // only ever return numeric scalars (the common case for B5.6).
-        // The fallthrough is observable: a guest returning a `v128` or a
-        // reference type silently became `null` before, masking a genuine
-        // signature mismatch. Emit a debug event so operators can see when
-        // a non-numeric return is being lossily projected.
+        Val::I32(n) => Ok(serde_json::json!(*n)),
+        Val::I64(n) => Ok(serde_json::json!(*n)),
+        Val::F32(bits) => Ok(serde_json::json!(f32::from_bits(*bits))),
+        Val::F64(bits) => Ok(serde_json::json!(f64::from_bits(*bits))),
+        // No faithful JSON encoding for these. `Val::ty()` needs a store
+        // handle we don't thread here, so describe the variant directly —
+        // enough for a caller to tell a `v128` apart from a reference type.
         other => {
-            // `Val::ty()` needs a store handle we don't thread here, so
-            // describe the variant directly — enough for an operator to
-            // tell a `v128` apart from a reference type.
             let kind = match other {
                 Val::V128(_) => "v128",
                 Val::FuncRef(_) => "funcref",
@@ -633,9 +654,10 @@ fn val_to_json(v: &Val) -> serde_json::Value {
             debug!(
                 target: "tensor_wasm_exec::executor",
                 val_kind = kind,
-                "non-numeric wasm return value mapped to JSON null (v128 / reference types are not representable)",
+                "export returned a non-numeric value type with no JSON encoding; \
+                 surfacing UnsupportedReturnType instead of a misleading null",
             );
-            serde_json::Value::Null
+            Err(ExecError::UnsupportedReturnType(kind))
         }
     }
 }
@@ -2319,8 +2341,22 @@ impl TensorWasmExecutor {
                 .await
             {
                 Ok(()) => {
-                    let json: Vec<serde_json::Value> = results.iter().map(val_to_json).collect();
-                    Ok(serde_json::Value::Array(json))
+                    // Project each returned Val into JSON. A non-numeric return
+                    // type (`v128` / reference) yields `UnsupportedReturnType`
+                    // rather than a silent `null` (LOW finding). Collect into a
+                    // `Result` so the first unrepresentable value short-circuits;
+                    // bubble it up through the shared `call_outcome` match below
+                    // by mapping it back into a wasmtime-shaped error is NOT
+                    // appropriate (it is a typed exec error), so we return it
+                    // directly here.
+                    match results
+                        .iter()
+                        .map(val_to_json)
+                        .collect::<Result<Vec<serde_json::Value>, ExecError>>()
+                    {
+                        Ok(json) => return Ok(serde_json::Value::Array(json)),
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(e) => Err(e),
             }
@@ -2646,6 +2682,34 @@ mod tests {
         exec.call_export_with_args(id, "noop", &[]).await.unwrap();
         exec.terminate(id).await.unwrap();
         assert_eq!(exec.live_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn unsupported_return_type_is_typed_error() {
+        // LOW finding: an export returning a `v128` has no faithful JSON
+        // encoding. It must surface a typed `UnsupportedReturnType` rather
+        // than silently projecting to JSON `null` (which masked a genuine
+        // signature mismatch — a `v128` return looked like a void return).
+        let engine = Arc::new(TensorWasmEngine::new().unwrap());
+        let exec = TensorWasmExecutor::new(engine);
+        let wasm = wat::parse_str(
+            r#"(module (func (export "vec") (result v128)
+                  (v128.const i32x4 1 2 3 4)))"#,
+        )
+        .unwrap();
+        let id = exec
+            .spawn_instance(SpawnConfig::for_tenant(TenantId(1)), &wasm)
+            .await
+            .unwrap();
+        let err = exec
+            .call_export_with_args(id, "vec", &[])
+            .await
+            .unwrap_err();
+        match err {
+            ExecError::UnsupportedReturnType(kind) => assert_eq!(kind, "v128"),
+            other => panic!("expected UnsupportedReturnType(v128), got {other:?}"),
+        }
+        exec.terminate(id).await.unwrap();
     }
 
     #[tokio::test]
