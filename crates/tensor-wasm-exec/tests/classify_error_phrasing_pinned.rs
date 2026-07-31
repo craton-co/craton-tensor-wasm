@@ -47,17 +47,23 @@ use std::sync::Arc;
 
 use tensor_wasm_core::types::TenantId;
 use tensor_wasm_exec::engine::{EngineConfig, MemoryBackend, TensorWasmEngine};
-use tensor_wasm_exec::executor::{ExecError, SpawnConfig, TensorWasmExecutor};
+use tensor_wasm_exec::executor::{
+    ExecError, SpawnConfig, TensorWasmExecutor, MEMORY_FAILURE_MARKER, MEMORY_LIMIT_PHRASINGS,
+};
 
-/// The classifier's exact recognition rule, mirrored here verbatim so this
-/// test pins precisely what `classify_instantiation_error` keys off. Keep this
-/// in lock-step with `executor.rs` — if the classifier's substring set is
-/// changed, change it here too (and that is exactly the moment to re-verify the
-/// phrasings against the current wasmtime release).
+/// The classifier's exact recognition rule. Rather than mirror the substring
+/// literals here (which let the pin drift out of lock-step with `executor.rs`),
+/// we reference the SAME `MEMORY_FAILURE_MARKER` / `MEMORY_LIMIT_PHRASINGS`
+/// constants the classifier itself keys off (LOW finding: single source of
+/// truth). So this test pins precisely what `classify_instantiation_error`
+/// recognises — when a wasmtime bump forces an edit to those constants, that
+/// edit is exactly the moment to re-verify the phrasings against the new
+/// release, and this real-error test confirms the updated set still matches.
 fn classifier_recognizes(err_chain_lowercased: &str) -> bool {
-    err_chain_lowercased.contains("memory")
-        && (err_chain_lowercased.contains("exceeds the limit")
-            || err_chain_lowercased.contains("exceeds the configured"))
+    err_chain_lowercased.contains(MEMORY_FAILURE_MARKER)
+        && MEMORY_LIMIT_PHRASINGS
+            .iter()
+            .any(|p| err_chain_lowercased.contains(p))
 }
 
 /// Build a `wasmtime::Engine` whose pooling allocator has a deliberately tiny

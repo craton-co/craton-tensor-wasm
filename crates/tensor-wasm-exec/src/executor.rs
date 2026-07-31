@@ -1085,6 +1085,33 @@ fn check_raw_module_memory_within_cap(wasm: &[u8], cap_bytes: usize) -> Result<(
     Ok(())
 }
 
+/// Substring marker that, together with [`MEMORY_LIMIT_PHRASINGS`], identifies
+/// a wasmtime pooling-allocator memory-slot sizing refusal in
+/// [`classify_instantiation_error`].
+///
+/// Pulled out as a named constant (rather than an inline literal) so the
+/// version-coupling is a single source of truth the
+/// `tests/classify_error_phrasing_pinned.rs` pinned-phrasing test references
+/// directly — if a wasmtime bump rewords these, the test (which builds a real
+/// oversized-module error and asserts the refinement still fires) fails loudly
+/// instead of the refinement silently degrading (LOW finding).
+///
+/// `pub` (not `pub(crate)`) only so that out-of-crate integration test — which
+/// compiles as an external consumer and cannot see `pub(crate)` items — can pin
+/// the exact same phrasings the classifier uses.
+pub const MEMORY_FAILURE_MARKER: &str = "memory";
+
+/// The limit/exceeds phrasings wasmtime's pooling `memory_pool` uses for a
+/// memory-slot sizing refusal:
+///   * "memory index N has a minimum byte size of M which exceeds the limit
+///      of L bytes" (per-slot size refusal)
+///   * "maximum memory size of 0x… bytes exceeds the configured maximum size"
+///      (pool construction / sizing refusal)
+///
+/// See [`MEMORY_FAILURE_MARKER`] for why these live as named constants (and why
+/// they are `pub`).
+pub const MEMORY_LIMIT_PHRASINGS: &[&str] = &["exceeds the limit", "exceeds the configured"];
+
 /// Best-effort refinement of a pooling-allocator instantiation error into a
 /// typed [`ExecError::ModuleMemoryTooLarge`] (MED finding).
 ///
@@ -1107,19 +1134,23 @@ fn classify_instantiation_error(err: wasmtime::Error, cap_bytes: usize) -> ExecE
     // error into the typed `ModuleMemoryTooLarge`; every unrecognised error
     // falls through to the `else` branch below and is returned verbatim as
     // `ExecError::Wasmtime(err)` — the original error is never swallowed or
-    // dropped, only (best-effort) re-tagged. When bumping wasmtime, re-verify
-    // the phrasings below against the pooling `memory_pool` error messages.
-    // Conservative match: require both a "memory" mention and an
-    // exceeds/limit phrasing so unrelated traps/link errors are not
-    // misclassified. The pooling allocator's memory-size refusals all
-    // contain one of these limit phrasings.
-    // These phrasings track wasmtime 25's pooling memory_pool errors:
-    //   * "memory index N has a minimum byte size of M which exceeds the
-    //      limit of L bytes" (per-slot size refusal)
-    //   * "maximum memory size of 0x… bytes exceeds the configured maximum
-    //      size" (pool construction / sizing refusal)
-    let is_memory_size_failure = chain.contains("memory")
-        && (chain.contains("exceeds the limit") || chain.contains("exceeds the configured"));
+    // dropped, only (best-effort) re-tagged.
+    //
+    // The phrasings now live in the named `MEMORY_FAILURE_MARKER` /
+    // `MEMORY_LIMIT_PHRASINGS` constants above (a single source of truth) so
+    // the pinned-phrasing test (`tests/classify_error_phrasing_pinned.rs`)
+    // references them directly: that test builds a REAL oversized-module
+    // wasmtime error and asserts this refinement still fires, so a wasmtime
+    // bump that rewords the messages fails CI loudly rather than letting the
+    // refinement silently degrade. When bumping wasmtime, update the constants
+    // (and the test will confirm the new phrasings match).
+    //
+    // Conservative match: require both a "memory" mention AND one of the
+    // exceeds/limit phrasings so unrelated traps/link errors are not
+    // misclassified. The pooling allocator's memory-size refusals all contain
+    // one of these limit phrasings.
+    let is_memory_size_failure = chain.contains(MEMORY_FAILURE_MARKER)
+        && MEMORY_LIMIT_PHRASINGS.iter().any(|p| chain.contains(p));
     if is_memory_size_failure {
         ExecError::ModuleMemoryTooLarge {
             // We do not know the exact requested figure here (the allocator
