@@ -541,7 +541,11 @@ impl InstancePool {
                 break;
             }
             if i == 0 {
-                let (inst, module, _) = executor.build_pooled_instance(cfg, wasm).await?;
+                // PERF finding 6: pass the digest the pool already computed
+                // (`key.module_hash`) so the build does not re-hash the wasm.
+                let (inst, module, _) = executor
+                    .build_pooled_instance_with_hash(cfg, wasm, key.module_hash)
+                    .await?;
                 // Single builder per key + a channel sized at `cap >=
                 // warm_n` means `try_send` cannot fail here for capacity
                 // reasons; treat any error defensively by releasing the
@@ -582,7 +586,10 @@ impl InstancePool {
                 // here too and immediately release the slot + drop the
                 // instance — simplest path that keeps every internal
                 // invariant honest.
-                let (inst, module, _) = executor.build_pooled_instance(cfg, wasm).await?;
+                // PERF finding 6: reuse the pool's precomputed digest.
+                let (inst, module, _) = executor
+                    .build_pooled_instance_with_hash(cfg, wasm, key.module_hash)
+                    .await?;
                 drop(inst);
                 executor.release_instance_slot(cfg.tenant_id);
                 module

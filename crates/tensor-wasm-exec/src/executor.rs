@@ -861,6 +861,21 @@ pub struct TensorWasmExecutor {
     /// of `max_instances` — that caps live instances, this caps in-flight
     /// Cranelift work.
     compile_semaphore: Arc<Semaphore>,
+    /// Per-digest single-flight guard for [`Self::compile_module_cached`]
+    /// (PERF finding 6).
+    ///
+    /// Before this, two concurrent first-spawns of the SAME fresh module both
+    /// missed the `module_cache` read and each ran a full Cranelift compile —
+    /// the loser's `put` simply overwrote the winner's, so the duplicate
+    /// compile was wasted CPU (and, under the compile semaphore, a wasted
+    /// permit that could starve a distinct module's compile). A per-digest
+    /// `OnceCell` collapses those into one compile: the winner runs it; every
+    /// concurrent caller for the same digest parks on `get_or_try_init` and
+    /// clones the winner's [`Module`]. Cache hits never touch this map; the
+    /// cell is removed once resolved so the map does not grow unbounded.
+    /// Mirrors the pool's per-`PoolKey` single-flight discipline in
+    /// `instance_pool.rs`.
+    inflight_compiles: Arc<DashMap<[u8; 32], Arc<tokio::sync::OnceCell<Module>>>>,
 }
 
 /// Resolve the concurrent-compile permit count from the engine config,
@@ -1183,6 +1198,7 @@ impl TensorWasmExecutor {
             pool: None,
             jit_cache: None,
             compile_semaphore: Arc::new(Semaphore::new(permits)),
+            inflight_compiles: Arc::new(DashMap::new()),
         }
     }
 
@@ -1204,6 +1220,7 @@ impl TensorWasmExecutor {
             pool: None,
             jit_cache: None,
             compile_semaphore: Arc::new(Semaphore::new(permits)),
+            inflight_compiles: Arc::new(DashMap::new()),
         }
     }
 
@@ -1383,14 +1400,37 @@ impl TensorWasmExecutor {
     /// that also need the digest for the pool key do not re-hash the bytes
     /// (PERF: the hash was previously computed here AND in
     /// `build_pooled_instance`).
+    ///
+    /// PERF finding 6: concurrent first-spawns of the same digest are now
+    /// single-flighted (see [`Self::inflight_compiles`]), so a duplicate
+    /// Cranelift run no longer wastes CPU / a compile permit.
     async fn compile_module_cached(&self, wasm: &[u8]) -> Result<(Module, ModuleHash), ExecError> {
+        // BLAKE3 outputs a fixed 32-byte digest; use it whole as the cache key.
+        let key: [u8; 32] = *blake3::hash(wasm).as_bytes();
+        self.compile_module_cached_with_hash(wasm, key).await
+    }
+
+    /// Digest-precomputed sibling of [`Self::compile_module_cached`].
+    ///
+    /// PERF finding 6: the pool already hashes the wasm bytes to build its
+    /// per-tuple `PoolKey` (`instance_pool.rs`), and the spawn path hashed
+    /// them AGAIN here. Threading the precomputed `key` through lets the pool's
+    /// miss / pre-warm paths skip the second BLAKE3 over multi-MiB modules.
+    /// The bare [`Self::compile_module_cached`] computes the digest once and
+    /// delegates here, so the single-hash invariant holds for both entry
+    /// points. `key` MUST be `blake3::hash(wasm)` — passing a mismatched
+    /// digest would key the compiled module under the wrong cache slot.
+    pub(crate) async fn compile_module_cached_with_hash(
+        &self,
+        wasm: &[u8],
+        key: [u8; 32],
+    ) -> Result<(Module, ModuleHash), ExecError> {
         // Pre-compile size cap (exec hardening). Reject pathologically
-        // large blobs *before* hashing or handing them to Cranelift —
-        // a wasm with a malicious code section can otherwise force
-        // arbitrary compile-time CPU. The configured cap is floored at
-        // `MAX_MODULE_BYTES` upstream in `EngineConfig`, but we still
-        // observe the configured value here so a stricter operator
-        // policy wins.
+        // large blobs *before* handing them to Cranelift — a wasm with a
+        // malicious code section can otherwise force arbitrary compile-time
+        // CPU. The configured cap is floored at `MAX_MODULE_BYTES` upstream in
+        // `EngineConfig`, but we still observe the configured value here so a
+        // stricter operator policy wins.
         let cap = self.engine.config().max_module_bytes;
         if wasm.len() > cap {
             return Err(ExecError::ModuleTooLarge {
@@ -1398,33 +1438,57 @@ impl TensorWasmExecutor {
                 max: cap,
             });
         }
-        let digest = blake3::hash(wasm);
-        // BLAKE3 outputs a fixed 32-byte digest; use it whole as the cache key.
-        let key: [u8; 32] = *digest.as_bytes();
-        // Scoped lock for the get: releasing the mutex before the
-        // potentially-expensive `Module::from_binary` call below is what
-        // lets concurrent spawns of *different* modules compile in
-        // parallel. The cost is that two spawns of the *same* fresh
-        // module may both compile it — but the second one's `put` simply
-        // overwrites the first, no correctness hazard.
+        // Fast path: already compiled. The scoped lock releases before any
+        // compile so concurrent spawns of DIFFERENT modules compile in
+        // parallel.
         if let Some(m) = self.module_cache.lock().get(&key).cloned() {
             return Ok((m, key));
         }
-        // Cranelift compile is CPU-bound — offload to the blocking
-        // pool. We clone the wasmtime `Engine` (cheap `Arc`-shaped
-        // internally) and the wasm bytes so the closure is fully
-        // owning. `spawn_blocking` returns a `JoinError` which we
-        // surface as a wasmtime error: a panic inside Cranelift is
-        // not something a caller can usefully distinguish from a
+        // Single-flight (PERF finding 6): collapse concurrent first-spawns of
+        // the SAME digest onto one Cranelift run. The winner runs the compile
+        // inside `get_or_try_init`; concurrent callers for the same digest park
+        // there and clone the winner's `Module`. The shard write-guard on
+        // `inflight_compiles` is dropped immediately after we clone the
+        // `Arc<OnceCell>` (the `entry`/`or_insert_with` statement borrows the
+        // shard only for that statement) so it is never held across the await.
+        let cell = self
+            .inflight_compiles
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .value()
+            .clone();
+        let result = cell
+            .get_or_try_init(|| self.compile_uncached(wasm, key))
+            .await
+            .map(|m| m.clone());
+        // Drop the single-flight cell so the map does not grow unbounded; a
+        // straggler that already cloned this `Arc` is unaffected, and a fresh
+        // caller hits the `module_cache` fast path (the compile, on success,
+        // populated it). On error the cell holds nothing, so a later spawn
+        // retries the compile cleanly.
+        self.inflight_compiles.remove(&key);
+        result.map(|module| (module, key))
+    }
+
+    /// Run the actual Cranelift compile for `wasm` (no cache / single-flight
+    /// bookkeeping — that lives in [`Self::compile_module_cached_with_hash`]).
+    /// Offloads to the blocking pool under a compile permit, then populates
+    /// the module cache on success. Invoked at most once per digest via the
+    /// `inflight_compiles` `OnceCell`.
+    async fn compile_uncached(&self, wasm: &[u8], key: [u8; 32]) -> Result<Module, ExecError> {
+        // Cranelift compile is CPU-bound — offload to the blocking pool. We
+        // clone the wasmtime `Engine` (cheap `Arc`-shaped internally) and the
+        // wasm bytes so the closure is fully owning. `spawn_blocking` returns a
+        // `JoinError` which we surface as a wasmtime error: a panic inside
+        // Cranelift is not something a caller can usefully distinguish from a
         // parse failure, and either way the spawn must be aborted.
         let engine = self.engine.inner().clone();
         let bytes = wasm.to_vec();
         // Bound concurrent Cranelift compiles (MEDIUM finding). The permit is
         // held only for the duration of the `spawn_blocking` compile and
-        // dropped immediately after — cache hits above never reach here, so
-        // repeat tenants do not contend for permits. `acquire_owned` cannot
-        // fail unless the semaphore is closed, which we never do; surface the
-        // (unreachable) closed case as a wasmtime error rather than panicking.
+        // dropped immediately after. `acquire_owned` cannot fail unless the
+        // semaphore is closed, which we never do; surface the (unreachable)
+        // closed case as a wasmtime error rather than panicking.
         let _permit = self
             .compile_semaphore
             .clone()
@@ -1441,7 +1505,7 @@ impl TensorWasmExecutor {
             .map_err(ExecError::Wasmtime)?;
         drop(_permit);
         self.module_cache.lock().put(key, module.clone());
-        Ok((module, key))
+        Ok(module)
     }
 
     /// Internal: charge a live-instance slot, enforcing both the engine-wide
@@ -1559,6 +1623,26 @@ impl TensorWasmExecutor {
         cfg: &SpawnConfig,
         wasm: &[u8],
     ) -> Result<(TensorWasmInstance, Module, ModuleHash), ExecError> {
+        // Compute the digest once and delegate; the hash-threaded variant is
+        // the single implementation (PERF finding 6 — one BLAKE3 per build).
+        let module_hash: ModuleHash = *blake3::hash(wasm).as_bytes();
+        self.build_pooled_instance_with_hash(cfg, wasm, module_hash)
+            .await
+    }
+
+    /// Digest-precomputed sibling of [`Self::build_pooled_instance`].
+    ///
+    /// PERF finding 6: the pool already hashes the wasm bytes to build its
+    /// per-tuple `PoolKey`; passing that digest in lets the pool's pre-warm /
+    /// rebuild paths skip the second BLAKE3 over multi-MiB modules that the
+    /// `build_pooled_instance` → `compile_module_cached` path used to incur.
+    /// `module_hash` MUST be `blake3::hash(wasm)`.
+    pub(crate) async fn build_pooled_instance_with_hash(
+        &self,
+        cfg: &SpawnConfig,
+        wasm: &[u8],
+        module_hash: ModuleHash,
+    ) -> Result<(TensorWasmInstance, Module, ModuleHash), ExecError> {
         // Pre-compile memory-cap walk (exec-S-2 / mem-H5): reject a module
         // whose *declared* linear memory exceeds the engine cap with a
         // structured `ModuleMemoryTooLarge` BEFORE `Module::new` (and before
@@ -1572,13 +1656,13 @@ impl TensorWasmExecutor {
         // backend-independent (on-demand vs. pooling).
         check_raw_module_memory_within_cap(wasm, self.engine.config().effective_memory_cap())?;
         let slot_guard = self.charge_instance_slot(cfg.tenant_id)?;
-        // Compile (and cache) the module first; the cap check lives
-        // inside `compile_module_cached` so an oversized blob fails
-        // before the digest computation matters. The digest is computed
-        // once inside `compile_module_cached` (as the cache key) and
-        // returned here so the pool key path reuses it rather than
-        // re-hashing the wasm bytes (PERF: previously hashed twice).
-        let (module, module_hash) = self.compile_module_cached(wasm).await?;
+        // Compile (and cache) the module first; the cap check lives inside
+        // `compile_module_cached_with_hash` so an oversized blob still fails
+        // fast. The precomputed `module_hash` is reused as the cache key so the
+        // wasm bytes are hashed exactly once across the whole build (PERF).
+        let (module, module_hash) = self
+            .compile_module_cached_with_hash(wasm, module_hash)
+            .await?;
         let inst = self.instantiate_detached(cfg, &module).await?;
         // A wasmtime instance was successfully created — count it
         // against the monotonic spawn counter exactly once per genuine
