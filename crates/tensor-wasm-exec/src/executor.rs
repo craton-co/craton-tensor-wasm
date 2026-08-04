@@ -834,12 +834,17 @@ pub struct TensorWasmExecutor {
     ticker_warned: Arc<OnceLock<AtomicBool>>,
     /// Optional pre-instantiated instance pool (roadmap feature #5).
     ///
-    /// v0.3.6 scaffold: when set, the pool is wired through to embedders
-    /// but its [`crate::instance_pool::InstancePool::acquire`] path falls
-    /// through to [`Self::spawn_instance`] on every call. v0.4 lands the
-    /// channel-driven warm-instance draw on top of this same field —
-    /// callers wiring it up today get forward-compatible plumbing for
-    /// free.
+    /// When set, [`Self::invoke`] routes through
+    /// [`crate::instance_pool::InstancePool::acquire`] /
+    /// [`InstancePool::release`]: `acquire` draws a warm instance from the
+    /// per-`(tenant, module-hash)` channel (wait-free `try_recv`) and only
+    /// falls through to [`Self::spawn_instance`] on a cold/empty channel or a
+    /// streaming/input carve-out; `release` re-instantiates from the cached
+    /// [`wasmtime::Module`] and returns a fresh instance to the channel. The
+    /// warm path is live — the historical "scaffold that falls through on
+    /// every call" doc was stale (DOCS finding). Executors constructed without
+    /// [`Self::with_instance_pool`] see the pool-free path (every `invoke`
+    /// spawns + calls + terminates).
     pool: Option<Arc<InstancePool>>,
     /// Optional JIT kernel cache. When set, `instantiate_detached` registers
     /// the `tensor-wasm:jit/host` `dispatch`/`alloc`/`free` imports
@@ -1228,11 +1233,12 @@ impl TensorWasmExecutor {
     /// modified executor.
     ///
     /// Builder method; pairs with [`Self::new`] / [`Self::with_metrics`].
-    /// The pool itself is opt-in — embedders that do not call this method
-    /// see the v0.3.5 behaviour (every `spawn_instance` does a fresh
-    /// compile/instantiate). Calling it today wires up the v0.3.6
-    /// scaffold; the same call gets the v0.4 warm-pool path for free
-    /// once that lands.
+    /// The pool itself is opt-in — embedders that do not call this method get
+    /// the pool-free path (every [`Self::invoke`] does a fresh
+    /// spawn/compile/instantiate + call + terminate). With a pool attached,
+    /// `invoke` draws warm instances from the per-`(tenant, module-hash)`
+    /// channel and re-instantiates spent ones on release (DOCS finding: the
+    /// warm path is live, not the historical "v0.3.6 scaffold" placeholder).
     pub fn with_instance_pool(mut self, pool: Arc<InstancePool>) -> Self {
         self.pool = Some(pool);
         self
