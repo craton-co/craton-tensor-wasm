@@ -143,9 +143,16 @@ struct PoolEntry {
     receiver: Receiver<TensorWasmInstance>,
     module: wasmtime::Module,
     /// Capacity the channel was constructed with (mirrors
-    /// `config.warm_instances_per_tuple` floored at 1). Held for
-    /// observability — `try_send` already returns `TrySendError::Full`
-    /// so the runtime path does not consult this field.
+    /// `channel_capacity()`, itself `warm_instances_per_tuple + 1` floored).
+    ///
+    /// DEAD CODE, retained deliberately (DOCS finding): it is written at
+    /// `build_entry` time but never read — the runtime release path keys off
+    /// `try_send` returning `TrySendError::Full`, not this field, and
+    /// `crossbeam_channel` does not expose the bounded capacity back to us, so
+    /// stashing it here is the only record of the per-entry bound. Kept for
+    /// observability / future diagnostics (a `capacity()` accessor would light
+    /// it up the moment a consumer needs it). The `#[allow(dead_code)]` is
+    /// load-bearing: without it `-D warnings` CI fails on the unread field.
     #[allow(dead_code)]
     capacity: usize,
 }
