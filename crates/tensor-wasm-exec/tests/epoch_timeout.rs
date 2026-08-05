@@ -26,6 +26,13 @@ fn infinite_loop_wasm() -> Vec<u8> {
 // (`STATUS_STACK_BUFFER_OVERRUN`). Linux/macOS CI runs the test; Windows
 // developer machines skip it. Tracked in Wasmtime upstream; revisit at
 // the next minor bump.
+//
+// COVERAGE NOTE (TESTS finding 8): this `#[ignore]` is Windows-only — the
+// test (and the sibling epoch-interrupt tests `terminate_interrupts_running_call.rs`
+// and `deadline_less_runaway_bound.rs`, which carry the SAME Windows guard)
+// MUST run on Linux CI to have any value. A Windows-only test run gives ZERO
+// coverage of the epoch-interrupt / cancellation paths; ensure the CI matrix
+// includes a Linux job that does not pass `--ignored`-skipping flags for these.
 #[cfg_attr(
     windows,
     ignore = "wasmtime fiber unwinding on Windows panics on epoch interrupt"
