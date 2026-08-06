@@ -800,6 +800,29 @@ unsafe impl MemoryCreator for TensorWasmMemoryCreator {
             return Err(format!("minimum {minimum} > maximum {max}"));
         }
 
+        // Enforce the per-instance cap declared on this creator's
+        // `MemoryCreatorConfig` (mem finding #1). The hard-cap checks above
+        // bound requests against the workspace-wide
+        // `HARD_MAX_LINEAR_MEMORY_BYTES` ceiling; this gate additionally
+        // honours a *tighter* operator-configured ceiling
+        // (`config.max_linear_memory_bytes`, clamped to the hard cap by
+        // `effective_max_linear_memory_bytes`). Multi-tenant deployments use
+        // this to refuse a guest that declares a larger backing than the
+        // tenant's slice allows, BEFORE any pool-carve or fresh allocation
+        // runs. Both `max` (the backing we are about to allocate) and
+        // `minimum` (the initial committed size) are rejected against it.
+        let configured_cap = self.inner.config.effective_max_linear_memory_bytes();
+        if max > configured_cap {
+            return Err(format!(
+                "module-declared memory maximum {max} bytes exceeds per-instance cap {configured_cap} bytes",
+            ));
+        }
+        if minimum > configured_cap {
+            return Err(format!(
+                "module-declared memory minimum {minimum} bytes exceeds per-instance cap {configured_cap} bytes",
+            ));
+        }
+
         // We do not allocate OS guard pages for `TensorWasmLinearMemory`: it is
         // backed by `UnifiedBuffer` (managed memory on CUDA hosts), and the
         // CUDA driver migrates managed pages between host and device — host
@@ -1069,6 +1092,65 @@ mod tests {
         assert!(
             err.contains("hard cap"),
             "error must mention the hard cap; got: {err}"
+        );
+    }
+
+    #[test]
+    fn creator_enforces_per_instance_cap() {
+        // mem finding #1 regression: a creator built with a 64 MiB
+        // per-instance cap must REJECT a 256 MiB backing request before any
+        // allocation runs — exercising the previously-dead
+        // `effective_max_linear_memory_bytes()` gate in `new_memory`. This
+        // runs without a GPU because the reject happens before the
+        // pool-carve / fresh-allocation branches.
+        use wasmtime::MemoryCreator;
+        const MIB: usize = 1024 * 1024;
+        let creator = TensorWasmMemoryCreator::with_config(
+            DeviceId(0),
+            MemoryCreatorConfig {
+                max_linear_memory_bytes: 64 * MIB,
+            },
+        );
+        let mt = wasmtime::MemoryType::new(1, None);
+        // 256 MiB explicit maximum: above the 64 MiB cap, below the 4 GiB
+        // hard cap, so only the per-instance gate can reject it.
+        let err = match creator.new_memory(mt, 64 * 1024, Some(256 * MIB), None, 0) {
+            Ok(_) => panic!("256 MiB request must be refused by the 64 MiB per-instance cap"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("per-instance cap"),
+            "error must mention the per-instance cap; got: {err}"
+        );
+        // A request at or below the cap must still pass the gate. Use a 1 MiB
+        // backing so the downstream allocation is cheap on any host.
+        let mt_ok = wasmtime::MemoryType::new(1, None);
+        match creator.new_memory(mt_ok, 64 * 1024, Some(MIB), None, 0) {
+            Ok(_) => { /* admitted by the cap gate as expected */ }
+            Err(e) => panic!("1 MiB request is within the 64 MiB cap but was refused: {e}"),
+        }
+    }
+
+    #[test]
+    fn creator_enforces_per_instance_cap_on_minimum() {
+        // The minimum (initial committed size) is gated too: a guest can't
+        // sidestep the cap by declaring a small maximum but a large minimum.
+        use wasmtime::MemoryCreator;
+        const MIB: usize = 1024 * 1024;
+        let creator = TensorWasmMemoryCreator::with_config(
+            DeviceId(0),
+            MemoryCreatorConfig {
+                max_linear_memory_bytes: 64 * MIB,
+            },
+        );
+        let mt = wasmtime::MemoryType::new(1, Some(2048));
+        let err = match creator.new_memory(mt, 128 * MIB, Some(128 * MIB), None, 0) {
+            Ok(_) => panic!("128 MiB minimum must be refused by the 64 MiB per-instance cap"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("per-instance cap"),
+            "error must mention the per-instance cap; got: {err}"
         );
     }
 
