@@ -843,24 +843,33 @@ impl UnifiedBuffer {
         }
         // Never expose more than the physical allocation owns.
         let capacity = capacity.max(size);
-        // Allocate the full physical capacity. On the host path
+        // mem finding #2: only the host `Box<[u8]>` backing actually
+        // *uses* the spare `capacity` region — `try_grow_in_place` is host
+        // only (`supports_in_place_grow() == !IS_UVM_BACKED`). On UVM-backed
+        // CUDA hosts the in-place grow is deferred, so reserving the full
+        // `capacity` of managed/device memory just over-allocates GPU memory
+        // that can never be exposed. Allocate exactly `size` there (matching
+        // this constructor's documented "degrades to an exactly-`size`
+        // allocation" contract) and pin `host_capacity` to match so the
+        // bookkeeping never claims more than is physically owned.
+        //
+        // On the host path we still allocate the full `capacity`:
         // `Backing::allocate` zero-fills the entire `Box<[u8]>` regardless
-        // of the visible-window argument, so every byte the buffer can
-        // ever expose via an in-place grow is already zero (H2). On the
-        // CUDA paths the allocation is `capacity` bytes too, but the
-        // capacity is bookkeeping-only there because CUDA in-place grow is
-        // still deferred.
-        let (ptr, backing) = Backing::allocate(capacity, capacity)?;
+        // of the visible-window argument, so every byte a future in-place
+        // grow can expose is already zero (H2).
+        let backing_size = if IS_UVM_BACKED { size } else { capacity };
+        let (ptr, backing) = Backing::allocate(backing_size, backing_size)?;
         Ok(Self {
             ptr,
-            // Logical length starts at `size`; the rest of `capacity` is
-            // reserved spare that `try_grow_in_place` can later expose.
+            // Logical length starts at `size`; on the host path the rest of
+            // `capacity` is reserved spare that `try_grow_in_place` can
+            // later expose.
             size,
             device_id,
             backing,
             host_addressable: true,
             host_zeroize_on_drop: IS_HOST_BACKED,
-            host_capacity: capacity,
+            host_capacity: backing_size,
             tenant_ctx: None,
         })
     }
