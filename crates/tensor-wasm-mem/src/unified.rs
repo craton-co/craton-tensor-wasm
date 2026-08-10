@@ -388,15 +388,41 @@ mod backing {
     /// was never called. The result is held in a `OnceLock` so subsequent
     /// allocations are init-free. We only need to keep the `Context` alive
     /// for the rest of the process; nothing here ever drops it.
-    fn ensure_cuda_init() -> Result<(), UnifiedError> {
+    fn cust_primary_context() -> Result<&'static cust::context::Context, UnifiedError> {
         use std::sync::OnceLock;
         static CTX: OnceLock<Result<cust::context::Context, String>> = OnceLock::new();
         let r =
             CTX.get_or_init(|| cust::quick_init().map_err(|e| format!("cust::quick_init: {e:?}")));
         match r {
-            Ok(_) => Ok(()),
+            Ok(ctx) => Ok(ctx),
             Err(msg) => Err(UnifiedError::Cuda(msg.clone())),
         }
+    }
+
+    fn ensure_cuda_init() -> Result<(), UnifiedError> {
+        cust_primary_context().map(|_| ())
+    }
+
+    /// Bind the cust primary context to the calling thread (mem M4, cust path).
+    ///
+    /// The cudarc path's [`crate::cudarc_backend::ensure_context_bound`]
+    /// already does this before every context-sensitive driver call
+    /// (`cuMemAdvise` / `cuMemPrefetchAsync`). The cust path was missing the
+    /// equivalent: CUDA's driver keeps a *thread-local* current context, and
+    /// the process-wide primary context built by `cust::quick_init` is only
+    /// made current on the thread that ran the init. A `cuMemAdvise` issued
+    /// from any other thread (a tokio/rayon worker, or a fresh libtest
+    /// per-test thread) would otherwise dispatch against whatever context
+    /// that thread last touched — `CUDA_ERROR_INVALID_CONTEXT`, or worse, a
+    /// different tenant's context on a multi-tenant host.
+    ///
+    /// `CurrentContext::set_current` is idempotent on a thread already bound
+    /// to the same context (the driver compares context identity), so callers
+    /// may invoke it unconditionally. Surfaced as [`UnifiedError::Cuda`].
+    pub(crate) fn ensure_cust_context_bound() -> Result<(), UnifiedError> {
+        let ctx = cust_primary_context()?;
+        cust::context::CurrentContext::set_current(ctx)
+            .map_err(|e| UnifiedError::Cuda(format!("CurrentContext::set_current: {e:?}")))
     }
 
     impl Backing {
@@ -653,6 +679,14 @@ mod backing {
 // closes the audit-T5 finding that `Backing::Cuda` aliased the parent
 // struct's `NonNull<u8>`.
 use backing::{Backing, IS_HOST_BACKED, IS_UVM_BACKED};
+
+/// Crate-internal re-export of the cust primary-context binder (mem M4, cust
+/// path). Lets [`crate::advise`] bind the cust primary context before its
+/// `cuMemAdvise` call, mirroring the cudarc backend's
+/// [`crate::cudarc_backend::ensure_context_bound`]. Gated to the cust feature
+/// because the helper lives in the cust-only `backing` module.
+#[cfg(feature = "unified-memory")]
+pub(crate) use backing::ensure_cust_context_bound;
 
 /// T39 owning storage for a [`UnifiedBuffer`] allocated through a
 /// tenant-scoped `cuMemPool`.

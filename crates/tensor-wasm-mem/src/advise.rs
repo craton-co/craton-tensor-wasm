@@ -67,6 +67,15 @@ pub fn apply(_buffer: &UnifiedBuffer, _advice: Advice) -> Result<(), UnifiedErro
 fn apply_cuda(buffer: &UnifiedBuffer, advice: Advice) -> Result<(), UnifiedError> {
     use cust::sys as cuda_sys;
 
+    // mem finding #3: bind the cust primary context to THIS thread before
+    // `cuMemAdvise`, mirroring the cudarc path's `ensure_context_bound` (mem
+    // M4). CUDA keeps a thread-local current context; without this an advise
+    // call from a worker thread that never ran `cust::quick_init` would
+    // dispatch against an unset / wrong context (`CUDA_ERROR_INVALID_CONTEXT`,
+    // or another tenant's context on a multi-tenant host). Idempotent on an
+    // already-bound thread.
+    crate::unified::ensure_cust_context_bound()?;
+
     let ptr = buffer.as_ptr() as cuda_sys::CUdeviceptr;
     let size = buffer.len();
     let (advice_kind, device) = match advice {
