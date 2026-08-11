@@ -1404,6 +1404,115 @@ impl UnifiedBuffer {
     pub fn prefetch_to_host(&self) -> Result<(), UnifiedError> {
         Ok(())
     }
+
+    /// mem finding #4: zeroize the managed region on drop on CUDA hosts.
+    ///
+    /// The host `Box<[u8]>` build already volatile-zeros its backing in
+    /// [`Drop`] (`host_zeroize_on_drop`), but the CUDA UVM builds did not —
+    /// the freed managed pages kept whatever the guest last wrote, a residual
+    /// cross-tenant disclosure if the driver hands the same physical pages to
+    /// the next tenant before they are overwritten. cust/cudarc free the
+    /// allocation via the typed backing `Drop` which requires a live context;
+    /// a host `write_bytes` over managed memory could also race the driver's
+    /// page migration. The driver-side answer is `cuMemsetD8` (a device
+    /// memset that the runtime serialises against migration) issued against a
+    /// thread-bound context, BEFORE the backing's free runs.
+    ///
+    /// Scope: managed, host-addressable buffers only. Device-only T39
+    /// tenant-pool backings (`!host_addressable`) free through
+    /// `cuMemFreeAsync` on the pool handle and are out of scope here; their
+    /// zeroization is the pool's responsibility. On the no-CUDA build this is
+    /// a no-op so the [`Drop`] body stays uniform.
+    ///
+    /// Best-effort: a memset failure on the teardown path is logged at
+    /// `debug` and swallowed — `drop` cannot return an error, and the free
+    /// must still proceed. Errors here are rare (they imply a context the
+    /// driver has already torn down, in which case the pages are gone too).
+    #[cfg(any(feature = "unified-memory", feature = "cudarc-backend"))]
+    fn zeroize_managed_region(&mut self) {
+        // Only managed, host-addressable allocations: device-only tenant-pool
+        // backings are handled by the pool, and a zero-length buffer has
+        // nothing to clear.
+        if !self.host_addressable || self.size == 0 {
+            return;
+        }
+
+        #[cfg(feature = "unified-memory")]
+        {
+            use cust::sys as cuda_sys;
+            // mem M4: bind the cust primary context to this thread first, so
+            // the memset dispatches against the allocation's own context.
+            if let Err(e) = ensure_cust_context_bound() {
+                tracing::debug!(
+                    target: "tensor_wasm_mem::unified",
+                    error = %e,
+                    "drop-zeroize: could not bind cust context; skipping cuMemsetD8"
+                );
+                return;
+            }
+            // SAFETY: `self.ptr` points to `self.size` valid managed bytes
+            // (struct invariant, and `&mut self` in drop precludes any
+            // outstanding borrow). The backing is still alive — field drop
+            // runs only after the `Drop` body returns — so the region is
+            // mapped. `cuMemsetD8` writes `self.size` zero bytes through the
+            // driver, which serialises against UVM page migration.
+            let res = unsafe {
+                cuda_sys::cuMemsetD8_v2(self.ptr.as_ptr() as cuda_sys::CUdeviceptr, 0, self.size)
+            };
+            if res != cuda_sys::CUresult::CUDA_SUCCESS {
+                tracing::debug!(
+                    target: "tensor_wasm_mem::unified",
+                    result = ?res,
+                    "drop-zeroize: cuMemsetD8 failed; freeing without zeroization"
+                );
+            }
+            return;
+        }
+
+        // cudarc-only build (unified-memory off, cudarc-backend on).
+        #[cfg(all(not(feature = "unified-memory"), feature = "cudarc-backend"))]
+        {
+            use cudarc::driver::sys as cuda_sys;
+            // mem M4: bind the buffer's owning primary context before the
+            // memset. `device_for` returns the cached `Arc<CudaDevice>` for
+            // this ordinal (already primed by the allocation path).
+            let device = match crate::cudarc_backend::device_for(self.device_id.0) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "tensor_wasm_mem::unified",
+                        error = %e,
+                        "drop-zeroize: could not resolve cudarc device; skipping cuMemsetD8"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = crate::cudarc_backend::ensure_context_bound(&device) {
+                tracing::debug!(
+                    target: "tensor_wasm_mem::unified",
+                    error = %e,
+                    "drop-zeroize: could not bind cudarc context; skipping cuMemsetD8"
+                );
+                return;
+            }
+            // SAFETY: see the cust arm above — `self.ptr`/`self.size` describe
+            // a live managed allocation and the context is bound.
+            let res = unsafe {
+                cuda_sys::lib().cuMemsetD8_v2(
+                    self.ptr.as_ptr() as cuda_sys::CUdeviceptr,
+                    0,
+                    self.size,
+                )
+            };
+            if res != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+                tracing::debug!(
+                    target: "tensor_wasm_mem::unified",
+                    result = ?res,
+                    "drop-zeroize: cuMemsetD8 failed; freeing without zeroization"
+                );
+            }
+        }
+    }
 }
 
 impl UnifiedBacking for UnifiedBuffer {
@@ -1536,6 +1645,14 @@ impl Drop for UnifiedBuffer {
         if let Some(ctx) = self.tenant_ctx.as_ref() {
             ctx.release_gpu_bytes(self.size as u64);
         }
+
+        // mem finding #4 (CUDA hosts): zeroize managed memory via a
+        // context-bound `cuMemsetD8` BEFORE the backing's typed `Drop` frees
+        // it, so freed managed pages do not linger with cross-tenant residue.
+        // No-op on the no-CUDA `Box<[u8]>` build (that path is covered by the
+        // host volatile-memset below). See [`Self::zeroize_managed_region`].
+        #[cfg(any(feature = "unified-memory", feature = "cudarc-backend"))]
+        self.zeroize_managed_region();
 
         // Audit (LOW — no Drop-time zeroization of sensitive buffers):
         // overwrite the bytes before the backing's own `Drop` frees them,
