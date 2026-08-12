@@ -280,11 +280,53 @@ impl TenantMemPool {
     /// The release-threshold cap (in bytes) this pool was created with.
     ///
     /// Note: the CUDA driver may round the value internally; this
-    /// returns the *requested* value, not the effective one. v0.4
-    /// adds a separate `effective_cap_bytes()` query that round-trips
-    /// through `cuMemPoolGetAttribute`.
+    /// returns the *requested* value, not the effective one. See
+    /// [`Self::effective_cap_bytes`] for the driver-reported value that
+    /// round-trips through `cuMemPoolGetAttribute`.
     pub fn cap_bytes(&self) -> u64 {
         self.cap_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The *effective* release-threshold the driver actually holds, read
+    /// back via `cuMemPoolGetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)`
+    /// (mem finding #5).
+    ///
+    /// [`Self::cap_bytes`] returns the value this crate *requested*; the
+    /// driver may round or clamp it internally, so an operator validating a
+    /// per-tenant cap against the hardware wants the authoritative figure.
+    /// This issues the get-attribute query against the live pool handle.
+    ///
+    /// # Thread safety (mem M4)
+    ///
+    /// Binds the pool's primary context to the calling thread before the
+    /// query — `cuMemPoolGetAttribute` is context-sensitive, exactly like
+    /// the `cuMemPoolSetAttribute` calls in [`Self::new`] /
+    /// [`DriverMemPool::set_release_threshold`].
+    ///
+    /// Returns [`UnifiedError::Cuda`] (matching [`Self::allocate`]) if the
+    /// context bind or the driver query fails.
+    pub fn effective_cap_bytes(&self) -> Result<u64, UnifiedError> {
+        // mem M4: bind the primary context before the context-sensitive query.
+        ensure_context_bound(&self.device)?;
+        let mut value: u64 = 0;
+        // SAFETY: `self.pool` is non-null and live (this is a `&self` method,
+        // so `Drop` cannot have run); `value` is a valid `u64` out-parameter
+        // and `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` is documented as a
+        // `cuuint64_t`-typed attribute, so the 8-byte write the driver makes
+        // through the pointer is in-bounds.
+        let res = unsafe {
+            cuda_sys::lib().cuMemPoolGetAttribute(
+                self.pool,
+                cuda_sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                &mut value as *mut u64 as *mut core::ffi::c_void,
+            )
+        };
+        if res != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+            return Err(UnifiedError::Cuda(format!(
+                "cuMemPoolGetAttribute(RELEASE_THRESHOLD) -> {res:?}"
+            )));
+        }
+        Ok(value)
     }
 
     /// Device ordinal this pool's allocations target.

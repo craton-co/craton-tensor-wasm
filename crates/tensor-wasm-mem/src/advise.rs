@@ -24,6 +24,10 @@ use crate::unified::{DeviceId, UnifiedBuffer, UnifiedError};
 pub enum Advice {
     /// The region is mostly read; multiple devices may keep duplicated copies.
     ReadMostly,
+    /// Reverse a previous `ReadMostly` hint
+    /// (`CU_MEM_ADVISE_UNSET_READ_MOSTLY`). The runtime stops duplicating
+    /// the pages and reverts to single-copy migration on write.
+    UnsetReadMostly,
     /// Pages should live primarily on the given device.
     PreferredLocation(DeviceId),
     /// The given device will access the region; map it without migrating.
@@ -39,6 +43,7 @@ impl Advice {
     pub fn name(&self) -> &'static str {
         match self {
             Advice::ReadMostly => "read_mostly",
+            Advice::UnsetReadMostly => "unset_read_mostly",
             Advice::PreferredLocation(_) => "preferred_location",
             Advice::AccessedBy(_) => "accessed_by",
             Advice::UnsetPreferredLocation => "unset_preferred_location",
@@ -80,6 +85,10 @@ fn apply_cuda(buffer: &UnifiedBuffer, advice: Advice) -> Result<(), UnifiedError
     let size = buffer.len();
     let (advice_kind, device) = match advice {
         Advice::ReadMostly => (cuda_sys::CUmem_advise::CU_MEM_ADVISE_SET_READ_MOSTLY, 0i32),
+        Advice::UnsetReadMostly => (
+            cuda_sys::CUmem_advise::CU_MEM_ADVISE_UNSET_READ_MOSTLY,
+            0i32,
+        ),
         Advice::PreferredLocation(d) => (
             cuda_sys::CUmem_advise::CU_MEM_ADVISE_SET_PREFERRED_LOCATION,
             d.0 as i32,
@@ -132,6 +141,7 @@ mod tests {
     #[test]
     fn names_are_stable() {
         assert_eq!(Advice::ReadMostly.name(), "read_mostly");
+        assert_eq!(Advice::UnsetReadMostly.name(), "unset_read_mostly");
         assert_eq!(
             Advice::PreferredLocation(DeviceId(0)).name(),
             "preferred_location"
