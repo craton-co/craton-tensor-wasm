@@ -1291,6 +1291,19 @@ impl UnifiedBuffer {
         // CUDA backings: still deferred. Keep the documented sentinel so
         // the v0.4 caller match site is stable. Reported as a CUDA error
         // ONLY because the active backing IS CUDA here.
+        //
+        // mem finding #5: a real `cuMemAddressReserve`+`cuMemMap` in-place grow
+        // is NOT a localized change — `cuMemAllocManaged` allocations (the
+        // backing every constructor produces) are not VMM-mappable, so wiring
+        // it would require switching the whole `Backing` allocation/free model
+        // to the CUDA Virtual Memory Management API, and that path additionally
+        // needs the device's `CONCURRENT_MANAGED_ACCESS` attribute (0 on this
+        // host's RTX 2060 / Windows-WDDM, verified — see the doc above and
+        // docs/GPU-VALIDATION-2026-05-30.md). Rather than ship an
+        // unverifiable multi-hundred-LOC `unsafe` rewrite into a
+        // security-sensitive memory path, the sentinel is retained; the
+        // `try_grow_in_place_classifies_per_backing` test pins it as the
+        // contract for the v0.4 VMM cutover.
         if IS_UVM_BACKED {
             return Err(UnifiedError::Cuda(
                 "in-place grow not yet wired -- see UnifiedBuffer::try_grow_in_place doc + \
@@ -1378,31 +1391,166 @@ impl UnifiedBuffer {
     }
 
     /// Suggest to the runtime that the buffer should be migrated to the device.
-    /// No-op when `unified-memory` is disabled.
+    /// No-op when no CUDA backing feature is enabled.
     ///
-    /// **Implementation status:** under `--features unified-memory`, this is
-    /// currently an advisory no-op. cust 0.3.2's `MemoryAdvise::prefetch_to_device`
-    /// requires a `&Stream` + `&Device` (rather than the bare `i32` ordinal this
-    /// signature accepts), and the unified-memory subsystem does not yet thread
-    /// a `Stream` through the public surface. On Windows WDDM the equivalent
-    /// `cuMemPrefetchAsync` call returns `CUDA_ERROR_INVALID_DEVICE` anyway
-    /// because consumer Turing cards don't expose `concurrentManagedAccess`,
-    /// so the user-visible behavior is the same. The `cudarc_backend` path
-    /// (see `cudarc_backend.rs`) does call the driver fn directly via
-    /// `cudarc::driver::sys::lib().cuMemPrefetchAsync`, where the
-    /// platform support story is the same.
+    /// mem finding #5: under `--features unified-memory` this now issues a real
+    /// `cuMemPrefetchAsync` against a freshly-created stream (the cust path did
+    /// not previously thread a `Stream` through the public surface, so it was an
+    /// advisory no-op). The work happens through the raw `cust::sys` driver
+    /// surface rather than cust's safe `MemoryAdvise` trait, because the inner
+    /// cust `UnifiedBuffer` is sealed inside the [`Backing`] aliasing invariant
+    /// and must not be reached by pattern-matching the backing.
     ///
-    /// TODO(v0.4): thread a `Stream` through `UnifiedBuffer` and wire this
-    /// against `cust::memory::MemoryAdvise::prefetch_to_device(&stream, &device)`.
+    /// Mirrors the cudarc backend (`cudarc_backend.rs`): prefetch requires the
+    /// device's `CONCURRENT_MANAGED_ACCESS` attribute, which is `0` on
+    /// Windows/WDDM (consumer Turing cards), where `cuMemPrefetchAsync` fails
+    /// with `INVALID_DEVICE`. Prefetch is an advisory hint, so on platforms
+    /// that cannot honour it we degrade to a no-op rather than erroring —
+    /// managed memory stays correct without the migration.
     pub fn prefetch_to_device(&self) -> Result<(), UnifiedError> {
-        Ok(())
+        #[cfg(feature = "unified-memory")]
+        {
+            return self.cust_prefetch(self.device_id.0 as i32);
+        }
+        #[cfg(not(feature = "unified-memory"))]
+        {
+            Ok(())
+        }
     }
 
     /// Suggest to the runtime that the buffer should be migrated back to host
-    /// memory. Currently an advisory no-op for the same reasons as
-    /// [`Self::prefetch_to_device`].
+    /// memory. Real `cuMemPrefetchAsync` to `CU_DEVICE_CPU` on the cust path
+    /// (mem finding #5); advisory no-op on the non-cust builds. Same
+    /// `CONCURRENT_MANAGED_ACCESS` degradation as [`Self::prefetch_to_device`].
     pub fn prefetch_to_host(&self) -> Result<(), UnifiedError> {
+        #[cfg(feature = "unified-memory")]
+        {
+            // `CU_DEVICE_CPU` is the cuMemPrefetchAsync "host" sentinel; CUDA
+            // defines it as -1 and cust does not export a named constant.
+            const CU_DEVICE_CPU: i32 = -1;
+            return self.cust_prefetch(CU_DEVICE_CPU);
+        }
+        #[cfg(not(feature = "unified-memory"))]
+        {
+            Ok(())
+        }
+    }
+
+    /// cust-path `cuMemPrefetchAsync` worker (mem finding #5).
+    ///
+    /// `dst_device` is the destination device ordinal, or `-1`
+    /// (`CU_DEVICE_CPU`) for a host migration. Binds the cust primary context
+    /// (mem M4), gates on `CONCURRENT_MANAGED_ACCESS`, creates a short-lived
+    /// stream, issues the async prefetch, synchronises it, and destroys the
+    /// stream. Stream teardown runs on every exit path so a prefetch error
+    /// does not leak the stream handle.
+    #[cfg(feature = "unified-memory")]
+    fn cust_prefetch(&self, dst_device: i32) -> Result<(), UnifiedError> {
+        use cust::sys as cuda_sys;
+
+        // mem M4: bind the cust primary context to this thread first.
+        ensure_cust_context_bound()?;
+
+        // Gate on the owning device's CONCURRENT_MANAGED_ACCESS attribute.
+        // Prefetch only ever targets the owning device (or the host), so the
+        // owning ordinal is the correct one to probe.
+        if !Self::cust_supports_managed_prefetch(self.device_id.0) {
+            tracing::debug!(
+                target: "tensor_wasm_mem::unified",
+                device = self.device_id.0,
+                "cust prefetch: skipped (device lacks CONCURRENT_MANAGED_ACCESS, e.g. Windows/WDDM)"
+            );
+            return Ok(());
+        }
+
+        // Create a non-blocking stream for the prefetch. We own and destroy it
+        // here rather than threading a long-lived stream through the buffer —
+        // a per-call stream keeps the existing public signature and matches the
+        // null-stream usage in the cudarc path closely enough for an advisory
+        // hint.
+        let mut stream: cuda_sys::CUstream = std::ptr::null_mut();
+        // SAFETY: `stream` is a valid out-parameter; the context was bound
+        // above so the driver is initialised.
+        let res = unsafe {
+            cuda_sys::cuStreamCreate(
+                &mut stream as *mut cuda_sys::CUstream,
+                cuda_sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+            )
+        };
+        if res != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(UnifiedError::Cuda(format!("cuStreamCreate -> {res:?}")));
+        }
+
+        // SAFETY: ptr/size describe a live managed allocation (struct
+        // invariant); `stream` was just created; `dst_device` is either the
+        // owning ordinal or CU_DEVICE_CPU (-1).
+        let pf = unsafe {
+            cuda_sys::cuMemPrefetchAsync(
+                self.ptr.as_ptr() as cuda_sys::CUdeviceptr,
+                self.size,
+                dst_device,
+                stream,
+            )
+        };
+        // Synchronise so the hint has actually been issued before we destroy
+        // the stream; capture the result but always tear the stream down.
+        let sync = if pf == cuda_sys::CUresult::CUDA_SUCCESS {
+            // SAFETY: `stream` is the live handle created above.
+            unsafe { cuda_sys::cuStreamSynchronize(stream) }
+        } else {
+            cuda_sys::CUresult::CUDA_SUCCESS
+        };
+        // SAFETY: `stream` is the live handle created above; after this call it
+        // is invalid and we drop our copy.
+        let destroy = unsafe { cuda_sys::cuStreamDestroy_v2(stream) };
+
+        if pf != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(UnifiedError::Cuda(format!("cuMemPrefetchAsync -> {pf:?}")));
+        }
+        if sync != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(UnifiedError::Cuda(format!(
+                "cuStreamSynchronize -> {sync:?}"
+            )));
+        }
+        if destroy != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(UnifiedError::Cuda(format!(
+                "cuStreamDestroy_v2 -> {destroy:?}"
+            )));
+        }
         Ok(())
+    }
+
+    /// True if the cust-path device at `ordinal` reports
+    /// `CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS != 0` (mem finding #5).
+    ///
+    /// Mirror of `cudarc_backend::supports_managed_prefetch`. Returns `false`
+    /// on any driver error querying the attribute — the conservative default
+    /// for an advisory hint path. `0` on Windows/WDDM (consumer Turing), `1`
+    /// on Linux / Windows-TCC.
+    #[cfg(feature = "unified-memory")]
+    fn cust_supports_managed_prefetch(ordinal: u32) -> bool {
+        use cust::sys as cuda_sys;
+        // SAFETY: out-params are valid locals; the cust primary context has
+        // been initialised by the caller (`cust_prefetch` binds it first), so
+        // the driver is live for these queries.
+        unsafe {
+            let mut dev: cuda_sys::CUdevice = 0;
+            if cuda_sys::cuDeviceGet(&mut dev as *mut cuda_sys::CUdevice, ordinal as i32)
+                != cuda_sys::CUresult::CUDA_SUCCESS
+            {
+                return false;
+            }
+            let mut val: i32 = 0;
+            if cuda_sys::cuDeviceGetAttribute(
+                &mut val as *mut i32,
+                cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS,
+                dev,
+            ) != cuda_sys::CUresult::CUDA_SUCCESS
+            {
+                return false;
+            }
+            val != 0
+        }
     }
 
     /// mem finding #4: zeroize the managed region on drop on CUDA hosts.
@@ -1540,17 +1688,11 @@ impl UnifiedBacking for UnifiedBuffer {
         {
             let advice = match hint {
                 UvmAdvice::SetReadMostly => crate::advise::Advice::ReadMostly,
-                UvmAdvice::UnsetReadMostly => {
-                    // The cust path's [`crate::advise::Advice`] enum has
-                    // no `UnsetReadMostly` variant yet (v0.3 never wired
-                    // it). Surface as `NotSupported` so callers can
-                    // detect the gap without scraping a driver error
-                    // string; the v0.4 cutover will add the variant.
-                    return Err(UnifiedError::NotSupported {
-                        feature: "apply_advice(UnsetReadMostly)",
-                        backing: "cust",
-                    });
-                }
+                // mem finding #5: the cust `Advice` enum now carries
+                // `UnsetReadMostly` (wired to `CU_MEM_ADVISE_UNSET_READ_MOSTLY`
+                // in `crate::advise::apply_cuda`), so this is a real driver
+                // call rather than the old `NotSupported` sentinel.
+                UvmAdvice::UnsetReadMostly => crate::advise::Advice::UnsetReadMostly,
                 UvmAdvice::SetPreferredLocation(d) => {
                     crate::advise::Advice::PreferredLocation(DeviceId(d))
                 }

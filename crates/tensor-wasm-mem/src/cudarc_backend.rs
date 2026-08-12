@@ -594,18 +594,13 @@ impl UnifiedBacking for CudarcUnifiedBuffer {
 
     fn apply_advice(&self, hint: UvmAdvice) -> Result<(), UnifiedError> {
         // Translate the trait-facing `UvmAdvice` to the cudarc path's
-        // internal `Advice` enum. `UvmAdvice::UnsetReadMostly` has no
-        // matching variant on the cudarc path today, so surface it as
-        // `NotSupported` rather than papering over the gap with a
-        // silent no-op.
+        // internal `Advice` enum. mem finding #5: `UvmAdvice::UnsetReadMostly`
+        // now maps to a real `CU_MEM_ADVISE_UNSET_READ_MOSTLY` driver call
+        // (`Advice::UnsetReadMostly`) instead of the old `NotSupported`
+        // sentinel.
         let advice = match hint {
             UvmAdvice::SetReadMostly => Advice::ReadMostly,
-            UvmAdvice::UnsetReadMostly => {
-                return Err(UnifiedError::NotSupported {
-                    feature: "apply_advice(UnsetReadMostly)",
-                    backing: "cudarc",
-                });
-            }
+            UvmAdvice::UnsetReadMostly => Advice::UnsetReadMostly,
             UvmAdvice::SetPreferredLocation(d) => Advice::PreferredLocation(DeviceId(d)),
             UvmAdvice::UnsetPreferredLocation => Advice::UnsetPreferredLocation,
             UvmAdvice::SetAccessedBy(d) => Advice::AccessedBy(DeviceId(d)),
@@ -727,6 +722,10 @@ pub fn apply_advice(buffer: &CudarcUnifiedBuffer, advice: Advice) -> Result<(), 
     let (advice_kind, device) = match advice {
         Advice::ReadMostly => (
             cuda_sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_READ_MOSTLY,
+            0i32,
+        ),
+        Advice::UnsetReadMostly => (
+            cuda_sys::CUmem_advise_enum::CU_MEM_ADVISE_UNSET_READ_MOSTLY,
             0i32,
         ),
         Advice::PreferredLocation(d) => (
