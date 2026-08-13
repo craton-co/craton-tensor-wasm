@@ -22,9 +22,18 @@
 //! between host and device and applying host page protection would race
 //! with the migration machinery. That limitation is unchanged.
 //!
-//! Wiring a real `cudaHostAlloc` (with `cudaHostAllocMapped |
-//! cudaHostAllocPortable`) path that produces page-locked, DMA-friendly memory
-//! is deferred to a future revision.
+//! mem finding #6: with a CUDA backing feature enabled (`unified-memory` or
+//! `cudarc-backend`) the usable region is additionally **page-locked** for DMA
+//! via `cuMemHostRegister_v2(CU_MEMHOSTREGISTER_PORTABLE |
+//! CU_MEMHOSTREGISTER_DEVICEMAP)` — the driver-API equivalent of
+//! `cudaHostAlloc(cudaHostAllocPortable | cudaHostAllocMapped)`. We *register*
+//! the already-allocated guarded mapping rather than allocating fresh memory
+//! with `cuMemHostAlloc` precisely so the `PROT_NONE` guard pages bracketing
+//! the usable region are preserved (a fresh `cuMemHostAlloc` block would have
+//! no guards). On the no-CUDA `--no-default-features` build the registration is
+//! compiled out and the buffer is plain guarded (unpinned) host memory, as
+//! before. Registration failure degrades to unpinned memory with a `debug`
+//! log — page-locking is a DMA *optimisation*, not a correctness requirement.
 //!
 //! The API is intentionally symmetric with [`crate::unified::UnifiedBuffer`]
 //! so call sites can swap one buffer type for the other without conditional
@@ -78,6 +87,14 @@ pub struct GuardedHostBuffer {
     size: usize,
     device_id: DeviceId,
     allocation: GuardedAllocation,
+    /// Whether the usable region was successfully page-locked via
+    /// `cuMemHostRegister_v2` (mem finding #6). `true` only on a CUDA build
+    /// where registration succeeded; gates the matching `cuMemHostUnregister`
+    /// in [`Drop`]. Only present on CUDA builds — on the no-CUDA build there
+    /// is no pinning, so the field (and the whole [`Drop`] impl) is compiled
+    /// out and teardown relies on `GuardedAllocation`'s mapping `Drop`.
+    #[cfg(any(feature = "unified-memory", feature = "cudarc-backend"))]
+    pinned: bool,
 }
 
 // SAFETY: the inner buffer is owned by this struct, not shared. The
@@ -133,6 +150,12 @@ impl GuardedHostBuffer {
         }
         let ptr = NonNull::new(usable_start as *mut u8)
             .ok_or_else(|| UnifiedError::Allocation("region::alloc returned null".into()))?;
+        // mem finding #6: page-lock the usable region for DMA on CUDA builds.
+        // We register exactly the `[ptr, ptr + usable)` window (page-aligned
+        // and a whole number of pages, so it satisfies `cuMemHostRegister`'s
+        // alignment requirement) and leave the guard pages untouched.
+        #[cfg(any(feature = "unified-memory", feature = "cudarc-backend"))]
+        let pinned = Self::try_pin(ptr, usable, device_id);
         Ok(Self {
             ptr,
             size,
@@ -142,7 +165,93 @@ impl GuardedHostBuffer {
                 usable_offset: page,
                 usable_size: usable,
             },
+            #[cfg(any(feature = "unified-memory", feature = "cudarc-backend"))]
+            pinned,
         })
+    }
+
+    /// Page-lock `[ptr, ptr + usable)` for DMA via `cuMemHostRegister_v2`
+    /// (mem finding #6). Returns `true` if the region is now pinned.
+    ///
+    /// Best-effort: any failure (no driver, unsupported platform, already
+    /// registered) logs at `debug` and returns `false` so the buffer falls
+    /// back to ordinary (unpinned) guarded host memory — page-locking is a DMA
+    /// optimisation, not a correctness requirement. The `PORTABLE` flag makes
+    /// the pinning visible to every CUDA context (multi-tenant safe); `DEVICEMAP`
+    /// requests a device-accessible mapping so a kernel can DMA the bytes
+    /// without a staging copy.
+    #[cfg(feature = "unified-memory")]
+    fn try_pin(ptr: NonNull<u8>, usable: usize, _device_id: DeviceId) -> bool {
+        use cust::sys as cuda_sys;
+        // mem M4: bind the cust primary context before the context-sensitive
+        // registration call.
+        if crate::unified::ensure_cust_context_bound().is_err() {
+            tracing::debug!(
+                target: "tensor_wasm_mem::pinned_host",
+                "try_pin: could not bind cust context; leaving host memory unpinned"
+            );
+            return false;
+        }
+        let flags = cuda_sys::CU_MEMHOSTREGISTER_PORTABLE | cuda_sys::CU_MEMHOSTREGISTER_DEVICEMAP;
+        // SAFETY: `ptr` is page-aligned and points to `usable` valid, RW,
+        // host-addressable bytes (the freshly-protected middle of the guarded
+        // mapping); the context was bound above.
+        let res =
+            unsafe { cuda_sys::cuMemHostRegister_v2(ptr.as_ptr() as *mut core::ffi::c_void, usable, flags) };
+        if res == cuda_sys::CUresult::CUDA_SUCCESS {
+            true
+        } else {
+            tracing::debug!(
+                target: "tensor_wasm_mem::pinned_host",
+                result = ?res,
+                "try_pin: cuMemHostRegister failed; leaving host memory unpinned"
+            );
+            false
+        }
+    }
+
+    /// cudarc-only variant of [`Self::try_pin`] (mem finding #6).
+    #[cfg(all(not(feature = "unified-memory"), feature = "cudarc-backend"))]
+    fn try_pin(ptr: NonNull<u8>, usable: usize, device_id: DeviceId) -> bool {
+        use cudarc::driver::sys as cuda_sys;
+        // mem M4: bind the owning device's primary context first.
+        let device = match crate::cudarc_backend::device_for(device_id.0) {
+            Ok(d) => d,
+            Err(_) => {
+                tracing::debug!(
+                    target: "tensor_wasm_mem::pinned_host",
+                    "try_pin: could not resolve cudarc device; leaving host memory unpinned"
+                );
+                return false;
+            }
+        };
+        if crate::cudarc_backend::ensure_context_bound(&device).is_err() {
+            tracing::debug!(
+                target: "tensor_wasm_mem::pinned_host",
+                "try_pin: could not bind cudarc context; leaving host memory unpinned"
+            );
+            return false;
+        }
+        let flags = cuda_sys::CU_MEMHOSTREGISTER_PORTABLE | cuda_sys::CU_MEMHOSTREGISTER_DEVICEMAP;
+        // SAFETY: see the cust arm — `ptr`/`usable` describe a page-aligned RW
+        // host region and the context is bound.
+        let res = unsafe {
+            cuda_sys::lib().cuMemHostRegister_v2(
+                ptr.as_ptr() as *mut core::ffi::c_void,
+                usable,
+                flags,
+            )
+        };
+        if res == cuda_sys::cudaError_enum::CUDA_SUCCESS {
+            true
+        } else {
+            tracing::debug!(
+                target: "tensor_wasm_mem::pinned_host",
+                result = ?res,
+                "try_pin: cuMemHostRegister failed; leaving host memory unpinned"
+            );
+            false
+        }
     }
 
     /// Length in bytes — matches the caller-requested size, not the page-rounded usable region.
@@ -223,6 +332,66 @@ impl fmt::Debug for GuardedHostBuffer {
             .field("usable_size", &self.allocation.usable_size)
             .field("device_id", &self.device_id)
             .finish()
+    }
+}
+
+// mem finding #6: unregister the page-locked region before its mapping is
+// unmapped. Only compiled on CUDA builds (the no-CUDA build never pins, so it
+// needs no Drop — the `region::Allocation` field's own Drop unmaps everything).
+//
+// Drop ordering: this `Drop::drop` body runs FIRST, then Rust drops the
+// struct's fields in declaration order — `allocation` (the
+// `region::Allocation`) last. So `cuMemHostUnregister` always precedes the
+// `munmap`/`VirtualFree`; unregistering after the unmap would target freed
+// virtual addresses.
+#[cfg(any(feature = "unified-memory", feature = "cudarc-backend"))]
+impl Drop for GuardedHostBuffer {
+    fn drop(&mut self) {
+        if !self.pinned {
+            return;
+        }
+        #[cfg(feature = "unified-memory")]
+        {
+            use cust::sys as cuda_sys;
+            // Bind the context so the unregister dispatches against the right
+            // primary context (mem M4). If the bind fails the pages are about
+            // to be unmapped anyway; log and proceed.
+            if crate::unified::ensure_cust_context_bound().is_ok() {
+                // SAFETY: `self.ptr` is the exact pointer passed to
+                // `cuMemHostRegister_v2`; the region is still mapped (the
+                // `allocation` field drops after this body returns).
+                let res =
+                    unsafe { cuda_sys::cuMemHostUnregister(self.ptr.as_ptr() as *mut core::ffi::c_void) };
+                if res != cuda_sys::CUresult::CUDA_SUCCESS {
+                    tracing::debug!(
+                        target: "tensor_wasm_mem::pinned_host",
+                        result = ?res,
+                        "drop: cuMemHostUnregister failed"
+                    );
+                }
+            }
+        }
+        #[cfg(all(not(feature = "unified-memory"), feature = "cudarc-backend"))]
+        {
+            use cudarc::driver::sys as cuda_sys;
+            if let Ok(device) = crate::cudarc_backend::device_for(self.device_id.0) {
+                if crate::cudarc_backend::ensure_context_bound(&device).is_ok() {
+                    // SAFETY: see the cust arm — `self.ptr` is the registered
+                    // pointer and the region is still mapped.
+                    let res = unsafe {
+                        cuda_sys::lib()
+                            .cuMemHostUnregister(self.ptr.as_ptr() as *mut core::ffi::c_void)
+                    };
+                    if res != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+                        tracing::debug!(
+                            target: "tensor_wasm_mem::pinned_host",
+                            result = ?res,
+                            "drop: cuMemHostUnregister failed"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
