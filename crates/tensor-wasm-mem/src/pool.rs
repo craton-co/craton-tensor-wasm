@@ -81,6 +81,23 @@ pub struct UnifiedMemoryPool {
     /// Total bytes ever issued (sticky counter for metrics). Saturates at
     /// `u64::MAX`. Never decremented; survives [`Self::reset`] intact.
     issued_total: AtomicU64,
+    /// High-water mark: the largest slab offset ever carved (max `end` over
+    /// every successful [`Self::allocate`]). Bytes in `[high_water, len)` have
+    /// NEVER been handed to a caller, so they still hold the zero-fill the
+    /// slab received at construction (the slab is allocated via
+    /// `UnifiedBuffer::new_on`, which zeroes the *whole* capacity on every
+    /// backend). Bytes in `[0, high_water)` have been handed out at least once
+    /// and — across a [`Self::reset`] — may carry a prior tenant's data, so
+    /// they MUST be re-zeroed on carve (audit H1).
+    ///
+    /// PERF (mem finding #6): [`Self::allocate`] uses this to memset only the
+    /// *recycled* sub-range of each carve and skip the fresh-from-OS tail,
+    /// turning the previous unconditional O(size) memset into O(recycled-bytes)
+    /// — zero for the common monotonic-growth case where every carve is from
+    /// fresh slab. Sticky across [`Self::reset`] (a reset rewinds `bump` but
+    /// NOT this), because the rewound bytes are exactly the ones that become
+    /// recycled and must be zeroed on re-carve.
+    carved_high_water: AtomicUsize,
 }
 
 /// A region of memory carved from a pool. Drops decrement the pool's live count.
@@ -104,6 +121,9 @@ impl UnifiedMemoryPool {
             bump: AtomicUsize::new(0),
             live: AtomicUsize::new(0),
             issued_total: AtomicU64::new(0),
+            // Fresh slab: nothing carved yet, so the whole capacity is
+            // fresh-from-OS (zeroed by `new_on` above).
+            carved_high_water: AtomicUsize::new(0),
         })
     }
 
@@ -271,56 +291,63 @@ impl UnifiedMemoryPool {
         // thread may hold a different `&mut [u8]` slice into a disjoint
         // region of the same slab.
         //
-        // Finding (PERF, allocate whole-region memset defeats the
-        // sub-microsecond pool goal for large slabs):
+        // PERF (mem finding #6): zero only the RECYCLED portion of the carve.
         // -------------------------------------------------------------------
-        // Cost: O(size) per allocation. For a 256 MiB Wasm linear memory this
-        // is on the order of tens of milliseconds — large enough that callers
-        // doing many small allocations should batch where possible, but
-        // unavoidable for correctness given the recycle discipline. Skipping
-        // it would re-open the H1 cross-tenant disclosure window.
+        // The H1 guarantee is "every byte handed out reads as zero". Bytes in
+        // `[carved_high_water, slab.len())` have NEVER been carved, so they
+        // still hold the construction-time zero-fill (`UnifiedBuffer::new_on`
+        // zeroes the whole slab on every backend) and need no re-zeroing.
+        // Only bytes that were carved on a prior epoch — i.e. those below the
+        // high-water mark, made re-issuable by a `reset()` — can carry a prior
+        // tenant's data. So we split the carve `[aligned_bump, end)` at the
+        // high-water mark and memset only the recycled prefix
+        // `[aligned_bump, min(end, high_water))`.
         //
-        // DECISION: the memset is REQUIRED and is kept at full `size`; the
-        // "zero only the visible window" narrowing CANNOT be applied at this
-        // layer. `allocate` takes a single `size` and has no `minimum` /
-        // visible-window parameter, and the `PoolAllocation` it returns hands
-        // the caller the FULL `[0, size)` range immediately via
-        // `as_slice()` / `as_mut_slice()` (see the public accessors below).
-        // There is no `grow_to` step at the pool layer that would zero a tail
-        // before first read, and several callers — including the H1 regression
-        // tests `recycled_allocation_reads_as_zero` and
-        // `first_allocation_reads_as_zero`, plus the cross-tenant
-        // `tests/cudarc_visible_window_only.rs` — rely on every byte of the
-        // carved region reading zero on hand-out. Narrowing the zero-fill to a
-        // prefix here would leave the recycled tail observable and re-open the
-        // H1 cross-tenant disclosure window: a soundness regression, not a
-        // safe optimization. (The wasm path's tail IS additionally re-zeroed
-        // by `PooledLinearMemory::grow_to`, but the pool API contract is wider
-        // than that single consumer, so the conservative full memset is the
-        // only sound choice at this layer.)
-        //
-        // PERF note (considered, intentionally NOT applied here): the
-        // `UnifiedBuffer` visible-window path can zero only `[0, minimum)` and
-        // lean on `grow_to`'s tail zero-fill because the bytes past `minimum`
-        // are not host-visible until a later `grow_to` zeroes them on the way
-        // in. That optimization does NOT transfer to the pool layer: a
-        // `PoolAllocation` exposes the FULL carved `[0, size)` range to the
-        // caller immediately (there is no `minimum`/visible-window narrowing
-        // and no `grow_to` step that would zero a tail before first read), so
-        // every byte we hand out is reachable right away. Zeroing only a
-        // prefix here would leave the recycled tail observable and re-open the
-        // H1 cross-tenant disclosure window — a soundness regression. The
-        // whole-region `memset` is therefore the correct conservative choice.
-        //
-        // SAFETY: `aligned_bump + size <= self.slab.len()` (checked above);
-        // the slab's pointer is non-null and points to `len()` valid bytes
-        // for the lifetime of `&self`; the bump allocator guarantees the
-        // `[aligned_bump, aligned_bump + size)` byte range is disjoint from
-        // every other live `PoolAllocation`, so this write cannot race
-        // another thread's `as_mut_slice()`.
-        unsafe {
-            let base = self.slab.as_ptr().add(aligned_bump) as *mut u8;
-            std::ptr::write_bytes(base, 0u8, size);
+        // Soundness vs. concurrency: within one epoch (no `reset`) the bump
+        // pointer is monotonic, so every carve targets a strictly-higher range
+        // than any prior carve — its prefix-to-zero is empty (it is all fresh)
+        // and we correctly skip the memset. A range only becomes "recycled"
+        // after a `reset`, which takes `&mut self`; that exclusive borrow is a
+        // full barrier after every prior `allocate` (and its high-water
+        // update) has completed, so by the time a byte is re-carved the
+        // high-water mark already covers it and the prefix split zeroes it.
+        // `reset` deliberately does NOT rewind `carved_high_water` (see its
+        // field doc), which is what keeps recycled bytes classified as
+        // must-zero across the rewind.
+        let end = aligned_bump + size;
+        let high_water = self.carved_high_water.load(Ordering::Acquire);
+        let recycled_end = end.min(high_water);
+        if recycled_end > aligned_bump {
+            let recycled_len = recycled_end - aligned_bump;
+            // SAFETY: `aligned_bump + recycled_len <= aligned_bump + size <=
+            // self.slab.len()` (checked above); the slab pointer is non-null
+            // and points to `len()` valid bytes for the lifetime of `&self`;
+            // the bump allocator guarantees `[aligned_bump, end)` is disjoint
+            // from every other live `PoolAllocation`, so this write cannot
+            // race another thread's `as_mut_slice()`. `write_bytes` lowers to
+            // a single `memset` intrinsic — see the original rationale for
+            // preferring it over `slice::fill(0)`.
+            unsafe {
+                let base = self.slab.as_ptr().add(aligned_bump) as *mut u8;
+                std::ptr::write_bytes(base, 0u8, recycled_len);
+            }
+        }
+        // Bump the high-water mark to cover this carve (monotonic max). On the
+        // common monotonic-growth path this is the only bookkeeping cost; the
+        // memset above was skipped entirely. `Release` pairs with the
+        // `Acquire` load above so a later carve (after a reset barrier)
+        // observes the extended high-water.
+        let mut hw = high_water;
+        while hw < end {
+            match self.carved_high_water.compare_exchange_weak(
+                hw,
+                end,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => hw = observed,
+            }
         }
 
         Ok(PoolAllocation {
@@ -398,6 +425,13 @@ impl UnifiedMemoryPool {
         // is in flight). `issued_total` is sticky on purpose — it reflects
         // lifetime activity.
         *self.bump.get_mut() = 0;
+        // `carved_high_water` is deliberately NOT reset (mem finding #6): the
+        // bytes below it have been handed out and may carry prior-tenant data,
+        // so re-carves after this rewind MUST re-zero them. Leaving the
+        // high-water mark in place is exactly what makes `allocate` classify
+        // those rewound bytes as recycled (must-zero) rather than
+        // fresh-from-OS. `&mut self` here is also the synchronisation barrier
+        // that guarantees a subsequent carve observes the full high-water mark.
         Ok(())
     }
 
@@ -710,6 +744,43 @@ mod tests {
         assert!(
             leaked.is_empty(),
             "recycled pool allocation leaked tenant-A data at {} byte offsets (first: {:?})",
+            leaked.len(),
+            leaked.first(),
+        );
+    }
+
+    #[test]
+    fn fresh_then_recycled_carve_reads_zero_across_high_water() {
+        // mem finding #6 regression: the fresh-vs-recycled memset split must
+        // preserve the H1 zero-on-handout guarantee even when a re-carve
+        // straddles the high-water mark (recycled prefix + fresh-from-OS tail).
+        //
+        // Epoch 1: carve 8 KiB and poison it, establishing high_water = 8 KiB.
+        // Reset. Epoch 2: carve 16 KiB — the first 8 KiB is recycled (must be
+        // re-zeroed) and the next 8 KiB is fresh-from-OS (already zero from
+        // construction). Every byte of the 16 KiB must read zero.
+        const FIRST: usize = 8 * 1024;
+        const SECOND: usize = 16 * 1024;
+        let mut pool = UnifiedMemoryPool::new(64 * 1024).unwrap();
+
+        {
+            let mut a = pool.allocate(FIRST, 1).unwrap();
+            a.as_mut_slice().fill(0xCD);
+            assert!(a.as_slice().iter().all(|&b| b == 0xCD));
+        }
+        pool.reset().expect("reset after epoch 1");
+
+        let b = pool.allocate(SECOND, 1).unwrap();
+        let leaked: Vec<usize> = b
+            .as_slice()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| if v != 0 { Some(i) } else { None })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "straddling carve leaked non-zero bytes at {} offsets (first: {:?}); \
+             the recycled-prefix memset or the fresh-tail classification is wrong",
             leaked.len(),
             leaked.first(),
         );

@@ -294,15 +294,42 @@ pub(crate) fn ensure_context_bound(device: &Arc<CudaDevice>) -> Result<(), Unifi
 ///
 /// Returns `false` on any driver error querying the attribute — the safe,
 /// conservative default (skip the optimisation) for a hint path.
+///
+/// PERF (mem finding #6): the `CONCURRENT_MANAGED_ACCESS` attribute is a
+/// fixed property of the physical device, so the two-call driver query is
+/// memoised per ordinal in [`PREFETCH_SUPPORT_CACHE`] (mirroring
+/// [`DEVICE_CACHE`]). Every `prefetch_to_device` / `prefetch_to_host` on a
+/// hot path then costs a single hash lookup instead of two FFI round-trips.
+/// A driver error is treated as a transient negative and is NOT cached, so a
+/// later successful query can still flip the device to "supported".
+static PREFETCH_SUPPORT_CACHE: OnceLock<Mutex<std::collections::HashMap<u32, bool>>> =
+    OnceLock::new();
+
+fn prefetch_support_cache() -> &'static Mutex<std::collections::HashMap<u32, bool>> {
+    PREFETCH_SUPPORT_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
 fn supports_managed_prefetch(ordinal: u32) -> bool {
+    // Hot path: return the memoised answer if we have queried this ordinal
+    // before. The attribute cannot change for a live device, so a cached
+    // value is authoritative for the process lifetime.
+    {
+        let cache = prefetch_support_cache().lock();
+        if let Some(&cached) = cache.get(&ordinal) {
+            return cached;
+        }
+    }
+
+    // Cold path: run the two-call driver query outside the cache lock.
     // SAFETY: out-params are valid locals; a prior `device_for(ordinal)` (every
     // caller allocates before prefetching) has primed the driver lib + run
     // `cuInit`, so these queries cannot hit an uninitialised driver.
-    unsafe {
+    let result = unsafe {
         let mut dev: cuda_sys::CUdevice = 0;
         if cuda_sys::lib().cuDeviceGet(&mut dev as *mut cuda_sys::CUdevice, ordinal as i32)
             != cuda_sys::cudaError_enum::CUDA_SUCCESS
         {
+            // Transient driver error: do NOT cache — a later call may succeed.
             return false;
         }
         let mut val: i32 = 0;
@@ -315,7 +342,11 @@ fn supports_managed_prefetch(ordinal: u32) -> bool {
             return false;
         }
         val != 0
-    }
+    };
+    // Memoise the authoritative result (last writer wins; the value is
+    // device-stable so any concurrent query computes the same answer).
+    prefetch_support_cache().lock().insert(ordinal, result);
+    result
 }
 
 /// A contiguous CUDA Unified Memory region allocated via `cudarc`.
