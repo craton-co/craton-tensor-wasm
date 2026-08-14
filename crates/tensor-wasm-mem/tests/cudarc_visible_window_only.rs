@@ -59,10 +59,21 @@ use tensor_wasm_mem::pool::UnifiedMemoryPool;
 /// in the pool's per-allocation zero-fill would surface here.
 ///
 /// Marked `#[ignore]` because allocating a 4 MiB cudarc-backed pool slab
-/// hits `cuMemAllocManaged`, which requires a working CUDA driver. The
-/// S22 self-hosted runner unignores via `-- --ignored`.
+/// hits `cuMemAllocManaged`, which requires a working CUDA driver AND the
+/// `cudarc-backend` feature flag (this whole file is `#![cfg]`-gated on it).
+///
+/// HARDWARE NOTE (mem finding 7): this box now HAS a CUDA GPU (RTX 2060,
+/// sm_75, CUDA 13.2), so this test is hardware-runnable today via
+/// `cargo test -p tensor-wasm-mem --features cudarc-backend \
+///   --test cudarc_visible_window_only -- --ignored`. It stays `#[ignore]`d
+/// by default because it still needs the non-default feature flag and a
+/// driver, so the plain host-only `cargo test` must not attempt it. The
+/// backing-agnostic half of this contract (recycled bytes read zero, and the
+/// fresh-vs-recycled memset split) is additionally pinned WITHOUT hardware by
+/// `src/pool.rs`'s `recycled_allocation_reads_as_zero` and
+/// `fresh_then_recycled_carve_reads_zero_across_high_water` unit tests.
 #[test]
-#[ignore = "requires CUDA hardware"]
+#[ignore = "requires CUDA hardware + --features cudarc-backend (GPU now present; run with -- --ignored)"]
 fn cudarc_allocate_does_not_zero_beyond_visible_window() {
     const ALLOC_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
     const SLAB_SIZE: usize = 4 * 1024 * 1024; // 4 MiB — fits two non-overlapping carves.

@@ -63,6 +63,12 @@ use crate::unified::{UnifiedBacking, UnifiedError, UvmAdvice};
 #[derive(Debug, Clone, Default)]
 pub struct FreeLog {
     frees: Arc<AtomicUsize>,
+    /// Count of FAILED frees (leaks). Models the real backings'
+    /// [`crate::cudarc_backend::cudarc_free_failures`] counter: a free that
+    /// the driver rejected leaves the allocation orphaned, a
+    /// security-relevant event the audit surface must count. Incremented by
+    /// the mock `Drop` paths when a free failure is injected (finding 7).
+    leaks: Arc<AtomicUsize>,
 }
 
 impl FreeLog {
@@ -76,9 +82,22 @@ impl FreeLog {
         self.frees.load(Ordering::Acquire)
     }
 
-    /// Record one free event. Called by the mock backings' `Drop` impls.
+    /// Number of FAILED frees (leaks) recorded so far. Mirrors
+    /// [`crate::cudarc_backend::cudarc_free_failures`] for the mock seam.
+    pub fn leaks(&self) -> usize {
+        self.leaks.load(Ordering::Acquire)
+    }
+
+    /// Record one successful free event. Called by the mock backings' `Drop`
+    /// impls.
     fn record_free(&self) {
         self.frees.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Record one FAILED free (a leak). Called by a mock `Drop` when a free
+    /// failure is injected, modelling the real backings' leak accounting.
+    fn record_leak(&self) {
+        self.leaks.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -94,6 +113,10 @@ impl FreeLog {
 pub struct MockUnifiedBacking {
     bytes: Vec<u8>,
     free_log: FreeLog,
+    /// When `true`, the `Drop` impl simulates a FAILED `cuMemFree_v2`:
+    /// instead of recording a successful free it records a leak (finding 7),
+    /// modelling the real backings' free-failure / leak-recording path.
+    fail_free: bool,
 }
 
 impl MockUnifiedBacking {
@@ -105,6 +128,19 @@ impl MockUnifiedBacking {
         Self {
             bytes: vec![0u8; size],
             free_log,
+            fail_free: false,
+        }
+    }
+
+    /// Like [`Self::alloc`], but the buffer's `Drop` will simulate a FAILED
+    /// free (`cuMemFree_v2 -> error`): it records a leak into the `FreeLog`
+    /// rather than a successful free (finding 7). Used to drive the
+    /// drop-failure-observability branch without a GPU.
+    pub fn alloc_with_failing_free(size: usize, free_log: FreeLog) -> Self {
+        Self {
+            bytes: vec![0u8; size],
+            free_log,
+            fail_free: true,
         }
     }
 
@@ -126,10 +162,18 @@ impl MockUnifiedBacking {
 
 impl Drop for MockUnifiedBacking {
     fn drop(&mut self) {
-        // Models the free-on-drop discipline of the real backings: a
-        // single recorded free per live allocation. A test asserts
-        // `free_log.frees() == 1` after the buffer drops.
-        self.free_log.record_free();
+        // Models the free-on-drop discipline of the real backings. On the
+        // happy path a single free is recorded per live allocation (a test
+        // asserts `free_log.frees() == 1`). When a free failure is injected
+        // (finding 7) the buffer instead records a LEAK — mirroring
+        // `CudarcUnifiedBuffer::drop`, which on a failed `cuMemFree_v2` bumps
+        // `cudarc_free_failures` and retains the orphaned VA — so a test can
+        // assert the leak was observed and counted without a GPU.
+        if self.fail_free {
+            self.free_log.record_leak();
+        } else {
+            self.free_log.record_free();
+        }
     }
 }
 
@@ -221,6 +265,10 @@ pub struct MockDriverMemPool {
     free_log: FreeLog,
     next_handle: AtomicUsize,
     fail_alloc: std::sync::atomic::AtomicBool,
+    /// When set, [`Self::deallocate`] simulates a FAILED `cuMemFreeAsync`:
+    /// it records a leak (not a free) into the `FreeLog` and returns an
+    /// error (finding 7).
+    fail_free: std::sync::atomic::AtomicBool,
 }
 
 impl MockDriverMemPool {
@@ -232,6 +280,7 @@ impl MockDriverMemPool {
             // Start at 1 so a handle is never the null-equivalent 0.
             next_handle: AtomicUsize::new(1),
             fail_alloc: std::sync::atomic::AtomicBool::new(false),
+            fail_free: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -239,6 +288,14 @@ impl MockDriverMemPool {
     /// [`Self::allocate`] call(s).
     pub fn set_alloc_failure(&self, fail: bool) {
         self.fail_alloc.store(fail, Ordering::Release);
+    }
+
+    /// Arm or disarm an injected FREE failure for the next
+    /// [`Self::deallocate`] call(s) (finding 7). A failed free records a
+    /// leak rather than a free and returns an error, modelling a failed
+    /// `cuMemFreeAsync` that orphans the allocation.
+    pub fn set_free_failure(&self, fail: bool) {
+        self.fail_free.store(fail, Ordering::Release);
     }
 
     /// Simulate `cuMemAllocFromPoolAsync`: returns an opaque non-zero
@@ -252,8 +309,17 @@ impl MockDriverMemPool {
         Ok(self.next_handle.fetch_add(1, Ordering::AcqRel))
     }
 
-    /// Simulate `cuMemFreeAsync`: records the free into the pool's log.
+    /// Simulate `cuMemFreeAsync`: records a successful free into the pool's
+    /// log, or — when a free failure is armed (finding 7) — records a leak
+    /// and returns an error, modelling a failed free that orphans the
+    /// allocation.
     pub fn deallocate(&self, _handle: usize) -> Result<(), UnifiedError> {
+        if self.fail_free.load(Ordering::Acquire) {
+            self.free_log.record_leak();
+            return Err(UnifiedError::Cuda(
+                "mock-cuda: cuMemFreeAsync -> CUDA_ERROR_INVALID_VALUE (leaked)".into(),
+            ));
+        }
         self.free_log.record_free();
         Ok(())
     }
@@ -399,6 +465,38 @@ mod tests {
             .expect_err("injected over-cap failure must surface");
         assert!(matches!(err, UnifiedError::Cuda(_)));
         assert_eq!(log.frees(), 0, "failed alloc records no free");
+    }
+
+    #[test]
+    fn failing_free_records_leak_not_free() {
+        // finding 7: a backing whose free fails on drop must record a LEAK
+        // (mirroring `cudarc_free_failures`) and NOT a successful free, so
+        // the drop-failure-observability gap is closed in CI without a GPU.
+        let log = FreeLog::new();
+        {
+            let b = MockUnifiedBacking::alloc_with_failing_free(128, log.clone());
+            assert_eq!(b.len(), 128);
+            assert_eq!(log.frees(), 0);
+            assert_eq!(log.leaks(), 0, "no leak before drop");
+        }
+        assert_eq!(log.frees(), 0, "a failed free must NOT count as a free");
+        assert_eq!(log.leaks(), 1, "the leaked allocation must be counted");
+    }
+
+    #[test]
+    fn tenant_pool_failing_free_records_leak_on_drop() {
+        // finding 7: the tenant-pool free path's failure branch records a
+        // leak when `cuMemFreeAsync` fails. `Drop` swallows the error (it
+        // cannot return one), but the leak counter still reflects it.
+        let log = FreeLog::new();
+        let pool = Arc::new(MockDriverMemPool::new(log.clone()));
+        {
+            let _buf = MockTenantPoolBuffer::new(pool.clone(), 256).expect("pool alloc");
+            pool.set_free_failure(true);
+            assert_eq!(log.leaks(), 0, "no leak before drop");
+        }
+        assert_eq!(log.frees(), 0, "the free failed, so no successful free");
+        assert_eq!(log.leaks(), 1, "the failed free was counted as a leak");
     }
 
     #[test]
