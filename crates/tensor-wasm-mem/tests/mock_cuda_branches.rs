@@ -112,6 +112,40 @@ fn tenant_pool_over_cap_alloc_fails_without_free() {
     assert_eq!(log.frees(), 0);
 }
 
+/// Branch 4 (finding 7): a FREE failure on drop must be recorded as a LEAK,
+/// not a free. This closes the drop-failure-observability gap — the real
+/// `CudarcUnifiedBuffer::drop` bumps `cudarc_free_failures` and retains the
+/// orphaned VA on a failed `cuMemFree_v2`; here the mock seam lets CI assert
+/// the same accounting shape without a GPU.
+#[test]
+fn failed_free_on_drop_is_counted_as_a_leak() {
+    let log = FreeLog::new();
+    {
+        let backing = MockUnifiedBacking::alloc_with_failing_free(2048, log.clone());
+        assert_eq!(backing.len(), 2048);
+        assert_eq!(log.frees(), 0);
+        assert_eq!(log.leaks(), 0, "no leak while the backing is live");
+    }
+    assert_eq!(log.frees(), 0, "a failed free is never a successful free");
+    assert_eq!(log.leaks(), 1, "the leaked allocation must be recorded");
+}
+
+/// Tenant-pool variant of branch 4: a failed `cuMemFreeAsync` in the
+/// pool-backed buffer's drop records a leak (the error itself is swallowed by
+/// `Drop`, as in production).
+#[test]
+fn tenant_pool_failed_free_records_leak() {
+    let log = FreeLog::new();
+    let pool = Arc::new(MockDriverMemPool::new(log.clone()));
+    {
+        let _buf = MockTenantPoolBuffer::new(pool.clone(), 4096).expect("pool alloc");
+        pool.set_free_failure(true);
+        assert_eq!(log.leaks(), 0, "no leak before drop");
+    }
+    assert_eq!(log.frees(), 0, "the free failed");
+    assert_eq!(log.leaks(), 1, "the failed pool free was counted as a leak");
+}
+
 /// The mock pool is a real `DriverMemPool` so the tenant driver-cap path
 /// (`with_driver_enforced_gpu_cap`) can drive it end-to-end. Pinning a
 /// cap and reading it back guards the trait wiring.

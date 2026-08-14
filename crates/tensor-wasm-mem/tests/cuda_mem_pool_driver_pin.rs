@@ -35,12 +35,22 @@
 //!   v0.4 contract that the driver MAY round internally but our getter
 //!   returns the value the operator asked for.
 //!
-//! Every test is `#[ignore]`d because it requires a working CUDA
-//! driver. Run on a hardware-equipped host with:
+//! Every test is `#[ignore]`d because it requires a working CUDA driver AND
+//! the non-default `gpu-mem-pool` feature flag. Run on a hardware-equipped
+//! host with:
 //!
 //! ```text
 //! cargo test --features gpu-mem-pool -- --ignored cuda_mem_pool_driver_pin
 //! ```
+//!
+//! HARDWARE NOTE (mem finding 7): this box now HAS a CUDA GPU (RTX 2060,
+//! sm_75, CUDA 13.2), so these tests are hardware-runnable today via the
+//! command above. They stay `#[ignore]`d by default because they still need
+//! the `gpu-mem-pool` feature and a driver, so plain `cargo test` must not
+//! attempt them. The host-reachable half of the cap contract (the
+//! reservation arithmetic, the `DriverMemPool` trait wiring) is additionally
+//! covered WITHOUT hardware by `src/cuda_mem_pool.rs`'s `reserve_step_*` unit
+//! tests and the `mock-cuda` `MockDriverMemPool` integration tests.
 
 #![cfg(feature = "gpu-mem-pool")]
 
@@ -148,11 +158,11 @@ fn under_cap_allocation_through_pool_succeeds() {
 /// The driver may round the threshold internally (per CUDA 12.x
 /// docs); we deliberately surface the *requested* value through this
 /// getter so the operator's monitoring dashboards align with the
-/// configured cap. A v0.5 follow-up adds
-/// `effective_cap_bytes()` that round-trips through
-/// `cuMemPoolGetAttribute` for the rounded value.
+/// configured cap. [`TenantMemPool::effective_cap_bytes`] (mem finding 5)
+/// round-trips through `cuMemPoolGetAttribute` for the driver's actual,
+/// possibly-rounded, value.
 #[test]
-#[ignore = "requires CUDA hardware"]
+#[ignore = "requires CUDA hardware + --features gpu-mem-pool (GPU now present; run with -- --ignored)"]
 fn driver_pin_matches_requested_cap() {
     let pool = TenantMemPool::new(0, CAP_64_MIB)
         .expect("cuMemPoolCreate + SetAttribute must succeed on a CUDA host");
@@ -171,5 +181,16 @@ fn driver_pin_matches_requested_cap() {
     assert!(
         !pool.raw_handle().is_null(),
         "raw CUmemoryPool handle must be non-null after successful new()",
+    );
+    // mem finding 5: the driver-reported effective cap must be readable and
+    // at least the requested value (the driver may round UP, never silently
+    // below the configured retention threshold).
+    let effective = pool
+        .effective_cap_bytes()
+        .expect("cuMemPoolGetAttribute(RELEASE_THRESHOLD) must succeed on a CUDA host");
+    assert!(
+        effective >= CAP_64_MIB,
+        "driver effective cap {effective} must be >= the requested {CAP_64_MIB}; \
+         the driver may round up but must not report below the configured threshold",
     );
 }

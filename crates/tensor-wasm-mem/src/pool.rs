@@ -750,6 +750,55 @@ mod tests {
     }
 
     #[test]
+    fn release_balances_live_counter_to_zero() {
+        // finding 7: the live counter must walk back to exactly zero when
+        // every issued allocation is released. Issue three, forget the drop
+        // guards (so the safe `PoolAllocation::Drop` does not also release),
+        // then release each by hand and assert the counter lands at 0.
+        let pool = UnifiedMemoryPool::new(64 * 1024).unwrap();
+        let mut issued = Vec::new();
+        for _ in 0..3 {
+            let a = pool.allocate(1024, 1).unwrap();
+            issued.push((a.offset(), a.len()));
+            std::mem::forget(a);
+        }
+        assert_eq!(pool.live_allocations(), 3);
+        for (off, len) in issued {
+            pool.release(off, len);
+        }
+        assert_eq!(
+            pool.live_allocations(),
+            0,
+            "balanced releases must bring the live counter to exactly zero"
+        );
+    }
+
+    /// finding 7: an over-release (double-drop) must SATURATE the live counter
+    /// at zero rather than wrapping to `usize::MAX`. In debug builds the
+    /// `debug_assert!(current > 0)` in `release` catches the misuse with a
+    /// panic, so the saturation defence is only observable in release builds —
+    /// this test is gated accordingly.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn over_release_saturates_live_counter_at_zero() {
+        let pool = UnifiedMemoryPool::new(64 * 1024).unwrap();
+        let a = pool.allocate(1024, 1).unwrap();
+        let (off, len) = (a.offset(), a.len());
+        std::mem::forget(a);
+        assert_eq!(pool.live_allocations(), 1);
+        // First release balances the single allocation.
+        pool.release(off, len);
+        assert_eq!(pool.live_allocations(), 0);
+        // Second (erroneous) release must NOT wrap the counter.
+        pool.release(off, len);
+        assert_eq!(
+            pool.live_allocations(),
+            0,
+            "double-release must saturate at zero, never wrap to usize::MAX"
+        );
+    }
+
+    #[test]
     fn fresh_then_recycled_carve_reads_zero_across_high_water() {
         // mem finding #6 regression: the fresh-vs-recycled memset split must
         // preserve the H1 zero-on-handout guarantee even when a re-carve
