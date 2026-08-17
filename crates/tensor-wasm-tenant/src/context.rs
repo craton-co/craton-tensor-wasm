@@ -294,14 +294,41 @@ impl TokenBucket {
             .min(self.capacity_micros)
     }
 
+    /// Production entry point: sample the clock **inside** the lock and
+    /// admit `n` tokens against the refilled bucket.
+    ///
+    /// HIGH fix (clock race): the wall-clock instant used for the refill is
+    /// read here, while the bucket lock is held, rather than by the caller
+    /// before it contends for the lock. Sampling outside the lock let two
+    /// threads each capture an `Instant`, then acquire the lock in the
+    /// opposite order, so the thread holding the *earlier* sample could win
+    /// the lock *last* and store a `last_refill` that moved backward in time
+    /// — a stale anchor that manufactures extra refill credit on the next
+    /// call. Reading `Instant::now()` under the lock means the value the
+    /// admission math sees and the value stored back into `last_refill` are
+    /// the same monotonic observation, serialised with every other acquire.
+    fn try_acquire_now(&self, n: u64) -> Result<(), RateLimited> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Sampled under the lock — see the method doc. `Instant` is
+        // monotonic, but two samples taken outside the lock could still be
+        // applied in inverted order; taking it here removes that window.
+        let now = Instant::now();
+        // `&mut state` deref-coerces the `MutexGuard` to the inner state.
+        self.admit_locked(&mut state, n, now)
+    }
+
     /// Attempt to remove `n` tokens, refilling for elapsed wall-clock time
     /// first. Admits (returns `Ok`) only if at least `n` tokens are available
     /// after the refill; otherwise returns [`RateLimited`] and leaves the
     /// bucket untouched (all-or-nothing).
     ///
     /// `now` is injected rather than read internally so tests can drive the
-    /// refill deterministically without sleeping; the public
-    /// [`TenantContext::try_acquire_op`] passes `Instant::now()`.
+    /// refill deterministically without sleeping; the production path
+    /// [`Self::try_acquire_now`] reads `Instant::now()` under the lock and
+    /// delegates to the same [`Self::admit_locked`] body.
     ///
     /// All accounting is exact integer arithmetic in micro-tokens, so the
     /// admission test is a plain `available_micros >= need_micros`: an
@@ -309,14 +336,39 @@ impl TokenBucket {
     /// request for exactly the full burst has `need_micros == capacity_micros`,
     /// which compares equal and therefore admits (no `f64::EPSILON` nudge, no
     /// magnitude-dependent rounding that could spuriously reject it).
+    #[cfg(test)]
     fn try_acquire_at(&self, n: u64, now: Instant) -> Result<(), RateLimited> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // `now` may predate `last_refill` only if a caller injected a
-        // non-monotonic instant in a test; `checked_duration_since` yields
-        // `None` there and we credit nothing rather than panicking.
+        self.admit_locked(&mut state, n, now)
+    }
+
+    /// Shared admission body, run while `state` is locked.
+    ///
+    /// HIGH fix (clock race, anchor monotonicity): before computing
+    /// `elapsed`, the effective `now` is clamped to `max(last_refill, now)`.
+    /// `Instant` is monotonic per-thread, but a sample observed by one
+    /// thread can still be applied to the shared state *after* a later
+    /// sample from another thread has already advanced `last_refill`; a bare
+    /// `checked_duration_since` would then credit zero (harmless) but the
+    /// unconditional `state.last_refill = now` further down would move the
+    /// anchor *backward*. Clamping first guarantees the stored anchor only
+    /// ever advances, so a stale sample can never rewind the refill clock
+    /// and gift the next caller free tokens. (Injected non-monotonic test
+    /// instants are clamped the same way.)
+    fn admit_locked(
+        &self,
+        state: &mut TokenBucketState,
+        n: u64,
+        now: Instant,
+    ) -> Result<(), RateLimited> {
+        // Anchor can only move forward: a `now` that predates the stored
+        // `last_refill` (a stale sample or an injected non-monotonic test
+        // instant) is pinned to `last_refill`, crediting nothing and leaving
+        // the anchor where it was rather than rewinding it.
+        let now = now.max(state.last_refill);
         let elapsed = now
             .checked_duration_since(state.last_refill)
             .unwrap_or(Duration::ZERO);
@@ -842,7 +894,10 @@ impl TenantContext {
     /// refusal clears on its own once the bucket refills.
     pub fn try_acquire_ops(&self, n: u64) -> Result<(), RateLimited> {
         match &self.rate_limiter {
-            Some(bucket) => bucket.try_acquire_at(n, Instant::now()),
+            // HIGH fix (clock race): the bucket reads `Instant::now()` itself
+            // under its own lock rather than receiving a sample taken here,
+            // outside the lock — see [`TokenBucket::try_acquire_now`].
+            Some(bucket) => bucket.try_acquire_now(n),
             None => Ok(()),
         }
     }
@@ -2147,6 +2202,77 @@ mod tests {
             .try_acquire_at(1, t0)
             .expect("clamped burst of 1 admits one");
         assert!(bucket.try_acquire_at(1, t0).is_err());
+    }
+
+    #[test]
+    fn try_acquire_concurrent_never_over_admits() {
+        // HIGH fix (clock-race regression): many threads hammer a single
+        // tenant's rate limiter concurrently. The bucket reads the clock
+        // under its own lock and the anchor is clamped monotonically, so no
+        // interleaving may admit more operations than the bucket can hold
+        // over the test window. With the old "sample `Instant::now()`
+        // outside the lock" shape a thread holding a stale (earlier) sample
+        // could rewind `last_refill`, manufacturing refill credit and
+        // letting the bucket over-admit.
+        //
+        // We bound the window tightly: a tiny steady-state rate and a known
+        // burst, run fast enough that the legitimate time-based refill over
+        // the whole test is at most a couple of tokens. The total admits
+        // must therefore stay within `burst + small_refill_slack`.
+        use std::sync::atomic::AtomicU64 as StdAtomicU64;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const THREADS: usize = 16;
+        const ATTEMPTS_PER_THREAD: usize = 1_000;
+        const OPS_PER_SEC: u64 = 1; // ~1 token/s steady-state refill
+        const BURST: u64 = 50;
+
+        let ctx = Arc::new(
+            TenantContext::builder(TenantId(0x9A7E))
+                .with_rate_limit(OPS_PER_SEC, BURST)
+                .build(),
+        );
+        let admitted = Arc::new(StdAtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(THREADS));
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let ctx = Arc::clone(&ctx);
+            let admitted = Arc::clone(&admitted);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ATTEMPTS_PER_THREAD {
+                    if ctx.try_acquire_op().is_ok() {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let total = admitted.load(Ordering::Relaxed);
+        // At least the full burst is admittable (the bucket starts full).
+        assert!(
+            total >= BURST,
+            "at least the burst of {BURST} should be admitted, got {total}",
+        );
+        // The hard invariant: admits never exceed the burst plus the few
+        // tokens that could legitimately refill during the run. At
+        // OPS_PER_SEC=1 the refill over a sub-second test is < a handful of
+        // tokens; a generous slack of 16 still catches the over-admission a
+        // rewound anchor would produce (which would let `total` approach the
+        // raw attempt count of THREADS * ATTEMPTS_PER_THREAD = 16_000).
+        const REFILL_SLACK: u64 = 16;
+        assert!(
+            total <= BURST + REFILL_SLACK,
+            "rate limiter over-admitted: {total} > burst {BURST} + slack {REFILL_SLACK} \
+             (a rewound refill anchor would let admits approach {})",
+            THREADS as u64 * ATTEMPTS_PER_THREAD as u64,
+        );
     }
 
     #[test]
