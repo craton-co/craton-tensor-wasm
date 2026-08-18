@@ -670,6 +670,24 @@ impl TenantContext {
         self.gpu_bytes_in_use.load(Ordering::Acquire)
     }
 
+    /// Sentinel the uncapped GPU counter saturates to on `checked_add`
+    /// overflow, deliberately set *below* `u64::MAX`.
+    ///
+    /// MEDIUM fix (uncapped overflow recovery): the uncapped consume path
+    /// must never refuse, so an overflowing add clamps rather than erroring.
+    /// Clamping to `u64::MAX` exactly was a latent footgun — a later
+    /// `release_gpu_bytes(n)` brings the counter down by only `n`, so an
+    /// implementation (or a future refactor) that clamped releases at the
+    /// top, or any consumer treating `u64::MAX` as "stuck/poisoned", could
+    /// leave the gauge pinned forever and the per-tenant series reporting
+    /// garbage. Saturating to this sentinel — a full `u64::MAX >> 1` below
+    /// the ceiling — keeps the value strictly recoverable by normal-sized
+    /// releases while remaining an obviously-abnormal, easily-alertable
+    /// reading on dashboards. The headroom also means a subsequent
+    /// in-flight consume that races in can still `checked_add` a realistic
+    /// `n` without immediately re-overflowing.
+    pub const GPU_BYTES_OVERFLOW_SENTINEL: u64 = u64::MAX - (u64::MAX >> 1);
+
     /// Atomically reserve `n` GPU bytes against the per-tenant cap.
     ///
     /// Returns `Err(TensorWasmError::GpuMemoryExhausted)` if
@@ -679,8 +697,12 @@ impl TenantContext {
     /// surface real utilisation) but the request is never refused. The
     /// add is performed with `checked_add` so a malicious or buggy
     /// caller cannot wrap the counter by repeatedly requesting close
-    /// to `u64::MAX` — the second such call observes the overflow and
-    /// returns `GpuMemoryExhausted` while leaving the counter unchanged.
+    /// to `u64::MAX` — the second such call observes the overflow and,
+    /// on the *capped* path, returns `GpuMemoryExhausted` while leaving
+    /// the counter unchanged; on the *uncapped* path it clamps the
+    /// running total to [`Self::GPU_BYTES_OVERFLOW_SENTINEL`] (below
+    /// `u64::MAX`) so subsequent releases can still bring it back down
+    /// rather than pinning the counter and gauge at the ceiling forever.
     ///
     /// Mirrors `Self::consume_bytes_inner` for the GPU side; the
     /// atomic discipline is intentionally identical so a single mental
@@ -703,15 +725,19 @@ impl TenantContext {
         let limit = self.gpu_memory_bytes_cap;
         let mut current = self.gpu_bytes_in_use.load(Ordering::Acquire);
         loop {
-            // MEDIUM fix (uncapped overflow): the counter contract is
-            // "never refused when there is no cap". A `checked_add`
+            // MEDIUM fix (uncapped overflow recovery): the counter contract
+            // is "never refused when there is no cap". A `checked_add`
             // overflow on the uncapped path used to surface as a
             // non-retryable `GpuMemoryExhausted { limit: u64::MAX }`,
             // violating that contract. When `limit` is `None` we instead
-            // saturate at `u64::MAX` and `warn!` — the request is always
-            // admitted. The overflow-as-error behaviour is retained only
-            // for the capped path (a saturating add there could mask an
-            // over-cap allocation), where `next > cap` already rejects it.
+            // clamp to [`Self::GPU_BYTES_OVERFLOW_SENTINEL`] (below
+            // `u64::MAX`) and `warn!` — the request is always admitted AND a
+            // subsequent `release_gpu_bytes` can still bring the total back
+            // down, instead of pinning it at the ceiling permanently and
+            // leaving the per-tenant gauge stuck. The overflow-as-error
+            // behaviour is retained only for the capped path (a clamping add
+            // there could mask an over-cap allocation), where `next > cap`
+            // already rejects it.
             let next = match current.checked_add(n) {
                 Some(v) => v,
                 None => {
@@ -721,9 +747,17 @@ impl TenantContext {
                             tenant = %self.tenant_id,
                             current,
                             requested = n,
-                            "consume_gpu_bytes overflow on uncapped tenant; saturating at u64::MAX",
+                            sentinel = Self::GPU_BYTES_OVERFLOW_SENTINEL,
+                            "consume_gpu_bytes overflow on uncapped tenant; \
+                             clamping to recoverable sentinel below u64::MAX",
                         );
-                        u64::MAX
+                        // Clamp the new total to the recoverable sentinel
+                        // (strictly below u64::MAX). If `current` had already
+                        // been driven up to or past the sentinel by an
+                        // earlier overflow, this clamps it back *down* so a
+                        // release can always make progress; it never nudges
+                        // the counter up toward the ceiling.
+                        Self::GPU_BYTES_OVERFLOW_SENTINEL
                     } else {
                         return Err(TensorWasmError::GpuMemoryExhausted {
                             requested: n,
@@ -1938,6 +1972,40 @@ mod tests {
         assert_eq!(pool.threshold.load(Ordering::SeqCst), 0);
         // The in-process counter still reflects the accepted allocation.
         assert_eq!(ctx.gpu_bytes_in_use(), 1000);
+    }
+
+    #[test]
+    fn uncapped_gpu_overflow_clamps_to_recoverable_sentinel() {
+        // MEDIUM fix: an uncapped tenant must never be refused, but the
+        // overflow clamp must leave the counter strictly below u64::MAX so a
+        // later release can bring it down — the old `u64::MAX` clamp pinned
+        // the gauge at the ceiling forever.
+        let ctx = TenantContext::builder(TenantId(40)).build();
+        assert_eq!(ctx.gpu_memory_bytes_cap(), None);
+
+        // First consume lands normally.
+        ctx.consume_gpu_bytes(u64::MAX - 10).unwrap();
+        assert_eq!(ctx.gpu_bytes_in_use(), u64::MAX - 10);
+
+        // Second consume would overflow `checked_add`; uncapped, so it must
+        // succeed and clamp to the recoverable sentinel rather than error.
+        ctx.consume_gpu_bytes(100).unwrap();
+        assert_eq!(
+            ctx.gpu_bytes_in_use(),
+            TenantContext::GPU_BYTES_OVERFLOW_SENTINEL
+        );
+        assert!(
+            ctx.gpu_bytes_in_use() < u64::MAX,
+            "sentinel must be strictly below u64::MAX so releases can recover"
+        );
+
+        // A normal-sized release brings it back down — the recovery the old
+        // u64::MAX clamp made impossible in practice.
+        ctx.release_gpu_bytes(4096);
+        assert_eq!(
+            ctx.gpu_bytes_in_use(),
+            TenantContext::GPU_BYTES_OVERFLOW_SENTINEL - 4096
+        );
     }
 
     #[test]
