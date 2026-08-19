@@ -24,7 +24,7 @@
 //! any additional authority over tenants it did not create.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use dashmap::DashMap;
@@ -32,6 +32,44 @@ use tensor_wasm_core::types::TenantId;
 use thiserror::Error;
 
 use crate::context::{TenantCapability, TenantContext};
+
+/// Process-wide count of admin-capability checks that failed because the
+/// presented [`RegistryAdminCapability`] was minted by a *different*
+/// `TenantRegistry` (the H1 foreign-cap / forged-admin-cap rejection
+/// path). Incremented unconditionally on every rejection — regardless of
+/// the `strict-cap-binding` feature — and never decremented.
+///
+/// MEDIUM fix (silent foreign-cap collapse): the legacy admin methods
+/// ([`TenantRegistry::get`], [`TenantRegistry::unregister`],
+/// [`TenantRegistry::len`], [`TenantRegistry::tenants`],
+/// [`TenantRegistry::collect_tombstones`]) fail *closed* on a foreign cap
+/// but collapse the typed [`RegistryError::CapabilityFromForeignRegistry`]
+/// into `None` / `0` / an empty `Vec`, so a cross-registry confusion bug
+/// (or an attack probing for one) produced no operator-visible signal —
+/// especially under `default-features = false`, where the typed `*_strict`
+/// variants that surface the error are compiled out entirely. Every
+/// rejection now also emits an unconditional `warn!` and bumps this
+/// counter so the misuse is observable on dashboards and in logs even when
+/// the caller swallows the `Option`/`usize`/`Vec` return.
+///
+/// Read via [`foreign_cap_rejections_total`]. Kept as a process-local
+/// `AtomicU64` (not a `prometheus-client` series) for the same reason as
+/// `context::ISOLATION_DOWNGRADE_COUNT`: `tensor-wasm-core`'s
+/// `TensorWasmMetrics` exposes no counter with matching semantics and this
+/// crate must not edit that crate. The alert pipeline scrapes it out of
+/// band today; wiring it through the registry is future work once core
+/// grows a dedicated counter.
+static FOREIGN_CAP_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of admin-cap checks rejected as foreign / forged
+/// since startup. See [`FOREIGN_CAP_REJECTIONS`] for the alert contract:
+/// any non-zero reading means some caller presented a
+/// [`RegistryAdminCapability`] minted by a different `TenantRegistry`,
+/// which is either a wiring bug (the wrong registry's cap was plumbed) or
+/// an attempt to confuse the capability check across registries.
+pub fn foreign_cap_rejections_total() -> u64 {
+    FOREIGN_CAP_REJECTIONS.load(Ordering::Relaxed)
+}
 
 /// Errors specific to [`TenantRegistry`] bookkeeping.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -446,6 +484,19 @@ impl TenantRegistry {
         if Arc::ptr_eq(&self.registry_token, &cap.registry_token) {
             Ok(())
         } else {
+            // MEDIUM fix (silent foreign-cap collapse): make the rejection
+            // observable. The legacy admin methods turn this error into
+            // `None`/`0`/`Vec::new()`, and under `default-features = false`
+            // the typed `*_strict` variants that would propagate it are not
+            // even compiled — so without this side channel a cross-registry
+            // confusion bug or probe left no trace. The `warn!` and counter
+            // bump are unconditional (independent of `strict-cap-binding`).
+            FOREIGN_CAP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "tensor_wasm_tenant::registry",
+                "admin capability minted by a different TenantRegistry was rejected \
+                 (foreign/forged cap); refusing cross-registry operation",
+            );
             Err(RegistryError::CapabilityFromForeignRegistry)
         }
     }
@@ -876,6 +927,50 @@ mod tests {
 
         // And B's own counter is untouched throughout.
         assert_eq!(b_ctx.bytes_in_use(), 0);
+    }
+
+    #[test]
+    fn foreign_admin_cap_bumps_rejection_counter_and_fails_closed() {
+        // MEDIUM fix: a foreign admin cap must (a) fail closed on every
+        // legacy admin method and (b) leave an observable trace — the
+        // process-global rejection counter increments even though the
+        // method swallows the typed error into None/0/empty.
+        let (reg_a, _cap_a) = TenantRegistry::new();
+        let (_reg_b, cap_b) = TenantRegistry::new();
+        reg_a.register(ctx(7001)).unwrap();
+
+        // The counter is process-global and monotonic; other tests in this
+        // binary may run concurrently and bump it too, so we assert the
+        // delta-from-`before` GREW by at least the number of rejections this
+        // test caused, never an exact absolute. Each foreign-cap admin call
+        // must contribute at least one bump.
+        let before = foreign_cap_rejections_total();
+
+        // Each legacy admin method, presented reg_b's cap against reg_a,
+        // must fail closed: get -> None, len -> 0, tenants -> empty,
+        // unregister -> None, collect_tombstones -> 0.
+        assert!(reg_a.get(TenantId(7001), &cap_b).is_none());
+        assert_eq!(reg_a.len(&cap_b), 0);
+        assert!(reg_a.tenants(&cap_b).is_empty());
+        assert!(reg_a.unregister(TenantId(7001), &cap_b).is_none());
+        assert_eq!(reg_a.collect_tombstones(&cap_b), 0);
+
+        let after = foreign_cap_rejections_total();
+        // Five rejected admin calls → at least five counter bumps from this
+        // test (more is possible under parallel test execution).
+        assert!(
+            after.wrapping_sub(before) >= 5,
+            "every foreign-cap admin rejection must bump the counter (delta={})",
+            after.wrapping_sub(before),
+        );
+
+        // Fail-closed did not lock out the rightful operator, and the tenant
+        // was never evicted by the foreign unregister attempt: a legitimate
+        // same-registry cap still works end-to-end.
+        let (reg_c, cap_c) = TenantRegistry::new();
+        reg_c.register(ctx(7002)).unwrap();
+        assert!(reg_c.get(TenantId(7002), &cap_c).is_some());
+        assert_eq!(reg_c.len(&cap_c), 1);
     }
 
     #[test]

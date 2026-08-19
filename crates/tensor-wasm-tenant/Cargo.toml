@@ -63,4 +63,16 @@ loom = ["dep:loom"]
 # typed `*_strict` admin APIs and the `cap_binding_strict` integration test
 # (it no longer toggles any security behaviour). Kept in `default` so the
 # `*_strict` surface is available out of the box.
+#
+# CAVEAT (default-features = false): disabling this feature removes the ONLY
+# typed channel for foreign-cap misuse — the `*_strict` admin methods
+# (`get_strict`, `unregister_strict`, `len_strict`, `tenants_strict`) that
+# return `Result<_, RegistryError::CapabilityFromForeignRegistry>`. The
+# binding still fails CLOSED (the legacy `get`/`unregister`/`len`/`tenants`
+# collapse a foreign cap to `None`/`0`/empty), but with the typed variants
+# compiled out, callers cannot observe *why* an operation returned nothing.
+# To keep the misuse observable in that configuration, the foreign-cap
+# rejection path ALWAYS emits a `warn!` and bumps the process-global counter
+# read by `foreign_cap_rejections_total()` — independent of this feature.
+# Alert on a non-zero reading regardless of how the crate is built.
 strict-cap-binding = []
