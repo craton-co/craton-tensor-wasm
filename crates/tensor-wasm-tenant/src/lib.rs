@@ -52,6 +52,6 @@ pub use context::{
     TenantContextBuilder,
 };
 pub use registry::{
-    MpsDecision, RegistryAdminCapability, RegistryError, TenantRegistry, MPS_CONTROL_PATH,
-    MPS_PIPE_DIRECTORY_ENV,
+    foreign_cap_rejections_total, MpsDecision, RegistryAdminCapability, RegistryError,
+    TenantRegistry, MPS_CONTROL_PATH, MPS_PIPE_DIRECTORY_ENV,
 };
