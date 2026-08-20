@@ -930,6 +930,62 @@ mod tests {
     }
 
     #[test]
+    fn release_outcome_reports_clamp_for_double_release() {
+        // MEDIUM fix: the capability-checked release surfaces an underflow
+        // clamp so the accounting layer can detect a double-release. A clean
+        // release reports the full amount and no clamp; an over-release
+        // reports only what was actually subtracted and `clamped == true`.
+        use tensor_wasm_core::error::TensorWasmError;
+
+        let (reg, _admin) = TenantRegistry::new();
+        let (ctx, cap) = reg
+            .register_with_capability(
+                TenantContext::builder(TenantId(7100))
+                    .with_memory_quota_bytes(1 << 20)
+                    .build(),
+            )
+            .unwrap();
+
+        ctx.consume_bytes_with_capability(&cap, 1000).unwrap();
+
+        // Clean release of the full balance: released == requested, no clamp.
+        let out = ctx.release_bytes_with_capability(&cap, 600).unwrap();
+        assert_eq!(out.released, 600);
+        assert!(!out.clamped);
+        assert_eq!(ctx.bytes_in_use(), 400);
+
+        // Over-release (double-release): only 400 remained, so 400 is
+        // subtracted, the counter clamps at zero, and `clamped` flags it.
+        let out = ctx.release_bytes_with_capability(&cap, 1000).unwrap();
+        assert_eq!(out.released, 400);
+        assert!(out.clamped, "over-release must be flagged as clamped");
+        assert_eq!(ctx.bytes_in_use(), 0);
+
+        // The GPU side mirrors the contract.
+        ctx.consume_gpu_bytes_with_capability(&cap, 256).unwrap();
+        let gout = ctx.release_gpu_bytes_with_capability(&cap, 256).unwrap();
+        assert_eq!(gout.released, 256);
+        assert!(!gout.clamped);
+        let gout = ctx.release_gpu_bytes_with_capability(&cap, 1).unwrap();
+        assert_eq!(gout.released, 0);
+        assert!(gout.clamped, "GPU over-release must be flagged as clamped");
+
+        // The capability check still fires first: a foreign cap is rejected
+        // before any release happens (and the counter is untouched).
+        let (other_ctx, other_cap) = reg
+            .register_with_capability(TenantContext::builder(TenantId(7101)).build())
+            .unwrap();
+        let err = ctx
+            .release_bytes_with_capability(&other_cap, 1)
+            .expect_err("foreign cap must be rejected");
+        assert!(matches!(
+            err,
+            TensorWasmError::TenantIsolationViolation { .. }
+        ));
+        let _ = other_ctx;
+    }
+
+    #[test]
     fn foreign_admin_cap_bumps_rejection_counter_and_fails_closed() {
         // MEDIUM fix: a foreign admin cap must (a) fail closed on every
         // legacy admin method and (b) leave an observable trace — the

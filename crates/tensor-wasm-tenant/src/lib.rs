@@ -48,8 +48,8 @@ pub mod context;
 pub mod registry;
 
 pub use context::{
-    isolation_downgrade_count, IsolationKind, RateLimited, TenantCapability, TenantContext,
-    TenantContextBuilder,
+    isolation_downgrade_count, IsolationKind, RateLimited, ReleaseOutcome, TenantCapability,
+    TenantContext, TenantContextBuilder,
 };
 pub use registry::{
     foreign_cap_rejections_total, MpsDecision, RegistryAdminCapability, RegistryError,
