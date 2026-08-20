@@ -181,6 +181,36 @@ impl std::fmt::Display for RateLimited {
 
 impl std::error::Error for RateLimited {}
 
+/// Outcome of a capability-checked release
+/// ([`TenantContext::release_bytes_with_capability`] /
+/// [`TenantContext::release_gpu_bytes_with_capability`]).
+///
+/// MEDIUM fix (double-release detection): the release counters saturate on
+/// underflow — releasing more than was consumed clamps the counter at zero
+/// rather than wrapping. That is the right *runtime* behaviour (a
+/// bookkeeping slip must not panic or wrap), but the previous `Ok(())`
+/// return hid it: an accounting layer doing matched consume/release pairs
+/// could double-release and never learn that the second release was a
+/// no-op clamp, silently drifting its own shadow ledger. This struct
+/// surfaces both how many bytes were *actually* subtracted (`released`)
+/// and whether the request hit the underflow clamp (`clamped`), so the
+/// caller can detect and alert on a double-release / mismatched-pair bug.
+///
+/// `released < requested` exactly when `clamped` is `true`; on a clean
+/// release `released == requested` and `clamped == false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseOutcome {
+    /// Bytes actually subtracted from the counter. Equals the requested
+    /// amount on a clean release; on an underflow clamp it is only the
+    /// portion that brought the counter down to zero (i.e. the counter's
+    /// value before the release).
+    pub released: u64,
+    /// `true` when the request exceeded the outstanding balance and the
+    /// counter was clamped at zero — the signal of an over-release /
+    /// double-release / mismatched consume-release pair.
+    pub clamped: bool,
+}
+
 /// A monotonic-clock token bucket guarding a tenant's operation rate.
 ///
 /// The bucket holds up to `burst` tokens and refills at `ops_per_sec` tokens
@@ -828,8 +858,19 @@ impl TenantContext {
     /// method — a concurrent `consume_gpu_bytes` race must not be
     /// silently erased by a clamping `store`.
     pub fn release_gpu_bytes(&self, bytes: u64) {
+        // Discards the `ReleaseOutcome`: the uncapped variant keeps its `()`
+        // return; the capability-checked variant surfaces the outcome.
+        let _ = self.release_gpu_bytes_inner(bytes);
+    }
+
+    /// Shared GPU-release implementation: CAS-loop `saturating_sub` +
+    /// underflow warn, returning a [`ReleaseOutcome`] so
+    /// [`Self::release_gpu_bytes_with_capability`] can report an
+    /// underflow-clamp (double-release signal) to the accounting layer.
+    /// Mirrors the CPU `Self::release_bytes_inner`.
+    fn release_gpu_bytes_inner(&self, bytes: u64) -> ReleaseOutcome {
         let mut current = self.gpu_bytes_in_use.load(Ordering::Acquire);
-        let after = loop {
+        let (after, before) = loop {
             let next = current.saturating_sub(bytes);
             match self.gpu_bytes_in_use.compare_exchange_weak(
                 current,
@@ -847,12 +888,16 @@ impl TenantContext {
                             "release_gpu_bytes underflow clamped",
                         );
                     }
-                    break next;
+                    break (next, current);
                 }
                 Err(observed) => current = observed,
             }
         };
         self.publish_gpu_memory_gauge(after);
+        ReleaseOutcome {
+            released: before - after,
+            clamped: before < bytes,
+        }
     }
 
     /// Capability-checked variant of [`Self::consume_gpu_bytes`].
@@ -884,18 +929,22 @@ impl TenantContext {
     /// Mirrors [`Self::release_bytes_with_capability`] on the GPU side:
     /// returns [`TensorWasmError::TenantIsolationViolation`] if `cap` was
     /// minted for a different tenant (leaving the counter untouched);
-    /// otherwise releases exactly as the uncapped [`Self::release_gpu_bytes`]
-    /// (saturating on underflow) and returns `Ok(())`. The public signature
-    /// is `Result` because the capability check is fallible, even though the
-    /// underflow path of the underlying release is a best-effort clamp.
+    /// otherwise releases (saturating on underflow) and returns a
+    /// [`ReleaseOutcome`].
+    ///
+    /// MEDIUM fix (double-release detection): like the CPU sibling, this
+    /// used to return `Ok(())` and hide an underflow clamp. It now returns
+    /// `Ok(ReleaseOutcome { released, clamped })` so the GPU accounting
+    /// layer can detect an over-release (`clamped == true`). The clamp
+    /// itself remains best-effort (never panics/wraps); `.unwrap()` call
+    /// sites continue to compile.
     pub fn release_gpu_bytes_with_capability(
         &self,
         cap: &TenantCapability,
         bytes: u64,
-    ) -> Result<(), TensorWasmError> {
+    ) -> Result<ReleaseOutcome, TensorWasmError> {
         self.check_capability(cap, "quota.release_gpu_bytes")?;
-        self.release_gpu_bytes(bytes);
-        Ok(())
+        Ok(self.release_gpu_bytes_inner(bytes))
     }
 
     /// Attempt to admit a single operation against this tenant's
@@ -1197,34 +1246,45 @@ impl TenantContext {
         note = "use release_bytes_with_capability; unchecked variant will be removed in v0.4"
     )]
     pub fn release_bytes(&self, bytes: u64) {
-        self.release_bytes_inner(bytes);
+        // Discards the `ReleaseOutcome`: the deprecated unchecked variant
+        // keeps its `()` return for backwards compatibility.
+        let _ = self.release_bytes_inner(bytes);
     }
 
     /// Capability-checked variant of [`Self::release_bytes`].
     ///
     /// Returns [`TensorWasmError::TenantIsolationViolation`] if `cap` was
-    /// minted for a different tenant; otherwise behaves exactly like the
-    /// (deprecated) unchecked variant. Returns `Ok(())` on success — the
-    /// unchecked variant returns `()` because the underflow path is a
-    /// best-effort clamp, but the capability check itself is fallible, so
-    /// the public signature here is `Result<(), TensorWasmError>`.
+    /// minted for a different tenant; otherwise releases the bytes and
+    /// returns a [`ReleaseOutcome`].
+    ///
+    /// MEDIUM fix (double-release detection): this used to return
+    /// `Ok(())`, hiding the underflow-clamp from the accounting layer. It
+    /// now returns `Ok(ReleaseOutcome { released, clamped })` so a caller
+    /// running matched consume/release pairs can detect an over-release —
+    /// `clamped == true` (equivalently `released < bytes`) means the
+    /// request exceeded the outstanding balance and the counter saturated
+    /// at zero, the fingerprint of a double-release / mismatched-pair bug.
+    /// The underflow itself is still a best-effort clamp (never a panic or
+    /// wrap); the change is purely additive observability on the success
+    /// path. `.unwrap()`/`.expect()` call sites are unaffected.
     pub fn release_bytes_with_capability(
         &self,
         cap: &TenantCapability,
         bytes: u64,
-    ) -> Result<(), TensorWasmError> {
+    ) -> Result<ReleaseOutcome, TensorWasmError> {
         self.check_capability(cap, "quota.release_bytes")?;
-        self.release_bytes_inner(bytes);
-        Ok(())
+        Ok(self.release_bytes_inner(bytes))
     }
 
     /// Shared implementation: CAS-loop `saturating_sub` + underflow warn.
     /// Both the deprecated `release_bytes` and the checked
     /// `release_bytes_with_capability` delegate here so the atomic
-    /// discipline lives in one place.
-    fn release_bytes_inner(&self, bytes: u64) {
+    /// discipline lives in one place. Returns the [`ReleaseOutcome`] so the
+    /// checked variant can report a clamp (double-release signal) to the
+    /// accounting layer.
+    fn release_bytes_inner(&self, bytes: u64) -> ReleaseOutcome {
         let mut current = self.bytes_in_use.load(Ordering::Acquire);
-        let after = loop {
+        let (after, before) = loop {
             let next = current.saturating_sub(bytes);
             match self.bytes_in_use.compare_exchange_weak(
                 current,
@@ -1242,12 +1302,19 @@ impl TenantContext {
                             "release_bytes underflow clamped",
                         );
                     }
-                    break next;
+                    break (next, current);
                 }
                 Err(observed) => current = observed,
             }
         };
         self.publish_memory_gauge(after);
+        // `before` is the counter value the winning CAS observed; the actual
+        // amount subtracted is `before - after` (== `bytes` on a clean
+        // release, less on a clamp). `clamped` iff the request exceeded it.
+        ReleaseOutcome {
+            released: before - after,
+            clamped: before < bytes,
+        }
     }
 
     /// Whether this tenant owns a real `cust::context::Context`.
