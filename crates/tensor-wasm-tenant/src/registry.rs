@@ -763,6 +763,17 @@ impl TenantRegistry {
     /// [`MpsDecision::Mps`] carries an owned [`PathBuf`] — handing out
     /// `&'static` keeps the no-clone hot path while preserving the
     /// captured root directory for diagnostics.
+    ///
+    /// PROCESS-GLOBAL (caveat): this is an associated function, not a
+    /// per-registry method, and the decision is cached in a process-wide
+    /// `OnceLock`. Every `TenantRegistry` in the process — and every clone
+    /// — observes the SAME `MpsDecision`, computed once from the first
+    /// caller's environment and filesystem state and never recomputed. Two
+    /// registries cannot disagree on MPS availability, and flipping the MPS
+    /// daemon on or off underneath a running process is not a supported
+    /// reconfiguration (restart the process). The MPS control pipe is
+    /// itself process-global host state, so this matches the underlying
+    /// reality rather than imposing an extra constraint.
     pub fn mps_or_fallback() -> &'static MpsDecision {
         MPS_DECISION.get_or_init(probe_mps_env_and_disk)
     }

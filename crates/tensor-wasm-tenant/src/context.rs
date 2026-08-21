@@ -915,6 +915,18 @@ impl TenantContext {
     /// form (unlike `consume_bytes` / `consume_bytes_with_capability`); the
     /// uncapped [`Self::consume_gpu_bytes`] is retained for the 0.3 line in
     /// the same way the CPU path keeps its unchecked variant.
+    ///
+    /// ADVISORY / IN-PROCESS-ONLY (cross-reference): the capability gate
+    /// here authorises *who* may mutate the counter — it does NOT make the
+    /// GPU cap driver-enforced. Like [`Self::consume_gpu_bytes`], this path
+    /// caps allocations only through the in-process
+    /// [`Self::gpu_bytes_in_use`] counter (and, when a
+    /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`] pool is wired
+    /// in, host-side in `TenantMemPool::allocate`). A tenant that obtains a
+    /// raw CUDA driver handle and allocates outside this path is NOT capped
+    /// — `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` is a retention hint, not an
+    /// allocation ceiling (see [`Self::gpu_memory_bytes_cap`] and
+    /// `docs/GPU-QUOTAS.md`).
     pub fn consume_gpu_bytes_with_capability(
         &self,
         cap: &TenantCapability,
