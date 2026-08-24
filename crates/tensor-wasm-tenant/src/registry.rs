@@ -24,7 +24,7 @@
 //! any additional authority over tenants it did not create.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use dashmap::DashMap;
@@ -240,12 +240,6 @@ pub struct TenantRegistry {
     /// H1: always present so registry binding is enforced unconditionally,
     /// not just under the `strict-cap-binding` feature.
     registry_token: Arc<()>,
-    /// T-perf (amortized tombstone prune): monotonically increasing count
-    /// of register/unregister operations, used to throttle the
-    /// opportunistic O(tombstones) prune so it runs roughly once every
-    /// [`Self::PRUNE_EVERY_N_OPS`] mutations instead of on every call.
-    /// Shared (`Arc`) so registry clones increment the same counter.
-    prune_op_counter: Arc<AtomicUsize>,
 }
 
 impl TenantRegistry {
@@ -264,7 +258,6 @@ impl TenantRegistry {
             inner: Arc::new(DashMap::new()),
             tombstones: Arc::new(DashMap::new()),
             registry_token: Arc::clone(&registry_token),
-            prune_op_counter: Arc::new(AtomicUsize::new(0)),
         };
         let cap = RegistryAdminCapability::mint(registry_token);
         (reg, cap)
@@ -435,35 +428,37 @@ impl TenantRegistry {
             .retain(|id, weak| *id == skip_id || weak.strong_count() > 0);
     }
 
-    /// Amortize the O(tombstones) prune (T-perf): every register/unregister
-    /// previously ran [`Self::prune_dead_tombstones_except`] unconditionally,
-    /// taking per-shard tombstone locks on every call. Instead, run the
-    /// scan only once every [`Self::PRUNE_EVERY_N_OPS`] mutations, OR
-    /// immediately when the tombstone map has grown past
-    /// [`Self::PRUNE_TOMBSTONE_THRESHOLD`] (so a churn burst between
-    /// throttled prunes cannot let the map grow without bound).
+    /// Amortize the O(tombstones) prune.
     ///
-    /// Correctness is preserved: the prune only ever drops tombstones whose
+    /// PERF (Finding 7 — drop the shared op-counter): the previous throttle
+    /// kept a process-shared `Arc<AtomicUsize>` and `fetch_add`'d it on
+    /// every register/unregister. Because the `Arc` is shared across all
+    /// registry clones, that single atomic was a contended cache line on
+    /// the registration hot path — every thread doing a mutation bounced the
+    /// same line regardless of which tenant/shard it touched. We drop the
+    /// counter entirely and gate the prune purely on
+    /// [`Self::PRUNE_TOMBSTONE_THRESHOLD`]: the O(tombstones) scan runs only
+    /// when the tombstone map has actually grown past the bound it exists to
+    /// enforce. A cheap `DashMap::len` (a sum of per-shard counts, no shared
+    /// mutable line of our own) replaces the contended `fetch_add`.
+    ///
+    /// Correctness is unchanged: the prune only ever drops tombstones whose
     /// `Weak` can no longer upgrade (dead orphans), and the re-register
     /// orphan check reads `strong_count` live rather than depending on the
     /// prune having run. Skipping a prune therefore never resurrects an
-    /// orphaned tenant — it only delays reclaiming dead-tombstone space.
+    /// orphaned tenant — it only delays reclaiming dead-tombstone space,
+    /// which the threshold now bounds, and explicit
+    /// [`Self::collect_tombstones`] reclaims on demand regardless.
     fn maybe_prune_dead_tombstones_except(&self, skip_id: TenantId) {
-        let n = self.prune_op_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % Self::PRUNE_EVERY_N_OPS == 0
-            || self.tombstones.len() > Self::PRUNE_TOMBSTONE_THRESHOLD
-        {
+        if self.tombstones.len() > Self::PRUNE_TOMBSTONE_THRESHOLD {
             self.prune_dead_tombstones_except(skip_id);
         }
     }
 
-    /// Run the opportunistic tombstone prune once every this many
-    /// register/unregister ops (T-perf amortization).
-    const PRUNE_EVERY_N_OPS: usize = 64;
-
-    /// Prune immediately (ignoring the op-counter throttle) once the
-    /// tombstone map exceeds this many entries, bounding worst-case growth
-    /// between throttled prunes.
+    /// Prune once the tombstone map exceeds this many entries, bounding
+    /// worst-case growth. The sole prune trigger now that the per-op
+    /// counter has been dropped (PERF, Finding 7); explicit
+    /// [`Self::collect_tombstones`] reclaims below this bound on demand.
     const PRUNE_TOMBSTONE_THRESHOLD: usize = 1024;
 
     /// Verify that `cap` was minted by *this* registry's [`Self::new`]
@@ -731,6 +726,30 @@ impl TenantRegistry {
         self.inner.iter().map(|r| Arc::clone(r.value())).collect()
     }
 
+    /// Snapshot just the registered tenant **ids** into a `Vec`.
+    ///
+    /// PERF (Finding 7): [`Self::tenants`] clones every `Arc<TenantContext>`
+    /// while iterating under the `DashMap` shard locks — an atomic
+    /// refcount bump (and a later refcount drop) per entry, plus it keeps
+    /// every context alive for as long as the returned `Vec` lives. A
+    /// metrics scrape that only needs the *set of ids* (to address the
+    /// per-tenant gauge series, or to count/enumerate live tenants) pays
+    /// all of that for nothing. This id-only path copies a `TenantId` (a
+    /// plain `Copy` newtype over `u64`) per entry instead — no refcount
+    /// traffic, no extended context lifetimes, and the shard locks are
+    /// released as soon as the ids are collected.
+    ///
+    /// Gated behind [`RegistryAdminCapability`] for the same reason as
+    /// [`Self::tenants`]: enumerating the tenant set is a cross-tenant
+    /// side-channel. A foreign cap returns an empty `Vec` (fails closed),
+    /// unconditional of the `strict-cap-binding` feature.
+    pub fn tenant_ids(&self, cap: &RegistryAdminCapability) -> Vec<TenantId> {
+        if self.check_admin_cap(cap).is_err() {
+            return Vec::new();
+        }
+        self.inner.iter().map(|r| *r.key()).collect()
+    }
+
     /// Decide whether to use MPS or per-context isolation by probing the
     /// MPS control pipe.
     ///
@@ -886,6 +905,27 @@ mod tests {
         let mut ids: Vec<u64> = reg.tenants(&cap).iter().map(|c| c.id().get()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn tenant_ids_snapshot_is_id_only_and_cap_gated() {
+        // PERF (Finding 7): the id-only snapshot returns the same id set as
+        // the Arc-cloning `tenants()` without cloning any context Arc.
+        let (reg, cap) = TenantRegistry::new();
+        for i in 0..5u64 {
+            reg.register(ctx(i)).unwrap();
+        }
+        let mut ids: Vec<u64> = reg.tenant_ids(&cap).iter().map(|t| t.get()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+        // Same id set as the full snapshot.
+        let mut full: Vec<u64> = reg.tenants(&cap).iter().map(|c| c.id().get()).collect();
+        full.sort_unstable();
+        assert_eq!(ids, full);
+
+        // Fails closed on a foreign cap.
+        let (_other, foreign) = TenantRegistry::new();
+        assert!(reg.tenant_ids(&foreign).is_empty());
     }
 
     #[test]
@@ -1325,30 +1365,30 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // T27 / T-perf tests: AMORTIZED opportunistic tombstone prune on
+    // T27 / PERF tests: AMORTIZED opportunistic tombstone prune on
     // unregister and register_with_capability success paths.
     //
-    // T-perf changed the prune from per-op to amortized (every
-    // `PRUNE_EVERY_N_OPS` ops, or when the map exceeds
-    // `PRUNE_TOMBSTONE_THRESHOLD`). These tests pin the new contract:
-    // (1) the prune does NOT run on every op, (2) it eventually
-    // reclaims dead tombstones once enough ops accrue, and (3) the
-    // orphan / same-id correctness rules still hold whenever a prune
-    // does run.
+    // PERF (Finding 7) changed the throttle from a shared op-counter to a
+    // pure `tombstones.len() > PRUNE_TOMBSTONE_THRESHOLD` check (the
+    // contended `Arc<AtomicUsize>` was dropped). These tests pin the new
+    // contract: (1) the prune does NOT run on every op while the map is
+    // small, (2) it runs once the map grows past the threshold and reclaims
+    // dead tombstones for unrelated ids, and (3) the orphan / same-id
+    // correctness rules still hold whenever a prune does run.
     // ----------------------------------------------------------------
 
-    /// Drive enough register/unregister ops to force an amortized prune
-    /// boundary, then assert the prune drops dead tombstones for IDs
+    /// Grow the tombstone map past `PRUNE_TOMBSTONE_THRESHOLD` so a prune
+    /// is guaranteed to run, then assert it drops dead tombstones for ids
     /// other than the current one while skipping the same-id tombstone.
     #[test]
-    fn unregister_prunes_dead_tombstones_when_op_boundary_reached() {
+    fn unregister_prunes_dead_tombstones_when_threshold_reached() {
         let (reg, cap) = TenantRegistry::new();
         // Register tenant 1, drop the returned Arc; unregister it,
         // dropping that Arc too. Tombstone 1's Weak is now dead.
         let _ = reg.register(ctx(1)).unwrap();
         reg.unregister(TenantId(1), &cap).unwrap();
-        // T-perf: the prune is amortized, so a single unregister does
-        // NOT necessarily run it. The dead tombstone may linger.
+        // Amortized: while the map is small no prune runs, so the dead
+        // tombstone lingers.
         assert!(reg.tombstones.contains_key(&TenantId(1)));
         assert_eq!(
             reg.tombstones.get(&TenantId(1)).unwrap().strong_count(),
@@ -1356,27 +1396,31 @@ mod tests {
             "tombstone 1's Weak should be dead — both Arcs were dropped"
         );
 
-        // Drive enough churn on a *different* id to cross an op boundary
-        // so a prune is guaranteed to run. Each loop is a register +
-        // unregister = 2 ops; run well past PRUNE_EVERY_N_OPS.
-        for _ in 0..TenantRegistry::PRUNE_EVERY_N_OPS {
-            let _ = reg.register(ctx(2)).unwrap();
-            reg.unregister(TenantId(2), &cap).unwrap();
+        // Seed enough distinct DEAD tombstones to push the map size past the
+        // threshold; the next unregister then triggers a prune. Ids start at
+        // 100 to stay clear of id 1 and the trigger id below.
+        let n = TenantRegistry::PRUNE_TOMBSTONE_THRESHOLD + 1;
+        for i in 0..n as u64 {
+            let id = 100 + i;
+            let _ = reg.register(ctx(id)).unwrap();
+            reg.unregister(TenantId(id), &cap).unwrap();
         }
-        // By now a prune has run on an `id != 1` op, so dead tombstone 1
-        // must have been reclaimed. (Tombstone 2 is repeatedly re-seeded
-        // and same-id-skipped, so it may or may not linger — we assert
-        // only on the reclamation of the unrelated dead tombstone 1.)
+        // The map has now exceeded the threshold; one more churn op on a
+        // fresh id forces the prune (skipping only that id).
+        let _ = reg.register(ctx(50_000)).unwrap();
+        reg.unregister(TenantId(50_000), &cap).unwrap();
+
+        // The prune reclaimed dead tombstone 1 (an unrelated, dead entry).
         assert!(
             !reg.tombstones.contains_key(&TenantId(1)),
-            "amortized prune must eventually drop dead tombstone 1"
+            "threshold-triggered prune must drop dead tombstone 1"
         );
     }
 
     /// The amortized prune is genuinely throttled: a single successful
-    /// register does NOT run a full prune (the per-op-prune behaviour
-    /// T-perf removed). The dead tombstone is reclaimed later via the
-    /// explicit, admin-gated `collect_tombstones`.
+    /// register on a small map does NOT run a full prune. The dead
+    /// tombstone is reclaimed later via the explicit, admin-gated
+    /// `collect_tombstones`.
     #[test]
     fn register_prune_is_amortized_collect_reclaims() {
         let (reg, cap) = TenantRegistry::new();
@@ -1384,12 +1428,12 @@ mod tests {
         let _ = reg.register(ctx(1)).unwrap();
         reg.unregister(TenantId(1), &cap).unwrap();
         assert!(reg.tombstones.contains_key(&TenantId(1)));
-        // A single register of a different id does NOT force a prune
-        // under the amortized policy.
+        // A single register of a different id, with the map well below the
+        // threshold, does NOT force a prune.
         let _ = reg.register_with_capability(ctx(2)).unwrap();
         assert!(
             reg.tombstones.contains_key(&TenantId(1)),
-            "amortized policy: a single register must not prune dead tombstone 1"
+            "amortized policy: a single register on a small map must not prune"
         );
         // Explicit prune still reclaims it (id 1 dead, id 2 live → kept).
         let pruned = reg.collect_tombstones(&cap);

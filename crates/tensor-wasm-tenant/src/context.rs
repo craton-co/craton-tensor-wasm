@@ -42,6 +42,7 @@ use loom::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(feature = "loom"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -583,6 +584,22 @@ pub struct TenantContext {
     /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`].
     driver_mem_pool: Option<Arc<dyn DriverMemPool>>,
 
+    /// PERF (memoized driver-pin): `true` once the driver pool's release
+    /// threshold has been pinned to this tenant's cap. The pin is a fixed
+    /// *policy ceiling* — it does not change as the running total moves — so
+    /// re-pushing it through `set_release_threshold` on every
+    /// [`Self::consume_gpu_bytes`] was pure waste (an FFI / lock round-trip
+    /// on the allocation hot path for a value that never changes). The pin
+    /// is performed once at [`TenantContextBuilder::build`] time when a pool
+    /// and a cap are both present; this flag lets the consume path skip the
+    /// redundant re-push. If the build-time pin failed (e.g. transient
+    /// driver error) the flag stays `false` and the first successful consume
+    /// retries it exactly once, then sets the flag. Relaxed ordering
+    /// suffices: at worst two early racing consumes each push once before
+    /// the flag is observed set — still O(1), not O(consumes), and the pin
+    /// is idempotent.
+    driver_pool_pinned: AtomicBool,
+
     /// Optional time-windowed operation-rate limiter. `None` (the default)
     /// preserves the historical pure high-water-mark byte-cap behaviour —
     /// no per-operation rate is enforced. When set via
@@ -814,35 +831,68 @@ impl TenantContext {
             ) {
                 Ok(_) => {
                     self.publish_gpu_memory_gauge(next);
-                    // Pool cap alignment (T39): when a driver memory pool was
-                    // wired in via `with_driver_enforced_gpu_cap` AND a cap is
-                    // set, keep the pool's recorded cap aligned to this
-                    // tenant's policy ceiling. NB: this is NOT what enforces
-                    // the cap on the pool path — `set_release_threshold` sets
+                    // Pool cap alignment (T39): keep the driver pool's
+                    // recorded cap aligned to this tenant's policy ceiling.
+                    //
+                    // PERF (memoized, Finding 7): the pushed value is a fixed
+                    // policy ceiling — it never changes as the running total
+                    // moves — so the build-time pin handles it once and this
+                    // hot-path push is a no-op on every subsequent consume.
+                    // We only reach `pin_driver_pool` here if the build-time
+                    // pin had not yet succeeded (flag still `false`), and it
+                    // returns immediately once the flag is set. The previous
+                    // code re-issued the `set_release_threshold` FFI/lock
+                    // round-trip on EVERY consume for a value that never
+                    // changed. NB: `set_release_threshold` sets
                     // `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD`, a memory-RETENTION
                     // hint, not an allocation ceiling (see
-                    // `docs/GPU-VALIDATION-2026-05-30.md` BUG-1). The pool's
+                    // `docs/GPU-VALIDATION-2026-05-30.md` BUG-1); the pool's
                     // real cap is enforced host-side in
-                    // `TenantMemPool::allocate`. We push the *cap* (a fixed
-                    // policy ceiling), not the running total. A failure is
-                    // logged but does NOT fail the consume: the in-process
-                    // counter already accepted this allocation, and the pool
-                    // cap is belt-and-braces.
-                    if let (Some(pool), Some(cap)) = (&self.driver_mem_pool, limit) {
-                        if let Err(e) = pool.set_release_threshold(cap) {
-                            tracing::warn!(
-                                target: "tensor_wasm_tenant::context",
-                                tenant = %self.tenant_id,
-                                cap,
-                                error = %e,
-                                "driver mem-pool set_release_threshold failed; \
-                                 in-process gpu cap still enforced",
-                            );
-                        }
-                    }
+                    // `TenantMemPool::allocate`. A pin failure is logged but
+                    // does NOT fail the consume — the in-process counter
+                    // already accepted this allocation.
+                    self.pin_driver_pool(limit);
                     return Ok(());
                 }
                 Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Pin the driver memory pool's release threshold to `limit` exactly
+    /// once (idempotent, memoized via [`Self::driver_pool_pinned`]).
+    ///
+    /// PERF (Finding 7): the threshold is a fixed policy ceiling, so this is
+    /// a one-shot. It returns immediately when there is no pool, no cap, or
+    /// the pin already succeeded. On the first call with both a pool and a
+    /// cap it pushes the cap through
+    /// [`DriverMemPool::set_release_threshold`] and, on success, sets the
+    /// flag so no later consume re-issues the FFI/lock round-trip. A failure
+    /// leaves the flag clear so the next consume retries; the in-process
+    /// counter enforces the cap meanwhile, so a pin failure never fails the
+    /// consume. Relaxed ordering is sufficient — the pin is idempotent, so a
+    /// brief early race that pushes twice is harmless and still O(1).
+    fn pin_driver_pool(&self, limit: Option<u64>) {
+        // Fast path: already pinned, or nothing to pin.
+        if self.driver_pool_pinned.load(Ordering::Relaxed) {
+            return;
+        }
+        let (Some(pool), Some(cap)) = (&self.driver_mem_pool, limit) else {
+            return;
+        };
+        match pool.set_release_threshold(cap) {
+            Ok(()) => {
+                self.driver_pool_pinned.store(true, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "tensor_wasm_tenant::context",
+                    tenant = %self.tenant_id,
+                    cap,
+                    error = %e,
+                    "driver mem-pool set_release_threshold failed; \
+                     in-process gpu cap still enforced (will retry on next consume)",
+                );
             }
         }
     }
@@ -1686,6 +1736,12 @@ impl TenantContextBuilder {
             gpu_bytes_in_use: AtomicU64::new(0),
             cuda_mem_pool_quota_bytes: self.cuda_mem_pool_quota_bytes,
             driver_mem_pool: self.driver_mem_pool,
+            // PERF (memoized driver-pin): starts unpinned; the first
+            // successful `consume_gpu_bytes` pins the threshold once and
+            // flips this, so later consumes skip the redundant FFI/lock
+            // round-trip. Finding 6 additionally performs an eager
+            // build-time pin and pre-sets this flag.
+            driver_pool_pinned: AtomicBool::new(false),
             rate_limiter: self
                 .rate_limit
                 .map(|(ops_per_sec, burst)| TokenBucket::new(ops_per_sec, burst)),
@@ -1996,9 +2052,15 @@ mod tests {
         assert_eq!(pool.threshold.load(Ordering::SeqCst), 4096);
         assert_eq!(pool.release_threshold(), Some(4096));
 
-        // A second consume re-pins to the same cap.
+        // PERF (memoized pin, Finding 7): the threshold is a fixed policy
+        // ceiling, so a second consume must NOT re-push it. The pre-fix
+        // behaviour re-issued `set_release_threshold` on every consume.
         ctx.consume_gpu_bytes(500).unwrap();
-        assert_eq!(pool.set_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            pool.set_calls.load(Ordering::SeqCst),
+            1,
+            "memoized pin: the cap is pushed once, not on every consume",
+        );
         assert_eq!(pool.threshold.load(Ordering::SeqCst), 4096);
     }
 
