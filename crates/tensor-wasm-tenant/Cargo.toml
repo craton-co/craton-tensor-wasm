@@ -55,6 +55,16 @@ required-features = ["strict-cap-binding"]
 default = ["strict-cap-binding"]
 cuda = ["dep:cust"]
 loom = ["dep:loom"]
+# Finding 6 (Part B) forward-wiring: export the isolation-downgrade tally
+# through the `tensor-wasm-core` Prometheus registry. OFF by default — it
+# only compiles once `tensor-wasm-core` ships
+# `TensorWasmMetrics::isolation_downgrade_total() -> &Counter<u64>` (see the
+# `ISOLATION_DOWNGRADE_COUNT` docs in `src/context.rs` for the exact API).
+# Enabling it activates `metrics.isolation_downgrade_total().inc()` on every
+# `ContextIsolated -> StreamIsolated` downgrade in `TenantContextBuilder::build`.
+# Until core lands that counter, scrape the process-global tally via the
+# always-available `isolation_downgrade_count()` accessor instead.
+core-isolation-downgrade-metric = []
 # H1 fix: capability-to-registry binding (a cap from registry A is rejected
 # by registry B even if both name the same `TenantId`, and forged/foreign
 # admin caps are refused) is now UNCONDITIONAL — it is enforced whether or

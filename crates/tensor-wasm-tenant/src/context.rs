@@ -73,14 +73,19 @@ use tensor_wasm_core::types::TenantId;
 /// call site, surfaced via [`isolation_downgrade_count`] so the alert
 /// pipeline can scrape it out-of-band today.
 ///
-/// TODO(core): wire registry export once `tensor-wasm-core` grows a
-/// dedicated counter. The minimal core-crate API required is a
-/// `Counter<u64>` field on `TensorWasmMetrics` registered as
-/// `tensor_wasm_isolation_downgrade_total` with a public accessor
+/// Registry export (Finding 6, Part B): the `build()` downgrade path
+/// already contains the registry-inc call, forward-wired behind the
+/// `core-isolation-downgrade-metric` feature. It is off by default because
+/// `tensor-wasm-core` does not yet expose a matching counter and this crate
+/// must not add one (separate component). The minimal core-crate API the
+/// feature compiles against is a `Counter<u64>` field on
+/// `TensorWasmMetrics` registered as `tensor_wasm_isolation_downgrade_total`
+/// with a public accessor
 /// `TensorWasmMetrics::isolation_downgrade_total(&self) -> &Counter<u64>`.
-/// When that lands, the `build()` downgrade path below should call
-/// `metrics.isolation_downgrade_total().inc()` whenever `self.metrics`
-/// is `Some`, in addition to bumping this static.
+/// Once core ships that, enabling `--features core-isolation-downgrade-metric`
+/// activates `metrics.isolation_downgrade_total().inc()` on every downgrade
+/// (in addition to bumping this static). Until then, scrape the static via
+/// [`isolation_downgrade_count`].
 #[cfg(not(feature = "loom"))]
 static ISOLATION_DOWNGRADE_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -549,20 +554,25 @@ pub struct TenantContext {
     /// see [`Self::gpu_memory_bytes_cap`]).
     gpu_bytes_in_use: AtomicU64,
 
-    /// Recorded-only CUDA memory-pool release-threshold value. `None`
-    /// means "use the driver default" (typically unbounded retention).
+    /// Recorded CUDA memory-pool release-threshold value. `None` means
+    /// "use the driver default" (typically unbounded retention).
     ///
-    /// ADVISORY / RECORD-ONLY: this value is NEVER enforced. The cust
-    /// 0.3.x crate does not expose the `cuMemPool*` API, so this field is
-    /// **not** wired through to
-    /// `cudaMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)` — it
-    /// is stored purely for inspection / metrics / forward-compat and the
-    /// CUDA driver never sees it. The in-process
-    /// [`TenantContext::bytes_in_use`] counter is the only enforcement of
-    /// this crate's quota. See
-    /// [`TenantContextBuilder::with_recorded_cuda_mem_pool_quota`] for
-    /// the honest naming and the upgrade path.
-    #[allow(dead_code)]
+    /// STUB fix (Finding 6): this is no longer *purely* record-only. When a
+    /// driver pool is wired in via
+    /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`] AND no
+    /// separate [`Self::gpu_memory_bytes_cap`] is set, this value becomes
+    /// the [`Self::effective_driver_cap`] that [`Self::pin_driver_pool`]
+    /// pushes through the pool's `set_release_threshold` — so on a CUDA host
+    /// with a real `TenantMemPool` it reaches the driver via
+    /// `cuMemPoolSetAttribute(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)`. NB: that
+    /// attribute is a memory-*retention* hint, not an allocation ceiling
+    /// (see [`Self::gpu_memory_bytes_cap`] and BUG-1), so even when applied
+    /// it does not by itself cap allocation; the in-process counter and the
+    /// pool's host-side `allocate` check remain the real enforcement.
+    ///
+    /// With NO driver pool wired in, the value is still inspection-only (no
+    /// pool to push it to) — see
+    /// [`TenantContextBuilder::with_recorded_cuda_mem_pool_quota`].
     cuda_mem_pool_quota_bytes: Option<u64>,
 
     /// Optional driver-level memory pool whose release threshold is pinned
@@ -851,7 +861,7 @@ impl TenantContext {
                     // `TenantMemPool::allocate`. A pin failure is logged but
                     // does NOT fail the consume — the in-process counter
                     // already accepted this allocation.
-                    self.pin_driver_pool(limit);
+                    self.pin_driver_pool();
                     return Ok(());
                 }
                 Err(observed) => current = observed,
@@ -859,8 +869,27 @@ impl TenantContext {
         }
     }
 
-    /// Pin the driver memory pool's release threshold to `limit` exactly
-    /// once (idempotent, memoized via [`Self::driver_pool_pinned`]).
+    /// The driver-pool release threshold to pin: the GPU cap if one is set,
+    /// else the recorded CUDA mem-pool quota.
+    ///
+    /// STUB fix (Finding 6): the recorded
+    /// [`Self::cuda_mem_pool_quota_bytes`] used to be inert — stored but
+    /// never applied to any driver pool. When a driver pool is wired in via
+    /// [`TenantContextBuilder::with_driver_enforced_gpu_cap`], that recorded
+    /// quota now serves as the driver-pin ceiling whenever no separate
+    /// [`Self::gpu_memory_bytes_cap`] was given, so the value finally
+    /// reaches the CUDA driver (through the concrete
+    /// `TenantMemPool::set_release_threshold` → `cuMemPoolSetAttribute`
+    /// under the GPU feature) instead of only living on the struct.
+    /// `gpu_memory_bytes_cap` still takes precedence — it is the policy
+    /// ceiling the in-process counter also enforces.
+    fn effective_driver_cap(&self) -> Option<u64> {
+        self.gpu_memory_bytes_cap.or(self.cuda_mem_pool_quota_bytes)
+    }
+
+    /// Pin the driver memory pool's release threshold to the
+    /// [`Self::effective_driver_cap`] exactly once (idempotent, memoized via
+    /// [`Self::driver_pool_pinned`]).
     ///
     /// PERF (Finding 7): the threshold is a fixed policy ceiling, so this is
     /// a one-shot. It returns immediately when there is no pool, no cap, or
@@ -872,12 +901,12 @@ impl TenantContext {
     /// counter enforces the cap meanwhile, so a pin failure never fails the
     /// consume. Relaxed ordering is sufficient — the pin is idempotent, so a
     /// brief early race that pushes twice is harmless and still O(1).
-    fn pin_driver_pool(&self, limit: Option<u64>) {
+    fn pin_driver_pool(&self) {
         // Fast path: already pinned, or nothing to pin.
         if self.driver_pool_pinned.load(Ordering::Relaxed) {
             return;
         }
-        let (Some(pool), Some(cap)) = (&self.driver_mem_pool, limit) else {
+        let (Some(pool), Some(cap)) = (&self.driver_mem_pool, self.effective_driver_cap()) else {
             return;
         };
         match pool.set_release_threshold(cap) {
@@ -1703,14 +1732,26 @@ impl TenantContextBuilder {
                 // `error!` so the alert pipeline picks it up. The
                 // per-failure-cause logs inside `build_cuda_context`
                 // record the underlying CUDA error code.
-                //
-                // TODO(core): when `TensorWasmMetrics` grows
-                // `isolation_downgrade_total()` (see `ISOLATION_DOWNGRADE_COUNT`
-                // docs), also do `if let Some(m) = &self.metrics {
-                // m.isolation_downgrade_total().inc(); }` here so the
-                // downgrade is observable through the registry, not just
-                // the process-local static.
                 ISOLATION_DOWNGRADE_COUNT.fetch_add(1, Ordering::Relaxed);
+                // STUB fix (Finding 6, Part B): registry export.
+                //
+                // The downgrade tally is exported out-of-band today via the
+                // public `isolation_downgrade_count()` accessor (re-exported
+                // from the crate root) — the alert pipeline scrapes that. A
+                // direct Prometheus-registry series is blocked on
+                // `tensor-wasm-core` growing a matching counter, which this
+                // crate must not add (separate component). The registry-inc
+                // call is therefore forward-wired behind the
+                // `core-isolation-downgrade-metric` feature: it stays off in
+                // the default build (which keeps compiling against today's
+                // core), and turns on — together with the core change — the
+                // moment core ships
+                // `TensorWasmMetrics::isolation_downgrade_total()`. See the
+                // `ISOLATION_DOWNGRADE_COUNT` docs for the exact core API.
+                #[cfg(feature = "core-isolation-downgrade-metric")]
+                if let Some(m) = &self.metrics {
+                    m.isolation_downgrade_total().inc();
+                }
                 tracing::error!(
                     target: "tensor_wasm_tenant::context",
                     tenant = %self.tenant_id,
@@ -1726,7 +1767,7 @@ impl TenantContextBuilder {
         let cu_context = ();
 
         let metrics_labels = TenantLabels::new(self.tenant_id.to_string());
-        TenantContext {
+        let ctx = TenantContext {
             tenant_id: self.tenant_id,
             isolation: self.isolation,
             stream_id: self.stream_id,
@@ -1736,11 +1777,10 @@ impl TenantContextBuilder {
             gpu_bytes_in_use: AtomicU64::new(0),
             cuda_mem_pool_quota_bytes: self.cuda_mem_pool_quota_bytes,
             driver_mem_pool: self.driver_mem_pool,
-            // PERF (memoized driver-pin): starts unpinned; the first
-            // successful `consume_gpu_bytes` pins the threshold once and
-            // flips this, so later consumes skip the redundant FFI/lock
-            // round-trip. Finding 6 additionally performs an eager
-            // build-time pin and pre-sets this flag.
+            // STUB+PERF (Finding 6/7): starts unpinned; the eager pin just
+            // below flips it on success so the consume hot path skips the
+            // redundant FFI/lock round-trip. If the eager pin fails (or is
+            // deferred), the first successful `consume_gpu_bytes` retries it.
             driver_pool_pinned: AtomicBool::new(false),
             rate_limiter: self
                 .rate_limit
@@ -1754,7 +1794,21 @@ impl TenantContextBuilder {
             // constructs without going through the registry. H1: always
             // present so registry binding is enforced unconditionally.
             registry_token: None,
-        }
+        };
+        // STUB fix (Finding 6): pin the driver pool's release threshold to
+        // the effective cap eagerly, at build time, rather than lazily on
+        // the first `consume_gpu_bytes`. This (a) closes the window where an
+        // allocation routed straight through a raw pool handle before the
+        // first counted consume would see an unpinned threshold, and (b)
+        // makes the previously record-only `cuda_mem_pool_quota_bytes`
+        // actually reach the driver pool (via the effective-cap fallback)
+        // instead of sitting inert on the struct. On a CUDA host with a real
+        // `TenantMemPool`, this issues `cuMemPoolSetAttribute`
+        // (`CU_MEMPOOL_ATTR_RELEASE_THRESHOLD`) once. A pin failure is
+        // logged and left for the consume path to retry; it never fails the
+        // build.
+        ctx.pin_driver_pool();
+        ctx
     }
 
     /// Build the underlying primary `cust::context::Context` when the
@@ -2045,21 +2099,26 @@ mod tests {
         // The accessor returns the wired pool.
         assert!(ctx.mem_pool().is_some());
 
-        // A successful GPU consume pins the driver threshold to the cap
-        // (NOT the running total).
-        ctx.consume_gpu_bytes(1000).unwrap();
-        assert_eq!(pool.set_calls.load(Ordering::SeqCst), 1);
+        // STUB fix (Finding 6): the pin is EAGER — `build()` already pushed
+        // the cap to the pool (NOT the running total), before any consume.
+        assert_eq!(
+            pool.set_calls.load(Ordering::SeqCst),
+            1,
+            "build() must eagerly pin the driver threshold",
+        );
         assert_eq!(pool.threshold.load(Ordering::SeqCst), 4096);
         assert_eq!(pool.release_threshold(), Some(4096));
 
         // PERF (memoized pin, Finding 7): the threshold is a fixed policy
-        // ceiling, so a second consume must NOT re-push it. The pre-fix
-        // behaviour re-issued `set_release_threshold` on every consume.
+        // ceiling, so consumes after the eager pin must NOT re-push it. The
+        // pre-fix behaviour re-issued `set_release_threshold` on every
+        // consume.
+        ctx.consume_gpu_bytes(1000).unwrap();
         ctx.consume_gpu_bytes(500).unwrap();
         assert_eq!(
             pool.set_calls.load(Ordering::SeqCst),
             1,
-            "memoized pin: the cap is pushed once, not on every consume",
+            "memoized pin: the cap is pushed once at build, not per consume",
         );
         assert_eq!(pool.threshold.load(Ordering::SeqCst), 4096);
     }
@@ -2079,26 +2138,30 @@ mod tests {
 
     #[test]
     fn driver_enforced_gpu_cap_over_limit_does_not_push() {
-        // An over-cap consume is rejected by the in-process counter
-        // BEFORE the driver pin runs, so the pool sees no call for the
-        // rejected allocation.
+        // The pin is eager (Finding 6), so `build()` pushes the cap once.
+        // An over-cap consume is then rejected by the in-process counter
+        // BEFORE the (already-done) driver pin would run, so the rejected
+        // allocation adds NO further push.
         let pool = Arc::new(MockDriverMemPool::default());
         let ctx = TenantContext::builder(TenantId(22))
             .with_gpu_memory_bytes_cap(1024)
             .with_driver_enforced_gpu_cap(pool.clone())
             .build();
+        // Eager pin happened at build.
+        assert_eq!(pool.set_calls.load(Ordering::SeqCst), 1);
         let err = ctx.consume_gpu_bytes(2048).unwrap_err();
         assert!(matches!(err, TensorWasmError::GpuMemoryExhausted { .. }));
-        assert_eq!(pool.set_calls.load(Ordering::SeqCst), 0);
+        // The rejected allocation must not push again.
+        assert_eq!(pool.set_calls.load(Ordering::SeqCst), 1);
         // The rejected allocation must not move the counter either.
         assert_eq!(ctx.gpu_bytes_in_use(), 0);
     }
 
     #[test]
     fn driver_enforced_gpu_cap_set_failure_is_fail_soft() {
-        // If the driver pin fails, the in-process consume still succeeds:
-        // the counter already accepted the allocation and the driver pin
-        // is belt-and-braces.
+        // If the driver pin fails, the build still succeeds and the
+        // in-process consume still succeeds: the counter already accepted
+        // the allocation and the driver pin is belt-and-braces.
         let pool = Arc::new(MockDriverMemPool {
             fail: true,
             ..Default::default()
@@ -2107,8 +2170,17 @@ mod tests {
             .with_gpu_memory_bytes_cap(4096)
             .with_driver_enforced_gpu_cap(pool.clone())
             .build();
-        ctx.consume_gpu_bytes(1000).unwrap();
+        // Eager pin (Finding 6) attempted once at build and failed, so the
+        // memoization flag stayed clear.
         assert_eq!(pool.set_calls.load(Ordering::SeqCst), 1);
+        // The first consume retries the still-unpinned threshold (and fails
+        // again), but the consume itself succeeds regardless.
+        ctx.consume_gpu_bytes(1000).unwrap();
+        assert_eq!(
+            pool.set_calls.load(Ordering::SeqCst),
+            2,
+            "an unpinned (failed) threshold is retried once on the next consume",
+        );
         // Threshold never recorded because the mock errored before storing.
         assert_eq!(pool.threshold.load(Ordering::SeqCst), 0);
         // The in-process counter still reflects the accepted allocation.
@@ -2146,6 +2218,43 @@ mod tests {
         assert_eq!(
             ctx.gpu_bytes_in_use(),
             TenantContext::GPU_BYTES_OVERFLOW_SENTINEL - 4096
+        );
+    }
+
+    #[test]
+    fn recorded_cuda_quota_feeds_driver_pin_when_no_gpu_cap() {
+        // STUB fix (Finding 6): with a driver pool wired in but NO
+        // `with_gpu_memory_bytes_cap`, the previously record-only
+        // `with_recorded_cuda_mem_pool_quota` value is used as the
+        // driver-pin ceiling, so it finally reaches the pool's
+        // `set_release_threshold` (→ `cuMemPoolSetAttribute` on a real
+        // `TenantMemPool`) instead of sitting inert on the struct.
+        let pool = Arc::new(MockDriverMemPool::default());
+        let ctx = TenantContext::builder(TenantId(60))
+            .with_recorded_cuda_mem_pool_quota(2048)
+            .with_driver_enforced_gpu_cap(pool.clone())
+            .build();
+        // Eager pin pushed the recorded quota as the threshold.
+        assert_eq!(pool.set_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.threshold.load(Ordering::SeqCst), 2048);
+        assert_eq!(ctx.cuda_mem_pool_quota_bytes(), Some(2048));
+    }
+
+    #[test]
+    fn gpu_cap_takes_precedence_over_recorded_quota_for_driver_pin() {
+        // When BOTH are set, the GPU cap (the policy ceiling the in-process
+        // counter also enforces) wins the driver pin.
+        let pool = Arc::new(MockDriverMemPool::default());
+        let _ctx = TenantContext::builder(TenantId(61))
+            .with_gpu_memory_bytes_cap(4096)
+            .with_recorded_cuda_mem_pool_quota(2048)
+            .with_driver_enforced_gpu_cap(pool.clone())
+            .build();
+        assert_eq!(pool.set_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            pool.threshold.load(Ordering::SeqCst),
+            4096,
+            "gpu_memory_bytes_cap must take precedence over the recorded quota",
         );
     }
 
