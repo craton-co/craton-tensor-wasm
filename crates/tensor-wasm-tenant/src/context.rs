@@ -1131,32 +1131,16 @@ impl TenantContext {
     /// Shared implementation: the lock-free CAS loop. Both the deprecated
     /// `consume_bytes` and the checked `consume_bytes_with_capability`
     /// delegate here so the atomic discipline lives in one place.
+    ///
+    /// TESTS (Finding 8): the CAS arithmetic itself lives in the standalone
+    /// [`consume_cas`] free function so the loom model can drive the *real*
+    /// loop (against a `loom`-flavoured atomic) instead of reimplementing
+    /// it. This method just supplies the counter + limit and publishes the
+    /// gauge on success.
     fn consume_bytes_inner(&self, n: u64) -> Result<(), TensorWasmError> {
-        let limit = self.memory_quota_bytes;
-        let mut current = self.bytes_in_use.load(Ordering::Acquire);
-        loop {
-            let next = match current.checked_add(n) {
-                Some(v) if v <= limit => v,
-                _ => {
-                    return Err(TensorWasmError::MemoryExhausted {
-                        requested: n,
-                        limit,
-                    });
-                }
-            };
-            match self.bytes_in_use.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    self.publish_memory_gauge(next);
-                    return Ok(());
-                }
-                Err(observed) => current = observed,
-            }
-        }
+        let next = consume_cas(&self.bytes_in_use, n, self.memory_quota_bytes)?;
+        self.publish_memory_gauge(next);
+        Ok(())
     }
 
     /// Verify that `cap` was minted for the same tenant this context
@@ -1373,39 +1357,24 @@ impl TenantContext {
     /// discipline lives in one place. Returns the [`ReleaseOutcome`] so the
     /// checked variant can report a clamp (double-release signal) to the
     /// accounting layer.
+    ///
+    /// TESTS (Finding 8): the CAS arithmetic itself lives in the standalone
+    /// [`release_cas`] free function so the loom model can drive the *real*
+    /// loop. This method warns on the underflow clamp and publishes the
+    /// gauge using the returned new total.
     fn release_bytes_inner(&self, bytes: u64) -> ReleaseOutcome {
-        let mut current = self.bytes_in_use.load(Ordering::Acquire);
-        let (after, before) = loop {
-            let next = current.saturating_sub(bytes);
-            match self.bytes_in_use.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    if current < bytes {
-                        tracing::warn!(
-                            target: "tensor_wasm_tenant::context",
-                            tenant = %self.tenant_id,
-                            before = current,
-                            bytes,
-                            "release_bytes underflow clamped",
-                        );
-                    }
-                    break (next, current);
-                }
-                Err(observed) => current = observed,
-            }
-        };
-        self.publish_memory_gauge(after);
-        // `before` is the counter value the winning CAS observed; the actual
-        // amount subtracted is `before - after` (== `bytes` on a clean
-        // release, less on a clamp). `clamped` iff the request exceeded it.
-        ReleaseOutcome {
-            released: before - after,
-            clamped: before < bytes,
+        let (outcome, after) = release_cas(&self.bytes_in_use, bytes);
+        if outcome.clamped {
+            tracing::warn!(
+                target: "tensor_wasm_tenant::context",
+                tenant = %self.tenant_id,
+                released = outcome.released,
+                bytes,
+                "release_bytes underflow clamped",
+            );
         }
+        self.publish_memory_gauge(after);
+        outcome
     }
 
     /// Whether this tenant owns a real `cust::context::Context`.
@@ -1423,6 +1392,72 @@ impl TenantContext {
         #[cfg(not(feature = "cuda"))]
         {
             false
+        }
+    }
+}
+
+/// The lock-free consume CAS loop, extracted so the loom model can drive
+/// the **real** algorithm instead of reimplementing it (Finding 8).
+///
+/// Atomically adds `n` to `counter`, rejecting with
+/// [`TensorWasmError::MemoryExhausted`] if the add would overflow `u64`
+/// (the overflow-rejection arm) OR push the total above `limit` (the
+/// `> limit` arm). On success returns the new total (the caller publishes
+/// the gauge). Both rejection arms leave the counter untouched.
+///
+/// `#[doc(hidden)]` + `pub`: this is not part of the supported public API;
+/// it is exposed only so `tests/loom_consume_release.rs` can import and
+/// model-check the exact loop the production counters run. Under
+/// `--features loom` the `AtomicU64` / `Ordering` here are the
+/// `loom`-flavoured types (see the cfg import at the top of this module),
+/// so the loom scheduler explores every interleaving of this very code.
+#[doc(hidden)]
+pub fn consume_cas(counter: &AtomicU64, n: u64, limit: u64) -> Result<u64, TensorWasmError> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        // Two rejection arms: `checked_add` overflow, and `> limit`.
+        let next = match current.checked_add(n) {
+            Some(v) if v <= limit => v,
+            _ => {
+                return Err(TensorWasmError::MemoryExhausted {
+                    requested: n,
+                    limit,
+                });
+            }
+        };
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Ok(next),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// The lock-free release CAS loop, extracted for the loom model (Finding 8).
+///
+/// Atomically subtracts `bytes` from `counter`, saturating at zero on
+/// underflow. Returns the [`ReleaseOutcome`] (how much was actually
+/// subtracted, and whether the request underflow-clamped) together with the
+/// new total, so the caller can warn on the clamp and publish the gauge.
+///
+/// `#[doc(hidden)]` + `pub` for the same reason as [`consume_cas`].
+#[doc(hidden)]
+pub fn release_cas(counter: &AtomicU64, bytes: u64) -> (ReleaseOutcome, u64) {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.saturating_sub(bytes);
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                return (
+                    ReleaseOutcome {
+                        // `current` is the value the winning CAS observed; the
+                        // amount actually subtracted is `current - next`.
+                        released: current - next,
+                        clamped: current < bytes,
+                    },
+                    next,
+                );
+            }
+            Err(observed) => current = observed,
         }
     }
 }
