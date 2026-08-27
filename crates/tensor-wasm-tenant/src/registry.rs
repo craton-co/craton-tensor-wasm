@@ -398,14 +398,15 @@ impl TenantRegistry {
         // `tombstones`. The ordering remains `inner` then
         // `tombstones`; never the reverse.
         //
-        // T-perf (amortized prune): the prune is an O(tombstones)
+        // PERF (amortized prune, Finding 7): the prune is an O(tombstones)
         // shard-locking scan. Running it on every successful mutation was
-        // wasteful churn on a hot path. We now run it only every
-        // [`Self::PRUNE_EVERY_N_OPS`] ops (or whenever the tombstone map
-        // has grown past [`Self::PRUNE_TOMBSTONE_THRESHOLD`]); correctness
-        // is unaffected because the T11 orphan check on re-register reads
-        // the live `strong_count` directly and never relies on the prune
-        // having run — the prune is purely a space reclamation.
+        // wasteful churn on a hot path. It now runs only when the tombstone
+        // map has grown past `PRUNE_TOMBSTONE_THRESHOLD` (the shared op
+        // counter that used to throttle it was dropped — see
+        // `maybe_prune_dead_tombstones_except`). Correctness is unaffected
+        // because the T11 orphan check on re-register reads the live
+        // `strong_count` directly and never relies on the prune having run —
+        // the prune is purely space reclamation.
         if outcome.is_ok() {
             self.maybe_prune_dead_tombstones_except(id);
         }

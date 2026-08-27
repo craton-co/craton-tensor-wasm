@@ -42,7 +42,12 @@ use loom::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(feature = "loom"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use std::sync::atomic::AtomicBool;
+// `AtomicBool` and its ordering always come from `std` (never loom): only
+// the `AtomicU64` CAS hot path is loom-modeled. Aliasing the std `Ordering`
+// here keeps the `driver_pool_pinned` bool flag using std orderings even
+// under `--features loom`, where the module-level `Ordering` import is the
+// loom-flavoured one.
+use std::sync::atomic::{AtomicBool, Ordering as StdOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -902,8 +907,9 @@ impl TenantContext {
     /// consume. Relaxed ordering is sufficient — the pin is idempotent, so a
     /// brief early race that pushes twice is harmless and still O(1).
     fn pin_driver_pool(&self) {
-        // Fast path: already pinned, or nothing to pin.
-        if self.driver_pool_pinned.load(Ordering::Relaxed) {
+        // Fast path: already pinned, or nothing to pin. (std ordering: the
+        // bool flag is never loom-modeled — see the import alias.)
+        if self.driver_pool_pinned.load(StdOrdering::Relaxed) {
             return;
         }
         let (Some(pool), Some(cap)) = (&self.driver_mem_pool, self.effective_driver_cap()) else {
@@ -911,7 +917,7 @@ impl TenantContext {
         };
         match pool.set_release_threshold(cap) {
             Ok(()) => {
-                self.driver_pool_pinned.store(true, Ordering::Relaxed);
+                self.driver_pool_pinned.store(true, StdOrdering::Relaxed);
             }
             Err(e) => {
                 tracing::warn!(
