@@ -70,7 +70,9 @@ async fn terminate_interrupts_deadline_less_running_call() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     // `terminate` must succeed (the instance is still registered) and flip the
     // cancellation flag the epoch callback consults.
-    exec.terminate(id).await.expect("terminate registered instance");
+    exec.terminate(id)
+        .await
+        .expect("terminate registered instance");
 
     // The call MUST return (with an error — the guest was trapped) within a
     // bounded window. If `terminate` could not interrupt it, this `timeout`
@@ -85,5 +87,9 @@ async fn terminate_interrupts_deadline_less_running_call() {
     );
 
     // The instance is gone from the registry (terminate removed it).
-    assert_eq!(exec.live_count(), 0, "terminate must de-register the instance");
+    assert_eq!(
+        exec.live_count(),
+        0,
+        "terminate must de-register the instance"
+    );
 }

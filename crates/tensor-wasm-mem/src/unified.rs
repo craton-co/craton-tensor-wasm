@@ -1398,7 +1398,7 @@ impl UnifiedBuffer {
     /// not previously thread a `Stream` through the public surface, so it was an
     /// advisory no-op). The work happens through the raw `cust::sys` driver
     /// surface rather than cust's safe `MemoryAdvise` trait, because the inner
-    /// cust `UnifiedBuffer` is sealed inside the [`Backing`] aliasing invariant
+    /// cust `UnifiedBuffer` is sealed inside the `Backing` aliasing invariant
     /// and must not be reached by pattern-matching the backing.
     ///
     /// Mirrors the cudarc backend (`cudarc_backend.rs`): prefetch requires the

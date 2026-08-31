@@ -345,7 +345,22 @@ impl InstanceState {
     /// re-seeds `deadline = now + d` before calling this) gets the
     /// up-to-date `Instant` propagated through.
     pub(crate) fn rearm_scheduler(&mut self) {
-        self.scheduler.rearm_with_instant(self.deadline);
+        // Only propagate the absolute `Instant` deadline to the scheduler when
+        // the instance was explicitly configured with a per-call deadline
+        // (`deadline_duration.is_some()`). Without this guard a deadline-less
+        // spawn that has the engine-wide `max_call_duration` ceiling written
+        // into `self.deadline` would arm `bp_deadline_instant` on the
+        // `SchedulerContext`, causing `deadline_remaining_ms()` to return the
+        // engine-ceiling remaining milliseconds instead of the `u32::MAX`
+        // unbounded sentinel. The bp-aligned Instant path is an opt-in for
+        // guests that explicitly operate under a deadline; deadline-less spawns
+        // stay on the legacy `deadline_ms = None` → `u32::MAX` path.
+        let instant = if self.deadline_duration.is_some() {
+            self.deadline
+        } else {
+            None
+        };
+        self.scheduler.rearm_with_instant(instant);
     }
 
     /// Increment the kernel dispatch counter and return the new value.

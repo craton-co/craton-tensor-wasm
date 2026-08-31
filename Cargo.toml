@@ -52,10 +52,10 @@ tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 async-trait = "0.1"
 
-# Wasmtime (pinned to 45.x — bumped from 25.x to clear RUSTSEC-2026-0096,
-# a critical aarch64 Cranelift sandbox-escape advisory affecting <36.0.7 /
-# 37-41 / <42.0.2; 45.x is past the 43.0.1 fix line.)
-wasmtime = { version = "45", default-features = false, features = ["async", "cranelift", "component-model", "runtime"] }
+# Wasmtime (pinned to 46.x — bumped from 45.x to clear RUSTSEC-2026-0222,
+# a type-index confusion between engines advisory affecting <46.0.2; 46.x
+# is past the fix line.)
+wasmtime = { version = "46", default-features = false, features = ["async", "cranelift", "component-model", "runtime"] }
 wat = "1"
 wasmparser = "0.218"
 cranelift-codegen = "0.111"

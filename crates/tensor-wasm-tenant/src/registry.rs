@@ -62,8 +62,7 @@ use crate::context::{TenantCapability, TenantContext};
 static FOREIGN_CAP_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide count of admin-cap checks rejected as foreign / forged
-/// since startup. See [`FOREIGN_CAP_REJECTIONS`] for the alert contract:
-/// any non-zero reading means some caller presented a
+/// since startup. Any non-zero reading means some caller presented a
 /// [`RegistryAdminCapability`] minted by a different `TenantRegistry`,
 /// which is either a wiring bug (the wrong registry's cap was plumbed) or
 /// an attempt to confuse the capability check across registries.

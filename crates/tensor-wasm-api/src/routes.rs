@@ -788,6 +788,7 @@ pub(crate) fn sanitised_exec_error_message(err: &ExecError) -> &'static str {
         }
         ExecError::ModuleTooLarge { .. } => "module bytes above per-tenant cap",
         ExecError::EpochTickerNotRunning => "engine deadline ticker not running",
+        ExecError::UnsupportedReturnType(_) => "export returned an unsupported value type",
     }
 }
 
@@ -935,6 +936,23 @@ impl From<ExecError> for ApiError {
                 ApiError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     kind: "epoch_ticker_not_running".to_string(),
+                    message,
+                }
+            }
+            // Per exec: the export's return type is a Wasm value-type that
+            // the executor does not know how to serialise (e.g. `v128`).
+            // This is a module-authoring error — 400 Bad Request, same
+            // family as MissingExport. The offending type name is already
+            // in `message` (sanitised) and is also logged here for ops.
+            ExecError::UnsupportedReturnType(ty) => {
+                tracing::warn!(
+                    target: "tensor_wasm_api::routes",
+                    value_type = ty,
+                    "exec error: export returned an unsupported value type",
+                );
+                ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    kind: "unsupported_return_type".to_string(),
                     message,
                 }
             }
