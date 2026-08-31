@@ -196,8 +196,9 @@ impl GuardedHostBuffer {
         // SAFETY: `ptr` is page-aligned and points to `usable` valid, RW,
         // host-addressable bytes (the freshly-protected middle of the guarded
         // mapping); the context was bound above.
-        let res =
-            unsafe { cuda_sys::cuMemHostRegister_v2(ptr.as_ptr() as *mut core::ffi::c_void, usable, flags) };
+        let res = unsafe {
+            cuda_sys::cuMemHostRegister_v2(ptr.as_ptr() as *mut core::ffi::c_void, usable, flags)
+        };
         if res == cuda_sys::CUresult::CUDA_SUCCESS {
             true
         } else {
@@ -360,8 +361,9 @@ impl Drop for GuardedHostBuffer {
                 // SAFETY: `self.ptr` is the exact pointer passed to
                 // `cuMemHostRegister_v2`; the region is still mapped (the
                 // `allocation` field drops after this body returns).
-                let res =
-                    unsafe { cuda_sys::cuMemHostUnregister(self.ptr.as_ptr() as *mut core::ffi::c_void) };
+                let res = unsafe {
+                    cuda_sys::cuMemHostUnregister(self.ptr.as_ptr() as *mut core::ffi::c_void)
+                };
                 if res != cuda_sys::CUresult::CUDA_SUCCESS {
                     tracing::debug!(
                         target: "tensor_wasm_mem::pinned_host",

@@ -1057,6 +1057,7 @@ fn exec_error_code(err: &ExecError) -> &'static str {
         ExecError::EpochTickerNotRunning => "epoch_ticker_not_running",
         ExecError::NotFound(_) => "instance_not_found",
         ExecError::Wasmtime(_) => "wasm_error",
+        ExecError::UnsupportedReturnType(_) => "unsupported_return_type",
     }
 }
 

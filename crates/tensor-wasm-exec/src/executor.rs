@@ -1107,7 +1107,7 @@ fn check_raw_module_memory_within_cap(wasm: &[u8], cap_bytes: usize) -> Result<(
 
 /// Substring marker that, together with [`MEMORY_LIMIT_PHRASINGS`], identifies
 /// a wasmtime pooling-allocator memory-slot sizing refusal in
-/// [`classify_instantiation_error`].
+/// `classify_instantiation_error`.
 ///
 /// Pulled out as a named constant (rather than an inline literal) so the
 /// version-coupling is a single source of truth the
@@ -1124,9 +1124,9 @@ pub const MEMORY_FAILURE_MARKER: &str = "memory";
 /// The limit/exceeds phrasings wasmtime's pooling `memory_pool` uses for a
 /// memory-slot sizing refusal:
 ///   * "memory index N has a minimum byte size of M which exceeds the limit
-///      of L bytes" (per-slot size refusal)
+///     of L bytes" (per-slot size refusal)
 ///   * "maximum memory size of 0x… bytes exceeds the configured maximum size"
-///      (pool construction / sizing refusal)
+///     (pool construction / sizing refusal)
 ///
 /// See [`MEMORY_FAILURE_MARKER`] for why these live as named constants (and why
 /// they are `pub`).
@@ -1410,6 +1410,7 @@ impl TensorWasmExecutor {
     /// PERF finding 6: concurrent first-spawns of the same digest are now
     /// single-flighted (see [`Self::inflight_compiles`]), so a duplicate
     /// Cranelift run no longer wastes CPU / a compile permit.
+    #[allow(dead_code)]
     async fn compile_module_cached(&self, wasm: &[u8]) -> Result<(Module, ModuleHash), ExecError> {
         // BLAKE3 outputs a fixed 32-byte digest; use it whole as the cache key.
         let key: [u8; 32] = *blake3::hash(wasm).as_bytes();
@@ -1466,7 +1467,7 @@ impl TensorWasmExecutor {
         let result = cell
             .get_or_try_init(|| self.compile_uncached(wasm, key))
             .await
-            .map(|m| m.clone());
+            .cloned();
         // Drop the single-flight cell so the map does not grow unbounded; a
         // straggler that already cloned this `Arc` is unaffected, and a fresh
         // caller hits the `module_cache` fast path (the compile, on success,

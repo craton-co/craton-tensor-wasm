@@ -503,6 +503,7 @@ where
 ///
 /// Used only on the `--features cuda` launch path; kept module-level (not
 /// cuda-gated) so its unit test runs on every build.
+#[allow(dead_code)]
 fn ptx_entry_name(ptx: &str) -> Option<&str> {
     // Locate `.entry`, then skip whitespace to the symbol. We match
     // `.entry` rather than `.visible .entry` so a `.weak`/`.extern` linkage
@@ -652,7 +653,9 @@ fn launch_cached_kernel(
         )
     };
     if launch_status != cuda_sys::CUresult::CUDA_SUCCESS {
-        return Err(format!("cuLaunchKernel failed with status {launch_status:?}"));
+        return Err(format!(
+            "cuLaunchKernel failed with status {launch_status:?}"
+        ));
     }
 
     // Synchronous dispatch: block the fiber until the kernel completes so the
