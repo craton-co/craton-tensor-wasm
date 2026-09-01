@@ -2382,9 +2382,9 @@ dependencies = [
 
 [[package]]
 name = "pliron-llvm"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9d3502c163f76af8bb18f5f0138cb0bca3a370f668cd79944885e4d2efb0dda"
+checksum = "68cede7d2799c1621226a86d34ff74aca015803a56d7180606dde2ecf6b64fb5"
 dependencies = [
  "bitflags 2.11.1",
  "llvm-sys",
