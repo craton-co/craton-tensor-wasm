@@ -78,10 +78,11 @@ pub struct ServeArgs {
 
     /// Origin to allow via CORS. Repeat for multiple origins. NOTE: the
     /// api crate does not yet expose a programmatic CORS knob, so this flag
-    /// is currently informational — the gateway's CORS surface is wired
-    /// via tower-http defaults inside `tensor-wasm-api`. The flag is kept
-    /// so the README quickstart command parses cleanly; once
-    /// `tensor_wasm_api::CorsConfig` lands (H18-H20 follow-up) this will
+    /// is NOT yet enforced — the gateway's CORS surface is wired via
+    /// tower-http defaults inside `tensor-wasm-api`. To avoid letting an
+    /// operator believe a CORS allowlist is in force when it is not,
+    /// passing this flag is currently a HARD ERROR; once
+    /// `tensor_wasm_api::CorsConfig` lands (H18-H20 follow-up) it will
     /// thread through to the router builder.
     #[arg(long = "cors-origin", value_name = "ORIGIN")]
     pub cors_origins: Vec<String>,
@@ -89,9 +90,11 @@ pub struct ServeArgs {
     /// Maximum inbound request body size, in bytes. Defaults to 64 MiB to
     /// match the api crate's `MAX_REQUEST_BODY_BYTES`. NOTE: the api crate
     /// does not yet expose a programmatic body-cap knob via
-    /// `build_router_with_full_config`; passing a non-default value here
-    /// emits a warning and the router uses the compiled-in 64 MiB cap.
-    /// Wired through once the api crate grows a `BodyLimitConfig`.
+    /// `build_router_with_full_config`; to avoid letting an operator believe
+    /// a tighter cap is in force when it is not, passing a NON-DEFAULT value
+    /// here is currently a HARD ERROR (the router enforces the compiled-in
+    /// 64 MiB cap regardless). Wired through once the api crate grows a
+    /// `BodyLimitConfig`.
     #[arg(long, default_value_t = DEFAULT_MAX_BODY_BYTES)]
     pub max_body_bytes: usize,
 
@@ -211,22 +214,31 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // the limiter is a pass-through.
     let limiter = RateLimiter::new(RateLimitConfig::from_env());
 
+    // sec LOW: `--max-body-bytes` and `--cors-origin` are not yet wired into
+    // the api crate's router builder. Previously a non-default value here was
+    // accepted with a warn-only log, which is a fail-OPEN security trap: an
+    // operator could pass `--max-body-bytes 1048576` (or a tightened CORS
+    // allowlist) and believe a cap was in force when the gateway is silently
+    // using the compiled-in 64 MiB body cap and tower-http's default CORS.
+    // Until `tensor_wasm_api::BodyLimitConfig` / `CorsConfig` land, make a
+    // non-default value a HARD ERROR so the operator cannot mistake an
+    // unenforced flag for an enforced one. Both checks run BEFORE binding the
+    // listener (and before `--check-only` exits) so the misconfiguration
+    // fails fast with a single-line, actionable error.
     if args.max_body_bytes != DEFAULT_MAX_BODY_BYTES {
-        tracing::warn!(
-            target: "tensor_wasm_cli::serve",
-            requested = args.max_body_bytes,
-            actual = DEFAULT_MAX_BODY_BYTES,
-            "--max-body-bytes is currently informational; gateway uses the \
-             compiled-in 64 MiB cap until tensor-wasm-api exposes a \
-             BodyLimitConfig",
+        anyhow::bail!(
+            "--max-body-bytes is not yet supported (tensor-wasm-api does not \
+             expose a BodyLimitConfig); the gateway enforces the compiled-in \
+             {DEFAULT_MAX_BODY_BYTES}-byte cap regardless. Remove the flag — \
+             do not rely on it as an in-force body limit."
         );
     }
     if !args.cors_origins.is_empty() {
-        tracing::warn!(
-            target: "tensor_wasm_cli::serve",
-            count = args.cors_origins.len(),
-            "--cors-origin is currently informational; tensor-wasm-api does \
-             not yet expose a CorsConfig (H18-H20 follow-up)",
+        anyhow::bail!(
+            "--cors-origin is not yet supported (tensor-wasm-api does not \
+             expose a CorsConfig; H18-H20 follow-up); the gateway uses \
+             tower-http CORS defaults regardless. Remove the flag — do not \
+             rely on it as an in-force CORS allowlist."
         );
     }
 
@@ -522,5 +534,66 @@ mod tests {
     fn validate_accepts_auth_configured_on_loopback() {
         validate_bind_safety(addr("127.0.0.1:8080"), &prod_auth(), false)
             .expect("auth-configured deployment on loopback must be accepted");
+    }
+
+    // --- Unsupported-flag hard errors (sec LOW) -----------------------
+    //
+    // `--max-body-bytes` and `--cors-origin` are not yet wired into the api
+    // crate's router builder. Passing a non-default value must be a HARD
+    // ERROR rather than a warn-only no-op, so an operator can't believe a
+    // cap/allowlist is enforced when it is not. We drive `run` with
+    // `check_only = true` and a loopback addr (so the bind-safety gate and
+    // every other check accept the config) and assert the error fires
+    // *before* the `check_only` early-exit.
+
+    fn check_only_args() -> ServeArgs {
+        ServeArgs {
+            addr: addr("127.0.0.1:8080"),
+            tokens: vec!["secret".to_string()],
+            tenant_header_policy: TenantHeaderPolicy::Optional,
+            cors_origins: Vec::new(),
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            allow_plaintext_public: false,
+            check_only: true,
+        }
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(fut)
+    }
+
+    #[test]
+    fn run_rejects_non_default_max_body_bytes() {
+        let mut args = check_only_args();
+        args.max_body_bytes = DEFAULT_MAX_BODY_BYTES - 1;
+        let err = block_on(run(args)).expect_err("non-default --max-body-bytes must hard-error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--max-body-bytes is not yet supported"),
+            "error must explain the flag is unsupported: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_accepts_default_max_body_bytes_under_check_only() {
+        // The default value must still pass straight through to the
+        // `check_only` early-exit (no error).
+        block_on(run(check_only_args())).expect("default config must be accepted");
+    }
+
+    #[test]
+    fn run_rejects_cors_origin() {
+        let mut args = check_only_args();
+        args.cors_origins = vec!["https://app.example".to_string()];
+        let err = block_on(run(args)).expect_err("--cors-origin must hard-error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--cors-origin is not yet supported"),
+            "error must explain the flag is unsupported: {msg}"
+        );
     }
 }
