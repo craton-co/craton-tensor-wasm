@@ -1580,6 +1580,329 @@ fn validate_launch_args<T: HasWasiCuda>(
     Ok(KernelId(kernel_id as u64))
 }
 
+/// A `Vec<LoweredArg>` whose pointer arguments have been resolved into raw
+/// host pointers into the caller's *current* linear-memory snapshot.
+///
+/// ## Why this is a newtype (MED finding)
+///
+/// `LoweredArg::Ptr` carries a raw `host_ptr` into the guest's linear
+/// memory. Wasmtime is free to invalidate that pointer on *any* `await`
+/// that can reach `memory.grow` on the same store (e.g. an embedder host
+/// hook awaiting on the back-pressure path). The launch path's safety
+/// therefore rests on a single invariant: **no `await` may execute between
+/// the moment the pointers are resolved and the moment `cuLaunchKernel`
+/// captures them.**
+///
+/// Previously that invariant lived only in a comment. `ResolvedArgv` makes
+/// it a type-level guarantee:
+///
+/// * The inner `Vec<LoweredArg>` is private, so a `ResolvedArgv` can only
+///   be produced by [`ResolvedArgv::resolve`].
+/// * [`ResolvedArgv::resolve`] is a **non-async** `fn` that borrows the
+///   `&mut Caller` — it cannot itself `await`.
+/// * On CUDA builds the value is consumed by the **non-async**
+///   [`resolve_and_launch_cuda`], which does the managed-pointer check and
+///   the `cuLaunchKernel` call. Because that helper is not `async`, the
+///   compiler rejects any `await` inserted between resolution and launch.
+///
+/// The structural `debug_assert` in [`ResolvedArgv::args`] documents that
+/// the inner length never exceeds the kernel-args cap (a redundant guard
+/// that fails loudly if `parse_argv`'s caps are ever bypassed).
+pub(crate) struct ResolvedArgv {
+    args: Vec<LoweredArg>,
+}
+
+impl ResolvedArgv {
+    /// Resolve the guest argv buffer at `[args_ptr, args_ptr + args_len)`
+    /// into host pointers. NON-ASYNC by construction — see the type docs.
+    ///
+    /// `validate_launch_args` must already have proven the region is
+    /// non-negative and in-bounds; this helper re-derives the slice from a
+    /// single `mem.data(&caller)` borrow and runs [`parse_argv`].
+    fn resolve<T: HasWasiCuda>(
+        caller: &mut Caller<'_, T>,
+        args_ptr: i32,
+        args_len: i32,
+    ) -> Result<Self, AbiError> {
+        if args_len <= 0 {
+            return Ok(Self { args: Vec::new() });
+        }
+        // PERF (T23): skip the `read_bytes` Vec copy of the argv buffer.
+        // `parse_argv` already takes both inputs as `&[u8]`, so we can pass
+        // it slices directly into the caller's linear memory.
+        // `validate_launch_args` has already verified that `args_ptr >= 0`,
+        // `args_len >= 0`, and `[args_ptr, args_ptr + args_len) ⊆ memory`,
+        // so the slicing below cannot panic. A single `mem.data(&caller)`
+        // borrow covers both the args region and the whole-memory
+        // bounds-check that pointer args inside `parse_argv` need.
+        let mem = caller
+            .get_export("memory")
+            .and_then(|e| e.into_memory())
+            .ok_or(AbiError::InvalidPointer)?;
+        let mem_data = mem.data(&caller);
+        let start = args_ptr as usize;
+        let end = start + args_len as usize;
+        let argv_slice = &mem_data[start..end];
+        match parse_argv(argv_slice, mem_data) {
+            Ok(args) => Ok(Self { args }),
+            Err(e) => {
+                caller.data().wasi_cuda().record_error(format!(
+                    "launch: kernel argv parse failed ({}); args_len={args_len}",
+                    e.name()
+                ));
+                Err(e)
+            }
+        }
+    }
+
+    /// Borrow the resolved args. The `debug_assert` is a structural guard:
+    /// `parse_argv` already enforces [`crate::kernel_args::MAX_KERNEL_ARGS`],
+    /// so a longer `Vec` here would mean that cap was bypassed.
+    fn args(&self) -> &[LoweredArg] {
+        debug_assert!(
+            self.args.len() <= crate::kernel_args::MAX_KERNEL_ARGS,
+            "ResolvedArgv exceeds MAX_KERNEL_ARGS — parse_argv cap bypassed"
+        );
+        &self.args
+    }
+
+    /// Consume the wrapper, yielding the inner args. Used by the no-CUDA
+    /// stub path (which has no `cuLaunchKernel` to feed) and by the CUDA
+    /// launch helper once the pointers have been captured.
+    fn into_args(self) -> Vec<LoweredArg> {
+        self.args
+    }
+}
+
+/// The live CUDA dispatch state produced by [`resolve_and_launch_cuda`]
+/// once `cuLaunchKernel` has captured the resolved pointers.
+///
+/// The fields are moved into the `spawn_blocking(synchronize)` closure so
+/// the wasmtime fiber can suspend while the GPU runs. `observed_args` is
+/// the parsed argv re-surfaced into `last_lowered_args` after synchronize.
+#[cfg(feature = "cuda")]
+struct LaunchedKernel {
+    event: cust::event::Event,
+    stream: cust::stream::Stream,
+    storage: crate::kernel_args::KernelParamStorage,
+    observed_args: Vec<LoweredArg>,
+}
+
+/// Resolve guest pointers and launch the kernel in a single **non-async**
+/// critical section (MED finding).
+///
+/// This helper performs, with no `await` between them:
+///   1. bind the CUDA primary context to this thread;
+///   2. resolve the module / function / stream;
+///   3. build the `void**` parameter storage from the resolved argv;
+///   4. validate every pointer arg is GPU-addressable (managed memory);
+///   5. call `cuLaunchKernel`;
+///   6. record a completion `Event`.
+///
+/// Returning a [`LaunchedKernel`] hands the caller exactly the Send state
+/// it needs to await `stream.synchronize()` *after* the pointers are
+/// already captured by the driver — the only safe place for an `await`.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn resolve_and_launch_cuda<T: HasWasiCuda>(
+    caller: &mut Caller<'_, T>,
+    handle: &crate::registry::KernelHandle,
+    resolved: ResolvedArgv,
+    grid_x: i32,
+    grid_y: i32,
+    grid_z: i32,
+    block_x: i32,
+    block_y: i32,
+    block_z: i32,
+    shared_mem: i32,
+) -> Result<LaunchedKernel, AbiError> {
+    use cust::event::{Event, EventFlags};
+    use cust::stream::{Stream, StreamFlags};
+    use cust::sys as cuda_sys;
+
+    use crate::kernel_args::build_kernel_param_storage;
+
+    let lowered_args = resolved.into_args();
+
+    // Fix #6: bind the process-wide primary context to THIS thread before
+    // any of `Stream::new` / `cuLaunchKernel` / `Event::*` run. The async
+    // fiber may be polled on a tokio worker that has never made the context
+    // current, which would otherwise fail every driver call here with
+    // `CUDA_ERROR_INVALID_CONTEXT`. (The `spawn_blocking` synchronize
+    // closure re-binds on its own pool thread.)
+    crate::cuda_ctx::ensure_current_context().map_err(|e| {
+        caller
+            .data()
+            .wasi_cuda()
+            .record_error(format!("launch: CUDA context bind failed: {e}"));
+        AbiError::LaunchFailed
+    })?;
+
+    // The strong `Arc` we already hold keeps the module alive across
+    // launch + synchronize without any raw-pointer gymnastics.
+    let module = handle.module.clone().ok_or_else(|| {
+        caller
+            .data()
+            .wasi_cuda()
+            .record_error("launch: kernel entry has no compiled module");
+        AbiError::InvalidKernel
+    })?;
+
+    let func = module.get_function(&handle.entry).map_err(|e| {
+        caller.data().wasi_cuda().record_error(format!(
+            "launch: get_function({}) failed: {e:?}",
+            handle.entry
+        ));
+        AbiError::LaunchFailed
+    })?;
+
+    let stream = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(|e| {
+        caller
+            .data()
+            .wasi_cuda()
+            .record_error(format!("launch: Stream::new failed: {e:?}"));
+        AbiError::LaunchFailed
+    })?;
+
+    // Build the `void**` parameter storage from the parsed argv. The
+    // storage owns the per-arg value bytes (scalars) and the
+    // pointer-of-pointer slots that `cuLaunchKernel` consumes; we keep it
+    // alive across the launch call below.
+    //
+    // For zero-arg launches `storage.as_ptr()` is still a valid pointer to
+    // an empty slot vec — `cuLaunchKernel` interprets a zero parameter
+    // count as "ignore the argv pointer."
+    let mut storage = build_kernel_param_storage(&lowered_args);
+    let param_count = storage.len();
+    // CUDA reads `kernelParams` only when the kernel's PTX `.param` block
+    // is non-empty; for zero-arg kernels we pass NULL rather than the
+    // (possibly dangling) `Vec::as_mut_ptr()` of an empty slot vec.
+    let kernel_params_ptr: *mut *mut std::ffi::c_void = if param_count == 0 {
+        std::ptr::null_mut()
+    } else {
+        storage.as_ptr()
+    };
+
+    // SECURITY (cross-tenant context poisoning / DoS) — verify every
+    // pointer argument is actually GPU-dereferenceable (CUDA managed
+    // memory) BEFORE handing it to `cuLaunchKernel`.
+    //
+    // The argv pointer path resolves guest offsets to host addresses inside
+    // the guest's linear memory. Those double as device addresses ONLY when
+    // that linear memory is `cuMemAllocManaged`-backed (the unified-memory
+    // `MemoryCreator`). If an embedder runs `--features cuda` with plain
+    // host-heap linear memory, the addresses are not valid on the GPU and
+    // `cuLaunchKernel` makes the kernel dereference host memory, raising
+    // `CUDA_ERROR_ILLEGAL_ADDRESS`. That error is STICKY: it poisons the
+    // process-shared CUDA context, so every later CUDA op by EVERY tenant in
+    // the process then fails. A single guest could thus take down GPU
+    // offload for the whole host.
+    //
+    // We reject such a launch up front — before any driver launch state is
+    // touched — so one guest cannot corrupt the context for others. Managed
+    // pointers cost one cheap `cuPointerGetAttribute` query each. The
+    // `docs/RISKS.md` "linear memory must be UVM-backed" constraint was
+    // documented but unenforced; this is the enforcement.
+    //
+    // SECURITY (finding #3, hardening): we query the SAME `host_ptr` value
+    // that `build_kernel_param_storage` already encoded into the launch
+    // parameter slots, so the pointer we validate is provably the one we
+    // launch. (The `build_kernel_param_storage` call above and this loop
+    // both read `host_ptr` straight out of `lowered_args` — there is no
+    // intervening re-resolution that could let a validated pointer differ
+    // from a launched one.)
+    for arg in &lowered_args {
+        if let LoweredArg::Ptr { host_ptr, .. } = arg {
+            let mut is_managed: std::os::raw::c_int = 0;
+            // SAFETY: `is_managed` is a valid, correctly-typed out-param for
+            // the IS_MANAGED attribute (a 32-bit int). `host_ptr` was
+            // bounds-checked into the guest's live linear memory by
+            // `parse_argv`. `cuPointerGetAttribute` only reads driver
+            // bookkeeping for the address — it never dereferences it.
+            let res = unsafe {
+                cuda_sys::cuPointerGetAttribute(
+                    &mut is_managed as *mut std::os::raw::c_int as *mut std::ffi::c_void,
+                    cuda_sys::CUpointer_attribute_enum::CU_POINTER_ATTRIBUTE_IS_MANAGED,
+                    *host_ptr as cuda_sys::CUdeviceptr,
+                )
+            };
+            // Host-heap pointers are unknown to the driver and return
+            // `CUDA_ERROR_INVALID_VALUE`; managed pointers return success
+            // with `is_managed == 1`. Either non-success or `is_managed == 0`
+            // means the address is not safe to launch against.
+            if res != cuda_sys::CUresult::CUDA_SUCCESS || is_managed == 0 {
+                caller.data().wasi_cuda().record_error(format!(
+                    "launch: kernel pointer argument is not GPU-addressable \
+                     (cuPointerGetAttribute IS_MANAGED -> {res:?}, \
+                     is_managed={is_managed}); refusing to launch so an invalid \
+                     device pointer cannot raise a sticky CUDA_ERROR_ILLEGAL_ADDRESS \
+                     that would poison the shared CUDA context for all tenants. Back \
+                     guest linear memory with the unified-memory MemoryCreator \
+                     (enable the `unified-memory` feature on tensor-wasm-mem)."
+                ));
+                return Err(AbiError::LaunchFailed);
+            }
+        }
+    }
+
+    // SAFETY: launching a kernel is inherently unsafe — the host has no
+    // proof the kernel signature matches the parsed argv. The caller (the
+    // Wasm guest) is responsible for that match; we guarantee only that
+    // (a) every pointer arg points into the guest's own linear memory,
+    // (b) the dims fit the CUDA caps, and (c) the stream/function/module
+    // references are live for the duration of the call (the `Arc<Module>`
+    // clone held in `handle` keeps the module alive across the launch).
+    // Because this fn is non-async, no `await` can run between the
+    // pointer resolution / validation above and this launch call.
+    let launch_status = unsafe {
+        cuda_sys::cuLaunchKernel(
+            // cust 0.3.2 exposes the raw CUfunction handle via `to_raw()`.
+            func.to_raw(),
+            grid_x as u32,
+            grid_y as u32,
+            grid_z as u32,
+            block_x as u32,
+            block_y as u32,
+            block_z as u32,
+            shared_mem as u32,
+            stream.as_inner(),
+            kernel_params_ptr,
+            std::ptr::null_mut(),
+        )
+    };
+    if launch_status != cuda_sys::CUresult::CUDA_SUCCESS {
+        caller.data().wasi_cuda().record_error(format!(
+            "launch: cuLaunchKernel failed with status {launch_status:?}; \
+             param_count={param_count}"
+        ));
+        return Err(AbiError::LaunchFailed);
+    }
+
+    // Record an event on the stream so the dispatch future can poll
+    // completion without holding a stream synchronize call open.
+    let event = Event::new(EventFlags::DEFAULT).map_err(|e| {
+        caller
+            .data()
+            .wasi_cuda()
+            .record_error(format!("launch: Event::new failed: {e:?}"));
+        AbiError::LaunchFailed
+    })?;
+    event.record(&stream).map_err(|e| {
+        caller
+            .data()
+            .wasi_cuda()
+            .record_error(format!("launch: event.record failed: {e:?}"));
+        AbiError::LaunchFailed
+    })?;
+
+    Ok(LaunchedKernel {
+        event,
+        stream,
+        storage,
+        observed_args: lowered_args,
+    })
+}
+
 /// Asynchronous wrapper around the launch implementation.
 ///
 /// On the no-CUDA path the body is essentially identical to the old
@@ -1731,6 +2054,18 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
     // of the parameter slot bytes and we never re-read the resolved
     // pointers from this side.
     //
+    // MED finding: the use-after-grow safety used to rest on a comment
+    // alone — nothing structurally stopped a future edit from inserting an
+    // `await` between the `parse_argv` pointer resolution and the
+    // `cuLaunchKernel` that consumes those pointers. We now TYPE the
+    // invariant: [`ResolvedArgv`] can only be constructed inside the
+    // non-async [`ResolvedArgv::resolve`] helper, which takes the
+    // `&mut Caller` borrow and never awaits. The CUDA dispatch then takes
+    // the `ResolvedArgv` by value inside the equally non-async
+    // [`resolve_and_launch_cuda`], so the borrow checker forbids any
+    // `await` between resolution and launch — the comment is now a
+    // compile-time guarantee.
+    //
     // `KernelArgsUnsupported` is preserved as a fallback for buffers that
     // exceed the kernel-args sanity caps — see
     // [`crate::kernel_args::MAX_KERNEL_ARGS_BYTES`] /
@@ -1740,37 +2075,7 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
     // outer buffer still runs first inside `validate_launch_args`, so a
     // malicious guest cannot trade a `MemoryFault` for the friendlier
     // tag-byte error.
-    let lowered_args: Vec<LoweredArg> = if args_len > 0 {
-        // PERF (T23): skip the `read_bytes` Vec copy of the argv buffer.
-        // `parse_argv` already takes both inputs as `&[u8]`, so we can
-        // pass it slices directly into the caller's linear memory.
-        // `validate_launch_args` above has already verified that
-        // `args_ptr >= 0`, `args_len >= 0`, and `[args_ptr, args_ptr +
-        // args_len) ⊆ memory`, so the slicing below cannot panic. A
-        // single `mem.data(&caller)` borrow covers both the args region
-        // and the whole-memory bounds-check that pointer args inside
-        // `parse_argv` need.
-        let mem = caller
-            .get_export("memory")
-            .and_then(|e| e.into_memory())
-            .ok_or(AbiError::InvalidPointer)?;
-        let mem_data = mem.data(&caller);
-        let start = args_ptr as usize;
-        let end = start + args_len as usize;
-        let argv_slice = &mem_data[start..end];
-        match parse_argv(argv_slice, mem_data) {
-            Ok(v) => v,
-            Err(e) => {
-                caller.data().wasi_cuda().record_error(format!(
-                    "launch: kernel argv parse failed ({}); args_len={args_len}",
-                    e.name()
-                ));
-                return Err(e);
-            }
-        }
-    } else {
-        Vec::new()
-    };
+    let resolved = ResolvedArgv::resolve(caller, args_ptr, args_len)?;
 
     // Stash the parsed argv for observability BEFORE the kernel-handle
     // lookup. Tests inspect `last_lowered_args` to confirm the
@@ -1785,7 +2090,7 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
         .wasi_cuda()
         .last_lowered_args
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = lowered_args.clone();
+        .unwrap_or_else(|e| e.into_inner()) = resolved.args().to_vec();
 
     // Eagerly take a strong, owned handle to the kernel (Arc-wrapped on
     // CUDA builds). This both validates `kid` and frees the registry's
@@ -1796,189 +2101,21 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
 
     #[cfg(feature = "cuda")]
     {
-        use cust::event::{Event, EventFlags};
-        use cust::stream::{Stream, StreamFlags};
-
-        use crate::kernel_args::build_kernel_param_storage;
-
-        // Fix #6: bind the process-wide primary context to THIS thread before
-        // any of `Stream::new` / `cuLaunchKernel` / `Event::*` run. The async
-        // fiber may be polled on a tokio worker that has never made the context
-        // current, which would otherwise fail every driver call here with
-        // `CUDA_ERROR_INVALID_CONTEXT`. (The `spawn_blocking` synchronize
-        // closure below re-binds on its own pool thread.)
-        crate::cuda_ctx::ensure_current_context().map_err(|e| {
-            caller
-                .data()
-                .wasi_cuda()
-                .record_error(format!("launch: CUDA context bind failed: {e}"));
-            AbiError::LaunchFailed
-        })?;
-
-        // The strong `Arc` we already hold keeps the module alive across
-        // launch + synchronize without any raw-pointer gymnastics.
-        let module = handle.module.clone().ok_or_else(|| {
-            caller
-                .data()
-                .wasi_cuda()
-                .record_error("launch: kernel entry has no compiled module");
-            AbiError::InvalidKernel
-        })?;
-
-        let func = module.get_function(&handle.entry).map_err(|e| {
-            caller.data().wasi_cuda().record_error(format!(
-                "launch: get_function({}) failed: {e:?}",
-                handle.entry
-            ));
-            AbiError::LaunchFailed
-        })?;
-
-        let stream = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(|e| {
-            caller
-                .data()
-                .wasi_cuda()
-                .record_error(format!("launch: Stream::new failed: {e:?}"));
-            AbiError::LaunchFailed
-        })?;
-
-        // Build the `void**` parameter storage from the parsed argv. The
-        // storage owns the per-arg value bytes (scalars) and the
-        // pointer-of-pointer slots that `cuLaunchKernel` consumes; we
-        // keep it alive across the launch call below.
-        //
-        // For zero-arg launches `storage.as_ptr()` is still a valid
-        // pointer to an empty slot vec — `cuLaunchKernel` interprets a
-        // zero parameter count as "ignore the argv pointer."
-        let mut storage = build_kernel_param_storage(&lowered_args);
-        let param_count = storage.len();
-        // CUDA reads `kernelParams` only when the kernel's PTX `.param`
-        // block is non-empty; for zero-arg kernels we pass NULL rather
-        // than the (possibly dangling) `Vec::as_mut_ptr()` of an empty
-        // slot vec.
-        let kernel_params_ptr: *mut *mut std::ffi::c_void = if param_count == 0 {
-            std::ptr::null_mut()
-        } else {
-            storage.as_ptr()
-        };
-
-        // Drop down to `cust::sys::cuLaunchKernel` because `cust::launch!`
-        // forces statically-typed args at the call site. The raw call
-        // takes a `*mut *mut c_void` of length `param_count` — exactly
-        // what `storage.as_ptr()` provides. We pass a null `extra`
-        // pointer because CUDA accepts either form (params XOR extra).
-        //
-        // NOTE: `cust 0.3`'s `Function` and `Stream` raw-handle
-        // accessors (`as_raw` / `as_inner`) are stable across the 0.3.x
-        // line; if a future cust bump renames them this is the only
-        // call site that needs to follow.
-        //
-        // SAFETY: launching a kernel is inherently unsafe — the host has
-        // no proof the kernel signature matches the parsed argv. The
-        // caller (the Wasm guest) is responsible for that match; we
-        // guarantee only that (a) every pointer arg points into the
-        // guest's own linear memory, (b) the dims fit the CUDA caps,
-        // and (c) the stream/function/module references are live for
-        // the duration of the call (the `Arc<Module>` clone held in
-        // `handle` keeps the module alive across the launch).
-        use cust::sys as cuda_sys;
-
-        // SECURITY (cross-tenant context poisoning / DoS) — verify every
-        // pointer argument is actually GPU-dereferenceable (CUDA managed
-        // memory) BEFORE handing it to `cuLaunchKernel`.
-        //
-        // The argv pointer path resolves guest offsets to host addresses inside
-        // the guest's linear memory. Those double as device addresses ONLY when
-        // that linear memory is `cuMemAllocManaged`-backed (the unified-memory
-        // `MemoryCreator`). If an embedder runs `--features cuda` with plain
-        // host-heap linear memory, the addresses are not valid on the GPU and
-        // `cuLaunchKernel` makes the kernel dereference host memory, raising
-        // `CUDA_ERROR_ILLEGAL_ADDRESS`. That error is STICKY: it poisons the
-        // process-shared CUDA context, so every later CUDA op by EVERY tenant in
-        // the process then fails. A single guest could thus take down GPU
-        // offload for the whole host. (This is also what intermittently broke
-        // the launch e2e suite when an earlier test launched against host-heap
-        // memory — the poisoned context failed the next test's module load.)
-        //
-        // We reject such a launch up front — before any driver launch state is
-        // touched — so one guest cannot corrupt the context for others. Managed
-        // pointers cost one cheap `cuPointerGetAttribute` query each. The
-        // `docs/RISKS.md` "linear memory must be UVM-backed" constraint was
-        // documented but unenforced; this is the enforcement.
-        for arg in &lowered_args {
-            if let LoweredArg::Ptr { host_ptr, .. } = arg {
-                let mut is_managed: std::os::raw::c_int = 0;
-                // SAFETY: `is_managed` is a valid, correctly-typed out-param for
-                // the IS_MANAGED attribute (a 32-bit int). `host_ptr` was
-                // bounds-checked into the guest's live linear memory by
-                // `parse_argv`. `cuPointerGetAttribute` only reads driver
-                // bookkeeping for the address — it never dereferences it.
-                let res = unsafe {
-                    cuda_sys::cuPointerGetAttribute(
-                        &mut is_managed as *mut std::os::raw::c_int as *mut std::ffi::c_void,
-                        cuda_sys::CUpointer_attribute_enum::CU_POINTER_ATTRIBUTE_IS_MANAGED,
-                        *host_ptr as cuda_sys::CUdeviceptr,
-                    )
-                };
-                // Host-heap pointers are unknown to the driver and return
-                // `CUDA_ERROR_INVALID_VALUE`; managed pointers return success
-                // with `is_managed == 1`. Either non-success or `is_managed == 0`
-                // means the address is not safe to launch against.
-                if res != cuda_sys::CUresult::CUDA_SUCCESS || is_managed == 0 {
-                    caller.data().wasi_cuda().record_error(format!(
-                        "launch: kernel pointer argument is not GPU-addressable \
-                         (cuPointerGetAttribute IS_MANAGED -> {res:?}, \
-                         is_managed={is_managed}); refusing to launch so an invalid \
-                         device pointer cannot raise a sticky CUDA_ERROR_ILLEGAL_ADDRESS \
-                         that would poison the shared CUDA context for all tenants. Back \
-                         guest linear memory with the unified-memory MemoryCreator \
-                         (enable the `unified-memory` feature on tensor-wasm-mem)."
-                    ));
-                    return Err(AbiError::LaunchFailed);
-                }
-            }
-        }
-
-        let launch_status = unsafe {
-            cuda_sys::cuLaunchKernel(
-                // cust 0.3.2 exposes the raw CUfunction handle via `to_raw()`
-                // (NOT `as_raw()`); the spike originally guessed wrong.
-                func.to_raw(),
-                grid_x as u32,
-                grid_y as u32,
-                grid_z as u32,
-                block_x as u32,
-                block_y as u32,
-                block_z as u32,
-                shared_mem as u32,
-                stream.as_inner(),
-                kernel_params_ptr,
-                std::ptr::null_mut(),
-            )
-        };
-        if launch_status != cuda_sys::CUresult::CUDA_SUCCESS {
-            caller.data().wasi_cuda().record_error(format!(
-                "launch: cuLaunchKernel failed with status {launch_status:?}; \
-                 param_count={param_count}"
-            ));
-            return Err(AbiError::LaunchFailed);
-        }
-
-        // Record an event on the stream so the dispatch future can poll
-        // completion without holding a stream synchronize call open.
-        let event = Event::new(EventFlags::DEFAULT).map_err(|e| {
-            caller
-                .data()
-                .wasi_cuda()
-                .record_error(format!("launch: Event::new failed: {e:?}"));
-            AbiError::LaunchFailed
-        })?;
-        event.record(&stream).map_err(|e| {
-            caller
-                .data()
-                .wasi_cuda()
-                .record_error(format!("launch: event.record failed: {e:?}"));
-            AbiError::LaunchFailed
-        })?;
+        // The entire pointer-resolution → managed-pointer validation →
+        // `cuLaunchKernel` → `event.record` sequence runs inside the
+        // NON-ASYNC `resolve_and_launch_cuda` helper. Because that helper
+        // is a plain `fn` (not `async fn`), the borrow checker forbids any
+        // `await` inside it — so no future edit can re-open the
+        // use-after-grow window between resolving the guest pointers and
+        // handing them to `cuLaunchKernel`. The `await` below
+        // (`spawn_blocking(synchronize)`) only happens AFTER the launch has
+        // captured the pointers; the guest cannot run (let alone grow
+        // memory) until this async fn returns, so a post-launch await is
+        // safe by construction.
+        let launched = resolve_and_launch_cuda(
+            caller, &handle, resolved, grid_x, grid_y, grid_z, block_x, block_y, block_z,
+            shared_mem,
+        )?;
 
         // Move the stream + event + arg storage into the blocking task so
         // synchronize doesn't block the wasmtime fiber. Stream + Event
@@ -1990,6 +2127,12 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
         // captured, but the closure keeps the backing alive in case
         // CUDA dereferences it again during sync.
         let handle_for_keepalive = handle.clone();
+        let LaunchedKernel {
+            event,
+            stream,
+            storage,
+            observed_args,
+        } = launched;
         let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let _keep_event = event;
             let _keep_module = handle_for_keepalive;
@@ -2023,7 +2166,7 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
             .wasi_cuda()
             .last_lowered_args
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = lowered_args;
+            .unwrap_or_else(|e| e.into_inner()) = observed_args;
         // Telemetry: a successful launch + synchronize counts as one
         // dispatched kernel for this instance.
         caller.data().wasi_cuda().record_kernel_launched();
@@ -2042,6 +2185,7 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
         // surface `NotAvailable` so the Wasm caller knows the launch
         // did not run.
         let _ = handle; // suppress unused warning on no-CUDA.
+        let lowered_args = resolved.into_args();
         let parsed_count = lowered_args.len();
         *caller
             .data()
