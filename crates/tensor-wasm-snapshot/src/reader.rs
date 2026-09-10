@@ -1754,55 +1754,59 @@ pub struct RestoredOnGpu {
 /// Restore `bytes` and stage the `gpu_memory` payload onto the GPU at
 /// `device_index` via `cuMemPrefetchAsync` on a fresh non-blocking stream.
 ///
-/// # ⚠️ SECURITY — INSECURE BY DEFAULT, DEPRECATED ⚠️
+/// # SECURITY — authenticated by construction
 ///
-/// This convenience wrapper restores through a *default*
-/// [`SnapshotReader::new`]: **no HMAC/Ed25519 key, `require_signature =
-/// false`**. It will therefore accept an unsigned, unauthenticated v2 blob
-/// from an arbitrary source and copy its attacker-controlled `gpu_memory`
-/// straight into a `UnifiedBuffer` that is prefetched onto the device — a
-/// direct path for hostile bytes to reach the GPU with no signature, no
-/// freshness, and no replay check. Do **not** call this on any blob whose
-/// origin you do not fully trust.
+/// This entry point used to restore through a *default* [`SnapshotReader::new`]
+/// (**no HMAC key, `require_signature = false`**), so it would copy an
+/// unsigned, attacker-controlled `gpu_memory` blob straight onto the device.
+/// That insecure-by-default behaviour is gone: the function now **requires** a
+/// 32-byte HMAC-SHA256 verification key and verifies the signature before any
+/// payload byte is staged.
 ///
-/// Use [`restore_to_gpu_with`] instead and pass a reader hardened with
-/// [`SnapshotReader::with_hmac_sha256_key`] /
-/// [`SnapshotReader::with_ed25519_verifying_key`],
-/// [`SnapshotReader::require_signature`], and (as appropriate)
-/// [`SnapshotReader::with_max_age`] / [`SnapshotReader::with_min_sequence_no`] /
-/// [`SnapshotReader::with_expected_nonce`]. Those knobs are simply
-/// unreachable through this entry point.
+/// `hmac_key` is the symmetric key the snapshot was signed with. Internally we
+/// build a reader hardened with [`SnapshotReader::with_hmac_sha256_key`] **and**
+/// [`SnapshotReader::require_signature`], so an unsigned v2 blob and a v3 blob
+/// signed under any other key are both rejected — there is no longer a code
+/// path through this function that stages unauthenticated bytes to the GPU.
 ///
-/// Retained only for backward compatibility (deleting it would break existing
-/// callers); it is `#[deprecated]` to steer all new code to the `_with`
-/// variant. Behaviour is otherwise unchanged: it delegates verbatim to
-/// [`restore_to_gpu_with`] with a default reader.
+/// # Migration
+///
+/// This is a **breaking signature change** from the pre-0.3.8 form
+/// `restore_to_gpu(bytes, device_index)`. Callers must now pass the HMAC key:
+/// `restore_to_gpu(bytes, device_index, key)`. Callers that need finer control
+/// — an Ed25519 *public* key, a custom decompression cap, freshness, or replay
+/// floors — should use [`restore_to_gpu_with`] and pass a reader configured to
+/// taste. (That reader **must** still be hardened by the caller; this crate no
+/// longer offers an entry point that stages to the GPU without verification.)
 ///
 /// On success the returned [`RestoredOnGpu`] owns a populated
 /// `UnifiedBuffer<u8>` whose pages have been requested to migrate to the
 /// target device. The stream is synchronised before return so the buffer
 /// is observably ready (no half-prefetched state leaks to the caller).
 ///
-/// Requires the `cuda` feature; on no-CUDA builds this symbol does not
-/// exist, and callers should fall back to [`SnapshotReader::restore`]
-/// followed by a manual host-to-device copy.
-// SECURITY (insecure-by-default convenience entry point): mark deprecated so
-// the compiler nudges every call site toward the authenticated `_with`
-// variant. We intentionally do NOT change behaviour here (that would break
-// callers) — the fix is the deprecation attribute plus the elevated warning
-// above.
-#[cfg(feature = "cuda")]
-#[cfg_attr(docsrs, doc(cfg(feature = "cuda")))]
-#[deprecated(
-    since = "0.3.8",
-    note = "insecure by default (no signature verification): restores via a default reader with no \
-            signature/HMAC key and require_signature=false, staging attacker-controlled bytes to \
-            the GPU. Use restore_to_gpu_with with a key-configured SnapshotReader (pass a reader \
-            hardened with with_hmac_sha256_key/with_ed25519_verifying_key and require_signature)."
-)]
-#[instrument(skip(bytes), fields(input_len = bytes.len(), device_index = device_index))]
-pub fn restore_to_gpu(bytes: &[u8], device_index: u32) -> Result<RestoredOnGpu> {
-    restore_to_gpu_with(&SnapshotReader::new(), bytes, device_index)
+/// Requires the `cuda` **and** `signed-snapshots` features; on builds without
+/// HMAC verification this symbol does not exist, and callers should fall back
+/// to [`SnapshotReader::restore`] followed by a manual host-to-device copy.
+// SECURITY (was insecure-by-default): the old zero-argument-key form delegated
+// to a default reader with `require_signature == false`. Per finding M-1 the
+// public API now takes the HMAC key by value and hardens the reader itself, so
+// the verification cannot be skipped. We gate on `signed-snapshots` so the
+// signature is *structurally* unavoidable — there is no longer a build in which
+// this function can run without HMAC verification.
+#[cfg(all(feature = "cuda", feature = "signed-snapshots"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "cuda", feature = "signed-snapshots"))))]
+#[instrument(skip(bytes, hmac_key), fields(input_len = bytes.len(), device_index = device_index))]
+pub fn restore_to_gpu(
+    bytes: &[u8],
+    device_index: u32,
+    hmac_key: [u8; 32],
+) -> Result<RestoredOnGpu> {
+    // Build a reader that both knows the key and refuses anything unsigned, so
+    // the GPU never sees a byte that has not been HMAC-verified.
+    let reader = SnapshotReader::new()
+        .with_hmac_sha256_key(hmac_key)
+        .require_signature();
+    restore_to_gpu_with(&reader, bytes, device_index)
 }
 
 /// Restore `bytes` through the caller-supplied `reader` and stage the
