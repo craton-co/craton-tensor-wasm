@@ -449,6 +449,35 @@ fn finalize_into_tag(mac: ArtifactMac) -> [u8; ARTIFACT_HMAC_LEN] {
     tag
 }
 
+/// Render `hash` to its 64-char lowercase hex form and validate it is a
+/// safe filename segment before it is joined into a path.
+///
+/// A [`ContentHash`]'s `Display` always emits exactly 64 lowercase
+/// ascii-hex chars (32 bytes, two hex digits each), so for any real hash
+/// this check passes — but it is a *runtime* gate (not a `debug_assert!`)
+/// so the guarantee survives a release build. If a future change to the
+/// digest size or the `Display` impl ever yielded a wrong-length or
+/// traversal-shaped segment (e.g. one containing `/`, `\`, or `.`), this
+/// rejects it with [`ArtifactError::BadMagic`] rather than feeding a
+/// malformed component into `Path::join`. Returns the validated hex on
+/// success.
+fn validated_hash_segment(hash: &ContentHash) -> Result<String, ArtifactError> {
+    let hash_hex = hash.to_string();
+    let well_formed = hash_hex.len() == 64
+        && hash_hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !well_formed {
+        warn!(
+            target: "tensor_wasm_artifacts",
+            segment = %hash_hex,
+            "ContentHash rendered to an unsafe filename segment; refusing path"
+        );
+        return Err(ArtifactError::BadMagic);
+    }
+    Ok(hash_hex)
+}
+
 /// 8-byte hex fingerprint of the HMAC key. Used to partition the on-disk
 /// namespace when multiple stores share a directory under different
 /// keys — without this, two writers with different keys would clobber
@@ -607,29 +636,20 @@ impl DiskArtifactStore {
     /// Filename format: `{content_hash_hex}.{key_fp_hex}.bin`. The key
     /// fingerprint segment partitions the namespace per HMAC key so
     /// two stores in the same dir under different keys never collide.
-    fn path_for(&self, hash: &ContentHash) -> PathBuf {
+    fn path_for(&self, hash: &ContentHash) -> Result<PathBuf, ArtifactError> {
         self.path_for_key(hash, &self.key_fp_hex)
     }
 
     /// Compute the on-disk path for `hash` under the key whose fingerprint
     /// is `key_fp_hex`. Used by the rotation-aware `get` to probe each
     /// accepted read key's namespace in turn.
-    fn path_for_key(&self, hash: &ContentHash, key_fp_hex: &str) -> PathBuf {
-        let hash_hex = hash.to_string();
-        // The rendered hash MUST be exactly 64 lowercase ascii-hex chars
-        // before it becomes a path component — `ContentHash`'s `Display`
-        // guarantees this (32 bytes, two hex digits each), but assert it
-        // so a future change to the digest size or formatter can never
-        // silently feed a traversal-shaped or wrong-length segment into
-        // `Path::join`.
-        debug_assert!(
-            hash_hex.len() == 64
-                && hash_hex
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-            "ContentHash rendered to an unexpected filename segment: {hash_hex:?}"
-        );
-        self.dir.join(format!("{hash_hex}.{key_fp_hex}.bin"))
+    fn path_for_key(
+        &self,
+        hash: &ContentHash,
+        key_fp_hex: &str,
+    ) -> Result<PathBuf, ArtifactError> {
+        let hash_hex = validated_hash_segment(hash)?;
+        Ok(self.dir.join(format!("{hash_hex}.{key_fp_hex}.bin")))
     }
 
     /// On-disk path for the metadata sidecar of `hash` under the active
@@ -638,7 +658,7 @@ impl DiskArtifactStore {
     /// partitioned naming and is filtered out of `list` (which only
     /// matches `.bin`). Counterpart helper [`Self::meta_path_for_key`]
     /// resolves the sidecar under an arbitrary accepted read key.
-    fn meta_path_for(&self, hash: &ContentHash) -> PathBuf {
+    fn meta_path_for(&self, hash: &ContentHash) -> Result<PathBuf, ArtifactError> {
         self.meta_path_for_key(hash, &self.key_fp_hex)
     }
 
@@ -647,9 +667,13 @@ impl DiskArtifactStore {
     /// read so a sidecar written under a now-retired key is still found,
     /// and by `remove` so the sidecar is unlinked under the same key as the
     /// blob it describes.
-    fn meta_path_for_key(&self, hash: &ContentHash, key_fp_hex: &str) -> PathBuf {
-        let hash_hex = hash.to_string();
-        self.dir.join(format!("{hash_hex}.{key_fp_hex}.meta.json"))
+    fn meta_path_for_key(
+        &self,
+        hash: &ContentHash,
+        key_fp_hex: &str,
+    ) -> Result<PathBuf, ArtifactError> {
+        let hash_hex = validated_hash_segment(hash)?;
+        Ok(self.dir.join(format!("{hash_hex}.{key_fp_hex}.meta.json")))
     }
 
     /// Insert `payload` (exactly like [`ArtifactStore::put`]) and write an
@@ -682,7 +706,7 @@ impl DiskArtifactStore {
         // Atomic publish of the sidecar via temp-then-rename, mirroring
         // the blob's own publish so a torn write never leaves a partial
         // sidecar a concurrent reader trips over.
-        let meta_path = self.meta_path_for(&hash);
+        let meta_path = self.meta_path_for(&hash)?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| {
             warn!(target: "tensor_wasm_artifacts", error = %e, "metadata tempfile create failed");
             ArtifactError::Io
@@ -729,7 +753,7 @@ impl DiskArtifactStore {
             None => return Err(ArtifactError::NotFound(hash.to_string())),
         };
         let fp = key_fingerprint_hex(&key);
-        let meta_path = self.meta_path_for_key(hash, &fp);
+        let meta_path = self.meta_path_for_key(hash, &fp)?;
         let bytes = match std::fs::read(&meta_path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -950,7 +974,7 @@ impl DiskArtifactStore {
     ) -> Result<Option<(PathBuf, [u8; 32])>, ArtifactError> {
         for key in self.key_provider.read_keys() {
             let fp = key_fingerprint_hex(&key);
-            let path = self.path_for_key(hash, &fp);
+            let path = self.path_for_key(hash, &fp)?;
             match std::fs::metadata(&path) {
                 Ok(_) => return Ok(Some((path, key))),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1091,7 +1115,7 @@ impl ArtifactStore for DiskArtifactStore {
         // through. Result: peak heap during `put` is bounded by the
         // 64 KiB BufWriter slab plus zstd's internal window, regardless
         // of payload size.
-        let final_path = self.path_for(&hash);
+        let final_path = self.path_for(&hash)?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| {
             warn!(target: "tensor_wasm_artifacts", error = %e, "tempfile create failed");
             ArtifactError::Io
@@ -1634,7 +1658,13 @@ impl ArtifactStore for DiskArtifactStore {
         // the blob-removal result, since the blob — the authoritative entry
         // — is already gone.
         let fp = key_fingerprint_hex(&key);
-        let meta_path = self.meta_path_for_key(hash, &fp);
+        let meta_path = match self.meta_path_for_key(hash, &fp) {
+            Ok(p) => p,
+            // The blob was already resolved + unlinked above; a malformed
+            // segment here only affects the best-effort sidecar cleanup, so
+            // don't flip the authoritative blob-removal result.
+            Err(_) => return Ok(removed),
+        };
         if let Err(e) = std::fs::remove_file(&meta_path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 warn!(
@@ -2153,5 +2183,45 @@ mod tests {
         assert_eq!(ARTIFACT_HEADER_LEN, 16 + 4 + 32);
         assert_eq!(ARTIFACT_HMAC_LEN, 32);
         assert_eq!(ARTIFACT_MAGIC.len(), 16);
+    }
+
+    #[test]
+    fn validated_hash_segment_accepts_real_hash() {
+        // Every genuine `ContentHash` renders to 64 lowercase hex chars,
+        // so the runtime guard accepts it and returns that exact string.
+        let hash = ContentHash::of(b"path-safe payload");
+        let seg = validated_hash_segment(&hash).expect("real hash is a safe segment");
+        assert_eq!(seg.len(), 64);
+        assert_eq!(seg, hash.to_string());
+        // No traversal- or separator-shaped chars can be present.
+        assert!(seg
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    }
+
+    #[test]
+    fn validated_hash_segment_rejects_malformed_render() {
+        // The guard is a runtime check (not a `debug_assert!`), so it must
+        // reject a wrong-length / traversal-shaped segment in release too.
+        // We can't make a real `ContentHash` render badly, so exercise the
+        // predicate the guard applies directly against adversarial inputs.
+        let bad_segments = [
+            "../../../etc/passwd",          // traversal-shaped
+            "..",                           // parent dir
+            "deadbeef",                     // too short
+            &"ab".repeat(33),               // too long (66 chars)
+            &("zz".to_owned() + &"ab".repeat(31)), // non-hex char 'z'
+            "ab/cd",                        // embedded separator
+        ];
+        for bad in bad_segments {
+            let well_formed = bad.len() == 64
+                && bad
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            assert!(
+                !well_formed,
+                "guard predicate must reject unsafe segment {bad:?}"
+            );
+        }
     }
 }
