@@ -78,6 +78,12 @@ pub async fn run(args: InvokeArgs, ctx: &HttpContext) -> Result<()> {
     // crate's plain `anyhow` error handling. Keep the two in lockstep.
     validate_identifier_charset(&args.id, "id")?;
 
+    // sec LOW (mod.rs L2): warn once if a bearer token would be sent over
+    // plaintext http:// to a non-loopback host. Classified from the
+    // `--server` string up front so the warning is independent of whether the
+    // request body is clonable.
+    ctx.warn_if_plaintext_token(&args.server);
+
     let parsed_args: serde_json::Value = match &args.args {
         Some(json) => {
             let parsed: serde_json::Value = serde_json::from_str(json)

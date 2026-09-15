@@ -235,6 +235,9 @@ async fn save(
     ctx: &HttpContext,
 ) -> Result<()> {
     super::validate_server_url(server)?;
+    // sec LOW (mod.rs L2): warn once if a bearer token would be sent over
+    // plaintext http:// to a non-loopback host.
+    ctx.warn_if_plaintext_token(server);
     validate_parent_writable(output)?;
     if instance_id.trim().is_empty() {
         return Err(local_err("--instance must be non-empty"));
@@ -397,6 +400,13 @@ async fn restore(
     ctx: &HttpContext,
 ) -> Result<()> {
     super::validate_server_url(server)?;
+    // sec LOW (mod.rs L2): warn once if a bearer token would be sent over
+    // plaintext http:// to a non-loopback host. This call site is the reason
+    // the classification was hoisted out of `HttpContext::apply`: `restore`
+    // sends a streaming `ReaderStream` body, which makes `req.try_clone()`
+    // return `None`, so the old try_clone-based inspection in `apply` never
+    // warned for this command.
+    ctx.warn_if_plaintext_token(server);
     if as_instance.trim().is_empty() {
         return Err(local_err("--as-instance must be non-empty"));
     }

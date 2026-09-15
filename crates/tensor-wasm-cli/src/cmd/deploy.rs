@@ -80,6 +80,11 @@ struct CreateFunctionRequest<'a> {
 pub async fn run(args: DeployArgs, ctx: &HttpContext) -> Result<()> {
     super::validate_server_url(&args.server)?;
 
+    // sec LOW (mod.rs L2): warn once if a bearer token would be sent over
+    // plaintext http:// to a non-loopback host. Classified from the
+    // `--server` string up front (independent of body clonability).
+    ctx.warn_if_plaintext_token(&args.server);
+
     let metadata = std::fs::metadata(&args.file)
         .with_context(|| format!("locating wasm file {}", args.file.display()))?;
     if !metadata.is_file() {

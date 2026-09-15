@@ -221,33 +221,55 @@ impl HttpContext {
     /// when configured. Returns the (possibly unchanged) builder so callers
     /// can chain.
     ///
-    /// When a bearer token is configured and the request URL is non-loopback
-    /// `http://`, a one-shot `tracing::warn!` fires so an operator who
-    /// accidentally points the CLI at a plaintext endpoint sees a clear
-    /// signal in their logs. We do NOT refuse — operators may legitimately
-    /// be on a trusted private network; the HMAC-key case in `snapshot.rs`
-    /// is stricter (refuse) because the snapshot signing key is far more
-    /// sensitive than a bearer token (which can be rotated cheaply).
+    /// The plaintext-token safety warning is NOT emitted here. It used to be,
+    /// gated on `req.try_clone()` so we could peek at the builder's URL — but
+    /// `try_clone()` returns `None` for a streaming body (e.g. the
+    /// `snapshot restore` upload, which wraps a `ReaderStream`), so that path
+    /// silently skipped the warning for exactly the request that carries a
+    /// large body across the wire. Classification is now done up front from
+    /// the `--server` / `--addr` string via [`Self::warn_if_plaintext_token`],
+    /// which every command calls right after `validate_server_url` (before any
+    /// request — streaming or not — is built). See sec LOW (mod.rs L2).
     pub fn apply(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(t) = &self.token {
-            // Try to inspect the URL on the in-flight builder so we can warn
-            // before the token leaves the process. `try_clone` + `build` is
-            // the only stable way to peek at the builder's URL today.
-            if let Some(cloned) = req.try_clone() {
-                if let Ok(built) = cloned.build() {
-                    let scheme = built.url().scheme();
-                    let host = built.url().host_str().unwrap_or("");
-                    if scheme == "http" && !is_loopback_host(host) {
-                        warn_plaintext_token_once();
-                    }
-                }
-            }
             req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
         }
         if self.tenant != 0 {
             req = req.header(TENANT_HEADER, self.tenant.to_string());
         }
         req
+    }
+
+    /// Emit the one-shot plaintext-token warning if a bearer token is
+    /// configured AND `server_url` is a non-loopback `http://` target.
+    ///
+    /// Classifying from the configured `--server` / `--addr` string (rather
+    /// than from an in-flight `RequestBuilder` via `try_clone`) means the
+    /// warning fires uniformly for every command, including those that send a
+    /// streaming body — `try_clone()` returns `None` for a `ReaderStream`
+    /// body, so the old inspection in [`Self::apply`] never warned for the
+    /// `snapshot restore` upload. Callers invoke this once, right after
+    /// `validate_server_url`, before building any request.
+    ///
+    /// No warning fires when no token is configured (nothing to leak), when
+    /// the scheme is `https://` (encrypted), or when the host is loopback
+    /// (`localhost` / `127.0.0.0/8` / `::1`, the dev quickstart targets).
+    /// Reuses [`extract_scheme_host`] / [`is_loopback_host`] so the
+    /// classification matches the HMAC-key refuse gate in `snapshot.rs`.
+    ///
+    /// `pub` (gated by `#[doc(hidden)]`) so the integration test in
+    /// `tests/url_credential_safety.rs` can drive the warn-once gate through
+    /// the lib surface. NOT stable API.
+    #[doc(hidden)]
+    pub fn warn_if_plaintext_token(&self, server_url: &str) {
+        if self.token.is_none() {
+            return;
+        }
+        if let Some((scheme, host)) = extract_scheme_host(server_url) {
+            if scheme == "http" && !is_loopback_host(host) {
+                warn_plaintext_token_once();
+            }
+        }
     }
 }
 
@@ -730,9 +752,9 @@ mod tests {
             tls: TlsOptions::default(),
         };
         // Build an off-stack RequestBuilder so we can inspect headers.
-        // Use https:// so this test doesn't trip the plaintext-token warn-once
-        // latch and inadvertently flip the gate state observed by the
-        // sibling tests in `tests/url_credential_safety.rs`.
+        // `apply` no longer inspects the URL (the plaintext-token warning was
+        // hoisted into `warn_if_plaintext_token`), so the scheme here is
+        // immaterial to the latch; `https://` is kept for realism.
         let client = reqwest::Client::new();
         let req = ctx.apply(client.get("https://x")).build().unwrap();
         assert_eq!(req.headers().get("authorization").unwrap(), "Bearer abc");
@@ -906,6 +928,40 @@ mod tests {
             msg.contains("PEM") || msg.contains("--ca-cert"),
             "error should explain the PEM parse failure: {msg}"
         );
+    }
+
+    #[test]
+    fn warn_if_plaintext_token_is_noop_without_token() {
+        // No token configured → nothing to leak, so even a hostile
+        // non-loopback http:// URL must not flip the global warn-once latch.
+        // We can only assert the *unset* direction reliably if this is the
+        // first observer in the binary; to stay order-independent we instead
+        // assert the structural invariant: the call returns without panicking
+        // and the no-token branch is the only reachable path. (The positive
+        // trip is covered in `tests/url_credential_safety.rs`, which owns its
+        // own test binary.)
+        let ctx = HttpContext {
+            token: None,
+            tenant: 0,
+            tls: TlsOptions::default(),
+        };
+        ctx.warn_if_plaintext_token("http://attacker.example.com:8080");
+    }
+
+    #[test]
+    fn warn_if_plaintext_token_is_noop_for_https_and_loopback() {
+        // A configured token over https:// (encrypted) or loopback http://
+        // (dev) must not warn. These targets never flip the latch, so the
+        // test is safe to run in any order alongside the positive case.
+        let ctx = HttpContext {
+            token: Some("secret".to_string()),
+            tenant: 0,
+            tls: TlsOptions::default(),
+        };
+        ctx.warn_if_plaintext_token("https://prod.example.com");
+        ctx.warn_if_plaintext_token("http://localhost:8080");
+        ctx.warn_if_plaintext_token("http://127.0.0.1:8080");
+        ctx.warn_if_plaintext_token("http://[::1]:8080");
     }
 
     #[test]
