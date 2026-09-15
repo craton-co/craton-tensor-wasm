@@ -269,6 +269,11 @@ pub async fn run(args: ObserveArgs, ctx: &HttpContext) -> Result<()> {
     if args.interval == 0 {
         anyhow::bail!("--interval must be at least 1 second");
     }
+    // sec LOW (mod.rs L2): warn once if a bearer token would be sent over
+    // plaintext http:// to a non-loopback host. `observe` polls in a loop, so
+    // classifying once here (rather than per-tick) also avoids re-checking the
+    // unchanged address every refresh.
+    ctx.warn_if_plaintext_token(&args.addr);
     let interval = Duration::from_secs(args.interval);
     let base = super::server_base(&args.addr).to_string();
     let client = ctx.build_client(FETCH_TIMEOUT)?;

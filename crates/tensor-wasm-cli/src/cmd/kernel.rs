@@ -168,6 +168,9 @@ async fn publish(
     ctx: &HttpContext,
 ) -> Result<()> {
     super::validate_server_url(server)?;
+    // sec LOW (mod.rs L2): warn once if a bearer token would be sent over
+    // plaintext http:// to a non-loopback host.
+    ctx.warn_if_plaintext_token(server);
     if name.trim().is_empty() {
         return Err(local_err("kernel name must be non-empty"));
     }
@@ -300,6 +303,9 @@ fn hash_ptx_file(ptx_file: &Path) -> Result<[u8; 32]> {
 /// `tensor-wasm kernel list` — fetch and render the manifest table.
 async fn list(server: &str, ctx: &HttpContext) -> Result<()> {
     super::validate_server_url(server)?;
+    // sec LOW (mod.rs L2): warn once if a bearer token would be sent over
+    // plaintext http:// to a non-loopback host.
+    ctx.warn_if_plaintext_token(server);
     let url = format!("{}/kernels", super::server_base(server));
     let client = ctx.build_client(KERNEL_REQUEST_TIMEOUT)?;
     let resp = ctx

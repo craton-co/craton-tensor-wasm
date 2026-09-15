@@ -132,14 +132,19 @@ fn refuse_hmac_key_on_plaintext_allows_loopback() {
 }
 
 /// The plaintext-token warning is a one-shot, observed by flipping a
-/// `OnceLock` latch. This test verifies that pointing the bearer-token
-/// machinery at a non-loopback `http://` URL flips that latch. We can
+/// `OnceLock` latch. This test verifies that classifying a non-loopback
+/// `http://` URL via `warn_if_plaintext_token` flips that latch. We can
 /// only observe the gate transition once per process; the assertion
 /// scheme below tolerates the test running in any order relative to
-/// other tests in this binary by reading the gate state both before and
-/// after.
+/// other tests in this binary by reading the gate state after.
+///
+/// sec LOW (mod.rs L2): classification was moved out of `HttpContext::apply`
+/// (which inspected the URL via `req.try_clone()` and silently skipped
+/// streaming-body requests like `snapshot restore`) into the URL-string-based
+/// `warn_if_plaintext_token`, called by every command before any request is
+/// built. This test now drives that helper directly.
 #[test]
-fn apply_warn_once_gate_trips_on_plaintext_http_token() {
+fn warn_if_plaintext_token_trips_on_plaintext_http_token() {
     use tensor_wasm_cli::cmd::plaintext_token_warned_for_test;
 
     // Build a context with a token configured. We don't touch the env
@@ -147,34 +152,32 @@ fn apply_warn_once_gate_trips_on_plaintext_http_token() {
     // process env — constructing the struct directly is cleaner.
     let ctx = HttpContext::from_env_for_test_with_token("super-secret", 0);
 
-    let client = reqwest::Client::new();
-    // Trip the gate by routing the request through `apply` with a
-    // non-loopback http:// URL. We don't care about the resulting
-    // RequestBuilder — only that `apply` observed the URL and flipped
-    // the `OnceLock`.
-    let _ = ctx.apply(client.get("http://example.com:8080")).build();
+    // Trip the gate by classifying a non-loopback http:// URL — the exact
+    // shape a streaming-body command (snapshot restore) would pass.
+    ctx.warn_if_plaintext_token("http://example.com:8080");
 
     assert!(
         plaintext_token_warned_for_test(),
         "expected the plaintext-token warn-once gate to be tripped after \
-         apply() on http://example.com:8080"
+         warn_if_plaintext_token() on http://example.com:8080"
     );
 }
 
-/// Counterpart to the test above: pointing `apply` at https:// must NOT
+/// Counterpart to the test above: classifying an https:// URL must NOT
 /// trip the gate (because https:// is safe) and must NOT trip it for
 /// loopback http:// either (because dev workflows are exempt). We can't
 /// re-run this test in isolation if another test already tripped the
 /// gate, so we only assert in the direction that's safe regardless of
 /// ordering: a context with no token never trips the gate.
 #[test]
-fn apply_warn_once_gate_does_not_trip_without_a_token() {
+fn warn_if_plaintext_token_does_not_trip_without_a_token() {
     let ctx = HttpContext::from_env_for_test_with_token_optional(None, 0);
-    let client = reqwest::Client::new();
-    let _ = ctx.apply(client.get("http://attacker.example.com")).build();
+    // With no token, classification must short-circuit before reaching the
+    // URL inspection — passing a hostile non-loopback http:// URL is a no-op.
+    ctx.warn_if_plaintext_token("http://attacker.example.com");
     // We can't assert the gate is *unset* because a sibling test may have
     // tripped it. The meaningful assertion is the negative invariant on
-    // the path: with no token, `apply` should never even reach the URL
-    // inspection branch. That's structural — if it regresses, the path
-    // becomes observable via tracing and code review, not this test.
+    // the path: with no token, `warn_if_plaintext_token` returns before the
+    // latch can flip. That's structural — if it regresses, the path becomes
+    // observable via tracing and code review, not this test.
 }

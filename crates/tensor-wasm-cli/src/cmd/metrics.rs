@@ -37,6 +37,10 @@ pub struct MetricsArgs {
 pub async fn run(args: MetricsArgs, ctx: &HttpContext) -> Result<()> {
     super::validate_server_url(&args.server)?;
 
+    // sec LOW (mod.rs L2): warn once if a bearer token would be sent over
+    // plaintext http:// to a non-loopback host.
+    ctx.warn_if_plaintext_token(&args.server);
+
     let url = format!("{}/metrics", super::server_base(&args.server));
 
     let client = ctx.build_client(Duration::from_secs(30))?;
