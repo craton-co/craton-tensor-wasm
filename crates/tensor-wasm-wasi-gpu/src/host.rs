@@ -882,6 +882,31 @@ fn join_u64(lo: i32, hi: i32) -> u64 {
     ((hi as u32 as u64) << 32) | (lo as u32 as u64)
 }
 
+/// Validate that a wire-format `i32` length is non-negative and return it
+/// as a `u32`.
+///
+/// LOW finding: several host functions take a length as a raw i32 from the
+/// wire and then immediately reinterpret it `as u32` (or `as usize`). A
+/// negative value silently becomes a huge unsigned number that is only
+/// caught *incidentally* by a downstream size cap or bounds check, which
+/// misreports an "invalid pointer / length" condition as "input too large"
+/// (or relies on the cap existing at all). This helper makes the
+/// non-negativity an explicit, uniform precondition: a negative length is
+/// rejected up front with [`AbiError::InvalidPointer`] — the same code the
+/// `read_bytes` / `checked_guest_region` bounds checks already return for a
+/// malformed `(ptr, len)` pair — before any cast.
+///
+/// Used by the `memcpy_h2d` / `memcpy_d2h` paths (which previously cast a
+/// negative `len` straight to `u32` and leaned on the buffer-size cap to
+/// catch it) and shared with the `load_ptx` / `launch` length checks so
+/// every length-from-the-wire flows through one validator.
+fn checked_nonneg_len(len: i32) -> Result<u32, AbiError> {
+    if len < 0 {
+        return Err(AbiError::InvalidPointer);
+    }
+    Ok(len as u32)
+}
+
 /// Validate that `[ptr, ptr + len)` is a real region inside the caller's
 /// linear memory, returning the `(start, end)` byte range on success.
 ///
@@ -1099,6 +1124,21 @@ fn memcpy_h2d_impl<T: HasWasiCuda>(
     .entered();
     let owner = caller.data().wasi_cuda().instance_id;
     let device_mem = caller.data().wasi_cuda().device_mem.clone();
+    // LOW finding: reject a negative `len` explicitly BEFORE the
+    // `as u32` cast (and before the handle lookup's side effects). A
+    // negative i32 cast to u32 becomes a huge value that the buffer-size
+    // cap below would only catch incidentally; surfacing InvalidPointer up
+    // front keeps the failure honest (a memory-region fault, not a quota).
+    let len_u32 = match checked_nonneg_len(len) {
+        Ok(v) => v,
+        Err(e) => {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("memcpy_h2d: negative len ({len})"));
+            return Err(e);
+        }
+    };
     let dev = match device_mem.lookup(handle, owner) {
         Ok(d) => d,
         Err(e) => {
@@ -1109,7 +1149,6 @@ fn memcpy_h2d_impl<T: HasWasiCuda>(
             return Err(e);
         }
     };
-    let len_u32 = len as u32;
     // A copy longer than the buffer is a structural argument error — the
     // guest asked to write past the end of its own device allocation.
     if (len_u32 as u64) > dev.size {
@@ -1205,6 +1244,18 @@ fn memcpy_d2h_impl<T: HasWasiCuda>(
     .entered();
     let owner = caller.data().wasi_cuda().instance_id;
     let device_mem = caller.data().wasi_cuda().device_mem.clone();
+    // LOW finding: reject a negative `len` explicitly before the `as u32`
+    // cast — see the matching note in `memcpy_h2d_impl`.
+    let len_u32 = match checked_nonneg_len(len) {
+        Ok(v) => v,
+        Err(e) => {
+            caller
+                .data()
+                .wasi_cuda()
+                .record_error(format!("memcpy_d2h: negative len ({len})"));
+            return Err(e);
+        }
+    };
     let dev = match device_mem.lookup(handle, owner) {
         Ok(d) => d,
         Err(e) => {
@@ -1215,7 +1266,6 @@ fn memcpy_d2h_impl<T: HasWasiCuda>(
             return Err(e);
         }
     };
-    let len_u32 = len as u32;
     if (len_u32 as u64) > dev.size {
         caller.data().wasi_cuda().record_error(format!(
             "memcpy_d2h: len {len_u32} exceeds device buffer size {}",
@@ -1304,13 +1354,15 @@ fn load_ptx_impl<T: HasWasiCuda>(
     // QuotaExceeded/`MAX_PTX_BYTES` branch and misreport an invalid-pointer
     // condition as "input too large." `read_bytes` would ultimately reject
     // the negative length with `InvalidPointer` anyway; surfacing that code
-    // here keeps parity with the `entry_len < 0` check just below.
-    if ptx_len < 0 {
+    // here keeps parity with the `entry_len < 0` check just below. Routed
+    // through the shared `checked_nonneg_len` validator so every
+    // length-from-the-wire flows through one non-negativity check.
+    if let Err(e) = checked_nonneg_len(ptx_len) {
         caller
             .data()
             .wasi_cuda()
             .record_error(format!("load_ptx: negative ptx_len ({ptx_len})"));
-        return Err(AbiError::InvalidPointer);
+        return Err(e);
     }
     if (ptx_len as usize) > MAX_PTX_BYTES {
         caller.data().wasi_cuda().record_error(format!(
@@ -1469,7 +1521,11 @@ fn validate_launch_args<T: HasWasiCuda>(
     args_ptr: i32,
     args_len: i32,
 ) -> Result<KernelId, AbiError> {
-    if args_len < 0 || args_ptr < 0 {
+    // LOW finding: the length axis flows through the shared
+    // `checked_nonneg_len` validator (the pointer axis keeps its own
+    // non-negativity check); both surface `InvalidPointer` so a malformed
+    // `(args_ptr, args_len)` pair fails as a memory-region fault.
+    if checked_nonneg_len(args_len).is_err() || args_ptr < 0 {
         caller.data().wasi_cuda().record_error(format!(
             "launch: negative args_ptr ({args_ptr}) or args_len ({args_len})"
         ));
