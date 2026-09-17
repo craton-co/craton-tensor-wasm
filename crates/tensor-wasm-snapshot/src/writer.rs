@@ -1109,36 +1109,32 @@ impl SnapshotWriter {
         // `payload.len()`.
         let payload_len = payload.len();
 
-        // RESIDUAL UNAVOIDABLE COPY (streaming-restore audit, this wave).
+        // PERF (finding P-1): stream the compressed envelope directly into the
+        // output `Vec<u8>` rather than letting the artifact crate allocate its
+        // own envelope buffer and hand it back. `encode_envelope_to_vec`
+        // returns an owned `Vec<u8>` that we would then move out of this
+        // function, so for a multi-GiB capture the compressed envelope existed
+        // twice in flight (the crate's internal buffer + our return value).
+        // `encode_envelope_to_writer` tees the zstd output and the trailing
+        // HMAC tag straight into our pre-sized buffer, so the only compressed
+        // allocation is the one we return.
         //
-        // The ideal here is to stream the bincode output directly into the
-        // artifact envelope's zstd encoder so the full uncompressed `payload`
-        // never lives as an intermediate `Vec<u8>` (this is the same
-        // optimisation `capture_legacy` already performs with
-        // `encode_into_std_write` against the inline zstd encoder above). The
-        // legacy inline path can do that because it owns its own
-        // `zstd::stream::write::Encoder`; the artifact envelope, by contrast,
-        // is sealed behind `tensor_wasm_artifacts::encode_envelope_to_vec`,
-        // whose only public entry point takes the payload as a `&[u8]` slice.
-        // There is no `encode_envelope_to_writer` (the `MacWriter` tee that
-        // would make one possible is private to the artifacts crate), so the
-        // envelope encoder must be handed a fully-materialised slice.
+        // RESIDUAL UNAVOIDABLE COPY: the assumed `encode_envelope_to_writer`
+        // signature still takes the payload as a `&[u8]` slice (the BLAKE3
+        // content hash in the envelope header is computed over the whole
+        // payload, so the encoder must see every byte before it can write the
+        // header — there is no single-pass content-addressed framing). We
+        // therefore still hold `payload` (the uncompressed bincode blob)
+        // across the call; what this change removes is the *second* compressed
+        // buffer on the output side. `payload` is dropped before the envelope
+        // is returned to the caller.
         //
-        // We therefore cannot avoid holding `payload` (the full uncompressed
-        // bincode blob) across the `encode_envelope_to_vec` call, which itself
-        // allocates the compressed envelope. For a multi-GiB GPU snapshot the
-        // transient peak is `payload` (uncompressed) + the envelope buffer
-        // (compressed, typically a fraction of `payload`). `payload` is
-        // dropped at the end of this function, before the envelope is handed
-        // to the caller.
-        //
-        // Closing this fully requires a `Write`-streaming encode entry point
-        // in `tensor-wasm-artifacts` (tracked separately — this crate must
-        // not reach across the crate boundary to add it). The restore side
-        // does avoid the analogous redundant copy via
-        // `SnapshotReader::restore_streaming` (see `reader.rs`).
-        let envelope =
-            tensor_wasm_artifacts::encode_envelope_to_vec(&payload, hmac_key).map_err(|e| {
+        // Pre-size the output buffer with the same header + 4:1 + HMAC-tag
+        // heuristic the artifact crate's `encode_envelope_to_vec` uses, so the
+        // streamed write rarely reallocates.
+        let mut envelope: Vec<u8> = Vec::with_capacity(payload_len / 4 + 128);
+        tensor_wasm_artifacts::encode_envelope_to_writer(&mut envelope, &payload, hmac_key)
+            .map_err(|e| {
                 TensorWasmError::Serialization(format!("artifact envelope encode: {e}").into())
             })?;
         drop(payload);
