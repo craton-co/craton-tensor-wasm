@@ -68,6 +68,40 @@ fn list_skips_foreign_files() {
 }
 
 #[test]
+fn list_skips_zero_byte_and_truncated_lookalikes() {
+    // A foreign file can match the `{64hex}.{fp}.bin` name shape exactly
+    // yet hold no authenticatable blob (zero bytes, or a truncated stub
+    // shorter than header+hmac). `list` stats each candidate and drops
+    // anything below the minimum envelope length, so these never inflate a
+    // GC/audit listing with a hash that `get` would immediately reject.
+    use tensor_wasm_artifacts::{ARTIFACT_HEADER_LEN, ARTIFACT_HMAC_LEN};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().to_path_buf();
+    let store = DiskArtifactStore::new(dir.clone(), KEY);
+
+    // One genuine entry.
+    let real_hash = store.put(b"a real, full-length artifact body").expect("put");
+
+    let fp = key_fp_hex(&KEY);
+    // Name-shape-valid but content-empty: a zero-byte file under our key.
+    let empty_name = format!("{}.{fp}.bin", "ab".repeat(32));
+    std::fs::write(dir.join(&empty_name), b"").expect("write empty lookalike");
+    // Name-shape-valid but truncated: one byte short of the minimum.
+    let short_name = format!("{}.{fp}.bin", "cd".repeat(32));
+    let too_short = vec![0u8; ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN - 1];
+    std::fs::write(dir.join(&short_name), &too_short).expect("write short lookalike");
+
+    let listed = store.list().expect("list");
+    assert_eq!(
+        listed.len(),
+        1,
+        "zero-byte / truncated lookalikes must not be listed, got {listed:?}"
+    );
+    assert_eq!(listed[0], real_hash, "only the genuine full-length blob lists");
+}
+
+#[test]
 fn list_on_empty_or_missing_dir_is_empty() {
     // A store whose directory was never created (no `put` yet) lists
     // empty rather than erroring — the dir is created lazily.
