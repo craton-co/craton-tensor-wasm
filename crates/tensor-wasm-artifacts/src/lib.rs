@@ -1732,29 +1732,66 @@ impl DiskArtifactStore {
             if hash_hex.len() != 64 {
                 continue;
             }
-            let mut bytes = [0u8; 32];
-            let mut ok = true;
-            for (i, chunk) in hash_hex.as_bytes().chunks(2).enumerate() {
-                let s = match std::str::from_utf8(chunk) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
-                };
-                match u8::from_str_radix(s, 16) {
-                    Ok(b) => bytes[i] = b,
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
+            let bytes = match parse_hash_hex(hash_hex) {
+                Some(b) => b,
+                None => continue,
+            };
+            // Stat the candidate and skip anything too short to be a real
+            // envelope. A foreign zero-byte file (or a truncated stub) can
+            // share the `{64hex}.{fp}.bin` name shape yet hold no
+            // authenticatable blob; counting it would over-report the
+            // listing and hand GC/audit a hash that `get` immediately
+            // rejects with `BadMagic`. A genuine blob is always at least
+            // `ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN` bytes. A NotFound
+            // here means the entry was unlinked between `read_dir` and the
+            // stat (a benign race) — skip it; any other stat fault is a
+            // real enumeration failure and propagates as `Io`.
+            let min_len = (ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN) as u64;
+            match entry.metadata() {
+                Ok(meta) if meta.len() >= min_len => {
+                    seen.insert(ContentHash::from_bytes(bytes));
                 }
-            }
-            if ok {
-                seen.insert(ContentHash::from_bytes(bytes));
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    warn!(
+                        target: "tensor_wasm_artifacts",
+                        file = %name,
+                        error = %e,
+                        "list candidate stat failed"
+                    );
+                    return Err(ArtifactError::Io);
+                }
             }
         }
         Ok(())
+    }
+}
+
+/// Parse a 64-char lowercase ascii-hex `ContentHash` segment into its raw
+/// 32 bytes, or `None` if it is the wrong length or contains a non-hex
+/// char. Used by [`DiskArtifactStore::list_one_key`] to reconstruct
+/// hashes from on-disk filenames without per-`format!` allocation churn.
+fn parse_hash_hex(hash_hex: &str) -> Option<[u8; 32]> {
+    if hash_hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hash_hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_val(chunk[0])?;
+        let lo = hex_val(chunk[1])?;
+        bytes[i] = (hi << 4) | lo;
+    }
+    Some(bytes)
+}
+
+/// Decode a single ascii-hex digit to its 0..=15 value, or `None` for any
+/// non-hex byte. Lowercase-only (matching `ContentHash`'s `Display`).
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
     }
 }
 
