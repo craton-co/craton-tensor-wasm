@@ -55,3 +55,25 @@ fn replaces_del() {
     // with the visible placeholder `?` rather than letting it through.
     assert_eq!(sanitise_terminal_output("a\x7Fb"), "a?b");
 }
+
+#[test]
+fn drops_standalone_carriage_return() {
+    // sec LOW (mod.rs L3): a bare `\r` is a line-overwrite primitive. A
+    // malicious response can print a benign line, emit `\r`, and overwrite
+    // it in place so the terminal shows different text than was delivered
+    // (e.g. masking a `FAIL` as `ok`). A lone `\r` must not survive.
+    let cleaned = sanitise_terminal_output("FAIL\rok  ");
+    assert!(
+        !cleaned.contains('\r'),
+        "standalone CR must not survive: {cleaned:?}"
+    );
+    assert_eq!(cleaned, "FAILok  ");
+}
+
+#[test]
+fn normalises_crlf_to_lf() {
+    // The Windows newline `\r\n` collapses to a single `\n`, so legitimate
+    // CRLF-terminated server output round-trips as clean `\n`-separated text
+    // with no spurious placeholder characters introduced.
+    assert_eq!(sanitise_terminal_output("a\r\nb"), "a\nb");
+}
