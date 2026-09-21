@@ -618,14 +618,26 @@ pub async fn bounded_text(resp: reqwest::Response) -> std::result::Result<String
 // prompt, or otherwise hijack the operator's terminal session. The helper
 // below scrubs server-controlled bytes before they reach the terminal.
 
-/// Strip ASCII control bytes (`< 0x20`, except `\n`, `\r`, `\t`) and the
-/// DEL byte (`0x7F`) from a server-returned string before printing it to
-/// the user's terminal. Prevents ANSI escape injection, title-bar
-/// rewriting, and "smuggle a CR" attacks via malicious responses.
+/// Strip ASCII control bytes (`< 0x20`, except `\n` and `\t`) and the DEL
+/// byte (`0x7F`) from a server-returned string before printing it to the
+/// user's terminal. Prevents ANSI escape injection, title-bar rewriting,
+/// and "smuggle a CR" attacks via malicious responses.
+///
+/// Carriage-return handling (sec LOW, mod.rs L3): a bare `\r` is a
+/// line-overwrite primitive — a malicious response can print a benign
+/// prefix, emit `\r`, then overwrite it in place so the operator sees
+/// something different from the bytes actually delivered (e.g. masking a
+/// failure as success on a single visible line). We therefore:
+///   * normalise the `\r\n` Windows newline sequence to a single `\n`, and
+///   * drop any standalone `\r` (one not immediately followed by `\n`),
+/// so only genuine line breaks survive and the overwrite trick is defused.
+/// A previous version preserved bare `\r` verbatim, which this fix removes.
 ///
 /// Multi-byte UTF-8 sequences are preserved untouched — only US-ASCII
-/// control bytes are filtered. The replacement is `?` so the operator
-/// sees that something was stripped.
+/// control bytes are filtered. The replacement for a stripped control byte
+/// is `?` so the operator sees that something was removed; a dropped `\r`
+/// is elided rather than `?`-substituted so legitimate `\r\n` text does not
+/// gain a spurious placeholder.
 ///
 /// `pub` + `#[doc(hidden)]` so the integration test in
 /// `tests/sanitise_terminal_output.rs` can exercise the helper directly.
@@ -633,15 +645,25 @@ pub async fn bounded_text(resp: reqwest::Response) -> std::result::Result<String
 /// CLI binary.
 #[doc(hidden)]
 pub fn sanitise_terminal_output(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
-                '?'
-            } else {
-                c
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // `\r\n` → `\n`: consume the `\r` and let the `\n` pass through on
+            // the next iteration. A lone `\r` (no `\n` following) is dropped.
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    // Drop the `\r`; the `\n` is emitted next loop.
+                    continue;
+                }
+                // Standalone `\r`: elide it entirely.
             }
-        })
-        .collect()
+            '\n' | '\t' => out.push(c),
+            other if other.is_control() => out.push('?'),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -846,11 +868,32 @@ mod tests {
 
     #[test]
     fn sanitise_terminal_output_preserves_unicode_and_whitespace() {
-        // Newline, carriage return, tab, and any multi-byte UTF-8
-        // sequence must pass through untouched — the helper must NOT
-        // mangle legitimate human-readable output.
-        let input = "héllo\n\tworld\r";
+        // Newline, tab, and any multi-byte UTF-8 sequence must pass through
+        // untouched — the helper must NOT mangle legitimate human-readable
+        // output. (Carriage returns are handled separately; see the dedicated
+        // `\r` tests below.)
+        let input = "héllo\n\tworld";
         assert_eq!(sanitise_terminal_output(input), input);
+    }
+
+    #[test]
+    fn sanitise_terminal_output_drops_standalone_cr() {
+        // sec LOW (mod.rs L3): a bare `\r` is a line-overwrite primitive — a
+        // malicious response can print "FAIL", emit `\r`, and overwrite it
+        // with "ok  " so the operator sees a success line that does not match
+        // the bytes delivered. A standalone `\r` must be elided.
+        assert_eq!(sanitise_terminal_output("FAIL\rok  "), "FAILok  ");
+        // Trailing lone `\r` is dropped too.
+        assert_eq!(sanitise_terminal_output("done\r"), "done");
+        assert!(!sanitise_terminal_output("a\rb").contains('\r'));
+    }
+
+    #[test]
+    fn sanitise_terminal_output_normalises_crlf() {
+        // The Windows newline `\r\n` collapses to a single `\n` so legitimate
+        // CRLF-terminated output is not mangled and gains no spurious `?`.
+        assert_eq!(sanitise_terminal_output("line1\r\nline2"), "line1\nline2");
+        assert_eq!(sanitise_terminal_output("a\r\n\r\nb"), "a\n\nb");
     }
 
     #[test]
