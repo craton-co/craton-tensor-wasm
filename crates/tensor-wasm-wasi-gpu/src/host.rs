@@ -778,6 +778,12 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
         caller
             .data()
             .wasi_cuda()
+            // LOW finding #3: the `s.len() as i32` cast is SAFE. `last_error`
+            // is produced by `record_error`, which truncates every message
+            // to at most `MAX_RECORDED_ERROR_BYTES` (512) bytes before
+            // storing it. 512 is far below `i32::MAX`, so the length can
+            // never wrap to a negative value that a guest would misread as
+            // an error sentinel.
             .last_error()
             .map(|s| s.len() as i32)
             .unwrap_or(0)
@@ -1860,15 +1866,18 @@ fn resolve_and_launch_cuda<T: HasWasiCuda>(
     // `docs/RISKS.md` "linear memory must be UVM-backed" constraint was
     // documented but unenforced; this is the enforcement.
     //
-    // SECURITY (finding #3, hardening): we query the SAME `host_ptr` value
-    // that `build_kernel_param_storage` already encoded into the launch
-    // parameter slots, so the pointer we validate is provably the one we
-    // launch. (The `build_kernel_param_storage` call above and this loop
-    // both read `host_ptr` straight out of `lowered_args` — there is no
-    // intervening re-resolution that could let a validated pointer differ
-    // from a launched one.)
+    // SECURITY (finding #3, hardening): the pointer we validate is provably
+    // the pointer we launch. `build_kernel_param_storage(&lowered_args)`
+    // above and this validation loop both read `host_ptr` straight out of
+    // the SAME `lowered_args` slice, with no intervening re-resolution that
+    // could let a validated address differ from a launched one. The
+    // `debug_assert_eq!` after the loop is a structural guard: the number of
+    // pointer args we validated must equal the number of `Ptr` slots the
+    // storage built, or the two views of the argv have drifted.
+    let mut validated_ptr_args = 0usize;
     for arg in &lowered_args {
         if let LoweredArg::Ptr { host_ptr, .. } = arg {
+            validated_ptr_args += 1;
             let mut is_managed: std::os::raw::c_int = 0;
             // SAFETY: `is_managed` is a valid, correctly-typed out-param for
             // the IS_MANAGED attribute (a 32-bit int). `host_ptr` was
@@ -1900,6 +1909,20 @@ fn resolve_and_launch_cuda<T: HasWasiCuda>(
             }
         }
     }
+    // Structural guard (finding #3): the count of pointer args we just
+    // validated must equal the count of `Ptr` records `lowered_args`
+    // carries — i.e. exactly the slots `build_kernel_param_storage`
+    // encoded. A mismatch would mean the validated view and the launched
+    // view of the argv drifted, which cannot happen with the current
+    // single-`lowered_args`-source design.
+    debug_assert_eq!(
+        validated_ptr_args,
+        lowered_args
+            .iter()
+            .filter(|a| matches!(a, LoweredArg::Ptr { .. }))
+            .count(),
+        "validated pointer count drifted from the launched argv"
+    );
 
     // SAFETY: launching a kernel is inherently unsafe — the host has no
     // proof the kernel signature matches the parsed argv. The caller (the
