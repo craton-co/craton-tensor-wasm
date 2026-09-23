@@ -55,6 +55,16 @@ zeroize = { workspace = true, optional = true }
 # to emit and parse the legacy envelope byte-for-byte; this feature is
 # purely additive for v0.3.8.
 tensor-wasm-artifacts = { workspace = true, optional = true }
+# Optional AEAD encryption-at-rest for the whole snapshot blob. When the
+# `aead-at-rest` feature is enabled, `SnapshotWriter::capture_encrypted` /
+# `SnapshotReader::restore_decrypted` wrap the (already signed/framed) snapshot
+# bytes in a ChaCha20-Poly1305 AEAD envelope so the payload is confidential at
+# rest, not merely authenticated. Off by default so the no-feature build keeps
+# its current dependency surface. `default-features = false` drops the crate's
+# own `getrandom`-backed RNG helper — this crate takes the 12-byte nonce from
+# the caller (matching the rest of the writer's deterministic-by-request
+# philosophy) and only needs the core AEAD trait + the cipher.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
 # Optional memory-mapped input path for restore. When the `mmap` feature is
 # enabled, `SnapshotReader::restore_from_path_mmap` maps the snapshot file
 # read-only instead of reading it wholly into a `Vec<u8>`, then feeds the
@@ -109,8 +119,17 @@ artifact-backing = ["dep:tensor-wasm-artifacts"]
 # only how the input bytes are sourced; the verify-then-decode pipeline is
 # unchanged, so authentication still runs before any payload byte is exposed.
 mmap = ["dep:memmap2"]
+# AEAD encryption-at-rest (non-default). Pulls in `chacha20poly1305` and
+# enables `SnapshotWriter::capture_encrypted` /
+# `SnapshotReader::restore_decrypted`, which wrap the framed snapshot bytes in
+# a ChaCha20-Poly1305 envelope (`AEAD_MAGIC || nonce(12) || ciphertext || tag`).
+# This is *confidentiality* on top of the existing *authentication*: the inner
+# bytes can still be a signed v3/v4 blob, so a decrypted snapshot is then
+# verified by the normal reader pipeline. Purely additive — the default
+# capture/restore wire format is unchanged.
+aead-at-rest = ["dep:chacha20poly1305"]
 
 [package.metadata.docs.rs]
 all-features = false
-features = ["signed-snapshots", "artifact-backing", "mmap"]
+features = ["signed-snapshots", "artifact-backing", "mmap", "aead-at-rest"]
 rustdoc-args = ["--cfg", "docsrs"]

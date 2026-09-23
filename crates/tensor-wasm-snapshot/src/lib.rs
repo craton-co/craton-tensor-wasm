@@ -23,6 +23,9 @@ const _: () = assert!(
     "tensor-wasm-snapshot requires a 64-bit target",
 );
 
+#[cfg(feature = "aead-at-rest")]
+#[cfg_attr(docsrs, doc(cfg(feature = "aead-at-rest")))]
+pub mod aead;
 pub mod format;
 pub mod reader;
 pub mod writer;
