@@ -85,6 +85,18 @@ pub struct SnapshotReader {
     /// allocator's freelist after the reader has gone out of scope.
     #[cfg(feature = "signed-snapshots")]
     hmac_key: Option<Zeroizing<[u8; 32]>>,
+    /// Additional HMAC-SHA256 verification keys for key rotation / multi-key
+    /// acceptance. Populated via [`SnapshotReader::with_hmac_keys`]; empty by
+    /// default. On the v3 HMAC path **every** candidate key (this set plus the
+    /// single [`Self::hmac_key`], if set) is tried in constant time and the
+    /// results OR-ed together, so a verifier can accept blobs signed under the
+    /// old or the new key during a rotation window without leaking, via
+    /// response timing, which key matched.
+    ///
+    /// Each key is wrapped in [`zeroize::Zeroizing`] so the bytes are scrubbed
+    /// when the reader drops, exactly like [`Self::hmac_key`].
+    #[cfg(feature = "signed-snapshots")]
+    hmac_keys: Vec<Zeroizing<[u8; 32]>>,
     /// Ed25519 *public* verifying key used to verify v3 blobs whose trailer
     /// carries `signature_kind = 2`. `None` -> such blobs are rejected.
     ///
@@ -137,6 +149,11 @@ impl std::fmt::Debug for SnapshotReader {
         );
         #[cfg(feature = "signed-snapshots")]
         d.field(
+            "hmac_keys",
+            &format_args!("<{} REDACTED rotation key(s)>", self.hmac_keys.len()),
+        );
+        #[cfg(feature = "signed-snapshots")]
+        d.field(
             "ed25519_verifying_key",
             &self.ed25519_verifying_key.as_ref().map(|_| "<set>"),
         );
@@ -164,6 +181,8 @@ impl SnapshotReader {
             #[cfg(feature = "signed-snapshots")]
             hmac_key: None,
             #[cfg(feature = "signed-snapshots")]
+            hmac_keys: Vec::new(),
+            #[cfg(feature = "signed-snapshots")]
             ed25519_verifying_key: None,
             require_signature: false,
             min_sequence_no: None,
@@ -190,6 +209,37 @@ impl SnapshotReader {
         // drops. `Zeroizing::new` is not `const`, so this constructor is no
         // longer `const fn`. All existing call-sites are runtime contexts.
         self.hmac_key = Some(Zeroizing::new(key));
+        self
+    }
+
+    /// Configure a **set** of HMAC-SHA256 verification keys for key rotation
+    /// and multi-key acceptance.
+    ///
+    /// During a key rotation an operator must accept snapshots signed under
+    /// either the outgoing or the incoming key for the length of the rollout.
+    /// Pass every currently-valid key here; a v3 HMAC blob is accepted if its
+    /// trailer verifies under **any** of them (plus the single key set via
+    /// [`SnapshotReader::with_hmac_sha256_key`], if both are configured — the
+    /// two sets are unioned).
+    ///
+    /// SECURITY (constant-time try-all): the HMAC verification path computes
+    /// the candidate MAC against each key and folds the constant-time equality
+    /// results together **without** short-circuiting on the first match. The
+    /// number of HMAC computations therefore depends only on how many keys are
+    /// configured — never on which key (if any) matched, nor on the position of
+    /// the matching key in the set — so a remote attacker cannot use response
+    /// timing to learn which key signed a blob or to probe key membership. The
+    /// per-key comparison uses `subtle::ConstantTimeEq` exactly as the
+    /// single-key path does.
+    ///
+    /// Replaces any previously-installed rotation set (it is not additive
+    /// across calls). Passing an empty slice clears the set. The keys are each
+    /// wrapped in [`zeroize::Zeroizing`] so their bytes are scrubbed on drop.
+    #[cfg(feature = "signed-snapshots")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "signed-snapshots")))]
+    #[must_use]
+    pub fn with_hmac_keys(mut self, keys: &[[u8; 32]]) -> Self {
+        self.hmac_keys = keys.iter().map(|k| Zeroizing::new(*k)).collect();
         self
     }
 
@@ -771,6 +821,88 @@ impl SnapshotReader {
         Ok(snapshot)
     }
 
+    /// Authenticate `bytes` and return the snapshot's [`SnapshotMetadata`]
+    /// **without** handing the three large memory blobs back to the caller.
+    ///
+    /// Use this when a caller needs to make a policy decision from a snapshot's
+    /// metadata — tenant/instance attribution, `created_unix_ms` freshness,
+    /// `sequence_no` / `nonce` replay state, `total_uncompressed_bytes` sizing
+    /// — but does not (yet) need the multi-GiB `wasm_memory` / `gpu_memory` /
+    /// `registers` payloads. A scheduler that decides *whether* to restore a
+    /// snapshot, or a verifier that only needs to confirm a blob is authentic
+    /// and recent, can call `verify_only` and never pay the cost of keeping the
+    /// large blobs resident.
+    ///
+    /// # Security: full authentication, metadata only
+    ///
+    /// This runs the **same** authenticate-then-parse pipeline as
+    /// [`SnapshotReader::restore`] — HMAC / Ed25519 trailer verification (or
+    /// the v4 artifact-envelope HMAC), the zip-bomb decompression cap,
+    /// magic/version consistency, per-blob caps, CRC32, the
+    /// `total_uncompressed_bytes` cross-check, freshness, and replay. A
+    /// tampered, wrong-key, stale, or replayed blob returns `Err` here exactly
+    /// as it would from `restore`. The returned metadata is therefore
+    /// signature-certified for v3/v4 blobs.
+    ///
+    /// # Note on decompression
+    ///
+    /// The wire format orders the bincode fields `magic, version, wasm_memory,
+    /// gpu_memory, registers, metadata, crc32`, and bincode has no "seek past a
+    /// field" hook — so reaching `metadata` requires decoding past the three
+    /// byte blobs, which in turn requires the zstd frame to be decompressed.
+    /// What `verify_only` guarantees is that the large blobs are **never handed
+    /// to or retained by the caller**: they are decoded into the reader's
+    /// transient `Snapshot`, the metadata is copied out, and the blobs are
+    /// dropped before this function returns. The caller's peak resident set is
+    /// bounded by the metadata, not by the payload. (The decompression buffer
+    /// itself is still bounded by [`SnapshotReader::max_decompressed`].)
+    #[instrument(skip(self, bytes), fields(input_len = bytes.len()))]
+    pub fn verify_only(&self, bytes: &[u8]) -> Result<SnapshotMetadata> {
+        // Delegate to the full pipeline so every signature / integrity / replay
+        // check runs identically, then return only the metadata. The large
+        // blobs inside the returned `Snapshot` are dropped when `snapshot` goes
+        // out of scope at the end of this expression, so they never escape to
+        // the caller.
+        let snapshot = self.restore(bytes)?;
+        Ok(snapshot.metadata)
+    }
+
+    /// Decrypt a ChaCha20-Poly1305 AEAD-at-rest envelope (produced by
+    /// [`crate::writer::SnapshotWriter::capture_encrypted`]) under `aead_key`,
+    /// then run the recovered plaintext blob through the normal
+    /// [`SnapshotReader::restore`] pipeline (non-default `aead-at-rest`
+    /// feature).
+    ///
+    /// Two independent guarantees apply, in order:
+    /// 1. **AEAD decrypt + tag check.** The Poly1305 tag is verified (over the
+    ///    ciphertext, with the 8-byte framing magic as associated data) before
+    ///    any plaintext is exposed. A tampered envelope or a wrong `aead_key`
+    ///    fails here with a generic authentication error — no decrypted bytes
+    ///    leak, and the message never distinguishes "wrong key" from "tampered"
+    ///    nor echoes key/nonce bytes.
+    /// 2. **Snapshot verification.** The recovered inner blob is whatever the
+    ///    writer captured (unsigned v2, signed v3, or the v4 artifact
+    ///    envelope), so it is then fed through `restore`, which applies this
+    ///    reader's full policy — HMAC / Ed25519 signature, `require_signature`,
+    ///    decompression cap, per-blob caps, CRC32, freshness, and replay.
+    ///
+    /// This is the read side of **sign-then-encrypt**: AEAD confirms the
+    /// ciphertext is intact under the encryption key, and the inner snapshot
+    /// signature confirms the *contents* were produced by a holder of the
+    /// signing key. Configure the signing key on this reader (via
+    /// [`SnapshotReader::with_hmac_sha256_key`] /
+    /// [`SnapshotReader::with_hmac_keys`] /
+    /// [`SnapshotReader::with_ed25519_verifying_key`] and, for production,
+    /// [`SnapshotReader::require_signature`]) so step 2 actually authenticates
+    /// the contents rather than accepting an unsigned inner blob.
+    #[cfg(feature = "aead-at-rest")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "aead-at-rest")))]
+    #[instrument(skip(self, bytes, aead_key), fields(input_len = bytes.len()))]
+    pub fn restore_decrypted(&self, bytes: &[u8], aead_key: &[u8; 32]) -> Result<Snapshot> {
+        let plaintext = crate::aead::decrypt_blob(bytes, aead_key)?;
+        self.restore(&plaintext)
+    }
+
     /// Streaming restore: authenticate `bytes`, then hand each restored
     /// memory blob to `sink` one at a time, freeing each blob's backing
     /// allocation **before** the next is decoded out of the owned
@@ -967,6 +1099,44 @@ impl SnapshotReader {
         Ok(())
     }
 
+    /// Recompute the HMAC-SHA256 tag the writer would have produced for the v3
+    /// trailer under `key`: `HMAC(key, prefix || V3_TRAILER_MAGIC || [kind])`.
+    ///
+    /// Factored out of [`SnapshotReader::verify_v3_trailer`] so the multi-key
+    /// try-all loop can compute one tag per candidate key without duplicating
+    /// the byte-range bookkeeping. The returned digest is compared against the
+    /// stored signature with `subtle::ConstantTimeEq` by the caller; this
+    /// helper performs no comparison itself.
+    #[cfg(feature = "signed-snapshots")]
+    fn hmac_over_prefix(
+        &self,
+        bytes: &[u8],
+        prefix_len: usize,
+        kind_byte: u8,
+        key: &Zeroizing<[u8; 32]>,
+    ) -> Result<hmac::digest::Output<hmac::Hmac<sha2::Sha256>>> {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        // `key` is `&Zeroizing<[u8; 32]>`. `Zeroizing` is
+        // `Deref<Target = [u8; 32]>`, so `&key[..]` borrows the full 32-byte
+        // slice without copying the secret out of the zeroizing wrapper.
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key[..]).map_err(|_| {
+            // [u8; 32] is always a valid HMAC-SHA256 key length; this branch is
+            // unreachable but we translate rather than panic and keep the key
+            // out of the message.
+            TensorWasmError::Serialization("HMAC init failed".into())
+        })?;
+        // HMAC covers every byte the zstd decoder consumed (the v2-shaped
+        // prefix), i.e. transitively magic, version, payload, and CRC32, plus
+        // the 4-byte trailer magic and the signature-kind byte. Mixing the
+        // magic and kind byte in closes the "rewrite the trailer to disguise
+        // the blob / downgrade the scheme" vector at verification time.
+        mac.update(&bytes[..prefix_len]);
+        mac.update(&V3_TRAILER_MAGIC);
+        mac.update(&[kind_byte]);
+        Ok(mac.finalize().into_bytes())
+    }
+
     /// Validate the trailing `[magic][signature_kind][signature]` bytes of
     /// a v3 blob.
     ///
@@ -996,7 +1166,9 @@ impl SnapshotReader {
     /// leak information about the secret key under a side-channel attacker.
     /// The constant-time `ct_eq` from `subtle` is used to compare the
     /// recomputed HMAC against the stored bytes so a timing oracle cannot
-    /// recover the signature byte-by-byte; Ed25519 verification is delegated
+    /// recover the signature byte-by-byte; the multi-key path folds the
+    /// per-key `Choice` results without short-circuiting so timing does not
+    /// reveal which rotation key matched; Ed25519 verification is delegated
     /// to `ed25519_dalek`, which is constant-time with respect to the key.
     #[cfg(feature = "signed-snapshots")]
     fn verify_v3_trailer(
@@ -1084,44 +1256,33 @@ impl SnapshotReader {
                 })?;
             }
             SignatureKind::HmacSha256 => {
-                let key = self.hmac_key.as_ref().ok_or_else(|| {
-                    TensorWasmError::Serialization(
-                        "snapshot is signed (v3) but reader has no HMAC key".into(),
-                    )
-                })?;
-                use hmac::{Hmac, Mac};
-                use sha2::Sha256;
                 use subtle::ConstantTimeEq;
 
-                // `key` is `&Zeroizing<[u8; 32]>`. `Zeroizing` is
-                // `Deref<Target = [u8; 32]>`, so `&key[..]` borrows the full
-                // 32-byte slice without copying the secret out of the
-                // zeroizing wrapper.
-                let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key[..]).map_err(|_| {
-                    // [u8; 32] is always a valid HMAC-SHA256 key length; this
-                    // branch is unreachable but we translate rather than
-                    // panic and keep the key out of the message.
-                    TensorWasmError::Serialization("HMAC init failed".into())
-                })?;
-                // HMAC covers every byte the zstd decoder consumed (the v2-shaped
-                // prefix), i.e. transitively magic, version, payload, and CRC32.
-                mac.update(&bytes[..prefix_len]);
-                // T8: authenticate the 4-byte trailer magic. The writer
-                // mixes the same bytes into its HMAC input, so a tampered
-                // magic prefix would produce a mismatch here — closing
-                // the "rewrite the trailer magic to disguise the blob"
-                // attack vector at signature-verification time.
-                mac.update(&V3_TRAILER_MAGIC);
-                // snapshot 1.1: also authenticate the signature-kind byte
-                // so a future second variant cannot be substituted via
-                // trailer rewrite (would otherwise be a downgrade primitive
-                // once two kinds coexist). The writer adds the same byte
-                // to its HMAC input; verification must match.
-                mac.update(&[kind_byte]);
-                let expected = mac.finalize().into_bytes();
-                // ConstantTimeEq returns `Choice` (0 or 1) without short-circuiting.
-                let ok: bool = expected.as_slice().ct_eq(sig_bytes).unwrap_u8() == 1;
-                if !ok {
+                // Union of all configured HMAC keys: the single key set via
+                // `with_hmac_sha256_key` plus the rotation set from
+                // `with_hmac_keys`. A v3 HMAC blob verifies if it matches any
+                // of them. Empty union -> the reader has no HMAC key at all.
+                let mut any_key = false;
+                // Accumulate the constant-time match result across every key
+                // as a `Choice`. We never short-circuit on the first match, so
+                // the work — and thus the timing — depends only on how many
+                // keys are configured, not on which one (if any) matched.
+                let mut matched = subtle::Choice::from(0u8);
+                for key in self
+                    .hmac_keys
+                    .iter()
+                    .chain(self.hmac_key.as_ref())
+                {
+                    any_key = true;
+                    let expected = self.hmac_over_prefix(bytes, prefix_len, kind_byte, key)?;
+                    matched |= expected.as_slice().ct_eq(sig_bytes);
+                }
+                if !any_key {
+                    return Err(TensorWasmError::Serialization(
+                        "snapshot is signed (v3) but reader has no HMAC key".into(),
+                    ));
+                }
+                if matched.unwrap_u8() != 1 {
                     return Err(TensorWasmError::Serialization(
                         "snapshot HMAC mismatch".into(),
                     ));
@@ -1381,20 +1542,29 @@ impl SnapshotReader {
         if bytes.len() < ARTIFACT_MAGIC.len() || bytes[..ARTIFACT_MAGIC.len()] != ARTIFACT_MAGIC {
             return Ok(None);
         }
-        let key = self.hmac_key.as_ref().ok_or_else(|| {
-            TensorWasmError::Serialization(
+        // Union of the single key and the rotation set, same as the legacy v3
+        // HMAC path. The artifact crate's decode helper authenticates against
+        // one key at a time, so for key rotation we try each candidate in turn
+        // and accept on the first that verifies. Unlike the inline v3 trailer
+        // path this is *not* constant-time across keys — the artifact crate
+        // exposes no multi-key entry point — but the envelope HMAC is computed
+        // over the already-public ciphertext prefix, so the only thing the
+        // (local-decode) timing could leak is which rotation key matched, not
+        // any key bytes. Document the distinction rather than paper over it.
+        let mut candidate_keys = self.hmac_keys.clone();
+        if let Some(k) = self.hmac_key.as_ref() {
+            candidate_keys.push(k.clone());
+        }
+        if candidate_keys.is_empty() {
+            return Err(TensorWasmError::Serialization(
                 "snapshot is artifact-envelope (v4) but reader has no HMAC key".into(),
-            )
-        })?;
+            ));
+        }
         // The artifact crate's pure decode helper does magic + version +
         // HMAC + zstd + content-hash checks in one pass. We map its
         // errors into `TensorWasmError::Serialization` for forward to
         // the snapshot caller; the messages are already operator-facing
         // (no key bytes leak).
-        // `key: &Zeroizing<[u8; 32]>` deref-coerces to `&[u8; 32]` at
-        // the call site below — no explicit `&**key` dance needed, and
-        // the underlying 32 bytes are never copied out of the
-        // zeroizing wrapper.
         //
         // H1: pass `self.max_decompressed` through the cap-parameterised
         // variant so the reader's `with_max_decompressed` knob bounds the
@@ -1403,26 +1573,55 @@ impl SnapshotReader {
         // instead hardcode the artifact crate's 1 GiB `MAX_DECOMPRESSED_LEN`,
         // silently overriding a reader configured for a tighter (or looser)
         // budget.
-        let payload = tensor_wasm_artifacts::decode_envelope_from_bytes_with_cap(
-            bytes,
-            key,
-            self.max_decompressed,
-        )
-        .map_err(|e| match e {
-            // `BadMagic` should be impossible here — we already
-            // checked the leading 16 bytes — but treat it as a
-            // hard failure rather than a fall-through. Otherwise
-            // a writer that produced a malformed envelope (e.g.
-            // truncated below the minimum length) could escape
-            // through the legacy reader and surface a confusing
-            // "zstd init" error.
-            ArtifactError::BadMagic => TensorWasmError::Serialization(
-                "snapshot artifact envelope: minimum-length / magic check failed".into(),
-            ),
-            other => TensorWasmError::Serialization(
-                format!("snapshot artifact envelope: {other}").into(),
-            ),
-        })?;
+        let mut last_err: Option<TensorWasmError> = None;
+        let mut payload: Option<Vec<u8>> = None;
+        for key in &candidate_keys {
+            // `key: &Zeroizing<[u8; 32]>` deref-coerces to `&[u8; 32]` — the
+            // underlying 32 bytes are never copied out of the zeroizing
+            // wrapper.
+            match tensor_wasm_artifacts::decode_envelope_from_bytes_with_cap(
+                bytes,
+                key,
+                self.max_decompressed,
+            ) {
+                Ok(p) => {
+                    payload = Some(p);
+                    break;
+                }
+                Err(ArtifactError::BadHmac) => {
+                    // Wrong key — keep trying the rest of the rotation set.
+                    last_err = Some(TensorWasmError::Serialization(
+                        "snapshot artifact envelope: BadHmac".into(),
+                    ));
+                }
+                // `BadMagic` should be impossible here — we already checked the
+                // leading 16 bytes — but treat any non-HMAC failure as a hard
+                // error: it signals a tampered or malformed v4 blob, not a
+                // wrong-key condition that another key could fix. Surface it
+                // immediately rather than masking it behind a later key's
+                // BadHmac.
+                Err(ArtifactError::BadMagic) => {
+                    return Err(TensorWasmError::Serialization(
+                        "snapshot artifact envelope: minimum-length / magic check failed".into(),
+                    ));
+                }
+                Err(other) => {
+                    return Err(TensorWasmError::Serialization(
+                        format!("snapshot artifact envelope: {other}").into(),
+                    ));
+                }
+            }
+        }
+        let payload = match payload {
+            Some(p) => p,
+            None => {
+                return Err(last_err.unwrap_or_else(|| {
+                    TensorWasmError::Serialization(
+                        "snapshot artifact envelope: BadHmac".into(),
+                    )
+                }))
+            }
+        };
 
         // Decode the bincode payload using the same static allocator
         // ceiling the legacy path uses. The envelope's HMAC has already

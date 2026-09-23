@@ -826,6 +826,55 @@ impl SnapshotWriter {
         self.capture_legacy(state)
     }
 
+    /// Capture `state` and then wrap the resulting snapshot blob in a
+    /// ChaCha20-Poly1305 AEAD envelope for **encryption at rest** (non-default
+    /// `aead-at-rest` feature).
+    ///
+    /// The inner blob is produced by the normal [`SnapshotWriter::capture`]
+    /// path — so it carries whatever signing / envelope configuration this
+    /// writer has (unsigned v2, signed v3, or the v4 artifact envelope). This
+    /// method then encrypts those bytes under `aead_key` with the
+    /// caller-supplied `nonce`, yielding
+    /// `AEAD_MAGIC || nonce || ciphertext || tag`. The recommended layering is
+    /// **sign-then-encrypt**: configure an HMAC or Ed25519 key on this writer
+    /// so the inner blob is authenticated, then encrypt here for
+    /// confidentiality.
+    ///
+    /// Read the result back with
+    /// [`crate::reader::SnapshotReader::restore_decrypted`].
+    ///
+    /// # SECURITY — nonce uniqueness
+    ///
+    /// `nonce` MUST be unique per (`aead_key`, message). ChaCha20-Poly1305 is
+    /// catastrophically broken under nonce reuse: encrypting two different
+    /// snapshots with the same key and nonce leaks the XOR of their plaintexts
+    /// and the Poly1305 authentication key. Supply a fresh random 96-bit nonce
+    /// (or a strictly-monotonic counter you persist per key) for every call.
+    /// This crate deliberately does not generate the nonce for you, to keep an
+    /// RNG out of its dependency surface and to give the caller explicit
+    /// control over nonce discipline.
+    #[cfg(feature = "aead-at-rest")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "aead-at-rest")))]
+    #[instrument(skip(self, state, aead_key, nonce), fields(
+        tenant = %state.tenant_id,
+        instance = %state.instance_id,
+    ))]
+    pub fn capture_encrypted(
+        &self,
+        state: InstanceState<'_>,
+        aead_key: &[u8; 32],
+        nonce: &[u8; crate::aead::AEAD_NONCE_LEN],
+    ) -> Result<Vec<u8>> {
+        let blob = self.capture(state)?;
+        let envelope = crate::aead::encrypt_blob(&blob, aead_key, nonce)?;
+        debug!(
+            inner = blob.len(),
+            envelope = envelope.len(),
+            "snapshot captured and AEAD-encrypted at rest",
+        );
+        Ok(envelope)
+    }
+
     /// T40: explicit opt-out of the v0.4 artifact-store envelope —
     /// always emits the legacy v2/v3 inline shape regardless of the
     /// `artifact-backing` feature flag or
