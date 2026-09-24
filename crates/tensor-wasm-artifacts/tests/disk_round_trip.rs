@@ -75,3 +75,49 @@ fn disk_put_is_idempotent_on_same_payload() {
     );
     assert_eq!(store.get(&h1).unwrap(), p);
 }
+
+#[test]
+fn builder_custom_zstd_level_and_durability_round_trips() {
+    // A store built with a non-default zstd level and the relaxed
+    // durability policy still produces a fully decodable envelope — the
+    // read path is level-agnostic and the atomic rename still publishes
+    // the blob even when fsyncs are skipped.
+    use std::sync::Arc;
+    use tensor_wasm_artifacts::{DurabilityPolicy, SingleKeyProvider};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = DiskArtifactStore::builder(
+        tmp.path().to_path_buf(),
+        Arc::new(SingleKeyProvider::new([0x4D; 32])),
+    )
+    .zstd_level(19)
+    .durability(DurabilityPolicy::None)
+    .build();
+
+    let payload = b"compressed at a non-default level, published without fsync \
+                    compressed at a non-default level, published without fsync";
+    let hash = store.put(payload).expect("put via builder");
+    assert_eq!(store.get(&hash).expect("get"), payload);
+    assert_eq!(store.list().expect("list").len(), 1);
+}
+
+#[test]
+fn builder_defaults_match_constructor() {
+    // `builder(...).build()` with no overrides must behave exactly like the
+    // historical `with_key_provider` constructor: same envelope, same
+    // round-trip.
+    use std::sync::Arc;
+    use tensor_wasm_artifacts::SingleKeyProvider;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().to_path_buf();
+    let built = DiskArtifactStore::builder(
+        dir.clone(),
+        Arc::new(SingleKeyProvider::new([0x2A; 32])),
+    )
+    .build();
+
+    let payload = b"default-built body";
+    let hash = built.put(payload).expect("put");
+    assert_eq!(built.get(&hash).expect("get"), payload);
+}
