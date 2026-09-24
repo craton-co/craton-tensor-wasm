@@ -142,6 +142,29 @@ pub enum ArtifactError {
     Io,
 }
 
+/// Lowercase ascii-hex digit lookup table, indexed by nibble (0..=15).
+/// Used by the hot-path hex encoders below instead of a per-byte
+/// `format!("{:02x}")`, which allocates an intermediate formatter and a
+/// `String` on every call.
+const HEX_LUT: [u8; 16] = *b"0123456789abcdef";
+
+/// Encode `bytes` as lowercase ascii-hex directly into a caller-owned
+/// `[u8; N2]` stack buffer (`N2` must be `2 * N`), with no heap
+/// allocation and no per-byte formatter dispatch. The buffer is pure
+/// ascii-hex on return, so `str::from_utf8` over it is always valid.
+///
+/// This is the shared core of [`ContentHash`]'s `Display`,
+/// [`key_fingerprint_hex`], and [`hex_of`] — all of which sat on the
+/// `resolve_read_key` / `list` hot paths and previously rebuilt a `String`
+/// per byte via `format!`.
+fn hex_into<const N: usize, const N2: usize>(bytes: &[u8; N], out: &mut [u8; N2]) {
+    debug_assert_eq!(N2, N * 2, "output buffer must be exactly 2x the input");
+    for (i, b) in bytes.iter().enumerate() {
+        out[i * 2] = HEX_LUT[(b >> 4) as usize];
+        out[i * 2 + 1] = HEX_LUT[(b & 0x0f) as usize];
+    }
+}
+
 /// 32-byte BLAKE3 content hash. The `put` path computes this from the
 /// uncompressed payload; the `get` path recomputes it from the decoded
 /// body and rejects on mismatch.
@@ -150,10 +173,13 @@ pub struct ContentHash([u8; 32]);
 
 impl std::fmt::Display for ContentHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for b in &self.0 {
-            write!(f, "{:02x}", b)?;
-        }
-        Ok(())
+        // Render into a fixed 64-byte stack buffer via the hex LUT, then
+        // emit it in one `write_str` — no per-byte formatter dispatch and
+        // no heap allocation. The buffer is guaranteed valid UTF-8 (ascii
+        // hex), so the `from_utf8` cannot fail.
+        let mut buf = [0u8; 64];
+        hex_into(&self.0, &mut buf);
+        f.write_str(std::str::from_utf8(&buf).expect("hex output is ascii"))
     }
 }
 
@@ -485,10 +511,12 @@ fn validated_hash_segment(hash: &ContentHash) -> Result<String, ArtifactError> {
 /// always fail the HMAC check.
 fn key_fingerprint_hex(key: &[u8; 32]) -> String {
     let h = blake3::hash(&key[..]);
-    h.as_bytes()[..8]
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect()
+    let mut first8 = [0u8; 8];
+    first8.copy_from_slice(&h.as_bytes()[..8]);
+    let mut hex = [0u8; 16];
+    hex_into(&first8, &mut hex);
+    // Safe: `hex_into` writes only ascii-hex digits.
+    String::from_utf8(hex.to_vec()).expect("hex output is ascii")
 }
 
 /// `Write` adapter that tees every byte into both an inner writer (the
@@ -565,6 +593,109 @@ impl<R: Read> Read for MacReader<'_, R> {
 // Disk store
 // =====================================================================
 
+/// Crash-durability policy for [`DiskArtifactStore`] writes, configured
+/// via [`DiskArtifactStoreBuilder::durability`].
+///
+/// Every `put` always publishes atomically (temp-then-rename), so a torn
+/// write never leaves a half-formed entry regardless of this setting. The
+/// policy only governs the *fsync* steps that make a freshly-published
+/// blob survive a power loss / kernel panic:
+///
+/// * [`DurabilityPolicy::Full`] (the default) — `fsync` the blob's data
+///   before the rename, then best-effort `fsync` the directory after it,
+///   so a successful `put` is durable across a crash. This is the
+///   safe default the snapshot/JIT durability story relies on.
+/// * [`DurabilityPolicy::None`] — skip both fsyncs. The atomic rename is
+///   still issued (so concurrent readers never see a partial file), but a
+///   crash immediately after `put` may lose the most recent writes. Useful
+///   for ephemeral caches and tests where throughput matters more than
+///   surviving a power cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityPolicy {
+    /// fsync blob data before rename and the directory after — durable.
+    Full,
+    /// Skip fsyncs; rely on the atomic rename alone — faster, not durable.
+    None,
+}
+
+impl Default for DurabilityPolicy {
+    fn default() -> Self {
+        DurabilityPolicy::Full
+    }
+}
+
+/// Builder for [`DiskArtifactStore`], exposing the previously-hardcoded
+/// zstd compression level and crash-durability policy as tunables.
+///
+/// Obtain one from [`DiskArtifactStore::builder`]. The defaults match the
+/// historical constructors exactly — zstd [`DEFAULT_ZSTD_LEVEL`] and
+/// [`DurabilityPolicy::Full`] — so `DiskArtifactStore::builder(dir,
+/// provider).build()` is byte-for-byte equivalent to
+/// `DiskArtifactStore::with_key_provider(dir, provider)`.
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use tensor_wasm_artifacts::{
+///     DiskArtifactStore, DurabilityPolicy, SingleKeyProvider,
+/// };
+///
+/// let store = DiskArtifactStore::builder(
+///     "/var/cache/artifacts".into(),
+///     Arc::new(SingleKeyProvider::new([0u8; 32])),
+/// )
+/// .zstd_level(9)
+/// .durability(DurabilityPolicy::None)
+/// .build();
+/// ```
+pub struct DiskArtifactStoreBuilder {
+    dir: PathBuf,
+    key_provider: Arc<dyn KeyProvider>,
+    zstd_level: i32,
+    durability: DurabilityPolicy,
+}
+
+impl DiskArtifactStoreBuilder {
+    /// Begin a builder with the default zstd level ([`DEFAULT_ZSTD_LEVEL`])
+    /// and durability ([`DurabilityPolicy::Full`]).
+    pub fn new(dir: PathBuf, key_provider: Arc<dyn KeyProvider>) -> Self {
+        Self {
+            dir,
+            key_provider,
+            zstd_level: DEFAULT_ZSTD_LEVEL,
+            durability: DurabilityPolicy::default(),
+        }
+    }
+
+    /// Override the zstd compression level applied by `put` / `put_from`.
+    /// The read path is level-agnostic, so this only affects newly-written
+    /// blobs. Out-of-range levels are clamped by zstd itself.
+    pub fn zstd_level(mut self, level: i32) -> Self {
+        self.zstd_level = level;
+        self
+    }
+
+    /// Override the crash-durability policy. See [`DurabilityPolicy`].
+    pub fn durability(mut self, policy: DurabilityPolicy) -> Self {
+        self.durability = policy;
+        self
+    }
+
+    /// Finish building the [`DiskArtifactStore`].
+    pub fn build(self) -> DiskArtifactStore {
+        let active = self.key_provider.active_key();
+        let key_fp_hex = key_fingerprint_hex(&active);
+        DiskArtifactStore {
+            dir: self.dir,
+            hmac_key: Zeroizing::new(active),
+            key_fp_hex,
+            key_provider: self.key_provider,
+            zstd_level: self.zstd_level,
+            durability: self.durability,
+            fp_cache: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
 /// On-disk content-addressed signed artifact store.
 ///
 /// Format on disk for a single blob:
@@ -575,6 +706,11 @@ impl<R: Read> Read for MacReader<'_, R> {
 ///
 /// The HMAC covers everything except the trailing 32-byte tag itself.
 /// Verification uses constant-time comparison.
+///
+/// Construct with [`Self::new`] / [`Self::with_key_provider`] for the
+/// defaults (zstd level [`DEFAULT_ZSTD_LEVEL`], [`DurabilityPolicy::Full`]),
+/// or with [`Self::builder`] to tune the compression level and durability
+/// policy.
 pub struct DiskArtifactStore {
     dir: PathBuf,
     /// Active signing key — the key new `put`s sign with. Cached out of the
@@ -589,13 +725,29 @@ pub struct DiskArtifactStore {
     /// `path_for` / `meta_path_for` (and thus `put` / `put_with_metadata`);
     /// caching it here avoids re-hashing the active key on every write. The
     /// rotation-aware read/probe paths derive per-key fingerprints on demand
-    /// via `key_fingerprint_hex` instead.
+    /// via the [`Self::fp_for`] cache instead.
     key_fp_hex: String,
     /// Pluggable source of signing keys. For a single-key store this is a
     /// [`SingleKeyProvider`]; for a rotating store it yields the active
     /// key plus the retired keys still accepted for reads. `get` and
     /// `list` consult [`KeyProvider::read_keys`] so they span a rotation.
     key_provider: Arc<dyn KeyProvider>,
+    /// zstd compression level applied by `put` / `put_from`. Defaults to
+    /// [`DEFAULT_ZSTD_LEVEL`]; tune via [`DiskArtifactStoreBuilder`]. The
+    /// read path is level-agnostic (zstd frames are self-describing), so a
+    /// store can decode blobs written at any level.
+    zstd_level: i32,
+    /// Crash-durability policy for the write path. See [`DurabilityPolicy`].
+    durability: DurabilityPolicy,
+    /// Memoised `key -> key_fingerprint_hex(key)` map for the rotation-aware
+    /// read/probe paths (`resolve_read_key`, `list`). `key_fingerprint_hex`
+    /// runs a BLAKE3 over the 32-byte key plus a hex render; on a `get`/
+    /// `contains`/`remove` it was recomputed for every accepted read key on
+    /// every call. Caching collapses that to one hash per distinct key for
+    /// the store's lifetime. Keyed by raw key bytes (the fingerprint is a
+    /// public 8-byte digest of the key, not secret, so caching its hex is
+    /// not a key-exposure concern).
+    fp_cache: parking_lot::Mutex<HashMap<[u8; 32], String>>,
 }
 
 impl DiskArtifactStore {
@@ -604,8 +756,10 @@ impl DiskArtifactStore {
     ///
     /// This wraps `hmac_key` in a [`SingleKeyProvider`] internally, so the
     /// store writes and reads under exactly that one key — identical to
-    /// the historical single-key behaviour. Use
-    /// [`Self::with_key_provider`] for rotation support.
+    /// the historical single-key behaviour. The zstd level defaults to
+    /// [`DEFAULT_ZSTD_LEVEL`] and durability to [`DurabilityPolicy::Full`];
+    /// use [`Self::builder`] to change either, or [`Self::with_key_provider`]
+    /// for rotation support.
     pub fn new(dir: PathBuf, hmac_key: [u8; 32]) -> Self {
         Self::with_key_provider(dir, Arc::new(SingleKeyProvider::new(hmac_key)))
     }
@@ -617,16 +771,33 @@ impl DiskArtifactStore {
     /// try every key in [`KeyProvider::read_keys`], so a store built with
     /// a [`RotatingKeyProvider`] can read blobs written under a retired
     /// key after rotation. The directory is created lazily on the first
-    /// `put`.
+    /// `put`. zstd level and durability take their defaults; use
+    /// [`Self::builder`] to tune them.
     pub fn with_key_provider(dir: PathBuf, key_provider: Arc<dyn KeyProvider>) -> Self {
-        let active = key_provider.active_key();
-        let key_fp_hex = key_fingerprint_hex(&active);
-        Self {
-            dir,
-            hmac_key: Zeroizing::new(active),
-            key_fp_hex,
-            key_provider,
+        DiskArtifactStoreBuilder::new(dir, key_provider).build()
+    }
+
+    /// Start building a disk store rooted at `dir` whose signing keys come
+    /// from `key_provider`, exposing the zstd compression level and
+    /// crash-durability policy as tunables. See [`DiskArtifactStoreBuilder`].
+    pub fn builder(
+        dir: PathBuf,
+        key_provider: Arc<dyn KeyProvider>,
+    ) -> DiskArtifactStoreBuilder {
+        DiskArtifactStoreBuilder::new(dir, key_provider)
+    }
+
+    /// Resolve the key-fingerprint hex for `key`, memoising it in
+    /// [`Self::fp_cache`] so the rotation-aware read/probe paths hash each
+    /// distinct key at most once for the store's lifetime instead of on
+    /// every `get` / `contains` / `remove`.
+    fn fp_for(&self, key: &[u8; 32]) -> String {
+        if let Some(fp) = self.fp_cache.lock().get(key) {
+            return fp.clone();
         }
+        let fp = key_fingerprint_hex(key);
+        self.fp_cache.lock().insert(*key, fp.clone());
+        fp
     }
 
     /// Compute the on-disk path for `hash` under this store's *active*
@@ -715,19 +886,25 @@ impl DiskArtifactStore {
             warn!(target: "tensor_wasm_artifacts", error = %e, "metadata write failed");
             ArtifactError::Io
         })?;
-        // Durability (crash-consistency fix): flush the sidecar's data
-        // before the atomic rename, mirroring the blob publish above.
-        tmp.as_file().sync_all().map_err(|e| {
-            warn!(target: "tensor_wasm_artifacts", error = %e, "metadata fsync (pre-persist) failed");
-            ArtifactError::Io
-        })?;
+        // Durability (crash-consistency): under `DurabilityPolicy::Full`,
+        // flush the sidecar's data before the atomic rename, mirroring the
+        // blob publish above. Skipped under `DurabilityPolicy::None`.
+        if self.durability == DurabilityPolicy::Full {
+            tmp.as_file().sync_all().map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "metadata fsync (pre-persist) failed");
+                ArtifactError::Io
+            })?;
+        }
         tmp.persist(&meta_path).map_err(|e| {
             warn!(target: "tensor_wasm_artifacts", error = %e, "metadata persist failed");
             ArtifactError::Io
         })?;
         // Durability: best-effort directory fsync to persist the rename
         // (tolerant of Windows, where directory sync is unsupported).
-        self.sync_dir_best_effort();
+        // Skipped under `DurabilityPolicy::None`.
+        if self.durability == DurabilityPolicy::Full {
+            self.sync_dir_best_effort();
+        }
         Ok(hash)
     }
 
@@ -752,7 +929,7 @@ impl DiskArtifactStore {
             Some(found) => found,
             None => return Err(ArtifactError::NotFound(hash.to_string())),
         };
-        let fp = key_fingerprint_hex(&key);
+        let fp = self.fp_for(&key);
         let meta_path = self.meta_path_for_key(hash, &fp)?;
         let bytes = match std::fs::read(&meta_path) {
             Ok(b) => b,
@@ -973,7 +1150,7 @@ impl DiskArtifactStore {
         hash: &ContentHash,
     ) -> Result<Option<(PathBuf, [u8; 32])>, ArtifactError> {
         for key in self.key_provider.read_keys() {
-            let fp = key_fingerprint_hex(&key);
+            let fp = self.fp_for(&key);
             let path = self.path_for_key(hash, &fp)?;
             match std::fs::metadata(&path) {
                 Ok(_) => return Ok(Some((path, key))),
@@ -1153,7 +1330,7 @@ impl ArtifactStore for DiskArtifactStore {
             // emits compressed bytes downstream — those compressed bytes
             // pass through `tee`, so they're both written to disk AND
             // hashed into the MAC in one pass.
-            let mut encoder = zstd::stream::write::Encoder::new(&mut tee, DEFAULT_ZSTD_LEVEL)
+            let mut encoder = zstd::stream::write::Encoder::new(&mut tee, self.zstd_level)
                 .map_err(|e| {
                     warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed");
                     ArtifactError::Io
@@ -1194,21 +1371,25 @@ impl ArtifactStore for DiskArtifactStore {
             ArtifactError::Io
         })?;
 
-        // Durability (crash-consistency fix): flush the temp file's data
-        // to stable storage BEFORE the atomic rename. Without this
-        // `sync_all`, a crash after `persist` could leave the renamed
-        // file's directory entry pointing at data still sitting in the
-        // page cache, so the blob the doc comments promise is durable
-        // could come back truncated or zero-length on the next boot.
-        tmp.as_file().sync_all().map_err(|e| {
-            warn!(target: "tensor_wasm_artifacts", error = %e, "blob fsync (pre-persist) failed");
-            ArtifactError::Io
-        })?;
+        // Durability (crash-consistency): under `DurabilityPolicy::Full`,
+        // flush the temp file's data to stable storage BEFORE the atomic
+        // rename. Without this `sync_all`, a crash after `persist` could
+        // leave the renamed file's directory entry pointing at data still
+        // sitting in the page cache, so the blob the doc comments promise
+        // is durable could come back truncated or zero-length on the next
+        // boot. Under `DurabilityPolicy::None` this fsync is skipped (the
+        // atomic rename below still prevents a torn read).
+        if self.durability == DurabilityPolicy::Full {
+            tmp.as_file().sync_all().map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "blob fsync (pre-persist) failed");
+                ArtifactError::Io
+            })?;
+        }
 
         // Atomic publish: temp-then-rename in the same directory,
         // mirroring the JIT L2 disk-cache pattern so a partial write
         // can never leave a half-formed entry that a concurrent reader
-        // trips over.
+        // trips over. This happens regardless of durability policy.
         tmp.persist(&final_path).map_err(|e| {
             // `tempfile::PersistError` wraps the underlying `io::Error`
             // plus the temp handle; the `Display` impl forwards to the
@@ -1217,13 +1398,16 @@ impl ArtifactStore for DiskArtifactStore {
             ArtifactError::Io
         })?;
 
-        // Durability: fsync the containing directory so the rename itself
-        // is persisted, not just the file data. On Windows a directory
-        // `sync_all` typically fails (you cannot open a directory as a
-        // syncable file handle); that is tolerated as best-effort — the
-        // file data is already durable from the `sync_all` above, which
-        // is the part that matters most for crash consistency.
-        self.sync_dir_best_effort();
+        // Durability: under `DurabilityPolicy::Full`, fsync the containing
+        // directory so the rename itself is persisted, not just the file
+        // data. On Windows a directory `sync_all` typically fails (you
+        // cannot open a directory as a syncable file handle); that is
+        // tolerated as best-effort — the file data is already durable from
+        // the `sync_all` above, which is the part that matters most for
+        // crash consistency. Skipped entirely under `DurabilityPolicy::None`.
+        if self.durability == DurabilityPolicy::Full {
+            self.sync_dir_best_effort();
+        }
         Ok(hash)
     }
 
@@ -1586,23 +1770,85 @@ impl ArtifactStore for DiskArtifactStore {
     fn list(&self) -> Result<Vec<ContentHash>, ArtifactError> {
         // Rotation-aware enumeration: union the hashes visible under every
         // accepted read-key fingerprint so an audit spans the rotation
-        // boundary. Dedup because a content hash may be present under more
-        // than one key (e.g. re-put after rotation). Probe each key's
-        // `.bin` suffix in turn.
-        let mut seen: std::collections::HashSet<ContentHash> = std::collections::HashSet::new();
-        let mut fps: Vec<String> = self
+        // boundary. PERF: scan the directory exactly ONCE and bucket each
+        // `{hash}.{fp}.bin` entry against the deduped accepted-fingerprint
+        // set, instead of re-`read_dir`-ing the whole directory once per
+        // read key (the old O(keys × dir) cost). Dedup the content hashes
+        // because the same hash may live under more than one accepted key
+        // (e.g. re-put after rotation).
+        let accepted: std::collections::HashSet<String> = self
             .key_provider
             .read_keys()
             .iter()
-            .map(key_fingerprint_hex)
+            .map(|k| self.fp_for(k))
             .collect();
-        // The single-key common case has exactly one fingerprint; dedup the
-        // fingerprint list so a provider that repeats the active key in
-        // `read_keys` doesn't scan the directory twice.
-        fps.sort();
-        fps.dedup();
-        for fp in fps {
-            self.list_one_key(&fp, &mut seen)?;
+
+        let mut seen: std::collections::HashSet<ContentHash> = std::collections::HashSet::new();
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(e) => e,
+            // The dir is created lazily on first `put`; absent == empty.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                warn!(
+                    target: "tensor_wasm_artifacts",
+                    dir = %self.dir.display(),
+                    error = %e,
+                    "read_dir failed"
+                );
+                return Err(ArtifactError::Io);
+            }
+        };
+        for entry in entries {
+            // A per-entry error is a real enumeration failure (racing
+            // unlink mid-scan, underlying I/O fault), not a skippable
+            // filename mismatch — propagate it rather than silently
+            // shortening the listing.
+            let entry = entry.map_err(|e| {
+                warn!(
+                    target: "tensor_wasm_artifacts",
+                    dir = %self.dir.display(),
+                    error = %e,
+                    "read_dir entry failed"
+                );
+                ArtifactError::Io
+            })?;
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            // Parse `{64 hex}.{16 hex}.bin`, bucketing by the `fp`
+            // segment against the accepted set so a foreign key's blobs
+            // (and `.meta.json` sidecars) are partitioned out.
+            let (hash, fp) = match parse_blob_filename(&name) {
+                Some(parsed) => parsed,
+                None => continue,
+            };
+            if !accepted.contains(fp) {
+                continue;
+            }
+            // Min-length stat: a foreign zero-byte / truncated lookalike
+            // can share the name shape yet hold no authenticatable blob;
+            // dropping it keeps it out of GC/audit listings (see the
+            // dedicated `list_skips_zero_byte_and_truncated_lookalikes`
+            // test). A NotFound here is a benign mid-scan unlink race —
+            // skip; any other stat fault is a real enumeration failure.
+            let min_len = (ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN) as u64;
+            match entry.metadata() {
+                Ok(meta) if meta.len() >= min_len => {
+                    seen.insert(ContentHash::from_bytes(hash));
+                }
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    warn!(
+                        target: "tensor_wasm_artifacts",
+                        file = %name,
+                        error = %e,
+                        "list candidate stat failed"
+                    );
+                    return Err(ArtifactError::Io);
+                }
+            }
         }
         Ok(seen.into_iter().collect())
     }
@@ -1657,7 +1903,7 @@ impl ArtifactStore for DiskArtifactStore {
         // writes none); any other unlink fault is logged but does not flip
         // the blob-removal result, since the blob — the authoritative entry
         // — is already gone.
-        let fp = key_fingerprint_hex(&key);
+        let fp = self.fp_for(&key);
         let meta_path = match self.meta_path_for_key(hash, &fp) {
             Ok(p) => p,
             // The blob was already resolved + unlinked above; a malformed
@@ -1679,99 +1925,29 @@ impl ArtifactStore for DiskArtifactStore {
     }
 }
 
-impl DiskArtifactStore {
-    /// Enumerate the content hashes stored under the single key fingerprint
-    /// `fp`, inserting each into `seen`. Shared by [`ArtifactStore::list`]'s
-    /// per-key loop. A missing store directory is treated as empty (the dir
-    /// is created lazily on the first `put`); any other `read_dir` fault is
-    /// propagated as [`ArtifactError::Io`].
-    fn list_one_key(
-        &self,
-        fp: &str,
-        seen: &mut std::collections::HashSet<ContentHash>,
-    ) -> Result<(), ArtifactError> {
-        let suffix = format!(".{fp}.bin");
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => {
-                warn!(
-                    target: "tensor_wasm_artifacts",
-                    dir = %self.dir.display(),
-                    error = %e,
-                    "read_dir failed"
-                );
-                return Err(ArtifactError::Io);
-            }
-        };
-        for entry in entries {
-            // A per-entry error (e.g. the directory was racing with a
-            // concurrent unlink, or an underlying I/O fault) is a real
-            // enumeration failure, not a skippable filename mismatch —
-            // propagate it rather than silently shortening the listing.
-            let entry = entry.map_err(|e| {
-                warn!(
-                    target: "tensor_wasm_artifacts",
-                    dir = %self.dir.display(),
-                    error = %e,
-                    "read_dir entry failed"
-                );
-                ArtifactError::Io
-            })?;
-            let name = match entry.file_name().into_string() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            // Filenames look like `{64 hex chars}.{16 hex chars}.bin`.
-            // Match the suffix so we ignore files written under a
-            // different key (and the `.meta.json` sidecars).
-            if !name.ends_with(&suffix) {
-                continue;
-            }
-            let hash_hex = &name[..name.len() - suffix.len()];
-            if hash_hex.len() != 64 {
-                continue;
-            }
-            let bytes = match parse_hash_hex(hash_hex) {
-                Some(b) => b,
-                None => continue,
-            };
-            // Stat the candidate and skip anything too short to be a real
-            // envelope. A foreign zero-byte file (or a truncated stub) can
-            // share the `{64hex}.{fp}.bin` name shape yet hold no
-            // authenticatable blob; counting it would over-report the
-            // listing and hand GC/audit a hash that `get` immediately
-            // rejects with `BadMagic`. A genuine blob is always at least
-            // `ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN` bytes. A NotFound
-            // here means the entry was unlinked between `read_dir` and the
-            // stat (a benign race) — skip it; any other stat fault is a
-            // real enumeration failure and propagates as `Io`.
-            let min_len = (ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN) as u64;
-            match entry.metadata() {
-                Ok(meta) if meta.len() >= min_len => {
-                    seen.insert(ContentHash::from_bytes(bytes));
-                }
-                Ok(_) => continue,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    warn!(
-                        target: "tensor_wasm_artifacts",
-                        file = %name,
-                        error = %e,
-                        "list candidate stat failed"
-                    );
-                    return Err(ArtifactError::Io);
-                }
-            }
-        }
-        Ok(())
-    }
+/// Parse a store blob filename `{64 hex}.{16 hex}.bin` into its decoded
+/// 32-byte content hash and a borrow of the 16-char key-fingerprint
+/// segment, or `None` if the name does not match the shape (wrong suffix,
+/// wrong-length / non-hex hash segment, missing fp segment, `.meta.json`
+/// sidecar, or any foreign file).
+///
+/// Used by [`ArtifactStore::list`]'s single directory scan to bucket each
+/// entry by fingerprint against the accepted-key set in one pass, instead
+/// of re-scanning the directory per key.
+fn parse_blob_filename(name: &str) -> Option<([u8; 32], &str)> {
+    let stem = name.strip_suffix(".bin")?;
+    // `stem` is now `{64 hex}.{fp}`; split off the trailing `.fp` segment.
+    let dot = stem.rfind('.')?;
+    let hash_hex = &stem[..dot];
+    let fp = &stem[dot + 1..];
+    let hash = parse_hash_hex(hash_hex)?;
+    Some((hash, fp))
 }
 
 /// Parse a 64-char lowercase ascii-hex `ContentHash` segment into its raw
 /// 32 bytes, or `None` if it is the wrong length or contains a non-hex
-/// char. Used by [`DiskArtifactStore::list_one_key`] to reconstruct
-/// hashes from on-disk filenames without per-`format!` allocation churn.
+/// char. Used by [`parse_blob_filename`] to reconstruct hashes from
+/// on-disk filenames without per-`format!` allocation churn.
 fn parse_hash_hex(hash_hex: &str) -> Option<[u8; 32]> {
     if hash_hex.len() != 64 {
         return None;
@@ -1796,7 +1972,10 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 fn hex_of(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    let mut hex = [0u8; 64];
+    hex_into(bytes, &mut hex);
+    // Safe: `hex_into` writes only ascii-hex digits.
+    String::from_utf8(hex.to_vec()).expect("hex output is ascii")
 }
 
 // =====================================================================
