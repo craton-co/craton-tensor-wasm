@@ -314,14 +314,25 @@ async fn save(
     // Three benefits over the previous resp.bytes() approach:
     //   1. A malicious / buggy server cannot OOM the CLI by streaming
     //      arbitrarily many gigabytes — we abort as soon as `cap` bytes
-    //      have been accumulated.
-    //   2. An early Content-Length check rejects oversized payloads before
-    //      a single chunk is read.
+    //      have been accumulated (the per-chunk tripwire in the loop below).
+    //   2. An early Content-Length check rejects oversized *length-declared*
+    //      responses before a single chunk is read — see the caveat below.
     //   3. The write goes to a temp file in the same directory as `output`
     //      and is atomically renamed on success, so a failed download
     //      never leaves a half-written snapshot at the target path.
-    if let Some(declared) = resp.content_length() {
-        if declared > cap {
+    //
+    // cli LOW (snapshot L4): the `content_length()` fast-fail below ONLY
+    // covers responses that declare a `Content-Length`. A chunked
+    // (`Transfer-Encoding: chunked`) response — which is exactly what a
+    // streaming snapshot server emits, and what a malicious server would use
+    // to dodge the declared-length check — has `content_length() == None`, so
+    // this block is a no-op for it. That is intentional and NOT a hole: the
+    // real, always-on bound is the per-chunk `received > cap` tripwire in the
+    // streaming loop below, which fires regardless of transfer encoding. This
+    // fast-fail is a bandwidth optimisation for the honest-but-too-large case
+    // (reject before reading a byte), not the security boundary.
+    match resp.content_length() {
+        Some(declared) if declared > cap => {
             return Err(anyhow::anyhow!(
                 "server declared {} bytes; refusing to write more than {} bytes to disk \
                  (lower with --max-restore-bytes; the hard ceiling is {} bytes)",
@@ -329,6 +340,19 @@ async fn save(
                 cap,
                 MAX_RESTORE_BYTES_CEILING
             ));
+        }
+        Some(_) => {}
+        None => {
+            // Chunked / length-undeclared response: the fast-fail cannot
+            // apply. Note it at debug level so an operator chasing an
+            // unexpected disk write can confirm the per-chunk cap is the only
+            // bound in play for this response.
+            tracing::debug!(
+                target: "tensor_wasm_cli::snapshot",
+                cap,
+                "snapshot response declared no Content-Length (chunked); \
+                 relying on the per-chunk cap tripwire to bound disk writes"
+            );
         }
     }
     let parent = output.parent().unwrap_or_else(|| std::path::Path::new("."));
