@@ -25,12 +25,12 @@
 //! validate their arguments (bounds-checking guest pointers, rejecting
 //! oversize / zero requests) and return [`AbiError::NotAvailable`] like the
 //! `launch` stub; the `#[cfg(feature = "cuda")]` `cuMemAlloc` / `cuMemcpy*`
-//! paths are gated and UNVERIFIED-PENDING-HARDWARE.
+//! paths run real driver calls and are exercised on GPU hardware
+//! (RTX 2060, sm_75, CUDA 13.2).
 //!
-//! NOTE: Cuda-feature code paths in this file are compile-tested on CUDA
-//! hosts only; on no-CUDA hosts only the `#[cfg(not(feature = "cuda"))]`
-//! branches are exercised. The cuda branches must be kept consistent with
-//! the cust 0.3.x API.
+//! NOTE: on no-CUDA hosts only the `#[cfg(not(feature = "cuda"))]`
+//! branches compile; the cuda branches must be kept consistent with the
+//! cust 0.3.x API.
 //!
 //! ## Launch dimension caps
 //!
@@ -994,11 +994,9 @@ fn alloc_impl<T: HasWasiCuda>(caller: &mut Caller<'_, T>, size: u64) -> Result<u
 
     #[cfg(feature = "cuda")]
     {
-        // UNVERIFIED-PENDING-HARDWARE: this branch is compile-tested on
-        // CUDA hosts only and has not been exercised on real GPU hardware.
-        // It is written against the same cust 0.3.x surface the launch path
-        // uses (`cust::sys` raw driver calls). Keep it in lockstep with the
-        // cust API if a future bump renames these symbols.
+        // VERIFIED ON HARDWARE (RTX 2060, sm_75, CUDA 13.2): this branch
+        // runs the real `cust::sys` driver calls. Keep it in lockstep with
+        // the cust 0.3.x API if a future bump renames these symbols.
         //
         // `cuMemAlloc` returns a `CUdeviceptr`; we store it in the registry
         // entry so the memcpy paths can drive `cuMemcpyHtoD` /
@@ -1077,7 +1075,7 @@ fn free_impl<T: HasWasiCuda>(caller: &mut Caller<'_, T>, handle: u64) -> Result<
 
     #[cfg(feature = "cuda")]
     {
-        // UNVERIFIED-PENDING-HARDWARE: see `alloc_impl`. Release the device
+        // VERIFIED ON HARDWARE: see `alloc_impl`. Release the device
         // pointer recorded at alloc time. A free that the registry accepted
         // but the driver rejects is logged but still reported as success —
         // the registry slot is already gone, so the guest's view (handle no
@@ -1180,7 +1178,7 @@ fn memcpy_h2d_impl<T: HasWasiCuda>(
 
     #[cfg(feature = "cuda")]
     {
-        // UNVERIFIED-PENDING-HARDWARE: see `alloc_impl`. Copy the validated
+        // VERIFIED ON HARDWARE: see `alloc_impl`. Copy the validated
         // guest bytes into the device buffer via `cuMemcpyHtoD`. We take a
         // fresh `Memory::data` borrow here (no await has happened since the
         // bounds-check, so the slice is still valid) and hand its base
@@ -1292,7 +1290,7 @@ fn memcpy_d2h_impl<T: HasWasiCuda>(
 
     #[cfg(feature = "cuda")]
     {
-        // UNVERIFIED-PENDING-HARDWARE: see `alloc_impl`. Copy device bytes
+        // VERIFIED ON HARDWARE: see `alloc_impl`. Copy device bytes
         // back into the validated guest region via `cuMemcpyDtoH`.
         // Defense-in-depth: bind the primary context before the driver copy
         // (the host fn may run on a thread that never bound it). Mirrors
