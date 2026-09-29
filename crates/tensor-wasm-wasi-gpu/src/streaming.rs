@@ -21,11 +21,11 @@
 //!
 //! Two hard caps are enforced before any chunk is forwarded:
 //!
-//! * [`MAX_CHUNK_BYTES`] (64 KiB) — single-chunk size cap. Currently the
-//!   parser-side check is left for the v0.4 host-fn implementation (the
-//!   wasi-tensor WIT signature does not yet carry a per-call cap distinct
-//!   from the total cap); the constant is exported so the host-fn wrapper
-//!   and tests share a single source of truth.
+//! * [`MAX_CHUNK_BYTES`] (64 KiB) — single-chunk size cap. Enforced live in
+//!   [`prepare_emit_chunk`]: an `emit-chunk` whose `buf_len` exceeds the cap
+//!   returns the documented `-2` code without touching the channel. The
+//!   constant is exported so the host-fn wrapper and tests share a single
+//!   source of truth.
 //! * [`MAX_TOTAL_STREAM_BYTES`] (64 MiB) — total bytes a single
 //!   invocation may emit before the host returns the documented
 //!   `-2 = cap exceeded` code from `emit-chunk`.
@@ -54,8 +54,10 @@ use crate::abi::AbiError;
 
 /// Maximum size, in bytes, of a single `emit-chunk` call. 64 KiB matches
 /// typical HTTP chunk-encoder buffer sizes; guests producing larger
-/// payloads should call `emit-chunk` repeatedly. Enforced by the v0.4
-/// host-fn wrapper; exported here so wrapper and tests share a constant.
+/// payloads should call `emit-chunk` repeatedly. Enforced live in
+/// [`prepare_emit_chunk`] (an over-cap `buf_len` returns `-2` without
+/// touching the channel); exported here so the host-fn wrapper and tests
+/// share a single constant.
 pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Maximum total bytes a single invocation may emit across all
@@ -174,15 +176,33 @@ impl StreamingContext {
         }
     }
 
-    /// Flush any buffered chunks. The scaffold uses an unbuffered
-    /// `mpsc::Sender` whose `send` already delivers per-call, so this
-    /// is a no-op. v0.4 may introduce a coalescing buffer in front of
-    /// the channel; the flush hook is reserved for that.
+    /// Flush any buffered chunks.
     ///
-    /// Returns `0` on success, `-1` when streaming is disabled.
+    /// The scaffold uses an `mpsc::Sender` whose `send` already delivers
+    /// per-call, so there is nothing to drain. But "flush" still has a
+    /// useful, observable verdict to return: whether the downstream
+    /// receiver is still attached. We consult the channel rather than
+    /// blindly returning `0`, mirroring the `emit-chunk` error contract so a
+    /// guest can distinguish a live stream from a disconnected client:
+    ///
+    /// * `0`  — streaming enabled and the downstream receiver is still live.
+    /// * `-1` — streaming is disabled (no channel attached).
+    /// * `-3` — the downstream client disconnected (receiver dropped); a
+    ///   subsequent `emit-chunk` would also fail with `-3`.
+    ///
+    /// v0.4 may introduce a coalescing buffer in front of the channel; the
+    /// flush hook will drain it then. Until then the receiver-liveness check
+    /// is the meaningful behaviour.
     pub fn flush(&self) -> i32 {
-        if self.sender.is_none() {
+        let Some(s) = &self.sender else {
             return -1;
+        };
+        // `Sender::is_closed` is `true` once every `Receiver` has been
+        // dropped — the same condition that makes `emit_chunk`'s `send`
+        // return `Err` (`-3`). Surfacing it here lets a guest probe the
+        // connection without having to emit a (possibly empty) chunk.
+        if s.is_closed() {
+            return -3;
         }
         0
     }
@@ -511,6 +531,23 @@ mod tests {
         let chunk = rx.recv().await.expect("chunk delivered");
         assert_eq!(chunk, vec![0xAA, 0xBB, 0xCC]);
         assert_eq!(ctx.flush(), 0);
+    }
+
+    /// `flush` now consults channel liveness rather than returning a blind
+    /// `0`: once the downstream receiver is dropped it reports `-3`, the same
+    /// disconnect code `emit_chunk` returns. Regression guard for the
+    /// flush-wiring fix.
+    #[tokio::test]
+    async fn flush_reports_receiver_disconnect() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
+        let ctx = StreamingContext::with_channel(tx);
+        // Receiver alive → flush succeeds.
+        assert_eq!(ctx.flush(), 0);
+        // Drop the receiver → flush reports the disconnect.
+        drop(rx);
+        assert_eq!(ctx.flush(), -3);
+        // A subsequent emit also fails with the same disconnect code.
+        assert_eq!(ctx.emit_chunk(vec![1, 2, 3]).await, -3);
     }
 
     #[test]

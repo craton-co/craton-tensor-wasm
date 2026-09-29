@@ -460,20 +460,76 @@ impl Drop for BorrowedDispatchPermit<'_> {
     }
 }
 
+/// Shared completion state driven by a `cuStreamAddCallback` host callback
+/// (CUDA-only).
+///
+/// The driver invokes [`stream_completion_trampoline`] on one of its own
+/// internal threads once all work enqueued on the stream *before* the
+/// callback has finished. The trampoline flips [`done`](Self::done) and
+/// wakes the [`waker`](Self::waker) the future last parked, so the
+/// wasmtime fiber resumes exactly once — no busy-poll, no fixed-interval
+/// sleep. The future, in turn, stores the latest waker on every `Pending`
+/// poll so a runtime task-migration cannot strand a stale waker.
+#[cfg(feature = "cuda")]
+struct CallbackState {
+    /// Set `true` by the driver callback once the stream work completes.
+    done: std::sync::atomic::AtomicBool,
+    /// The most recent waker parked by the future. The callback takes it
+    /// and wakes it; the future replaces it on every `Pending` poll.
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+/// `extern "C"` trampoline handed to `cuStreamAddCallback`.
+///
+/// # Safety
+///
+/// `user_data` MUST be the `Arc::into_raw(Arc<CallbackState>)` pointer the
+/// future passed when it registered the callback. The driver guarantees it
+/// invokes this exactly once per registration, so reconstructing the `Arc`
+/// with `Arc::from_raw` here consumes precisely the strong reference the
+/// registration leaked — balancing the refcount with no leak and no
+/// double-free.
+#[cfg(feature = "cuda")]
+unsafe extern "C" fn stream_completion_trampoline(
+    _stream: cust::sys::CUstream,
+    _status: cust::sys::CUresult,
+    user_data: *mut std::ffi::c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    // Reclaim the strong ref the registration leaked via `Arc::into_raw`.
+    let state: Arc<CallbackState> = Arc::from_raw(user_data as *const CallbackState);
+    // Mark complete BEFORE waking so the woken poll observes `done == true`.
+    // `_status` may report an error; we still resolve the future — the
+    // launch-side error handling (cuLaunchKernel return code, the
+    // synchronize path) owns error reporting, and the dispatch future's
+    // only job is to signal "the stream drained."
+    state.done.store(true, Ordering::Release);
+    if let Some(w) = state
+        .waker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        w.wake();
+    }
+    // `state` drops here, releasing the registration's strong ref.
+}
+
 /// A future representing an in-flight GPU dispatch.
 ///
 /// On the no-CUDA stub path this resolves immediately. On CUDA hosts the
-/// future polls a `cust::event::Event` recorded on the launch stream:
-/// `event.query()` returns `Ok(())` once the GPU has finished the
-/// associated work. Until then we re-schedule via the waker so the
-/// wasmtime fiber can continue to be suspended.
+/// future is driven by a real `cuStreamAddCallback` waker: the driver wakes
+/// the task once the stream's queued work has drained, so the future
+/// returns `Pending` exactly once and resumes on a genuine completion
+/// signal — no busy-spin and no fixed-interval sleep poll.
 ///
 /// The future carries a `tracing::Span` captured at construction time
 /// (the active span belonging to whichever host function created it,
 /// typically `wasi_cuda.launch`). Every `poll` call enters that span,
-/// so any work — including the `cust::event::Event::query` poll path —
-/// is attributed to the originating dispatch in the trace tree even
-/// though `poll` is invoked from the Tokio runtime's reactor, not from
+/// so any work is attributed to the originating dispatch in the trace tree
+/// even though `poll` is invoked from the Tokio runtime's reactor, not from
 /// inside the host function. Without this the dispatch's poll events
 /// would be parented to the runtime worker's empty context and would
 /// disappear from the distributed trace.
@@ -485,22 +541,31 @@ pub struct DispatchFuture {
     /// `Arc`-clone) and lets us re-enter on each poll without leaking
     /// the guard.
     dispatch_span: tracing::Span,
-    /// On CUDA builds: a recorded event whose completion signals kernel
-    /// done. We poll `event.query()` from the future. On no-CUDA builds
-    /// this field is absent and the future resolves on first poll.
+    /// On CUDA builds: a recorded event kept alive for the future's
+    /// lifetime so the stream's completion bookkeeping outlives the
+    /// callback. `None` on the [`DispatchFuture::ready`] path (resolves
+    /// immediately). On no-CUDA builds the field is absent.
+    ///
+    /// Held purely as a lifetime keepalive — the callback waker drives
+    /// completion, so the field is never read, only dropped.
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     event: Option<cust::event::Event>,
-    /// On CUDA builds: an in-flight short sleep used to yield the Tokio
-    /// worker between CUDA event polls. The sleep timer wakes us, so we
-    /// do not need to call `wake_by_ref` and avoid a busy-poll loop.
+    /// On CUDA builds: the stream the callback is (or will be) registered
+    /// on. `None` on the immediate-resolution path.
     #[cfg(feature = "cuda")]
-    sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    stream: Option<cust::stream::Stream>,
+    /// On CUDA builds: the shared completion state the driver callback
+    /// drives. Lazily created and the callback lazily registered on the
+    /// first `Pending` poll so the registration captures a live waker.
+    #[cfg(feature = "cuda")]
+    callback_state: Option<Arc<CallbackState>>,
 }
 
 impl DispatchFuture {
     /// Build a future bound to the given back-pressure permit. The future
-    /// resolves the next time it is polled (no-CUDA path) or once the
-    /// CUDA event has fired (CUDA path with `bind_event`).
+    /// resolves the next time it is polled (no-CUDA path, or the CUDA path
+    /// with no event/stream attached).
     pub fn ready(permit: DispatchPermit) -> Self {
         Self {
             _permit: permit,
@@ -508,23 +573,50 @@ impl DispatchFuture {
             #[cfg(feature = "cuda")]
             event: None,
             #[cfg(feature = "cuda")]
-            sleep: None,
+            stream: None,
+            #[cfg(feature = "cuda")]
+            callback_state: None,
         }
     }
 
     /// Attach a recorded CUDA event to this future (CUDA-only).
     ///
-    /// After this call, `poll` will return `Pending` until `event.query()`
-    /// reports the work has completed. Without this call (the
-    /// [`DispatchFuture::ready`] path) the future still resolves
-    /// immediately, matching the no-CUDA semantics.
+    /// Kept for source-compat with callers that only hold an event. Without
+    /// a stream the future cannot register a `cuStreamAddCallback` waker, so
+    /// it resolves on the next poll — the event is held only as a lifetime
+    /// keepalive. Prefer [`DispatchFuture::with_stream_event`] for the
+    /// real callback-driven path.
     #[cfg(feature = "cuda")]
     pub fn with_event(permit: DispatchPermit, event: cust::event::Event) -> Self {
         Self {
             _permit: permit,
             dispatch_span: tracing::info_span!("wasi_cuda.dispatch"),
             event: Some(event),
-            sleep: None,
+            stream: None,
+            callback_state: None,
+        }
+    }
+
+    /// Attach the launch stream + recorded event (CUDA-only).
+    ///
+    /// This is the real callback-driven path: on the first `Pending` poll
+    /// the future registers [`stream_completion_trampoline`] on `stream`
+    /// via `cuStreamAddCallback`, and the driver wakes the task once the
+    /// stream's queued work has drained. The `event` is held purely as a
+    /// lifetime keepalive so its completion bookkeeping outlives the
+    /// callback.
+    #[cfg(feature = "cuda")]
+    pub fn with_stream_event(
+        permit: DispatchPermit,
+        stream: cust::stream::Stream,
+        event: cust::event::Event,
+    ) -> Self {
+        Self {
+            _permit: permit,
+            dispatch_span: tracing::info_span!("wasi_cuda.dispatch"),
+            event: Some(event),
+            stream: Some(stream),
+            callback_state: None,
         }
     }
 }
@@ -535,50 +627,81 @@ impl std::future::Future for DispatchFuture {
         self: std::pin::Pin<&mut Self>,
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
+        // `self` is `Pin<&mut Self>`; none of our fields are structurally
+        // pinned (no self-referential state), so projecting to an unpinned
+        // `&mut Self` is sound. We take the `&mut` BEFORE entering the span so
+        // the span guard (which borrows `this.dispatch_span`) and the
+        // mutable field access below do not contend for `self`.
+        let this = unsafe { self.get_unchecked_mut() };
+
         // Enter the dispatch span for the duration of this poll so the
         // trace stays attached to the originating `wasi_cuda.launch`
         // span tree regardless of which Tokio worker is running us. The
         // returned guard is dropped at the end of this function.
-        let _entered = self.dispatch_span.enter();
+        let _entered = this.dispatch_span.enter();
 
-        // On the no-CUDA path (and the `ready` constructor on CUDA hosts)
-        // we resolve immediately. The permit is held until the future is
-        // dropped, which provides the back-pressure semantics needed by
-        // the host bridge even without real CUDA.
+        // On the no-CUDA path (and the `ready` / event-only constructors on
+        // CUDA hosts) we resolve immediately. The permit is held until the
+        // future is dropped, which provides the back-pressure semantics
+        // needed by the host bridge even without real CUDA.
         #[cfg(feature = "cuda")]
         {
-            if let Some(ev) = self.event.as_ref() {
-                // cust 0.3.2's Event::query returns CudaResult<EventStatus>;
-                // the enum is { Ready, NotReady }. EventStatus::Ready means the
-                // GPU work has completed (equivalent to Event::synchronize for
-                // Unified Memory per the cust docs).
-                //
-                // On NotReady / Err we DO NOT call `waker.wake_by_ref()`
-                // immediately — that creates a busy-spin loop that pins
-                // the Tokio worker at 100% CPU until the event finishes
-                // (every poll re-wakes synchronously). Instead, we clone
-                // the waker, spawn a 50 µs sleep, and have THAT task wake
-                // us up. The worker is free to schedule other tasks in
-                // the meantime. 50 µs is a reasonable poll interval for
-                // GPU events: most kernels take longer than that, so we
-                // miss at most one quantum of post-completion latency,
-                // and the worker spends ≈ 50 µs / quantum doing other
-                // work instead of spinning. v0.4 cuda-async work (see
-                // RFC 0001 + F3 bench scaffold) replaces this with a
-                // proper `cuStreamAddCallback`-driven waker.
-                return match ev.query() {
-                    Ok(cust::event::EventStatus::Ready) => std::task::Poll::Ready(()),
-                    Ok(cust::event::EventStatus::NotReady) | Err(_) => {
-                        let waker = cx.waker().clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_micros(50)).await;
-                            waker.wake();
-                        });
-                        std::task::Poll::Pending
-                    }
+            let Some(stream) = this.stream.as_ref() else {
+                // No stream attached → nothing to wait on. The event (if any)
+                // is just a keepalive; resolve now.
+                return std::task::Poll::Ready(());
+            };
+
+            // First Pending poll: create the shared state, park the waker,
+            // and register the driver callback. The callback consumes one
+            // leaked strong ref (`Arc::into_raw`); the trampoline reclaims it.
+            if this.callback_state.is_none() {
+                let state = Arc::new(CallbackState {
+                    done: std::sync::atomic::AtomicBool::new(false),
+                    waker: std::sync::Mutex::new(Some(cx.waker().clone())),
+                });
+                let raw = Arc::into_raw(Arc::clone(&state)) as *mut std::ffi::c_void;
+                // SAFETY: `stream.as_inner()` is a live CUstream; `raw` is a
+                // valid `Arc<CallbackState>` pointer the trampoline reclaims
+                // exactly once. The driver guarantees a single invocation.
+                let status = unsafe {
+                    cust::sys::cuStreamAddCallback(
+                        stream.as_inner(),
+                        Some(stream_completion_trampoline),
+                        raw,
+                        0,
+                    )
                 };
+                if status != cust::sys::CUresult::CUDA_SUCCESS {
+                    // Registration failed: reclaim the leaked ref so we don't
+                    // leak, and fall back to resolving immediately rather than
+                    // hanging the fiber. A failed callback registration is
+                    // surfaced by the launch-side synchronize path, not here.
+                    // SAFETY: `raw` came from `Arc::into_raw` just above and
+                    // the driver did not take ownership (registration failed).
+                    drop(unsafe { Arc::from_raw(raw as *const CallbackState) });
+                    return std::task::Poll::Ready(());
+                }
+                this.callback_state = Some(state);
+                return std::task::Poll::Pending;
             }
+
+            // Subsequent polls: the callback may already have fired. Check
+            // the completion flag; if not done, refresh the parked waker so a
+            // task migration between workers cannot strand a stale waker.
+            let state = this.callback_state.as_ref().expect("state present");
+            if state.done.load(Ordering::Acquire) {
+                return std::task::Poll::Ready(());
+            }
+            *state.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(cx.waker().clone());
+            // Re-check after re-parking to close the race where the callback
+            // fired between the load above and storing the new waker.
+            if state.done.load(Ordering::Acquire) {
+                return std::task::Poll::Ready(());
+            }
+            return std::task::Poll::Pending;
         }
+        #[cfg(not(feature = "cuda"))]
         std::task::Poll::Ready(())
     }
 }
