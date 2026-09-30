@@ -37,13 +37,24 @@ use std::path::{Path, PathBuf};
 
 use tensor_wasm_core::error::TensorWasmError;
 use tensor_wasm_core::types::{InstanceId, TenantId};
+use tensor_wasm_snapshot::payload_crc32;
 use tensor_wasm_snapshot::reader::SnapshotReader;
-use tensor_wasm_snapshot::writer::{SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
+use tensor_wasm_snapshot::writer::{
+    Snapshot, SnapshotMetadata, DEFAULT_ZSTD_LEVEL, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
+};
 
 /// Filename of the minimal golden fixture (empty bodies).
 const MINIMAL_FIXTURE: &str = "golden_v0_1_0_minimal.snap";
 /// Filename of the slightly richer golden fixture (non-empty wasm/gpu/regs).
 const RICH_FIXTURE: &str = "golden_v0_1_0_with_wasm_memory.snap";
+
+/// Current-format goldens minted against the live `SNAPSHOT_VERSION` and
+/// metadata layout (see `examples/generate_golden.rs`). Unlike the frozen
+/// v0.1.0 fixtures above, these are regenerated whenever the writer format
+/// changes and back the *un-ignored* cross-version assertions below.
+const CURRENT_MINIMAL_FIXTURE: &str = "golden_current_minimal.snap";
+/// Current-format richer golden (non-empty wasm/gpu/registers).
+const CURRENT_RICH_FIXTURE: &str = "golden_current_with_wasm_memory.snap";
 
 /// Tenant ID embedded in the minimal fixture (must match
 /// `examples/generate_golden.rs`).
@@ -267,6 +278,215 @@ fn bumped_version_byte_is_rejected() {
                 msg.contains("version"),
                 "expected version rejection, got: {msg}",
             );
+        }
+        other => panic!("expected Serialization error, got {other:?}"),
+    }
+}
+
+// =============================================================================
+// CURRENT-FORMAT cross-version guards (un-ignored).
+//
+// The v0.1.0 fixtures above no longer decode under the current reader (the
+// `Snapshot` payload grew `sequence_no` / `nonce`), so their round-trip tests
+// stay `#[ignore]`d as historical documentation of that break — per
+// `tests/fixtures/README.md` the frozen bytes must NOT be regenerated to paper
+// over it. To keep `compat.rs` enforcing a *live* cross-version contract, the
+// tests below mint a golden against the **current** `SNAPSHOT_VERSION` +
+// metadata layout and assert it restores.
+//
+// Each test builds the golden deterministically in-process (byte-identical to
+// what `examples/generate_golden.rs` writes for `golden_current_*.snap`, via
+// the same fixed timestamp + bincode-legacy + zstd-level path), so the
+// assertion runs even on a checkout that has not yet had the binary fixtures
+// generated. When the checked-in `golden_current_*.snap` is present, an
+// additional assertion confirms it is byte-identical to the freshly built
+// bytes — catching a stale checked-in fixture after a format bump.
+// =============================================================================
+
+/// Fixed timestamp used for the current-format goldens. MUST match
+/// `GOLDEN_CREATED_UNIX_MS` in `examples/generate_golden.rs` so the in-test
+/// bytes equal the checked-in fixture bytes.
+const GOLDEN_CREATED_UNIX_MS: u64 = 1_767_225_600_000;
+
+/// Deterministic wasm body for the richer current fixture (mirrors
+/// `synth_wasm_memory` in `examples/generate_golden.rs`).
+fn synth_wasm_memory() -> Vec<u8> {
+    (0u32..4096).map(|i| (i % 251) as u8).collect()
+}
+/// Mirrors `synth_gpu_memory` in the generator.
+fn synth_gpu_memory() -> Vec<u8> {
+    (0u32..1024)
+        .map(|i| ((i.wrapping_mul(17)) % 253) as u8)
+        .collect()
+}
+/// Mirrors `synth_registers` in the generator.
+fn synth_registers() -> Vec<u8> {
+    (0u32..256).map(|i| ((i ^ 0x5A) & 0xFF) as u8).collect()
+}
+
+/// Build a current-format golden blob deterministically — the same bincode +
+/// zstd path the production writer and the generator use, with a pinned
+/// timestamp so the bytes are stable.
+fn build_current_golden(
+    tenant_id: TenantId,
+    instance_id: InstanceId,
+    wasm_memory: Vec<u8>,
+    gpu_memory: Vec<u8>,
+    registers: Vec<u8>,
+) -> Vec<u8> {
+    let total_uncompressed_bytes =
+        (wasm_memory.len() + gpu_memory.len() + registers.len()) as u64;
+    let crc32 = payload_crc32(&wasm_memory, &gpu_memory, &registers);
+    let snap = Snapshot {
+        magic: SNAPSHOT_MAGIC,
+        version: SNAPSHOT_VERSION,
+        wasm_memory,
+        gpu_memory,
+        registers,
+        metadata: SnapshotMetadata {
+            tenant_id,
+            instance_id,
+            created_unix_ms: GOLDEN_CREATED_UNIX_MS,
+            total_uncompressed_bytes,
+            sequence_no: 0,
+            nonce: None,
+        },
+        crc32,
+    };
+    let cfg = bincode::config::legacy();
+    let encoded = bincode::serde::encode_to_vec(&snap, cfg).expect("bincode encode golden");
+    zstd::encode_all(encoded.as_slice(), DEFAULT_ZSTD_LEVEL).expect("zstd encode golden")
+}
+
+/// If a checked-in current-format fixture exists, assert it matches the
+/// freshly-built bytes (so a stale fixture after a format bump is caught).
+fn assert_checked_in_matches(name: &str, fresh: &[u8]) {
+    let path = fixtures_dir().join(name);
+    if Path::new(&path).exists() {
+        let on_disk = fs::read(&path).expect("read current fixture");
+        assert_eq!(
+            on_disk.as_slice(),
+            fresh,
+            "checked-in {name} is stale — regenerate with `cargo run -p \
+             tensor-wasm-snapshot --example generate_golden -- \
+             crates/tensor-wasm-snapshot/tests/fixtures`",
+        );
+    }
+}
+
+#[test]
+fn current_minimal_golden_restores_under_current_reader() {
+    let bytes = build_current_golden(
+        TenantId(MINIMAL_TENANT_ID),
+        InstanceId(MINIMAL_INSTANCE_ID),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let restored = SnapshotReader::new()
+        .restore(&bytes)
+        .expect("current minimal golden must restore");
+    assert_eq!(restored.magic, SNAPSHOT_MAGIC);
+    assert_eq!(restored.version, SNAPSHOT_VERSION);
+    assert_eq!(restored.metadata.tenant_id, TenantId(MINIMAL_TENANT_ID));
+    assert_eq!(
+        restored.metadata.instance_id,
+        InstanceId(MINIMAL_INSTANCE_ID)
+    );
+    assert!(restored.wasm_memory.is_empty());
+    assert!(restored.gpu_memory.is_empty());
+    assert!(restored.registers.is_empty());
+    assert_eq!(restored.metadata.total_uncompressed_bytes, 0);
+
+    assert_checked_in_matches(CURRENT_MINIMAL_FIXTURE, &bytes);
+}
+
+#[test]
+fn current_rich_golden_restores_under_current_reader() {
+    let bytes = build_current_golden(
+        TenantId(RICH_TENANT_ID),
+        InstanceId(RICH_INSTANCE_ID),
+        synth_wasm_memory(),
+        synth_gpu_memory(),
+        synth_registers(),
+    );
+    let restored = SnapshotReader::new()
+        .restore(&bytes)
+        .expect("current rich golden must restore");
+    assert_eq!(restored.magic, SNAPSHOT_MAGIC);
+    assert_eq!(restored.version, SNAPSHOT_VERSION);
+    assert_eq!(restored.metadata.tenant_id, TenantId(RICH_TENANT_ID));
+    assert_eq!(restored.metadata.instance_id, InstanceId(RICH_INSTANCE_ID));
+    assert_eq!(restored.wasm_memory.len(), RICH_WASM_LEN);
+    assert_eq!(restored.gpu_memory.len(), RICH_GPU_LEN);
+    assert_eq!(restored.registers.len(), RICH_REGISTERS_LEN);
+    assert_eq!(
+        restored.metadata.total_uncompressed_bytes,
+        (RICH_WASM_LEN + RICH_GPU_LEN + RICH_REGISTERS_LEN) as u64,
+    );
+
+    assert_checked_in_matches(CURRENT_RICH_FIXTURE, &bytes);
+}
+
+/// The current-format guard's analogue of the historical
+/// `raw_magic_and_version_match_source_constants` test: decompress the freshly
+/// built current golden and confirm the on-wire magic + version equal the
+/// in-source constants. Always runs (no `#[ignore]`) because the bytes are
+/// generated in-process.
+#[test]
+fn current_golden_raw_magic_and_version_match_source_constants() {
+    let bytes = build_current_golden(
+        TenantId(MINIMAL_TENANT_ID),
+        InstanceId(MINIMAL_INSTANCE_ID),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let decompressed = zstd::decode_all(bytes.as_slice()).expect("zstd decode current golden");
+    assert!(decompressed.len() >= 8, "payload too short for magic+version");
+    let magic = u32::from_le_bytes([
+        decompressed[0],
+        decompressed[1],
+        decompressed[2],
+        decompressed[3],
+    ]);
+    let version = u32::from_le_bytes([
+        decompressed[4],
+        decompressed[5],
+        decompressed[6],
+        decompressed[7],
+    ]);
+    assert_eq!(magic, SNAPSHOT_MAGIC);
+    assert_eq!(version, SNAPSHOT_VERSION);
+}
+
+/// Current-format analogue of the historical `bumped_version_byte_is_rejected`
+/// guard, but un-ignored: overwrite the on-wire version with `V3 + 1` and
+/// confirm the reader refuses it with a version-mentioning error. Guards
+/// against silently weakening the strict-version check.
+#[test]
+fn current_golden_bumped_version_byte_is_rejected() {
+    use tensor_wasm_snapshot::format::SNAPSHOT_VERSION_V3;
+
+    let bytes = build_current_golden(
+        TenantId(MINIMAL_TENANT_ID),
+        InstanceId(MINIMAL_INSTANCE_ID),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let mut decompressed = zstd::decode_all(bytes.as_slice()).expect("zstd decode current golden");
+    assert!(decompressed.len() >= 8, "payload too short");
+    let unsupported_version: u32 = SNAPSHOT_VERSION_V3 + 1;
+    decompressed[4..8].copy_from_slice(&unsupported_version.to_le_bytes());
+    let recompressed = zstd::encode_all(decompressed.as_slice(), 3).expect("zstd re-encode");
+
+    let err = SnapshotReader::new()
+        .restore(&recompressed)
+        .expect_err("bumped version must be rejected");
+    match err {
+        TensorWasmError::Serialization(msg) => {
+            assert!(msg.contains("version"), "expected version rejection, got: {msg}");
         }
         other => panic!("expected Serialization error, got {other:?}"),
     }

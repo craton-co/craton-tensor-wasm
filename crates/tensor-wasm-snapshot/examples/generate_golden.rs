@@ -191,5 +191,62 @@ fn main() -> ExitCode {
     }
     println!("wrote {} ({} bytes)", rich_path.display(), rich_bytes.len());
 
+    // Fixtures 3 & 4: CURRENT-format goldens. The v0.1.0 fixtures above are a
+    // frozen historical wire format that no longer decodes under the current
+    // reader (the `Snapshot` payload grew the `sequence_no` / `nonce` metadata
+    // fields). To keep `tests/compat.rs` exercising a live cross-version
+    // assertion rather than only `#[ignore]`d historical guards, emit a pair of
+    // fixtures minted against the *current* `SNAPSHOT_VERSION` and metadata
+    // layout. These are the ones the un-ignored compat tests load.
+    let cur_minimal = build_snapshot(
+        TenantId(MINIMAL_TENANT_ID),
+        InstanceId(MINIMAL_INSTANCE_ID),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let cur_minimal_bytes = match encode(&cur_minimal) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("encode current minimal fixture: {e}");
+            return ExitCode::from(6);
+        }
+    };
+    let cur_minimal_path = out_dir.join("golden_current_minimal.snap");
+    if let Err(e) = fs::write(&cur_minimal_path, &cur_minimal_bytes) {
+        eprintln!("write {}: {e}", cur_minimal_path.display());
+        return ExitCode::from(7);
+    }
+    println!(
+        "wrote {} ({} bytes)",
+        cur_minimal_path.display(),
+        cur_minimal_bytes.len()
+    );
+
+    let cur_rich = build_snapshot(
+        TenantId(RICH_TENANT_ID),
+        InstanceId(RICH_INSTANCE_ID),
+        synth_wasm_memory(),
+        synth_gpu_memory(),
+        synth_registers(),
+    );
+    let cur_rich_bytes = match encode(&cur_rich) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("encode current rich fixture: {e}");
+            return ExitCode::from(8);
+        }
+    };
+    let cur_rich_path = out_dir.join("golden_current_with_wasm_memory.snap");
+    if let Err(e) = fs::write(&cur_rich_path, &cur_rich_bytes) {
+        eprintln!("write {}: {e}", cur_rich_path.display());
+        return ExitCode::from(9);
+    }
+    println!(
+        "wrote {} ({} bytes)",
+        cur_rich_path.display(),
+        cur_rich_bytes.len()
+    );
+
     ExitCode::SUCCESS
 }
