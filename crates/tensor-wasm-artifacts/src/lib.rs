@@ -610,17 +610,65 @@ impl<R: Read> Read for MacReader<'_, R> {
 ///   crash immediately after `put` may lose the most recent writes. Useful
 ///   for ephemeral caches and tests where throughput matters more than
 ///   surviving a power cut.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DurabilityPolicy {
     /// fsync blob data before rename and the directory after — durable.
+    #[default]
     Full,
     /// Skip fsyncs; rely on the atomic rename alone — faster, not durable.
     None,
 }
 
-impl Default for DurabilityPolicy {
-    fn default() -> Self {
-        DurabilityPolicy::Full
+/// Garbage-collection policy for [`DiskArtifactStore::gc`].
+///
+/// Both bounds are optional and applied in order — age first, then size —
+/// so an operator can express "drop anything older than 7 days, and if the
+/// survivors still exceed 2 GiB, evict the oldest until they fit". A policy
+/// with neither bound set is a no-op.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GcPolicy {
+    /// Remove blobs whose last-modification time is older than
+    /// `now - max_age`. `None` disables age-based pruning.
+    pub max_age: Option<std::time::Duration>,
+    /// After age pruning, if the surviving blobs' total on-disk size still
+    /// exceeds this many bytes, evict the oldest blobs (by modification
+    /// time) until the footprint fits. `None` disables size-based eviction.
+    pub max_total_bytes: Option<u64>,
+}
+
+impl GcPolicy {
+    /// A policy that only enforces an age bound.
+    pub fn with_max_age(max_age: std::time::Duration) -> Self {
+        Self {
+            max_age: Some(max_age),
+            max_total_bytes: None,
+        }
+    }
+
+    /// A policy that only enforces a total-size bound.
+    pub fn with_max_total_bytes(max_total_bytes: u64) -> Self {
+        Self {
+            max_age: None,
+            max_total_bytes: Some(max_total_bytes),
+        }
+    }
+}
+
+/// Summary of a [`DiskArtifactStore::gc`] run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GcOutcome {
+    /// Blobs reclaimed by the age bound ([`GcPolicy::max_age`]).
+    pub removed_by_age: usize,
+    /// Blobs reclaimed by the size bound ([`GcPolicy::max_total_bytes`]).
+    pub removed_by_size: usize,
+    /// Total on-disk blob footprint, in bytes, after the GC run.
+    pub bytes_after: u64,
+}
+
+impl GcOutcome {
+    /// Total blobs removed across both stages.
+    pub fn total_removed(&self) -> usize {
+        self.removed_by_age + self.removed_by_size
     }
 }
 
@@ -950,6 +998,344 @@ impl DiskArtifactStore {
             warn!(target: "tensor_wasm_artifacts", error = %e, "metadata deserialize failed");
             ArtifactError::Metadata(e.to_string())
         })
+    }
+
+    /// Streaming counterpart to [`ArtifactStore::put`]: ingest a payload from
+    /// any [`std::io::Read`] source `src` without the caller first
+    /// materialising the whole payload in memory, mirroring what
+    /// [`ArtifactStore::get_to`] does on the read side. Returns the
+    /// content hash of the bytes consumed, exactly as `put` would.
+    ///
+    /// The resulting on-disk envelope is byte-identical to what `put` would
+    /// write for the same payload, so a blob ingested via `put_from`
+    /// round-trips through `get` / `get_to` indistinguishably.
+    ///
+    /// ## Why two passes over a temp file
+    ///
+    /// The envelope's header embeds `blake3(payload)`, and the HMAC covers
+    /// `header || zstd_body` — so the tag cannot be computed until the
+    /// content hash is known, which is only after the whole stream has been
+    /// consumed. To stay memory-bounded (the point of a streaming put) we:
+    ///
+    /// 1. Stream `src` through a BLAKE3 hasher and a zstd encoder into a
+    ///    *body* temp file, enforcing the [`MAX_PAYLOAD_LEN`] cap on the
+    ///    uncompressed bytes as they flow (so an unbounded source cannot
+    ///    OOM us). After this pass the content hash and the compressed body
+    ///    are both on hand.
+    /// 2. Stream the header (now that the hash is known) plus the body temp
+    ///    file through a `MacWriter` into an *envelope* temp file, append
+    ///    the HMAC tag, then atomically publish it under
+    ///    `{hash}.{key_fp}.bin` — the same temp-then-rename + durability
+    ///    policy `put` uses.
+    ///
+    /// Peak heap is bounded by the I/O buffers and zstd's window regardless
+    /// of payload size.
+    pub fn put_from(&self, src: &mut dyn Read) -> Result<ContentHash, ArtifactError> {
+        std::fs::create_dir_all(&self.dir).map_err(|e| {
+            warn!(
+                target: "tensor_wasm_artifacts",
+                dir = %self.dir.display(),
+                error = %e,
+                "create_dir_all failed (put_from)"
+            );
+            ArtifactError::Io
+        })?;
+
+        // ---- Pass 1: stream src -> hasher + zstd -> body temp file. ----
+        let mut body_tmp = tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "body tempfile create failed (put_from)");
+            ArtifactError::Io
+        })?;
+        let mut hasher = blake3::Hasher::new();
+        let mut uncompressed_len: u64 = 0;
+        {
+            let body_writer = BufWriter::with_capacity(STREAM_BUF_LEN, body_tmp.as_file_mut());
+            let mut encoder = zstd::stream::write::Encoder::new(body_writer, self.zstd_level)
+                .map_err(|e| {
+                    warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed (put_from)");
+                    ArtifactError::Io
+                })?;
+            let mut scratch = [0u8; STREAM_BUF_LEN];
+            loop {
+                let n = src.read(&mut scratch).map_err(|e| {
+                    warn!(target: "tensor_wasm_artifacts", error = %e, "source read failed (put_from)");
+                    ArtifactError::Io
+                })?;
+                if n == 0 {
+                    break;
+                }
+                // Enforce the uncompressed cap as bytes flow, before any are
+                // committed to the compressor's output — an unbounded source
+                // can't drive an arbitrarily large blob.
+                uncompressed_len = uncompressed_len.saturating_add(n as u64);
+                if uncompressed_len > MAX_PAYLOAD_LEN as u64 {
+                    warn!(
+                        target: "tensor_wasm_artifacts",
+                        actual = uncompressed_len,
+                        limit = MAX_PAYLOAD_LEN,
+                        "rejecting oversized streamed payload (put_from)"
+                    );
+                    return Err(ArtifactError::TooLarge {
+                        actual: uncompressed_len.min(usize::MAX as u64) as usize,
+                        limit: MAX_PAYLOAD_LEN,
+                    });
+                }
+                hasher.update(&scratch[..n]);
+                encoder.write_all(&scratch[..n]).map_err(|e| {
+                    warn!(target: "tensor_wasm_artifacts", error = %e, "zstd write failed (put_from)");
+                    ArtifactError::Io
+                })?;
+            }
+            encoder.finish().map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "zstd finish failed (put_from)");
+                ArtifactError::Io
+            })?;
+        }
+        let hash = ContentHash::from_bytes(hasher.finalize().into());
+        let final_path = self.path_for(&hash)?;
+
+        // ---- Pass 2: header + body temp -> MacWriter -> envelope temp. ----
+        let mut env_tmp = tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "envelope tempfile create failed (put_from)");
+            ArtifactError::Io
+        })?;
+        let mut mac = new_mac(&self.hmac_key);
+        {
+            let buf_writer = BufWriter::with_capacity(STREAM_BUF_LEN, env_tmp.as_file_mut());
+            let mut tee = MacWriter::new(buf_writer, &mut mac);
+
+            let mut header = [0u8; ARTIFACT_HEADER_LEN];
+            header[..16].copy_from_slice(&ARTIFACT_MAGIC);
+            header[16..20].copy_from_slice(&ARTIFACT_VERSION.to_le_bytes());
+            header[20..52].copy_from_slice(hash.as_bytes());
+            tee.write_all(&header).map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "header write failed (put_from)");
+                ArtifactError::Io
+            })?;
+
+            // Rewind the body temp and copy its compressed bytes through the
+            // tee so the MAC covers `header || zstd_body`, exactly as `put`.
+            use std::io::Seek;
+            body_tmp.as_file_mut().rewind().map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "body temp rewind failed (put_from)");
+                ArtifactError::Io
+            })?;
+            let mut body_reader =
+                BufReader::with_capacity(STREAM_BUF_LEN, body_tmp.as_file_mut());
+            std::io::copy(&mut body_reader, &mut tee).map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "body copy failed (put_from)");
+                ArtifactError::Io
+            })?;
+
+            tee.flush().map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "buf flush failed (put_from)");
+                ArtifactError::Io
+            })?;
+        }
+
+        // Append the HMAC tag (not fed back into the MAC).
+        let tag = finalize_into_tag(mac);
+        env_tmp.as_file_mut().write_all(&tag).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "hmac tag write failed (put_from)");
+            ArtifactError::Io
+        })?;
+
+        // Durability + atomic publish, identical to `put`.
+        if self.durability == DurabilityPolicy::Full {
+            env_tmp.as_file().sync_all().map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "blob fsync (pre-persist) failed (put_from)");
+                ArtifactError::Io
+            })?;
+        }
+        env_tmp.persist(&final_path).map_err(|e| {
+            warn!(target: "tensor_wasm_artifacts", error = %e, "tempfile persist failed (put_from)");
+            ArtifactError::Io
+        })?;
+        if self.durability == DurabilityPolicy::Full {
+            self.sync_dir_best_effort();
+        }
+        Ok(hash)
+    }
+
+    /// Total on-disk size, in bytes, of every artifact blob visible to this
+    /// store across all accepted read keys.
+    ///
+    /// Sums the file length of each `{hash}.{key_fp}.bin` blob whose
+    /// fingerprint is in the accepted-read set (the same partitioning
+    /// [`ArtifactStore::list`] uses), in a single directory scan. Metadata
+    /// sidecars (`.meta.json`) and foreign files are excluded, so the
+    /// figure is the store's blob footprint — what a quota/GC policy budgets
+    /// against. A missing store directory reports `0`.
+    pub fn total_bytes(&self) -> Result<u64, ArtifactError> {
+        let mut total: u64 = 0;
+        self.for_each_blob(|_hash, _path, len, _modified| {
+            total = total.saturating_add(len);
+            Ok(())
+        })?;
+        Ok(total)
+    }
+
+    /// Remove every blob whose last-modification time is strictly older than
+    /// `cutoff` (a [`std::time::SystemTime`]), returning the number of blobs
+    /// removed.
+    ///
+    /// This is the time-based GC primitive: an operator passes
+    /// `SystemTime::now() - max_age` to reclaim artifacts untouched for
+    /// longer than `max_age`. Each removal goes through [`Self::remove`], so
+    /// it is rotation-aware and takes any metadata sidecar with the blob.
+    /// Blobs whose modification time cannot be read are conservatively
+    /// **kept** (never reclaimed on a stat error).
+    pub fn prune_older_than(
+        &self,
+        cutoff: std::time::SystemTime,
+    ) -> Result<usize, ArtifactError> {
+        let mut victims: Vec<ContentHash> = Vec::new();
+        self.for_each_blob(|hash, _path, _len, modified| {
+            if let Some(mtime) = modified {
+                if mtime < cutoff {
+                    victims.push(hash);
+                }
+            }
+            Ok(())
+        })?;
+        let mut removed = 0usize;
+        for hash in victims {
+            if self.remove(&hash)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Garbage-collect the store down to a [`GcPolicy`], returning a
+    /// [`GcOutcome`] summarising what was reclaimed.
+    ///
+    /// The policy is applied in two stages, each optional:
+    ///
+    /// 1. **Age:** if [`GcPolicy::max_age`] is set, every blob older than
+    ///    `now - max_age` is removed first (delegating to
+    ///    [`Self::prune_older_than`]).
+    /// 2. **Size:** if [`GcPolicy::max_total_bytes`] is set and the surviving
+    ///    blobs still exceed it, the oldest blobs are evicted (oldest
+    ///    modification time first) until the footprint fits, so the most
+    ///    recently written artifacts are retained.
+    ///
+    /// A policy with neither bound set is a no-op. Removals are
+    /// rotation-aware (via [`Self::remove`]) and take sidecars with their
+    /// blobs.
+    pub fn gc(&self, policy: GcPolicy) -> Result<GcOutcome, ArtifactError> {
+        let mut outcome = GcOutcome::default();
+
+        // Stage 1: age-based pruning.
+        if let Some(max_age) = policy.max_age {
+            let cutoff = std::time::SystemTime::now()
+                .checked_sub(max_age)
+                .unwrap_or(std::time::UNIX_EPOCH);
+            outcome.removed_by_age = self.prune_older_than(cutoff)?;
+        }
+
+        // Stage 2: size-based eviction of the survivors, oldest first.
+        if let Some(max_total) = policy.max_total_bytes {
+            // Snapshot survivors as (hash, len, mtime) so we can sort by age
+            // and tally a running total without re-statting.
+            let mut blobs: Vec<(ContentHash, u64, std::time::SystemTime)> = Vec::new();
+            let mut total: u64 = 0;
+            self.for_each_blob(|hash, _path, len, modified| {
+                total = total.saturating_add(len);
+                // A blob with an unreadable mtime sorts as oldest (UNIX
+                // epoch) so it is preferentially evicted under pressure.
+                blobs.push((hash, len, modified.unwrap_or(std::time::UNIX_EPOCH)));
+                Ok(())
+            })?;
+            if total > max_total {
+                // Oldest first: evict until the footprint fits the budget.
+                blobs.sort_by_key(|(_, _, mtime)| *mtime);
+                for (hash, len, _) in blobs {
+                    if total <= max_total {
+                        break;
+                    }
+                    if self.remove(&hash)? {
+                        total = total.saturating_sub(len);
+                        outcome.removed_by_size += 1;
+                    }
+                }
+            }
+        }
+
+        outcome.bytes_after = self.total_bytes()?;
+        Ok(outcome)
+    }
+
+    /// Visit every accepted-key blob in the store exactly once, invoking
+    /// `f(hash, path, len, modified)` per blob. Shared by `total_bytes`,
+    /// `prune_older_than`, and `gc` so they all use the same single-scan,
+    /// fingerprint-partitioned, min-length-filtered enumeration as
+    /// [`ArtifactStore::list`]. `modified` is `None` when the entry's mtime
+    /// cannot be read (the OS does not support it, or a benign race). A
+    /// missing store directory visits nothing.
+    fn for_each_blob(
+        &self,
+        mut f: impl FnMut(
+            ContentHash,
+            &std::path::Path,
+            u64,
+            Option<std::time::SystemTime>,
+        ) -> Result<(), ArtifactError>,
+    ) -> Result<(), ArtifactError> {
+        let accepted: std::collections::HashSet<String> = self
+            .key_provider
+            .read_keys()
+            .iter()
+            .map(|k| self.fp_for(k))
+            .collect();
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                warn!(
+                    target: "tensor_wasm_artifacts",
+                    dir = %self.dir.display(),
+                    error = %e,
+                    "read_dir failed (for_each_blob)"
+                );
+                return Err(ArtifactError::Io);
+            }
+        };
+        let min_len = (ARTIFACT_HEADER_LEN + ARTIFACT_HMAC_LEN) as u64;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "read_dir entry failed (for_each_blob)");
+                ArtifactError::Io
+            })?;
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let (hash_bytes, fp) = match parse_blob_filename(&name) {
+                Some(parsed) => parsed,
+                None => continue,
+            };
+            if !accepted.contains(fp) {
+                continue;
+            }
+            let meta = match entry.metadata() {
+                Ok(m) if m.len() >= min_len => m,
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    warn!(target: "tensor_wasm_artifacts", file = %name, error = %e, "blob stat failed (for_each_blob)");
+                    return Err(ArtifactError::Io);
+                }
+            };
+            let modified = meta.modified().ok();
+            f(
+                ContentHash::from_bytes(hash_bytes),
+                &entry.path(),
+                meta.len(),
+                modified,
+            )?;
+        }
+        Ok(())
     }
 
     /// Pass 1 of the streaming `get_to`: verify the HMAC of the blob held
@@ -2017,16 +2403,74 @@ fn hex_of(bytes: &[u8; 32]) -> String {
 /// homogeneous with the disk store; the only failure modes are
 /// `TooLarge` (when `payload.len() > MAX_PAYLOAD_LEN`) and `Io` (when
 /// the in-memory zstd encoder reports an internal error).
+///
+/// This is a thin convenience wrapper over [`encode_envelope_to_writer`]:
+/// it pre-sizes a `Vec<u8>` sink and streams the same byte sequence into
+/// it, so the two entry points are guaranteed byte-identical.
 pub fn encode_envelope_to_vec(
     payload: &[u8],
     hmac_key: &[u8; 32],
 ) -> Result<Vec<u8>, ArtifactError> {
+    // Reject oversized payloads up front, before sizing the framing
+    // buffer, so a rejected `put` never triggers a large speculative
+    // allocation. `encode_envelope_to_writer` repeats this check (it is
+    // the load-bearing one for direct callers), but doing it here keeps
+    // the buffer estimate below from over-reserving for a doomed payload.
+    if payload.len() > MAX_PAYLOAD_LEN {
+        return Err(ArtifactError::TooLarge {
+            actual: payload.len(),
+            limit: MAX_PAYLOAD_LEN,
+        });
+    }
+    // Pre-size the framing buffer conservatively: header + a quarter of
+    // the payload (zstd typically compresses better than 4:1 on tensor
+    // memory, so this overshoots harmlessly for small inputs and
+    // undershoots only marginally on incompressible blobs) + the HMAC
+    // trailer. The Vec grows on demand if the estimate is too small.
+    let mut buf: Vec<u8> =
+        Vec::with_capacity(ARTIFACT_HEADER_LEN + payload.len() / 4 + ARTIFACT_HMAC_LEN);
+    encode_envelope_to_writer(&mut buf, payload, hmac_key)?;
+    Ok(buf)
+}
+
+/// Encode `payload` into the unified artifact-store envelope, streaming the
+/// framed bytes directly into the writer `w` instead of buffering the whole
+/// envelope in a `Vec<u8>` first.
+///
+/// The byte sequence written to `w` is **identical** to what
+/// [`encode_envelope_to_vec`] returns (and to what [`DiskArtifactStore::put`]
+/// writes to disk):
+/// `ARTIFACT_MAGIC || ARTIFACT_VERSION || blake3(payload) || zstd(payload) || hmac_sha256(prefix)`.
+/// `encode_envelope_to_vec` is a thin wrapper that calls this with a
+/// `Vec<u8>` sink, so the two cannot drift.
+///
+/// This exists so a caller with a large payload need not materialise the
+/// full framed envelope in memory on its side: it can hand any
+/// [`std::io::Write`] sink (a `File`, a socket, a hashing tee) and the
+/// header, the zstd-compressed body, and the trailing HMAC tag stream
+/// through in bounded buffers. Note that `payload` itself is still passed
+/// as a borrowed slice (the content hash and the size cap need its full
+/// length up front); what this avoids is buffering the *compressed* output
+/// plus framing a second time on the caller's side.
+///
+/// The HMAC covers `magic || version || content_hash || zstd(payload)`;
+/// the trailing 32-byte tag is appended after and is NOT fed back into the
+/// MAC. The counterpart decoder is [`decode_envelope_from_bytes`].
+///
+/// Errors mirror [`encode_envelope_to_vec`]: `TooLarge` when
+/// `payload.len() > MAX_PAYLOAD_LEN`, and `Io` for any writer or zstd
+/// failure.
+pub fn encode_envelope_to_writer<W: Write>(
+    mut w: W,
+    payload: &[u8],
+    hmac_key: &[u8; 32],
+) -> Result<(), ArtifactError> {
     if payload.len() > MAX_PAYLOAD_LEN {
         warn!(
             target: "tensor_wasm_artifacts",
             actual = payload.len(),
             limit = MAX_PAYLOAD_LEN,
-            "rejecting oversized payload (encode_envelope_to_vec)"
+            "rejecting oversized payload (encode_envelope_to_writer)"
         );
         return Err(ArtifactError::TooLarge {
             actual: payload.len(),
@@ -2037,57 +2481,51 @@ pub fn encode_envelope_to_vec(
     let hash = ContentHash::of(payload);
     let mut mac = new_mac(hmac_key);
 
-    // Pre-size the framing buffer conservatively: header + a quarter of
-    // the payload (zstd typically compresses better than 4:1 on tensor
-    // memory, so this overshoots harmlessly for small inputs and
-    // undershoots only marginally on incompressible blobs) + the HMAC
-    // trailer. The Vec grows on demand if the estimate is too small.
-    let mut buf: Vec<u8> =
-        Vec::with_capacity(ARTIFACT_HEADER_LEN + payload.len() / 4 + ARTIFACT_HMAC_LEN);
-
     // Header: 16-byte magic + 4-byte version + 32-byte content hash.
-    buf.extend_from_slice(&ARTIFACT_MAGIC);
-    buf.extend_from_slice(&ARTIFACT_VERSION.to_le_bytes());
-    buf.extend_from_slice(&hash.0);
-
-    // Stream zstd into the buffer through a MacWriter so the HMAC sees
-    // exactly the bytes we write. The MAC has already consumed the
-    // header by way of the explicit `mac.update`s above? No — the
-    // header was extended into `buf` directly (no tee). Feed it to
-    // the MAC explicitly here so the prefix the MAC covers matches the
-    // disk-store layout byte-for-byte (`header || zstd_body`).
+    // Assemble it in a fixed stack array so it reaches the writer in one
+    // shot AND feeds the MAC as one contiguous slice — byte-for-byte the
+    // prefix the disk store hashes (`header || zstd_body`).
+    let mut header = [0u8; ARTIFACT_HEADER_LEN];
+    header[..16].copy_from_slice(&ARTIFACT_MAGIC);
+    header[16..20].copy_from_slice(&ARTIFACT_VERSION.to_le_bytes());
+    header[20..52].copy_from_slice(&hash.0);
+    w.write_all(&header).map_err(|e| {
+        warn!(target: "tensor_wasm_artifacts", error = %e, "header write failed (encode_envelope_to_writer)");
+        ArtifactError::Io
+    })?;
     {
         use hmac::Mac;
-        mac.update(&buf[..ARTIFACT_HEADER_LEN]);
+        mac.update(&header);
     }
 
-    // Compress the payload into the buffer; tee through MacWriter so the
-    // MAC also consumes the compressed bytes. The MacWriter takes the
-    // buffer by mutable reference (Vec<u8> implements Write via
-    // `extend_from_slice`-flavoured semantics), so the resulting bytes
-    // continue to land in `buf` while the MAC observes the same
-    // sequence the disk-store writer would see.
+    // Compress the payload through a MacWriter so the MAC also consumes the
+    // compressed bytes as they stream to `w`. Same composition the disk
+    // store's `put` uses (`w <- MacWriter <- zstd encoder`), so the bytes
+    // landing in `w` and the MAC's view of them are identical.
     {
-        let mut tee = MacWriter::new(&mut buf, &mut mac);
+        let mut tee = MacWriter::new(&mut w, &mut mac);
         let mut encoder = zstd::stream::write::Encoder::new(&mut tee, DEFAULT_ZSTD_LEVEL)
             .map_err(|e| {
-                warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed (encode_envelope_to_vec)");
+                warn!(target: "tensor_wasm_artifacts", error = %e, "zstd init failed (encode_envelope_to_writer)");
                 ArtifactError::Io
             })?;
         encoder.write_all(payload).map_err(|e| {
-            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd write failed (encode_envelope_to_vec)");
+            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd write failed (encode_envelope_to_writer)");
             ArtifactError::Io
         })?;
         encoder.finish().map_err(|e| {
-            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd finish failed (encode_envelope_to_vec)");
+            warn!(target: "tensor_wasm_artifacts", error = %e, "zstd finish failed (encode_envelope_to_writer)");
             ArtifactError::Io
         })?;
     }
 
     // Append the HMAC tag. The tag is NOT fed back into the MAC.
     let tag = finalize_into_tag(mac);
-    buf.extend_from_slice(&tag);
-    Ok(buf)
+    w.write_all(&tag).map_err(|e| {
+        warn!(target: "tensor_wasm_artifacts", error = %e, "hmac tag write failed (encode_envelope_to_writer)");
+        ArtifactError::Io
+    })?;
+    Ok(())
 }
 
 /// Decode the unified artifact-store envelope from `bytes`, returning
