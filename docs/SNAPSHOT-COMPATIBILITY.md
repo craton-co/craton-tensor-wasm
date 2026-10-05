@@ -108,7 +108,7 @@ default-write format depends on the writer's key configuration:
 
 This supersedes the previous doc's claim that "v2 is the default-write
 through 0.3.6 / the default writer still emits v2" — an HMAC-keyed writer
-now defaults to v4. The workspace version is `0.3.7`
+now defaults to v4. The workspace version is `0.4.0`
 ([`Cargo.toml`](../Cargo.toml)); `FORMAT.md` labels the v4 cutover "default
 in v0.4 — T40" and it is live today because `artifact-backing` ships in the
 default feature set.

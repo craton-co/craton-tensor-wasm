@@ -6,7 +6,7 @@
 ### Run untrusted code. On the GPU. Safely. At serverless speed.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/release-v0.3.7-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/release-v0.4.0-green.svg)](CHANGELOG.md)
 [![Built in Rust](https://img.shields.io/badge/built_in-Rust-orange.svg)](https://www.rust-lang.org/)
 [![GPU](https://img.shields.io/badge/GPU-CUDA-76b900.svg)](docs/CUDA-SETUP.md)
 
@@ -77,7 +77,7 @@ asserting the GPU actually computed the right answer.
 | End-to-end GPU dispatch with typed arguments | ✅ Passing on real hardware |
 | Pure-CPU execution speed | ✅ Statistically tied with upstream Wasmtime 45 |
 | HTTP gateway, auth, audit, metrics | ✅ Shipped and exercised |
-| 11-crate workspace, 9 tagged releases (`v0.1.0` → `v0.3.7`) | ✅ 0 open **external**-audit findings (the external audit is itself roadmap — see [PATH-TO-V1](docs/PATH-TO-V1.md)) |
+| 11-crate workspace, 9 tagged releases (`v0.1.0` → `v0.4.0`) | ✅ 0 open **external**-audit findings (the external audit is itself roadmap — see [PATH-TO-V1](docs/PATH-TO-V1.md)) |
 
 We publish where we **win** and where we **lose** — see the
 [honest benchmarking guide](docs/BENCHMARKING.md). Credibility is the marketing.
@@ -141,7 +141,7 @@ on your hardware. Full setup in [CUDA-SETUP.md](docs/CUDA-SETUP.md).
 
 ## 🛣️ Where it's headed
 
-- **Today (v0.3.7)** — real GPU dispatch proven on hardware; auth, multi-tenancy,
+- **Today (v0.4.0)** — real GPU dispatch proven on hardware; auth, multi-tenancy,
   observability, and ops complete. A pre-certification internal audit found and
   **resolved on `dev`** a HIGH cross-tenant isolation issue plus several
   medium/low items — all tracked in [docs/RISKS.md](docs/RISKS.md). No open

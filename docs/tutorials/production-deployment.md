@@ -278,7 +278,7 @@ code. Commit it to git; the secret stays out (`auth.existingSecret`
 references the Secret from [Step 2](#4-step-2-generate-auth-tokens)).
 
 ```yaml
-# tensor-wasm.values.yaml -- production overrides for the v0.3.7
+# tensor-wasm.values.yaml -- production overrides for the v0.4.0
 # reference workload on an NVIDIA L4 (sm_89) GPU node.
 
 image:
@@ -286,7 +286,7 @@ image:
   # registry is a placeholder" -- replace with your built image until
   # ghcr.io/craton-co is provisioned.
   repository: my-registry.example.com/tensor-wasm
-  tag: "0.3.7"
+  tag: "0.4.0"
   pullPolicy: IfNotPresent
 
 replicaCount: 1
