@@ -334,8 +334,7 @@ fn build_current_golden(
     gpu_memory: Vec<u8>,
     registers: Vec<u8>,
 ) -> Vec<u8> {
-    let total_uncompressed_bytes =
-        (wasm_memory.len() + gpu_memory.len() + registers.len()) as u64;
+    let total_uncompressed_bytes = (wasm_memory.len() + gpu_memory.len() + registers.len()) as u64;
     let crc32 = payload_crc32(&wasm_memory, &gpu_memory, &registers);
     let snap = Snapshot {
         magic: SNAPSHOT_MAGIC,
@@ -443,7 +442,10 @@ fn current_golden_raw_magic_and_version_match_source_constants() {
         Vec::new(),
     );
     let decompressed = zstd::decode_all(bytes.as_slice()).expect("zstd decode current golden");
-    assert!(decompressed.len() >= 8, "payload too short for magic+version");
+    assert!(
+        decompressed.len() >= 8,
+        "payload too short for magic+version"
+    );
     let magic = u32::from_le_bytes([
         decompressed[0],
         decompressed[1],
@@ -486,7 +488,10 @@ fn current_golden_bumped_version_byte_is_rejected() {
         .expect_err("bumped version must be rejected");
     match err {
         TensorWasmError::Serialization(msg) => {
-            assert!(msg.contains("version"), "expected version rejection, got: {msg}");
+            assert!(
+                msg.contains("version"),
+                "expected version rejection, got: {msg}"
+            );
         }
         other => panic!("expected Serialization error, got {other:?}"),
     }

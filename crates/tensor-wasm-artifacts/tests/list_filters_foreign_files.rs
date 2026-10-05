@@ -81,7 +81,9 @@ fn list_skips_zero_byte_and_truncated_lookalikes() {
     let store = DiskArtifactStore::new(dir.clone(), KEY);
 
     // One genuine entry.
-    let real_hash = store.put(b"a real, full-length artifact body").expect("put");
+    let real_hash = store
+        .put(b"a real, full-length artifact body")
+        .expect("put");
 
     let fp = key_fp_hex(&KEY);
     // Name-shape-valid but content-empty: a zero-byte file under our key.
@@ -98,7 +100,10 @@ fn list_skips_zero_byte_and_truncated_lookalikes() {
         1,
         "zero-byte / truncated lookalikes must not be listed, got {listed:?}"
     );
-    assert_eq!(listed[0], real_hash, "only the genuine full-length blob lists");
+    assert_eq!(
+        listed[0], real_hash,
+        "only the genuine full-length blob lists"
+    );
 }
 
 #[test]

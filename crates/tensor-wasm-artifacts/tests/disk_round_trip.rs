@@ -111,11 +111,9 @@ fn builder_defaults_match_constructor() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path().to_path_buf();
-    let built = DiskArtifactStore::builder(
-        dir.clone(),
-        Arc::new(SingleKeyProvider::new([0x2A; 32])),
-    )
-    .build();
+    let built =
+        DiskArtifactStore::builder(dir.clone(), Arc::new(SingleKeyProvider::new([0x2A; 32])))
+            .build();
 
     let payload = b"default-built body";
     let hash = built.put(payload).expect("put");

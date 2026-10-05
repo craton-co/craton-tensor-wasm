@@ -1268,11 +1268,7 @@ impl SnapshotReader {
                 // the work — and thus the timing — depends only on how many
                 // keys are configured, not on which one (if any) matched.
                 let mut matched = subtle::Choice::from(0u8);
-                for key in self
-                    .hmac_keys
-                    .iter()
-                    .chain(self.hmac_key.as_ref())
-                {
+                for key in self.hmac_keys.iter().chain(self.hmac_key.as_ref()) {
                     any_key = true;
                     let expected = self.hmac_over_prefix(bytes, prefix_len, kind_byte, key)?;
                     matched |= expected.as_slice().ct_eq(sig_bytes);
@@ -1616,9 +1612,7 @@ impl SnapshotReader {
             Some(p) => p,
             None => {
                 return Err(last_err.unwrap_or_else(|| {
-                    TensorWasmError::Serialization(
-                        "snapshot artifact envelope: BadHmac".into(),
-                    )
+                    TensorWasmError::Serialization("snapshot artifact envelope: BadHmac".into())
                 }))
             }
         };

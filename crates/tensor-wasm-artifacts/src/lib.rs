@@ -828,10 +828,7 @@ impl DiskArtifactStore {
     /// Start building a disk store rooted at `dir` whose signing keys come
     /// from `key_provider`, exposing the zstd compression level and
     /// crash-durability policy as tunables. See [`DiskArtifactStoreBuilder`].
-    pub fn builder(
-        dir: PathBuf,
-        key_provider: Arc<dyn KeyProvider>,
-    ) -> DiskArtifactStoreBuilder {
+    pub fn builder(dir: PathBuf, key_provider: Arc<dyn KeyProvider>) -> DiskArtifactStoreBuilder {
         DiskArtifactStoreBuilder::new(dir, key_provider)
     }
 
@@ -862,11 +859,7 @@ impl DiskArtifactStore {
     /// Compute the on-disk path for `hash` under the key whose fingerprint
     /// is `key_fp_hex`. Used by the rotation-aware `get` to probe each
     /// accepted read key's namespace in turn.
-    fn path_for_key(
-        &self,
-        hash: &ContentHash,
-        key_fp_hex: &str,
-    ) -> Result<PathBuf, ArtifactError> {
+    fn path_for_key(&self, hash: &ContentHash, key_fp_hex: &str) -> Result<PathBuf, ArtifactError> {
         let hash_hex = validated_hash_segment(hash)?;
         Ok(self.dir.join(format!("{hash_hex}.{key_fp_hex}.bin")))
     }
@@ -1120,8 +1113,7 @@ impl DiskArtifactStore {
                 warn!(target: "tensor_wasm_artifacts", error = %e, "body temp rewind failed (put_from)");
                 ArtifactError::Io
             })?;
-            let mut body_reader =
-                BufReader::with_capacity(STREAM_BUF_LEN, body_tmp.as_file_mut());
+            let mut body_reader = BufReader::with_capacity(STREAM_BUF_LEN, body_tmp.as_file_mut());
             std::io::copy(&mut body_reader, &mut tee).map_err(|e| {
                 warn!(target: "tensor_wasm_artifacts", error = %e, "body copy failed (put_from)");
                 ArtifactError::Io
@@ -1185,10 +1177,7 @@ impl DiskArtifactStore {
     /// it is rotation-aware and takes any metadata sidecar with the blob.
     /// Blobs whose modification time cannot be read are conservatively
     /// **kept** (never reclaimed on a stat error).
-    pub fn prune_older_than(
-        &self,
-        cutoff: std::time::SystemTime,
-    ) -> Result<usize, ArtifactError> {
+    pub fn prune_older_than(&self, cutoff: std::time::SystemTime) -> Result<usize, ArtifactError> {
         let mut victims: Vec<ContentHash> = Vec::new();
         self.for_each_blob(|hash, _path, _len, modified| {
             if let Some(mtime) = modified {
@@ -2860,12 +2849,12 @@ mod tests {
         // We can't make a real `ContentHash` render badly, so exercise the
         // predicate the guard applies directly against adversarial inputs.
         let bad_segments = [
-            "../../../etc/passwd",          // traversal-shaped
-            "..",                           // parent dir
-            "deadbeef",                     // too short
-            &"ab".repeat(33),               // too long (66 chars)
+            "../../../etc/passwd",                 // traversal-shaped
+            "..",                                  // parent dir
+            "deadbeef",                            // too short
+            &"ab".repeat(33),                      // too long (66 chars)
             &("zz".to_owned() + &"ab".repeat(31)), // non-hex char 'z'
-            "ab/cd",                        // embedded separator
+            "ab/cd",                               // embedded separator
         ];
         for bad in bad_segments {
             let well_formed = bad.len() == 64
