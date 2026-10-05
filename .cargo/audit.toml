@@ -14,4 +14,15 @@ ignore = [
     # to a maintained codec is tracked separately — see docs/RISKS.md. Mirrors
     # the same entry in deny.toml [advisories].ignore.
     "RUSTSEC-2025-0141",
+    # RUSTSEC-2026-0316 — Dynamic record lifting can allocate beyond the
+    # hostcall fuel limit in Wasmtime's component model (GHSA-jqpg-j7w6-42pr).
+    # Unreachable: TensorWasm executes core WebAssembly modules (`wasmtime::Module`)
+    # and does not instantiate or fuel-limit component model dynamic records.
+    # Wasmtime major bump from 46.x is governed by docs/WASMTIME-UPGRADE.md.
+    "RUSTSEC-2026-0316",
+    # RUSTSEC-2026-0327 — Wasmtime component async-lifted callback result count
+    # is unvalidated, causing a native stack buffer overflow (GHSA-32h6-97mm-8q3c).
+    # Unreachable: TensorWasm does not use component async-lifted callbacks.
+    # Wasmtime major bump from 46.x is governed by docs/WASMTIME-UPGRADE.md.
+    "RUSTSEC-2026-0327",
 ]

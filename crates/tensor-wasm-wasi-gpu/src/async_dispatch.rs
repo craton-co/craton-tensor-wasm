@@ -506,12 +506,7 @@ unsafe extern "C" fn stream_completion_trampoline(
     // synchronize path) owns error reporting, and the dispatch future's
     // only job is to signal "the stream drained."
     state.done.store(true, Ordering::Release);
-    if let Some(w) = state
-        .waker
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-    {
+    if let Some(w) = state.waker.lock().unwrap_or_else(|e| e.into_inner()).take() {
         w.wake();
     }
     // `state` drops here, releasing the registration's strong ref.

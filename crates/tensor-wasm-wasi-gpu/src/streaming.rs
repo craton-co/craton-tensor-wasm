@@ -22,7 +22,7 @@
 //! Two hard caps are enforced before any chunk is forwarded:
 //!
 //! * [`MAX_CHUNK_BYTES`] (64 KiB) — single-chunk size cap. Enforced live in
-//!   [`prepare_emit_chunk`]: an `emit-chunk` whose `buf_len` exceeds the cap
+//!   `prepare_emit_chunk`: an `emit-chunk` whose `buf_len` exceeds the cap
 //!   returns the documented `-2` code without touching the channel. The
 //!   constant is exported so the host-fn wrapper and tests share a single
 //!   source of truth.
@@ -55,7 +55,7 @@ use crate::abi::AbiError;
 /// Maximum size, in bytes, of a single `emit-chunk` call. 64 KiB matches
 /// typical HTTP chunk-encoder buffer sizes; guests producing larger
 /// payloads should call `emit-chunk` repeatedly. Enforced live in
-/// [`prepare_emit_chunk`] (an over-cap `buf_len` returns `-2` without
+/// `prepare_emit_chunk` (an over-cap `buf_len` returns `-2` without
 /// touching the channel); exported here so the host-fn wrapper and tests
 /// share a single constant.
 pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
