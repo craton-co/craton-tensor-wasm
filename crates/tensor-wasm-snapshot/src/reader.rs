@@ -27,7 +27,9 @@ use crate::writer::{
 };
 
 #[cfg(feature = "signed-snapshots")]
-use crate::format::{SignatureKind, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN};
+use crate::format::{
+    SignatureKind, HMAC_SHA256_SIG_LEN, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN,
+};
 #[cfg(feature = "signed-snapshots")]
 // `verify_strict` is an *inherent* method on `VerifyingKey`, so the
 // `Verifier` trait is no longer imported — pulling it in would now be an
@@ -1114,7 +1116,7 @@ impl SnapshotReader {
         prefix_len: usize,
         kind_byte: u8,
         key: &Zeroizing<[u8; 32]>,
-    ) -> Result<hmac::digest::Output<hmac::Hmac<sha2::Sha256>>> {
+    ) -> Result<[u8; HMAC_SHA256_SIG_LEN]> {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         // `key` is `&Zeroizing<[u8; 32]>`. `Zeroizing` is
@@ -1134,7 +1136,9 @@ impl SnapshotReader {
         mac.update(&bytes[..prefix_len]);
         mac.update(&V3_TRAILER_MAGIC);
         mac.update(&[kind_byte]);
-        Ok(mac.finalize().into_bytes())
+        // HMAC-SHA256 always produces a 32-byte tag; copy it into a fixed array
+        // so this helper has a concrete, GenericArray-free return type.
+        Ok(mac.finalize().into_bytes().into())
     }
 
     /// Validate the trailing `[magic][signature_kind][signature]` bytes of
