@@ -488,13 +488,14 @@ pub fn add_input_to_linker<T: HasInput + Send + 'static>(
             if end > mem_len {
                 return AbiError::InvalidPointer.code();
             }
-            // Copy out of the Arc-backed buffer into an owned Vec so the
-            // subsequent mutable `memory.write` borrow does not alias the
-            // `input` borrow (mirrors `last_error_copy` in `host.rs`).
-            let buf = staged[..to_copy].to_vec();
-            if memory.write(&mut caller, start, &buf).is_err() {
-                return AbiError::InvalidPointer.code();
-            }
+            // PERF (finding #5): copy straight from the Arc-backed staged
+            // buffer into linear memory rather than materialising a
+            // throwaway `Vec`. `staged` borrows the local `input` clone, not
+            // `caller`, so taking a `data_mut(&mut caller)` slice and
+            // `copy_from_slice`-ing into it does not alias the source. The
+            // `[start..end]` destination slice is in-bounds (validated
+            // above), so the copy cannot panic.
+            memory.data_mut(&mut caller)[start..end].copy_from_slice(&staged[..to_copy]);
             // `to_copy <= len <= u32::MAX` and `to_copy <= staged.len()`,
             // and the WIT contract caps a single read at `input-len()`
             // which is itself clamped to `u32::MAX`, so the `as i32` cast

@@ -844,10 +844,14 @@ pub fn add_to_linker<T: HasWasiCuda + Send + 'static>(
             if end > mem_len {
                 return AbiError::InvalidPointer.code();
             }
-            let buf = bytes[..to_copy].to_vec();
-            if memory.write(&mut caller, dst_ptr as usize, &buf).is_err() {
-                return AbiError::InvalidPointer.code();
-            }
+            // PERF (finding #5): copy straight into linear memory rather
+            // than materialising a throwaway `Vec`. `msg` is an owned
+            // `String` cloned out of `last_error()`, so `bytes` does not
+            // borrow `caller` — taking a `data_mut(&mut caller)` slice and
+            // `copy_from_slice`-ing into it does not alias the source. The
+            // `[start..end]` slice is in-bounds (validated above), so the
+            // copy cannot panic.
+            memory.data_mut(&mut caller)[start..end].copy_from_slice(&bytes[..to_copy]);
             to_copy as i32
         },
     )?;
@@ -1734,18 +1738,33 @@ impl ResolvedArgv {
     }
 }
 
+/// Stash a clone of the parsed argv into `last_lowered_args` for
+/// observability.
+///
+/// PERF (finding #5): used only on the launch path's error / early-return
+/// branches. The happy path move-stores its `observed_args` once at the
+/// end (no clone), so this clone-store is paid only when a launch fails
+/// before that point — preserving the parse signal for diagnostics without
+/// taxing every successful launch.
+fn stash_observed_args<T: HasWasiCuda>(caller: &mut Caller<'_, T>, args: &[LoweredArg]) {
+    *caller
+        .data()
+        .wasi_cuda()
+        .last_lowered_args
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = args.to_vec();
+}
+
 /// The live CUDA dispatch state produced by [`resolve_and_launch_cuda`]
 /// once `cuLaunchKernel` has captured the resolved pointers.
 ///
 /// The fields are moved into the `spawn_blocking(synchronize)` closure so
-/// the wasmtime fiber can suspend while the GPU runs. `observed_args` is
-/// the parsed argv re-surfaced into `last_lowered_args` after synchronize.
+/// the wasmtime fiber can suspend while the GPU runs.
 #[cfg(feature = "cuda")]
 struct LaunchedKernel {
     event: cust::event::Event,
     stream: cust::stream::Stream,
     storage: crate::kernel_args::KernelParamStorage,
-    observed_args: Vec<LoweredArg>,
 }
 
 /// Resolve guest pointers and launch the kernel in a single **non-async**
@@ -1762,6 +1781,11 @@ struct LaunchedKernel {
 /// Returning a [`LaunchedKernel`] hands the caller exactly the Send state
 /// it needs to await `stream.synchronize()` *after* the pointers are
 /// already captured by the driver — the only safe place for an `await`.
+///
+/// The parsed argv is returned alongside the result (PERF finding #5): the
+/// caller move-stores it into `last_lowered_args` once — on the happy path
+/// after synchronize, on the error path immediately — without this helper
+/// having to clone it on every error branch.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn resolve_and_launch_cuda<T: HasWasiCuda>(
@@ -1775,14 +1799,45 @@ fn resolve_and_launch_cuda<T: HasWasiCuda>(
     block_y: i32,
     block_z: i32,
     shared_mem: i32,
+) -> (Result<LaunchedKernel, AbiError>, Vec<LoweredArg>) {
+    let lowered_args = resolved.into_args();
+    let result = resolve_and_launch_cuda_inner(
+        caller,
+        handle,
+        &lowered_args,
+        grid_x,
+        grid_y,
+        grid_z,
+        block_x,
+        block_y,
+        block_z,
+        shared_mem,
+    );
+    (result, lowered_args)
+}
+
+/// Fallible core of [`resolve_and_launch_cuda`]. Borrows the already-owned
+/// `lowered_args` so the outer helper retains ownership and can hand it
+/// back for a single move-store regardless of success or failure.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn resolve_and_launch_cuda_inner<T: HasWasiCuda>(
+    caller: &mut Caller<'_, T>,
+    handle: &crate::registry::KernelHandle,
+    lowered_args: &[LoweredArg],
+    grid_x: i32,
+    grid_y: i32,
+    grid_z: i32,
+    block_x: i32,
+    block_y: i32,
+    block_z: i32,
+    shared_mem: i32,
 ) -> Result<LaunchedKernel, AbiError> {
     use cust::event::{Event, EventFlags};
     use cust::stream::{Stream, StreamFlags};
     use cust::sys as cuda_sys;
 
     use crate::kernel_args::build_kernel_param_storage;
-
-    let lowered_args = resolved.into_args();
 
     // Fix #6: bind the process-wide primary context to THIS thread before
     // any of `Stream::new` / `cuLaunchKernel` / `Event::*` run. The async
@@ -1832,7 +1887,7 @@ fn resolve_and_launch_cuda<T: HasWasiCuda>(
     // For zero-arg launches `storage.as_ptr()` is still a valid pointer to
     // an empty slot vec — `cuLaunchKernel` interprets a zero parameter
     // count as "ignore the argv pointer."
-    let mut storage = build_kernel_param_storage(&lowered_args);
+    let mut storage = build_kernel_param_storage(lowered_args);
     let param_count = storage.len();
     // CUDA reads `kernelParams` only when the kernel's PTX `.param` block
     // is non-empty; for zero-arg kernels we pass NULL rather than the
@@ -1873,7 +1928,7 @@ fn resolve_and_launch_cuda<T: HasWasiCuda>(
     // pointer args we validated must equal the number of `Ptr` slots the
     // storage built, or the two views of the argv have drifted.
     let mut validated_ptr_args = 0usize;
-    for arg in &lowered_args {
+    for arg in lowered_args {
         if let LoweredArg::Ptr { host_ptr, .. } = arg {
             validated_ptr_args += 1;
             let mut is_managed: std::os::raw::c_int = 0;
@@ -1976,7 +2031,6 @@ fn resolve_and_launch_cuda<T: HasWasiCuda>(
         event,
         stream,
         storage,
-        observed_args: lowered_args,
     })
 }
 
@@ -2154,27 +2208,28 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
     // tag-byte error.
     let resolved = ResolvedArgv::resolve(caller, args_ptr, args_len)?;
 
-    // Stash the parsed argv for observability BEFORE the kernel-handle
-    // lookup. Tests inspect `last_lowered_args` to confirm the
-    // marshalling round-trip held; surfacing it only after the launch
-    // synchronizes (or after the CUDA branch's many error paths) means
-    // a missing-PTX or stream-failure case loses the parse signal,
-    // which is the more valuable data point for diagnostics. The CUDA
-    // and no-CUDA branches further down both overwrite this slot on
-    // their own happy path, so the duplication is intentional.
-    *caller
-        .data()
-        .wasi_cuda()
-        .last_lowered_args
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = resolved.args().to_vec();
+    // PERF (finding #5): the parsed argv used to be cloned-and-stored into
+    // `last_lowered_args` here AND again on the happy path further down —
+    // two stores (one a clone) on every successful launch. We now store
+    // exactly once: the happy path move-stores at the end (no clone), and
+    // the EARLY-RETURN paths stash a clone so the diagnostics signal (a
+    // missing-PTX or stream-failure that would otherwise lose the parse
+    // result) survives. `stash_observed_args` performs that error-path
+    // clone-store.
 
     // Eagerly take a strong, owned handle to the kernel (Arc-wrapped on
     // CUDA builds). This both validates `kid` and frees the registry's
     // dashmap entry before any further work, eliminating the UAF window
     // that existed when we kept a raw pointer derived from a transient
-    // `dashmap::Ref` alive across the launch.
-    let handle = registry.lookup(kid, owner)?;
+    // `dashmap::Ref` alive across the launch. On lookup failure stash the
+    // parsed argv first so the parse signal is not lost.
+    let handle = match registry.lookup(kid, owner) {
+        Ok(h) => h,
+        Err(e) => {
+            stash_observed_args(caller, resolved.args());
+            return Err(e);
+        }
+    };
 
     #[cfg(feature = "cuda")]
     {
@@ -2189,10 +2244,21 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
         // captured the pointers; the guest cannot run (let alone grow
         // memory) until this async fn returns, so a post-launch await is
         // safe by construction.
-        let launched = resolve_and_launch_cuda(
+        // PERF (finding #5): the helper hands `observed_args` back so we
+        // store the parsed argv exactly once. On a launch failure we stash
+        // it immediately (so the parse signal survives) and bail; on success
+        // we move-store it after synchronize.
+        let (launch_result, observed_args) = resolve_and_launch_cuda(
             caller, &handle, resolved, grid_x, grid_y, grid_z, block_x, block_y, block_z,
             shared_mem,
-        )?;
+        );
+        let launched = match launch_result {
+            Ok(l) => l,
+            Err(e) => {
+                stash_observed_args(caller, &observed_args);
+                return Err(e);
+            }
+        };
 
         // Move the stream + event + arg storage into the blocking task so
         // synchronize doesn't block the wasmtime fiber. Stream + Event
@@ -2208,7 +2274,6 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
             event,
             stream,
             storage,
-            observed_args,
         } = launched;
         let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let _keep_event = event;
@@ -2223,21 +2288,29 @@ async fn launch_impl_async_inner<T: HasWasiCuda>(
                 .synchronize()
                 .map_err(|e| format!("stream synchronize failed: {e:?}"))
         })
-        .await
-        .map_err(|_| {
-            // JoinError — internal scheduler issue.
-            AbiError::Internal
-        })?;
-        result.map_err(|e| {
+        .await;
+        // A `spawn_blocking` JoinError (internal scheduler issue) or a
+        // synchronize failure is still an early return — stash the parse
+        // signal first so diagnostics survive (PERF finding #5: the single
+        // store now lives on each exit path rather than eagerly up front).
+        let result = match result {
+            Ok(r) => r,
+            Err(_) => {
+                stash_observed_args(caller, &observed_args);
+                return Err(AbiError::Internal);
+            }
+        };
+        if let Err(e) = result {
             caller
                 .data()
                 .wasi_cuda()
                 .record_error(format!("launch: {e}"));
-            AbiError::LaunchFailed
-        })?;
+            stash_observed_args(caller, &observed_args);
+            return Err(AbiError::LaunchFailed);
+        }
         // Stash the parsed args for observability before releasing the
         // handle. Tests inspect `last_lowered_args` to confirm the
-        // marshalling round-trip held.
+        // marshalling round-trip held. Single move-store on the happy path.
         *caller
             .data()
             .wasi_cuda()
