@@ -80,20 +80,50 @@ use cust::sys as cuda_sys;
 /// `Send + Sync`; the driver handle is just an opaque pointer.
 static PRIMARY_CTX: OnceLock<Result<usize, String>> = OnceLock::new();
 
+/// Cached device-0 ordinal (PERF finding #5).
+///
+/// `cuDeviceGet(_, 0)` always returns the same `CUdevice` handle for
+/// ordinal 0, and `cuInit(0)` is idempotent, so calling both on *every*
+/// `ensure_current_context` entry (which runs at the top of every CUDA host
+/// op and inside each `spawn_blocking` synchronize) is pure overhead. We
+/// resolve the device once and cache the ordinal here. The retain +
+/// set-current still run on every entry — that is load-bearing and must NOT
+/// be cached (see the long note in [`ensure_current_context`]).
+///
+/// `CUdevice` is an `i32` ordinal, so caching the value is sound and
+/// `Send + Sync`.
+static DEVICE_ORDINAL: OnceLock<Result<cuda_sys::CUdevice, String>> = OnceLock::new();
+
+/// Resolve (once) and return device 0's `CUdevice` ordinal. Runs
+/// `cuInit(0)` + `cuDeviceGet(_, 0)` on the first call only; subsequent
+/// calls return the cached value.
+fn cached_device() -> Result<cuda_sys::CUdevice, String> {
+    DEVICE_ORDINAL
+        .get_or_init(|| {
+            // SAFETY: documented driver C ABI; out-param is a valid local.
+            // `cuInit` is idempotent.
+            unsafe {
+                let r = cuda_sys::cuInit(0);
+                if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+                    return Err(format!("cuInit -> {r:?}"));
+                }
+                let mut dev: cuda_sys::CUdevice = 0;
+                let r = cuda_sys::cuDeviceGet(&mut dev as *mut _, 0);
+                if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
+                    return Err(format!("cuDeviceGet(0) -> {r:?}"));
+                }
+                Ok(dev)
+            }
+        })
+        .clone()
+}
+
 fn retain_primary_ctx() -> Result<usize, String> {
+    let dev = cached_device()?;
     // SAFETY: all calls are the documented driver C ABI; out-params are valid
-    // locals. `cuInit` is idempotent; `cuDevicePrimaryCtxRetain` is
-    // reference-counted and returns the per-device singleton context.
+    // locals. `cuDevicePrimaryCtxRetain` is reference-counted and returns the
+    // per-device singleton context.
     unsafe {
-        let r = cuda_sys::cuInit(0);
-        if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(format!("cuInit -> {r:?}"));
-        }
-        let mut dev: cuda_sys::CUdevice = 0;
-        let r = cuda_sys::cuDeviceGet(&mut dev as *mut _, 0);
-        if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(format!("cuDeviceGet(0) -> {r:?}"));
-        }
         let mut ctx: cuda_sys::CUcontext = std::ptr::null_mut();
         let r = cuda_sys::cuDevicePrimaryCtxRetain(&mut ctx as *mut _, dev);
         if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
@@ -155,17 +185,14 @@ pub fn ensure_current_context() -> Result<(), String> {
     // context is a process-lifetime singleton we intend to keep alive anyway),
     // whereas the retain-once "fix" is a correctness regression.
     //
-    // SAFETY: documented driver C ABI; out-params are valid locals. cuInit is
-    // idempotent; cuDevicePrimaryCtxRetain is reference-counted.
+    // PERF finding #5: `cuInit(0)` + `cuDeviceGet(_, 0)` are resolved ONCE
+    // and cached via `cached_device()`, instead of being re-run on every
+    // entry. The retain + set-current below are deliberately NOT cached —
+    // see the load-bearing note above.
+    let dev = cached_device()?;
+    // SAFETY: documented driver C ABI; out-param is a valid local.
+    // cuDevicePrimaryCtxRetain is reference-counted.
     unsafe {
-        if cuda_sys::cuInit(0) != cuda_sys::cudaError_enum::CUDA_SUCCESS {
-            return Err("cuInit failed".to_string());
-        }
-        let mut dev: cuda_sys::CUdevice = 0;
-        let r = cuda_sys::cuDeviceGet(&mut dev as *mut _, 0);
-        if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(format!("cuDeviceGet(0) -> {r:?}"));
-        }
         let mut ctx: cuda_sys::CUcontext = std::ptr::null_mut();
         let r = cuda_sys::cuDevicePrimaryCtxRetain(&mut ctx as *mut _, dev);
         if r != cuda_sys::cudaError_enum::CUDA_SUCCESS {
