@@ -242,6 +242,37 @@ pub struct WasiCudaContext {
     /// (semaphore saturated or per-invocation deadline tripped) on this
     /// instance. Telemetry only — `Relaxed` ordering.
     pub(crate) back_pressure_rejections: AtomicU64,
+    /// Count of device-memory accesses (`free` / `memcpy-h2d` /
+    /// `memcpy-d2h`) refused because the handle is unknown or owned by a
+    /// different instance — i.e. surfaced as [`AbiError::InvalidHandle`]
+    /// (feature #6). A guest cannot tell cross-owner from unknown apart
+    /// (both return `InvalidHandle` by design), so this counter aggregates
+    /// both: it is the "a guest touched a handle it does not own" signal.
+    /// Telemetry only — `Relaxed` ordering.
+    pub(crate) cross_owner_rejections: AtomicU64,
+    /// Count of accesses refused on a quota / cap (`alloc` over a per-call
+    /// or aggregate cap, surfaced as [`AbiError::QuotaExceeded`]) on this
+    /// instance (feature #6). Telemetry only — `Relaxed` ordering.
+    pub(crate) quota_rejections: AtomicU64,
+    /// Cache of pointer-argument device residency keyed by linear-memory
+    /// base address (feature #6).
+    ///
+    /// On CUDA builds the launch path must confirm every pointer arg is
+    /// GPU-addressable (CUDA managed memory) before `cuLaunchKernel` — a
+    /// `cuPointerGetAttribute` driver query. Every pointer arg in a launch
+    /// resolves into the SAME guest linear-memory allocation, whose
+    /// managed-ness is a property of that allocation's base address, not of
+    /// the individual offset. We therefore cache the verdict keyed by the
+    /// linear-memory base pointer: the first pointer arg in the first launch
+    /// pays the query, and subsequent args / launches against the same
+    /// (un-grown) memory reuse it. A `memory.grow` changes the base address,
+    /// which naturally misses the cache and re-validates.
+    ///
+    /// `usize` key = the base address of the guest's linear memory; `bool`
+    /// value = "is managed / GPU-addressable." Behind a `Mutex` so the
+    /// `&self` host closures can update it.
+    #[cfg(feature = "cuda")]
+    pub(crate) residency_cache: Mutex<std::collections::HashMap<usize, bool>>,
 }
 
 impl WasiCudaContext {
@@ -263,6 +294,10 @@ impl WasiCudaContext {
             device_mem: Arc::new(DeviceMemRegistry::new()),
             kernels_launched: AtomicU64::new(0),
             back_pressure_rejections: AtomicU64::new(0),
+            cross_owner_rejections: AtomicU64::new(0),
+            quota_rejections: AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            residency_cache: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -290,6 +325,10 @@ impl WasiCudaContext {
             device_mem: Arc::new(DeviceMemRegistry::new()),
             kernels_launched: AtomicU64::new(0),
             back_pressure_rejections: AtomicU64::new(0),
+            cross_owner_rejections: AtomicU64::new(0),
+            quota_rejections: AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            residency_cache: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -319,6 +358,8 @@ impl WasiCudaContext {
             back_pressure_rejections: self.back_pressure_rejections.load(Ordering::Relaxed),
             yield_count: 0,
             device_bytes_allocated: self.device_mem.total_device_bytes(),
+            cross_owner_rejections: self.cross_owner_rejections.load(Ordering::Relaxed),
+            quota_rejections: self.quota_rejections.load(Ordering::Relaxed),
         }
     }
 
@@ -348,6 +389,19 @@ impl WasiCudaContext {
     fn record_back_pressure_rejection(&self) {
         self.back_pressure_rejections
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a device-memory access was refused because the handle is
+    /// unknown or owned by another instance (`InvalidHandle`). Telemetry
+    /// only (feature #6).
+    fn record_cross_owner_rejection(&self) {
+        self.cross_owner_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that an access was refused on a quota / cap
+    /// (`QuotaExceeded`). Telemetry only (feature #6).
+    fn record_quota_rejection(&self) {
+        self.quota_rejections.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Install a per-invocation absolute deadline that drives the
@@ -545,6 +599,13 @@ pub struct InstanceMetricsSnapshot {
     /// Current aggregate live device-buffer bytes allocated via the
     /// explicit `alloc` surface.
     pub device_bytes_allocated: u64,
+    /// Lifetime count of device-memory accesses refused as
+    /// [`AbiError::InvalidHandle`] — an unknown or cross-owner handle
+    /// (feature #6).
+    pub cross_owner_rejections: u64,
+    /// Lifetime count of accesses refused on a quota / cap
+    /// ([`AbiError::QuotaExceeded`], feature #6).
+    pub quota_rejections: u64,
 }
 
 /// Trait implemented by store data types that can hand out a [`WasiCudaContext`].
@@ -970,6 +1031,8 @@ fn alloc_impl<T: HasWasiCuda>(caller: &mut Caller<'_, T>, size: u64) -> Result<u
         return Err(AbiError::InvalidArgs);
     }
     if size > MAX_DEVICE_ALLOC_BYTES {
+        // Feature #6: per-call cap busts count as quota rejections.
+        caller.data().wasi_cuda().record_quota_rejection();
         caller.data().wasi_cuda().record_error(format!(
             "alloc: size {size} exceeds MAX_DEVICE_ALLOC_BYTES {MAX_DEVICE_ALLOC_BYTES}"
         ));
@@ -988,7 +1051,16 @@ fn alloc_impl<T: HasWasiCuda>(caller: &mut Caller<'_, T>, size: u64) -> Result<u
         // device-bytes gauge) behave consistently across feature configs.
         // The handle is retained (not rolled back) so the alloc→free
         // lifecycle is observable; the wire return is still `NotAvailable`.
-        let _handle = device_mem.insert(DeviceMemEntry { owner, size })?;
+        let _handle = match device_mem.insert(DeviceMemEntry { owner, size }) {
+            Ok(h) => h,
+            Err(e) => {
+                // Feature #6: an aggregate-cap bust is a quota rejection.
+                if e == AbiError::QuotaExceeded {
+                    caller.data().wasi_cuda().record_quota_rejection();
+                }
+                return Err(e);
+            }
+        };
         caller.data().wasi_cuda().record_error(format!(
             "alloc: CUDA not available on this host (requested {size} bytes; \
              handle tracked in registry)"
@@ -1018,18 +1090,22 @@ fn alloc_impl<T: HasWasiCuda>(caller: &mut Caller<'_, T>, size: u64) -> Result<u
                 .record_error(format!("alloc: CUDA context bind failed: {e}"));
             return Err(AbiError::LaunchFailed);
         }
-        use cust::sys as cuda_sys;
-        let mut device_ptr: cuda_sys::CUdeviceptr = 0;
-        // SAFETY: `cuMemAlloc` writes a fresh device pointer into
-        // `device_ptr`; `size` is bounded by MAX_DEVICE_ALLOC_BYTES above.
-        let status = unsafe { cuda_sys::cuMemAlloc_v2(&mut device_ptr, size as usize) };
-        if status != cuda_sys::CUresult::CUDA_SUCCESS {
-            caller
-                .data()
-                .wasi_cuda()
-                .record_error(format!("alloc: cuMemAlloc failed with status {status:?}"));
-            return Err(AbiError::LaunchFailed);
-        }
+        // Driver calls now flow through the `CudaDriver` seam (feature #6).
+        // `RealCudaDriver` is a pure pass-through to `cust::sys`, so the
+        // hardware behaviour is unchanged; the seam is what makes this logic
+        // mock-testable without a GPU.
+        use crate::cuda_seam::CudaDriver as _;
+        let driver = crate::cuda_seam::RealCudaDriver;
+        let device_ptr = match driver.mem_alloc(size) {
+            Ok(p) => p,
+            Err(status) => {
+                caller
+                    .data()
+                    .wasi_cuda()
+                    .record_error(format!("alloc: {status:?}"));
+                return Err(AbiError::LaunchFailed);
+            }
+        };
         let handle = match device_mem.insert(DeviceMemEntry {
             owner,
             size,
@@ -1039,11 +1115,13 @@ fn alloc_impl<T: HasWasiCuda>(caller: &mut Caller<'_, T>, size: u64) -> Result<u
             Err(e) => {
                 // Registry cap tripped after the driver alloc succeeded:
                 // free the device memory we just grabbed so the cap
-                // rejection does not leak it.
-                // SAFETY: `device_ptr` is the value cuMemAlloc just wrote.
-                unsafe {
-                    let _ = cuda_sys::cuMemFree_v2(device_ptr);
+                // rejection does not leak it. Telemetry: a quota rejection
+                // (the registry's `insert` only ever fails with
+                // QuotaExceeded, but guard for clarity / future codes).
+                if e == AbiError::QuotaExceeded {
+                    caller.data().wasi_cuda().record_quota_rejection();
                 }
+                let _ = driver.mem_free(device_ptr);
                 return Err(e);
             }
         };
@@ -1068,6 +1146,11 @@ fn free_impl<T: HasWasiCuda>(caller: &mut Caller<'_, T>, handle: u64) -> Result<
     let entry = match device_mem.free(handle, owner) {
         Ok(e) => e,
         Err(e) => {
+            // Feature #6: an `InvalidHandle` here means the guest tried to
+            // free a handle it does not own (or an unknown one) — count it.
+            if e == AbiError::InvalidHandle {
+                caller.data().wasi_cuda().record_cross_owner_rejection();
+            }
             caller
                 .data()
                 .wasi_cuda()
@@ -1080,11 +1163,12 @@ fn free_impl<T: HasWasiCuda>(caller: &mut Caller<'_, T>, handle: u64) -> Result<
     #[cfg(feature = "cuda")]
     {
         // VERIFIED ON HARDWARE: see `alloc_impl`. Release the device
-        // pointer recorded at alloc time. A free that the registry accepted
-        // but the driver rejects is logged but still reported as success —
-        // the registry slot is already gone, so the guest's view (handle no
-        // longer valid) is correct regardless of the driver's verdict.
-        use cust::sys as cuda_sys;
+        // pointer recorded at alloc time via the `CudaDriver` seam
+        // (feature #6; `RealCudaDriver` forwards to `cuMemFree`). A free that
+        // the registry accepted but the driver rejects is logged but still
+        // reported as success — the registry slot is already gone, so the
+        // guest's view (handle no longer valid) is correct regardless of the
+        // driver's verdict.
         // Defense-in-depth: bind the primary context before the driver free
         // (the host fn may run on a thread that never bound it). Consistent
         // with this fn's contract, a bind failure is logged but the free still
@@ -1097,15 +1181,14 @@ fn free_impl<T: HasWasiCuda>(caller: &mut Caller<'_, T>, handle: u64) -> Result<
                 .wasi_cuda()
                 .record_error(format!("free: CUDA context bind failed: {e}"));
         } else {
-            // SAFETY: `entry.device_ptr` was produced by `cuMemAlloc` in
-            // `alloc_impl` and has not been freed (the registry slot guaranteed
-            // single ownership until this `free`).
-            let status = unsafe { cuda_sys::cuMemFree_v2(entry.device_ptr) };
-            if status != cuda_sys::CUresult::CUDA_SUCCESS {
+            use crate::cuda_seam::CudaDriver as _;
+            let driver = crate::cuda_seam::RealCudaDriver;
+            let status = driver.mem_free(entry.device_ptr);
+            if !status.is_success() {
                 caller
                     .data()
                     .wasi_cuda()
-                    .record_error(format!("free: cuMemFree failed with status {status:?}"));
+                    .record_error(format!("free: {status:?}"));
             }
         }
     }
@@ -1150,6 +1233,10 @@ fn memcpy_h2d_impl<T: HasWasiCuda>(
     let dev = match device_mem.lookup(handle, owner) {
         Ok(d) => d,
         Err(e) => {
+            // Feature #6: cross-owner / unknown handle → count it.
+            if e == AbiError::InvalidHandle {
+                caller.data().wasi_cuda().record_cross_owner_rejection();
+            }
             caller
                 .data()
                 .wasi_cuda()
@@ -1197,7 +1284,12 @@ fn memcpy_h2d_impl<T: HasWasiCuda>(
                 .record_error(format!("memcpy_h2d: CUDA context bind failed: {e}"));
             return Err(AbiError::LaunchFailed);
         }
-        use cust::sys as cuda_sys;
+        // Copy via the `CudaDriver` seam (feature #6; `RealCudaDriver`
+        // forwards to `cuMemcpyHtoD`). We take a fresh `Memory::data` borrow
+        // here (no await has happened since the bounds-check, so the slice is
+        // still valid) and hand its base pointer to the driver.
+        use crate::cuda_seam::CudaDriver as _;
+        let driver = crate::cuda_seam::RealCudaDriver;
         let memory = caller
             .get_export("memory")
             .and_then(|e| e.into_memory())
@@ -1206,18 +1298,13 @@ fn memcpy_h2d_impl<T: HasWasiCuda>(
         // SAFETY: `dev.device_ptr` is a live `cuMemAlloc` pointer of at
         // least `dev.size >= len_u32` bytes; `src` is `len_u32` bytes inside
         // the caller's linear memory (bounds-checked above).
-        let status = unsafe {
-            cuda_sys::cuMemcpyHtoD_v2(
-                dev.device_ptr,
-                src.as_ptr() as *const std::ffi::c_void,
-                len_u32 as usize,
-            )
-        };
-        if status != cuda_sys::CUresult::CUDA_SUCCESS {
+        let status =
+            unsafe { driver.memcpy_h2d(dev.device_ptr, src.as_ptr(), len_u32 as usize) };
+        if !status.is_success() {
             caller
                 .data()
                 .wasi_cuda()
-                .record_error(format!("memcpy_h2d: cuMemcpyHtoD failed: {status:?}"));
+                .record_error(format!("memcpy_h2d: {status:?}"));
             return Err(AbiError::LaunchFailed);
         }
         return Ok(());
@@ -1267,6 +1354,10 @@ fn memcpy_d2h_impl<T: HasWasiCuda>(
     let dev = match device_mem.lookup(handle, owner) {
         Ok(d) => d,
         Err(e) => {
+            // Feature #6: cross-owner / unknown handle → count it.
+            if e == AbiError::InvalidHandle {
+                caller.data().wasi_cuda().record_cross_owner_rejection();
+            }
             caller
                 .data()
                 .wasi_cuda()
@@ -1306,7 +1397,10 @@ fn memcpy_d2h_impl<T: HasWasiCuda>(
                 .record_error(format!("memcpy_d2h: CUDA context bind failed: {e}"));
             return Err(AbiError::LaunchFailed);
         }
-        use cust::sys as cuda_sys;
+        // Copy via the `CudaDriver` seam (feature #6; `RealCudaDriver`
+        // forwards to `cuMemcpyDtoH`).
+        use crate::cuda_seam::CudaDriver as _;
+        let driver = crate::cuda_seam::RealCudaDriver;
         let memory = caller
             .get_export("memory")
             .and_then(|e| e.into_memory())
@@ -1315,18 +1409,13 @@ fn memcpy_d2h_impl<T: HasWasiCuda>(
         // SAFETY: `dev.device_ptr` is a live `cuMemAlloc` pointer of at
         // least `len_u32` bytes; `dst` is `len_u32` writable bytes inside
         // the caller's linear memory (bounds-checked above).
-        let status = unsafe {
-            cuda_sys::cuMemcpyDtoH_v2(
-                dst.as_mut_ptr() as *mut std::ffi::c_void,
-                dev.device_ptr,
-                len_u32 as usize,
-            )
-        };
-        if status != cuda_sys::CUresult::CUDA_SUCCESS {
+        let status =
+            unsafe { driver.memcpy_d2h(dst.as_mut_ptr(), dev.device_ptr, len_u32 as usize) };
+        if !status.is_success() {
             caller
                 .data()
                 .wasi_cuda()
-                .record_error(format!("memcpy_d2h: cuMemcpyDtoH failed: {status:?}"));
+                .record_error(format!("memcpy_d2h: {status:?}"));
             return Err(AbiError::LaunchFailed);
         }
         return Ok(());
@@ -1920,44 +2009,72 @@ fn resolve_and_launch_cuda_inner<T: HasWasiCuda>(
     // documented but unenforced; this is the enforcement.
     //
     // SECURITY (finding #3, hardening): the pointer we validate is provably
-    // the pointer we launch. `build_kernel_param_storage(&lowered_args)`
+    // the pointer we launch. `build_kernel_param_storage(lowered_args)`
     // above and this validation loop both read `host_ptr` straight out of
     // the SAME `lowered_args` slice, with no intervening re-resolution that
     // could let a validated address differ from a launched one. The
     // `debug_assert_eq!` after the loop is a structural guard: the number of
     // pointer args we validated must equal the number of `Ptr` slots the
     // storage built, or the two views of the argv have drifted.
+    //
+    // PERF (feature #6): residency is a property of the guest's linear-memory
+    // *allocation*, not of an individual offset — every pointer arg in a
+    // launch resolves into the same UVM-backed region. We therefore consult
+    // a per-instance cache keyed by the linear-memory base address: the
+    // first pointer arg pays the driver query, and subsequent args / launches
+    // against the same (un-grown) memory reuse the verdict. A `memory.grow`
+    // changes the base address, which misses the cache and re-validates.
+    let mem_base = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .map(|m| m.data_ptr(&caller) as usize)
+        .unwrap_or(0);
+    // Driver residency queries flow through the `CudaDriver` seam.
+    use crate::cuda_seam::CudaDriver as _;
+    let driver = crate::cuda_seam::RealCudaDriver;
     let mut validated_ptr_args = 0usize;
     for arg in lowered_args {
         if let LoweredArg::Ptr { host_ptr, .. } = arg {
             validated_ptr_args += 1;
-            let mut is_managed: std::os::raw::c_int = 0;
-            // SAFETY: `is_managed` is a valid, correctly-typed out-param for
-            // the IS_MANAGED attribute (a 32-bit int). `host_ptr` was
-            // bounds-checked into the guest's live linear memory by
-            // `parse_argv`. `cuPointerGetAttribute` only reads driver
-            // bookkeeping for the address — it never dereferences it.
-            let res = unsafe {
-                cuda_sys::cuPointerGetAttribute(
-                    &mut is_managed as *mut std::os::raw::c_int as *mut std::ffi::c_void,
-                    cuda_sys::CUpointer_attribute_enum::CU_POINTER_ATTRIBUTE_IS_MANAGED,
-                    *host_ptr as cuda_sys::CUdeviceptr,
-                )
+            // Cache hit: the base address was validated managed earlier.
+            let cached = caller
+                .data()
+                .wasi_cuda()
+                .residency_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&mem_base)
+                .copied();
+            let is_managed = match cached {
+                Some(v) => v,
+                None => {
+                    // Miss: query the driver for THIS pointer (any pointer in
+                    // the region resolves the whole region's verdict) and
+                    // memoise it under the base address.
+                    let verdict = driver.pointer_is_managed(*host_ptr as u64).unwrap_or(false);
+                    caller
+                        .data()
+                        .wasi_cuda()
+                        .residency_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(mem_base, verdict);
+                    verdict
+                }
             };
-            // Host-heap pointers are unknown to the driver and return
-            // `CUDA_ERROR_INVALID_VALUE`; managed pointers return success
-            // with `is_managed == 1`. Either non-success or `is_managed == 0`
-            // means the address is not safe to launch against.
-            if res != cuda_sys::CUresult::CUDA_SUCCESS || is_managed == 0 {
-                caller.data().wasi_cuda().record_error(format!(
+            // A non-managed (or driver-unknown) address is not safe to launch
+            // against — refuse before any driver launch state is touched.
+            if !is_managed {
+                caller.data().wasi_cuda().record_error(
                     "launch: kernel pointer argument is not GPU-addressable \
-                     (cuPointerGetAttribute IS_MANAGED -> {res:?}, \
-                     is_managed={is_managed}); refusing to launch so an invalid \
-                     device pointer cannot raise a sticky CUDA_ERROR_ILLEGAL_ADDRESS \
-                     that would poison the shared CUDA context for all tenants. Back \
-                     guest linear memory with the unified-memory MemoryCreator \
-                     (enable the `unified-memory` feature on tensor-wasm-mem)."
-                ));
+                     (cuPointerGetAttribute IS_MANAGED reported not-managed); \
+                     refusing to launch so an invalid device pointer cannot raise \
+                     a sticky CUDA_ERROR_ILLEGAL_ADDRESS that would poison the \
+                     shared CUDA context for all tenants. Back guest linear memory \
+                     with the unified-memory MemoryCreator (enable the \
+                     `unified-memory` feature on tensor-wasm-mem)."
+                        .to_string(),
+                );
                 return Err(AbiError::LaunchFailed);
             }
         }
@@ -3194,6 +3311,14 @@ mod tests {
             .device_mem()
             .lookup(foreign, InstanceId(999))
             .is_ok());
+        // Feature #6: all three cross-owner rejections were counted (one
+        // each for free / h2d / d2h), and no quota rejection was recorded.
+        let snap = store.data().wasi_cuda().metrics_snapshot();
+        assert_eq!(
+            snap.cross_owner_rejections, 3,
+            "free + h2d + d2h cross-owner rejections must each count"
+        );
+        assert_eq!(snap.quota_rejections, 0);
     }
 
     /// `alloc` of zero bytes is a structural error (`InvalidArgs`); an
@@ -3237,6 +3362,11 @@ mod tests {
             AbiError::QuotaExceeded.code() as i64,
             "oversize alloc must return QuotaExceeded, got {rc}"
         );
+        // Feature #6: the oversize alloc counted as a quota rejection; the
+        // zero-size alloc is `InvalidArgs`, not a quota bust, so it does not.
+        let snap = store.data().wasi_cuda().metrics_snapshot();
+        assert_eq!(snap.quota_rejections, 1, "only the oversize alloc is a quota bust");
+        assert_eq!(snap.cross_owner_rejections, 0);
     }
 
     /// `alloc` then `free` lifecycle, asserting the real per-feature return
