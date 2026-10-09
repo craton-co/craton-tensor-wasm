@@ -27,6 +27,10 @@ pub mod async_dispatch;
 // on `--features cuda`; the module itself is `#![cfg(feature = "cuda")]`.
 #[cfg(feature = "cuda")]
 pub mod cuda_ctx;
+/// Mockable CUDA driver seam (wasi-gpu feature 6): a trait over the raw
+/// `cust::sys` calls so the device-memory + launch paths are unit-testable
+/// without GPU hardware.
+pub mod cuda_seam;
 pub mod device_mem;
 pub mod host;
 pub mod kernel_args;
