@@ -3321,6 +3321,141 @@ mod tests {
         assert_eq!(snap.quota_rejections, 0);
     }
 
+    /// Finding #7: a negative `len` on `memcpy-h2d` / `memcpy-d2h` must
+    /// surface as `InvalidPointer` (a memory-region fault), caught by the
+    /// explicit `checked_nonneg_len` guard up front rather than incidentally
+    /// by the buffer-size cap after an `as u32` cast. We pre-seed a tracked
+    /// handle so the lookup succeeds and the failure is attributable to the
+    /// negative length.
+    #[tokio::test]
+    async fn memcpy_negative_len_returns_invalid_pointer() {
+        let config = wasmtime::Config::new();
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut linker: Linker<Dummy> = Linker::new(&engine);
+        add_to_linker(&mut linker).expect("add_to_linker");
+
+        let mut ctx = WasiCudaContext::new(InstanceId(310));
+        ctx.enable_wasi_cuda();
+        let handle = ctx
+            .device_mem()
+            .insert(crate::device_mem::DeviceMemEntry {
+                owner: InstanceId(310),
+                size: 1024,
+                #[cfg(feature = "cuda")]
+                device_ptr: 0,
+            })
+            .expect("insert");
+
+        let module = wasmtime::Module::new(&engine, wat::parse_str(device_mem_wat()).unwrap())
+            .expect("compile");
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+
+        // memcpy-h2d with len = -1.
+        let h2d = instance
+            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "do_h2d")
+            .expect("typed func");
+        let rc = h2d
+            .call_async(&mut store, (handle as i32, 0, 0, -1))
+            .await
+            .expect("call");
+        assert_eq!(
+            rc,
+            AbiError::InvalidPointer.code(),
+            "negative len on memcpy-h2d must return InvalidPointer, got {rc}"
+        );
+
+        // memcpy-d2h with len = -1.
+        let d2h = instance
+            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "do_d2h")
+            .expect("typed func");
+        let rc = d2h
+            .call_async(&mut store, (0, handle as i32, 0, -1))
+            .await
+            .expect("call");
+        assert_eq!(
+            rc,
+            AbiError::InvalidPointer.code(),
+            "negative len on memcpy-d2h must return InvalidPointer, got {rc}"
+        );
+    }
+
+    /// Finding #7: end-to-end quota-via-ABI. Repeatedly `do_alloc` through the
+    /// real wire surface until `QuotaExceeded` surfaces as the wire return
+    /// code. We drive the per-instance *count* cap
+    /// (`MAX_DEVICE_ALLOCS_PER_INSTANCE`) with 1-byte allocations: the
+    /// (cap+1)-th call must surface `QuotaExceeded` over the wire. Using
+    /// 1-byte allocations keeps the test cheap on real hardware too — under
+    /// `--features cuda` it makes `MAX_DEVICE_ALLOCS_PER_INSTANCE` tiny
+    /// `cuMemAlloc` calls rather than gigabytes. An isolated device-memory
+    /// budget keeps the process-wide singleton other tests share from
+    /// perturbing (or being perturbed by) this run.
+    #[tokio::test]
+    async fn quota_exceeded_surfaces_through_the_wire() {
+        use crate::device_mem::{
+            DeviceMemBudget, DeviceMemRegistry, MAX_DEVICE_ALLOCS_PER_INSTANCE,
+        };
+
+        let config = wasmtime::Config::new();
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut linker: Linker<Dummy> = Linker::new(&engine);
+        add_to_linker(&mut linker).expect("add_to_linker");
+
+        // Build a context whose device-memory registry charges an ISOLATED
+        // budget (not the shared singleton), so only this instance's caps
+        // gate the run.
+        let mut ctx = WasiCudaContext::new(InstanceId(311));
+        ctx.enable_wasi_cuda();
+        ctx.device_mem =
+            Arc::new(DeviceMemRegistry::with_budget(Arc::new(DeviceMemBudget::new())));
+
+        let module = wasmtime::Module::new(&engine, wat::parse_str(device_mem_wat()).unwrap())
+            .expect("compile");
+        let mut store = wasmtime::Store::new(&engine, Dummy(ctx));
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+        let alloc = instance
+            .get_typed_func::<(i32, i32), i64>(&mut store, "do_alloc")
+            .expect("typed func");
+
+        // 1-byte allocations: lo = 1, hi = 0.
+        for i in 0..MAX_DEVICE_ALLOCS_PER_INSTANCE {
+            let rc = alloc.call_async(&mut store, (1, 0)).await.expect("call");
+            // On no-CUDA the stub tracks the handle then returns NotAvailable;
+            // on CUDA the real alloc returns the non-negative handle.
+            #[cfg(not(feature = "cuda"))]
+            assert_eq!(
+                rc,
+                AbiError::NotAvailable.code() as i64,
+                "allocation {i} under the count cap must be admitted (NotAvailable stub)"
+            );
+            #[cfg(feature = "cuda")]
+            assert!(
+                rc >= 0,
+                "allocation {i} under the count cap must be admitted, got {rc}"
+            );
+        }
+
+        // The (cap+1)-th allocation trips the per-instance count cap and
+        // surfaces `QuotaExceeded` over the wire.
+        let rc = alloc.call_async(&mut store, (1, 0)).await.expect("call");
+        assert_eq!(
+            rc,
+            AbiError::QuotaExceeded.code() as i64,
+            "allocation past the count cap must surface QuotaExceeded over the wire, got {rc}"
+        );
+        // Feature #6: the cap bust was counted.
+        assert_eq!(
+            store.data().wasi_cuda().metrics_snapshot().quota_rejections,
+            1
+        );
+    }
+
     /// `alloc` of zero bytes is a structural error (`InvalidArgs`); an
     /// oversize request trips the per-call cap (`QuotaExceeded`). Both are
     /// rejected before the no-CUDA `NotAvailable` stub.
