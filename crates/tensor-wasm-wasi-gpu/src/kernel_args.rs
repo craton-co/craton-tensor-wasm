@@ -839,6 +839,48 @@ mod tests {
         assert_eq!(err, AbiError::InvalidPointer);
     }
 
+    /// Off-by-one guard (finding #7): a NON-zero-length pointer whose
+    /// `guest_offset` is exactly `mem.len()` is out of bounds — `[len, len+1)`
+    /// starts one past the end. This is the dual of
+    /// `zero_length_pointer_at_memory_end_is_allowed`: a zero-length pointer
+    /// at `mem.len()` is fine (it addresses nothing), but a positive-length
+    /// one at the same offset must be rejected with `InvalidPointer`.
+    #[test]
+    fn nonzero_length_pointer_at_memory_end_is_rejected() {
+        let mem = vec![0u8; 32];
+        let args = vec![LoweredArg::Ptr {
+            host_ptr: std::ptr::null(),
+            len: 1,
+            guest_offset: 32, // start == mem.len(); [32, 33) ⊄ [0, 32)
+        }];
+        let buf = encode_argv(&args);
+        let err = parse_argv(&buf, &mem).unwrap_err();
+        assert_eq!(err, AbiError::InvalidPointer);
+    }
+
+    /// A pointer arg whose `guest_offset + len` overflows `usize` must be
+    /// caught by the `checked_add` in `parse_argv` and surface as
+    /// `InvalidPointer` rather than wrapping to a small in-bounds `end`
+    /// (finding #7). `guest_offset` / `len` are each `u32`, so on a 64-bit
+    /// host `start + len` cannot actually overflow `usize`; we construct the
+    /// argv buffer BY HAND with the maximum values to exercise the
+    /// `checked_add` branch on the architectures where it can (32-bit) and
+    /// to prove that even the largest representable pair is rejected (the
+    /// bound `end > mem.len()` catches it everywhere).
+    #[test]
+    fn pointer_usize_overflow_argv_is_rejected() {
+        let mem = vec![0u8; 64];
+        // Hand-encode a Ptr record: tag 0x07, guest_offset=u32::MAX,
+        // len=u32::MAX. On 64-bit the sum is ~2^33 (no usize overflow) but is
+        // far past `mem.len()`, so the bounds check rejects it; on 32-bit the
+        // `checked_add` overflow branch rejects it. Either way: InvalidPointer.
+        let mut buf = vec![ArgTag::Ptr as u8];
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // guest_offset
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // len
+        let err = parse_argv(&buf, &mem).unwrap_err();
+        assert_eq!(err, AbiError::InvalidPointer);
+    }
+
     #[test]
     fn zero_length_pointer_at_memory_end_is_allowed() {
         // A common safe pattern: zero-length pointer pointing at one-past-end.

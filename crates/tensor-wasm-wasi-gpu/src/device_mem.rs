@@ -606,6 +606,57 @@ mod tests {
         assert_eq!(budget.total_allocs(), 0);
     }
 
+    /// Rollback guard (finding #7): when the per-instance byte reservation
+    /// succeeds but the shared process budget then refuses the allocation
+    /// (its count cap trips), `insert` must ROLL BACK the per-instance
+    /// byte reservation so the two counters never drift. We drive the
+    /// process budget to its count cap with one registry, then insert
+    /// through a *second* registry whose per-instance caps are wide open —
+    /// the only gate is the shared count cap. After the refusal the second
+    /// registry's `total_device_bytes` must still be 0 (rolled back), and a
+    /// `free` on the first registry must re-admit exactly one allocation.
+    #[test]
+    fn insert_rolls_back_byte_reservation_when_process_cap_trips() {
+        let budget = Arc::new(DeviceMemBudget::new());
+        // Saturate the process *count* cap with 1-byte allocations across
+        // enough registries that none trips its own per-instance count cap.
+        let fillers: Vec<DeviceMemRegistry> = (0..4)
+            .map(|_| DeviceMemRegistry::with_budget(Arc::clone(&budget)))
+            .collect();
+        for reg in &fillers {
+            for _ in 0..MAX_DEVICE_ALLOCS_PER_INSTANCE {
+                reg.insert(entry(InstanceId(1), 1)).expect("under count cap");
+            }
+        }
+        assert_eq!(budget.total_allocs(), MAX_PROCESS_DEVICE_ALLOCS as u64);
+
+        // Fresh registry: per-instance caps are wide open, so the only gate
+        // is the shared count cap. The insert reserves per-instance bytes,
+        // then the process budget refuses → per-instance bytes roll back.
+        let victim = DeviceMemRegistry::with_budget(Arc::clone(&budget));
+        assert_eq!(
+            victim.insert(entry(InstanceId(2), 4096)).unwrap_err(),
+            AbiError::QuotaExceeded
+        );
+        assert_eq!(
+            victim.total_device_bytes(),
+            0,
+            "per-instance byte reservation must roll back when the process cap refuses"
+        );
+        assert_eq!(victim.len(), 0, "no entry must have been inserted");
+
+        // Free one filler allocation → process count headroom returns → the
+        // victim's next insert succeeds and its byte counter tracks correctly.
+        fillers[0]
+            .free(1, InstanceId(1))
+            .expect("free a live filler allocation");
+        let h = victim
+            .insert(entry(InstanceId(2), 4096))
+            .expect("re-admitted after a free freed shared headroom");
+        assert!(victim.lookup(h, InstanceId(2)).is_ok());
+        assert_eq!(victim.total_device_bytes(), 4096);
+    }
+
     #[test]
     fn handles_are_unique_and_increasing() {
         let reg = DeviceMemRegistry::new();

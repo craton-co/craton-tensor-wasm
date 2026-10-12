@@ -551,6 +551,60 @@ mod tests {
         assert_eq!(ctx.emit_chunk(vec![1, 2, 3]).await, -3);
     }
 
+    /// Finding #7: concurrent `emit_chunk` against the total-bytes cap. Many
+    /// tasks racing to emit must collectively never forward more than
+    /// `max_total` bytes — the optimistic `fetch_add` + rollback keeps the
+    /// accepted total at or below the cap once quiescent, and every chunk the
+    /// receiver actually observes is one that was accounted for. We set a
+    /// small cap, spawn more emitters than the cap allows, and assert: (a)
+    /// the number of `0` (accepted) returns equals the number of chunks the
+    /// receiver drains, and (b) the final `bytes_emitted` never exceeds the
+    /// cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_emit_chunk_respects_total_cap() {
+        // Cap of 10 chunks' worth: each chunk is 100 bytes, cap = 1000.
+        const CHUNK: usize = 100;
+        const CAP: u64 = 1000;
+        const EMITTERS: usize = 50; // far more than the cap admits
+
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(EMITTERS);
+        let ctx = StreamingContext::with_channel_and_cap(tx, CAP);
+
+        let mut handles = Vec::new();
+        for _ in 0..EMITTERS {
+            let ctx = ctx.clone();
+            handles.push(tokio::spawn(async move {
+                ctx.emit_chunk(vec![0u8; CHUNK]).await
+            }));
+        }
+        let mut accepted = 0usize;
+        for h in handles {
+            if h.await.expect("task") == 0 {
+                accepted += 1;
+            }
+        }
+
+        // Drop the sender so the receiver loop terminates, then drain.
+        drop(ctx);
+        let mut received = 0usize;
+        while rx.recv().await.is_some() {
+            received += 1;
+        }
+
+        // Every accepted emit delivered exactly one chunk to the receiver.
+        assert_eq!(
+            accepted, received,
+            "accepted-count must equal delivered-count under concurrency"
+        );
+        // The cap was respected: at most CAP/CHUNK = 10 chunks accepted.
+        assert!(
+            accepted <= (CAP as usize / CHUNK),
+            "accepted {accepted} chunks exceeds the {} the cap allows",
+            CAP as usize / CHUNK
+        );
+        assert!(accepted > 0, "at least some emits must have been accepted");
+    }
+
     #[test]
     fn input_context_empty_by_default() {
         let ctx = InputContext::empty();
