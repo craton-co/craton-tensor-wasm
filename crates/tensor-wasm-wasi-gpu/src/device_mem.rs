@@ -625,7 +625,8 @@ mod tests {
             .collect();
         for reg in &fillers {
             for _ in 0..MAX_DEVICE_ALLOCS_PER_INSTANCE {
-                reg.insert(entry(InstanceId(1), 1)).expect("under count cap");
+                reg.insert(entry(InstanceId(1), 1))
+                    .expect("under count cap");
             }
         }
         assert_eq!(budget.total_allocs(), MAX_PROCESS_DEVICE_ALLOCS as u64);

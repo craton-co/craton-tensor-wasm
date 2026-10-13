@@ -41,16 +41,15 @@ fn sign(key: &[u8; 32], bytes: &[u8]) -> [u8; ARTIFACT_HMAC_LEN] {
 /// 8-byte hex fingerprint of the key — matches `lib.rs::key_fingerprint_hex`.
 fn key_fp_hex(key: &[u8; 32]) -> String {
     let h = blake3::hash(&key[..]);
-    h.as_bytes()[..8].iter().map(|b| format!("{:02x}", b)).collect()
+    h.as_bytes()[..8]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 /// Write `framed` to the store dir under the `{hash}.{fp}.bin` name `get`
 /// will look up for `hash`, returning the store rooted there.
-fn store_with_blob(
-    dir: &std::path::Path,
-    hash: &ContentHash,
-    framed: &[u8],
-) -> DiskArtifactStore {
+fn store_with_blob(dir: &std::path::Path, hash: &ContentHash, framed: &[u8]) -> DiskArtifactStore {
     let fname = format!("{}.{}.bin", hash, key_fp_hex(&KEY));
     std::fs::create_dir_all(dir).expect("mkdir");
     std::fs::write(dir.join(&fname), framed).expect("write crafted blob");
@@ -90,7 +89,9 @@ fn valid_hmac_but_wrong_header_hash_is_hash_mismatch() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = store_with_blob(tmp.path(), &lookup, &framed);
 
-    let err = store.get(&lookup).expect_err("must reject header/body hash disagreement");
+    let err = store
+        .get(&lookup)
+        .expect_err("must reject header/body hash disagreement");
     match err {
         ArtifactError::HashMismatch { .. } => {}
         other => panic!("expected HashMismatch, got {other:?}"),
@@ -119,7 +120,9 @@ fn valid_hmac_but_garbage_body_is_decompression() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = store_with_blob(tmp.path(), &lookup, &framed);
 
-    let err = store.get(&lookup).expect_err("must reject undecodable body");
+    let err = store
+        .get(&lookup)
+        .expect_err("must reject undecodable body");
     match err {
         ArtifactError::Decompression(_) => {}
         other => panic!("expected Decompression (post-HMAC), got {other:?}"),
@@ -141,7 +144,9 @@ fn truncated_file_below_min_len_is_bad_magic() {
 
     // `get_to` shares the same gate (in `verify_blob`).
     let mut sink: Vec<u8> = Vec::new();
-    let err2 = store.get_to(&hash, &mut sink).expect_err("get_to must reject too");
+    let err2 = store
+        .get_to(&hash, &mut sink)
+        .expect_err("get_to must reject too");
     assert!(matches!(err2, ArtifactError::BadMagic), "got {err2:?}");
     assert!(sink.is_empty(), "no bytes emitted for a truncated file");
 }

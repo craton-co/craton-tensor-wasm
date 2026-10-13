@@ -89,7 +89,10 @@ fn get_to_survives_remove_reput_race_between_passes() {
     // decode, the bytes streamed out are the authenticated ones.
     let n = store.get_to(&hash, &mut sink).expect("get_to across race");
     assert_eq!(n, payload.len() as u64, "byte count matches the original");
-    assert_eq!(sink.bytes, payload, "streamed bytes equal the authenticated payload");
+    assert_eq!(
+        sink.bytes, payload,
+        "streamed bytes equal the authenticated payload"
+    );
     assert!(sink.fired, "the swap actually fired during the decode pass");
 
     // The store still reads the blob back cleanly afterwards (the re-put
@@ -106,14 +109,17 @@ fn encode_to_writer_is_byte_identical_to_vec() {
         Vec::new(),
         b"x".to_vec(),
         b"the quick brown fox".repeat(100),
-        (0..200_000u32).map(|n| (n.wrapping_mul(40503) >> 7) as u8).collect(),
+        (0..200_000u32)
+            .map(|n| (n.wrapping_mul(40503) >> 7) as u8)
+            .collect(),
     ];
     for payload in &cases {
         let via_vec = encode_envelope_to_vec(payload, &KEY).expect("encode_to_vec");
         let mut via_writer: Vec<u8> = Vec::new();
         encode_envelope_to_writer(&mut via_writer, payload, &KEY).expect("encode_to_writer");
         assert_eq!(
-            via_vec, via_writer,
+            via_vec,
+            via_writer,
             "writer and vec encoders must be byte-identical (payload len {})",
             payload.len()
         );
@@ -125,8 +131,7 @@ fn put_from_round_trips_and_matches_put_hash() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = DiskArtifactStore::new(tmp.path().to_path_buf(), KEY);
 
-    let payload =
-        b"streamed in from a reader without buffering the whole thing first \
+    let payload = b"streamed in from a reader without buffering the whole thing first \
           streamed in from a reader without buffering the whole thing first";
 
     // Stream the payload in from a reader.
@@ -143,17 +148,27 @@ fn put_from_round_trips_and_matches_put_hash() {
     // store doing a buffered `put` of the same bytes lands the identical
     // file (idempotent, one entry).
     store.put(payload).expect("buffered put of same bytes");
-    assert_eq!(store.list().expect("list").len(), 1, "one content-addressed entry");
+    assert_eq!(
+        store.list().expect("list").len(),
+        1,
+        "one content-addressed entry"
+    );
 }
 
 #[test]
 fn total_bytes_sums_blob_footprint() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = DiskArtifactStore::new(tmp.path().to_path_buf(), KEY);
-    assert_eq!(store.total_bytes().expect("empty"), 0, "empty store is 0 bytes");
+    assert_eq!(
+        store.total_bytes().expect("empty"),
+        0,
+        "empty store is 0 bytes"
+    );
 
     let a = store.put(b"alpha payload one").expect("put a");
-    let b = store.put(b"beta payload two, different bytes").expect("put b");
+    let b = store
+        .put(b"beta payload two, different bytes")
+        .expect("put b");
     assert_ne!(a, b);
 
     // The reported total equals the on-disk sum of the two `.bin` files.
@@ -174,11 +189,12 @@ fn prune_older_than_removes_only_old_blobs() {
 
     let old = store.put(b"an older artifact").expect("put old");
     // Backdate the old blob's mtime well into the past.
-    let long_ago =
-        std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 24 * 30);
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 24 * 30);
     let backdated = set_mtime(tmp.path(), &old, long_ago);
 
-    let fresh = store.put(b"a fresh artifact written just now").expect("put fresh");
+    let fresh = store
+        .put(b"a fresh artifact written just now")
+        .expect("put fresh");
 
     // Prune anything older than one day ago.
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 24);
@@ -186,13 +202,19 @@ fn prune_older_than_removes_only_old_blobs() {
     if backdated {
         // The backdated blob must be reclaimed; the fresh one must survive.
         assert_eq!(removed, 1, "exactly the backdated blob is pruned");
-        assert!(!store.contains(&old).expect("old gone"), "backdated blob pruned");
+        assert!(
+            !store.contains(&old).expect("old gone"),
+            "backdated blob pruned"
+        );
     } else {
         // Platform refused the mtime set; neither blob is older than cutoff.
         assert_eq!(removed, 0, "nothing is older than the cutoff");
     }
     // The fresh blob is always retained.
-    assert!(store.contains(&fresh).expect("fresh present"), "fresh blob survives prune");
+    assert!(
+        store.contains(&fresh).expect("fresh present"),
+        "fresh blob survives prune"
+    );
 }
 
 #[test]
@@ -202,7 +224,9 @@ fn gc_size_bound_evicts_oldest_first() {
 
     // Three distinct, poorly-compressible blobs of similar size.
     let mk = |seed: u32| -> Vec<u8> {
-        (0..50_000u32).map(|n| (n.wrapping_mul(2246822519).wrapping_add(seed) >> 9) as u8).collect()
+        (0..50_000u32)
+            .map(|n| (n.wrapping_mul(2246822519).wrapping_add(seed) >> 9) as u8)
+            .collect()
     };
     let p0 = mk(1);
     let p1 = mk(2);
@@ -221,17 +245,31 @@ fn gc_size_bound_evicts_oldest_first() {
 
     // Budget that fits ~2 of the 3 blobs, forcing eviction of the oldest.
     let budget = total - (total / 3) - 1;
-    let outcome = store.gc(GcPolicy::with_max_total_bytes(budget)).expect("gc");
+    let outcome = store
+        .gc(GcPolicy::with_max_total_bytes(budget))
+        .expect("gc");
 
-    assert!(outcome.removed_by_size >= 1, "at least one blob evicted under the budget");
+    assert!(
+        outcome.removed_by_size >= 1,
+        "at least one blob evicted under the budget"
+    );
     assert_eq!(outcome.removed_by_age, 0, "no age bound was set");
-    assert!(outcome.bytes_after <= budget, "footprint fits the budget after gc");
+    assert!(
+        outcome.bytes_after <= budget,
+        "footprint fits the budget after gc"
+    );
     // The newest blob is always retained.
-    assert!(store.contains(&h2).expect("newest present"), "newest blob survives size gc");
+    assert!(
+        store.contains(&h2).expect("newest present"),
+        "newest blob survives size gc"
+    );
     // The oldest is the first to go — but only assert ordering if the mtime
     // staggering actually took effect on this platform.
     if s0 && s1 && s2 {
-        assert!(!store.contains(&h0).expect("oldest gone"), "oldest blob evicted first");
+        assert!(
+            !store.contains(&h0).expect("oldest gone"),
+            "oldest blob evicted first"
+        );
     }
 }
 
