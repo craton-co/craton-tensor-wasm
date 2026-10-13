@@ -27,9 +27,7 @@ use crate::writer::{
 };
 
 #[cfg(feature = "signed-snapshots")]
-use crate::format::{
-    SignatureKind, HMAC_SHA256_SIG_LEN, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN,
-};
+use crate::format::{SignatureKind, HMAC_SHA256_SIG_LEN, V3_TRAILER_MAGIC, V3_TRAILER_MAGIC_LEN};
 #[cfg(feature = "signed-snapshots")]
 // `verify_strict` is an *inherent* method on `VerifyingKey`, so the
 // `Verifier` trait is no longer imported — pulling it in would now be an

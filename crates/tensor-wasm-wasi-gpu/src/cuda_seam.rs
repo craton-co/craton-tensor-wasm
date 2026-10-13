@@ -322,7 +322,10 @@ mod tests {
         let a = drv.mem_alloc(4096).expect("alloc a");
         let b = drv.mem_alloc(4096).expect("alloc b");
         assert_ne!(a, b, "mock must hand out distinct pointers");
-        assert_eq!(drv.calls(), vec![MockCall::Alloc(4096), MockCall::Alloc(4096)]);
+        assert_eq!(
+            drv.calls(),
+            vec![MockCall::Alloc(4096), MockCall::Alloc(4096)]
+        );
     }
 
     #[test]
@@ -345,7 +348,11 @@ mod tests {
         assert!(!bad.is_success());
         assert_eq!(
             drv.calls(),
-            vec![MockCall::Alloc(16), MockCall::H2d(dst, 16), MockCall::D2h(dst, 16)]
+            vec![
+                MockCall::Alloc(16),
+                MockCall::H2d(dst, 16),
+                MockCall::D2h(dst, 16)
+            ]
         );
     }
 
@@ -399,6 +406,9 @@ mod tests {
         let dev = drv.mem_alloc(1024).expect("alloc");
         // Simulate the host's "registry cap tripped → free what we grabbed".
         let _ = drv.mem_free(dev);
-        assert_eq!(drv.calls(), vec![MockCall::Alloc(1024), MockCall::Free(dev)]);
+        assert_eq!(
+            drv.calls(),
+            vec![MockCall::Alloc(1024), MockCall::Free(dev)]
+        );
     }
 }

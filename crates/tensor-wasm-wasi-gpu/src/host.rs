@@ -1298,8 +1298,7 @@ fn memcpy_h2d_impl<T: HasWasiCuda>(
         // SAFETY: `dev.device_ptr` is a live `cuMemAlloc` pointer of at
         // least `dev.size >= len_u32` bytes; `src` is `len_u32` bytes inside
         // the caller's linear memory (bounds-checked above).
-        let status =
-            unsafe { driver.memcpy_h2d(dev.device_ptr, src.as_ptr(), len_u32 as usize) };
+        let status = unsafe { driver.memcpy_h2d(dev.device_ptr, src.as_ptr(), len_u32 as usize) };
         if !status.is_success() {
             caller
                 .data()
@@ -3409,8 +3408,9 @@ mod tests {
         // gate the run.
         let mut ctx = WasiCudaContext::new(InstanceId(311));
         ctx.enable_wasi_cuda();
-        ctx.device_mem =
-            Arc::new(DeviceMemRegistry::with_budget(Arc::new(DeviceMemBudget::new())));
+        ctx.device_mem = Arc::new(DeviceMemRegistry::with_budget(Arc::new(
+            DeviceMemBudget::new(),
+        )));
 
         let module = wasmtime::Module::new(&engine, wat::parse_str(device_mem_wat()).unwrap())
             .expect("compile");
@@ -3500,7 +3500,10 @@ mod tests {
         // Feature #6: the oversize alloc counted as a quota rejection; the
         // zero-size alloc is `InvalidArgs`, not a quota bust, so it does not.
         let snap = store.data().wasi_cuda().metrics_snapshot();
-        assert_eq!(snap.quota_rejections, 1, "only the oversize alloc is a quota bust");
+        assert_eq!(
+            snap.quota_rejections, 1,
+            "only the oversize alloc is a quota bust"
+        );
         assert_eq!(snap.cross_owner_rejections, 0);
     }
 
