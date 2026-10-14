@@ -1139,10 +1139,19 @@ impl DiskArtifactStore {
                 ArtifactError::Io
             })?;
         }
-        env_tmp.persist(&final_path).map_err(|e| {
-            warn!(target: "tensor_wasm_artifacts", error = %e, "tempfile persist failed (put_from)");
-            ArtifactError::Io
-        })?;
+        // Content-addressed idempotency (see `put`): a lost rename race on
+        // Windows where the identical target already exists is success.
+        if let Err(e) = env_tmp.persist(&final_path) {
+            if final_path.exists() {
+                tracing::debug!(
+                    target: "tensor_wasm_artifacts",
+                    "concurrent put_from lost the content-addressed rename race; identical artifact already present"
+                );
+            } else {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "tempfile persist failed (put_from)");
+                return Err(ArtifactError::Io);
+            }
+        }
         if self.durability == DurabilityPolicy::Full {
             self.sync_dir_best_effort();
         }
@@ -1765,13 +1774,26 @@ impl ArtifactStore for DiskArtifactStore {
         // mirroring the JIT L2 disk-cache pattern so a partial write
         // can never leave a half-formed entry that a concurrent reader
         // trips over. This happens regardless of durability policy.
-        tmp.persist(&final_path).map_err(|e| {
-            // `tempfile::PersistError` wraps the underlying `io::Error`
-            // plus the temp handle; the `Display` impl forwards to the
-            // io error so we don't need to reach for the field.
-            warn!(target: "tensor_wasm_artifacts", error = %e, "tempfile persist failed");
-            ArtifactError::Io
-        })?;
+        // Content-addressed idempotency under concurrent identical `put`s:
+        // racing renames target the SAME `{hash}.{fp}.bin` path. POSIX
+        // `rename(2)` replaces atomically, but on Windows a replace can fail
+        // (sharing violation / access denied) while another thread is mid-
+        // rename on the same target. Since the path is content-addressed, an
+        // already-present `final_path` necessarily holds byte-identical
+        // content, so a persist failure where the target now exists is a
+        // benign lost race — report success rather than a spurious `Io`. A
+        // genuine failure (target still absent) propagates.
+        if let Err(e) = tmp.persist(&final_path) {
+            if final_path.exists() {
+                tracing::debug!(
+                    target: "tensor_wasm_artifacts",
+                    "concurrent put lost the content-addressed rename race; identical artifact already present"
+                );
+            } else {
+                warn!(target: "tensor_wasm_artifacts", error = %e, "tempfile persist failed");
+                return Err(ArtifactError::Io);
+            }
+        }
 
         // Durability: under `DurabilityPolicy::Full`, fsync the containing
         // directory so the rename itself is persisted, not just the file
