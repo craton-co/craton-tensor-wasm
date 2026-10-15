@@ -2391,15 +2391,23 @@ impl TensorWasmExecutor {
             guard.store.data_mut().deadline = None;
             guard.store.data_mut().hard_deadline = None;
         }
-        // Re-arm the cooperative-scheduler context's wall-clock origin
-        // in lockstep with the deadline above. Without this, a guest
-        // that calls `wasi:scheduler/host.yield()` on a back-to-back
-        // call would see the elapsed time from the *previous* call
-        // charged against its budget, and the first yield would
-        // immediately return STOP. The re-arm is a no-op for spawns
-        // without a configured deadline (the unbounded context
-        // ignores `started_at`).
-        guard.store.data_mut().rearm_scheduler();
+        // Re-arm the cooperative-scheduler context's wall-clock origin in
+        // lockstep with the deadline above. Without this, a guest that calls
+        // `wasi:scheduler/host.yield()` on a back-to-back call would see the
+        // elapsed time from the *previous* call charged against its budget,
+        // and the first yield would immediately return STOP.
+        //
+        // Arm the cooperative deadline from the USER-configured deadline only
+        // (`None` when unset), NOT from the effective budget: the
+        // `max_call_duration` ceiling folded into `deadline`/`hard_deadline`
+        // above is a hard-kill safety net, not a cooperative deadline. A
+        // deadline-less spawn must keep reporting the unbounded sentinel (-1)
+        // from `deadline-remaining-ms` even though it is still hard-bounded.
+        let cooperative_deadline = configured_deadline.map(|d| call_start + d);
+        guard
+            .store
+            .data_mut()
+            .rearm_scheduler_with(cooperative_deadline);
         let deadline_at = guard.store.data().deadline;
         // Report the EFFECTIVE budget (per-call deadline reconciled with the
         // engine ceiling) in any resulting `TimeoutContext`, so a trap on a
