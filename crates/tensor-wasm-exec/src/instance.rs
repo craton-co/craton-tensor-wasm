@@ -363,6 +363,22 @@ impl InstanceState {
         self.scheduler.rearm_with_instant(instant);
     }
 
+    /// Re-arm the cooperative scheduler against an explicit cooperative
+    /// deadline instant, decoupled from [`Self::deadline`].
+    ///
+    /// [`Self::deadline`] now carries the EFFECTIVE call budget — the per-call
+    /// deadline reconciled with the engine-wide `max_call_duration` hard-kill
+    /// ceiling. That ceiling is a safety net enforced by the epoch callback
+    /// (via [`Self::hard_deadline`]); it is NOT a cooperative deadline the
+    /// guest should observe. A spawn with no configured deadline must keep
+    /// reporting the unbounded sentinel (`u32::MAX` / `-1`) from
+    /// `deadline-remaining-ms` even though it is still hard-bounded, so the
+    /// executor arms the cooperative scheduler from the USER deadline only
+    /// (`None` when unset).
+    pub(crate) fn rearm_scheduler_with(&mut self, cooperative_deadline: Option<Instant>) {
+        self.scheduler.rearm_with_instant(cooperative_deadline);
+    }
+
     /// Increment the kernel dispatch counter and return the new value.
     pub fn record_kernel_dispatch(&self) -> u64 {
         self.kernel_dispatches.fetch_add(1, Ordering::Relaxed) + 1
