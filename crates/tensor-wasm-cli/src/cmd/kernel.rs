@@ -198,27 +198,28 @@ async fn publish(
             MAX_PTX_BYTES / (1024 * 1024)
         )));
     }
-    // Compute the BLAKE3 digest by streaming the file through the hasher in
-    // bounded chunks rather than hashing a second time off a full in-memory
-    // copy. `hash_ptx_file` reads the file once into a buffered reader and
-    // updates the hasher incrementally, so peak memory for the *hash* step
-    // is one I/O buffer rather than a whole second copy of the PTX.
+    // perf (kernel P5): read the PTX exactly ONCE and hash the in-memory
+    // bytes, rather than the previous shape that read the file twice — once
+    // streaming through the BLAKE3 hasher (`hash_ptx_file`) and again via
+    // `read_to_string` for the request body. The server's `/kernels` contract
+    // (`tensor_wasm_api::kernels::PublishKernelRequest`) requires the PTX as a
+    // JSON *string* field (`ptx_text`), so the full text must be held in RAM
+    // to build the request body anyway; given that, a second pass over the
+    // file just to hash it was pure duplicated I/O. We now read once and feed
+    // the same bytes to both `blake3::hash` and the JSON body.
     //
-    // TODO(kernel-registry, multipart upload): the server's `/kernels`
-    // contract (`tensor_wasm_api::kernels::PublishKernelRequest`) requires
-    // the PTX as a JSON *string* field (`ptx_text`), so the bytes must still
-    // be held in RAM and JSON-escaped to build the request body — true
-    // streaming upload is not possible against this endpoint. Reducing peak
-    // memory further requires a server-side multipart/streamed upload route
-    // (e.g. `POST /kernels/{name}/{version}/ptx` accepting an
-    // `application/octet-stream` body) that the CLI could feed via
+    // The file is already size-capped above (`MAX_PTX_BYTES`), so the single
+    // in-memory copy is bounded.
+    //
+    // TODO(kernel-registry, multipart upload): true streaming upload (no full
+    // copy in RAM) requires a server-side `application/octet-stream` route
+    // (e.g. `POST /kernels/{name}/{version}/ptx`) the CLI could feed via
     // `reqwest::Body::wrap_stream` over a `ReaderStream`, exactly as
-    // `snapshot restore` already does. Until that route exists we hash
-    // streaming-ly (this block) but still read the PTX once for the body.
-    let digest = hash_ptx_file(ptx_file)?;
-
+    // `snapshot restore` already does. Until that route exists the JSON
+    // string field forces the bytes into RAM regardless.
     let ptx_text = std::fs::read_to_string(ptx_file)
         .with_context(|| format!("reading PTX file {}", ptx_file.display()))?;
+    let digest = *blake3::hash(ptx_text.as_bytes()).as_bytes();
 
     // Load the HMAC key via the snapshot helper so the on-disk format
     // (64 hex chars OR 32 raw bytes) and the Zeroize-on-drop scrub
@@ -267,37 +268,6 @@ async fn publish(
 
     println!("published {name}@{version}");
     Ok(())
-}
-
-/// Stream a PTX file through a BLAKE3 hasher and return the 32-byte digest.
-///
-/// Reads the file in bounded chunks via a [`std::io::BufReader`] and feeds
-/// each chunk to [`blake3::Hasher::update`], so the hash step's peak memory
-/// is a single I/O buffer rather than a full in-memory copy of the PTX. This
-/// is the lowest-risk half of the streaming work: the digest no longer
-/// depends on holding the whole file as a `String` just to hash it. See the
-/// `TODO(kernel-registry, multipart upload)` in [`publish`] for why the
-/// upload body itself still needs the bytes in RAM.
-fn hash_ptx_file(ptx_file: &Path) -> Result<[u8; 32]> {
-    use std::io::Read;
-
-    let file = std::fs::File::open(ptx_file)
-        .with_context(|| format!("opening PTX file {} for hashing", ptx_file.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut hasher = blake3::Hasher::new();
-    // 64 KiB chunks: large enough to amortise syscall overhead, small enough
-    // that the transient buffer never approaches the 16 MiB PTX cap.
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .with_context(|| format!("reading PTX file {}", ptx_file.display()))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(*hasher.finalize().as_bytes())
 }
 
 /// `tensor-wasm kernel list` — fetch and render the manifest table.
@@ -453,30 +423,6 @@ mod tests {
         let err = parse_selector("matmul.f32@").unwrap_err();
         let tagged: &SnapshotExit = err.downcast_ref().expect("typed error");
         assert_eq!(tagged.code, codes::LOCAL_VALIDATION_FAILED);
-    }
-
-    #[test]
-    fn hash_ptx_file_matches_oneshot_blake3() {
-        // The streaming hasher must produce a byte-identical digest to the
-        // one-shot `blake3::hash` over the same bytes — otherwise a manifest
-        // signed by the CLI would mismatch the digest the server recomputes.
-        let dir = tempfile::tempdir().unwrap();
-        // Use a payload larger than the 64 KiB read buffer so the chunk loop
-        // runs more than once.
-        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-        let path = dir.path().join("big.ptx");
-        std::fs::write(&path, &payload).unwrap();
-
-        let streamed = hash_ptx_file(&path).unwrap();
-        let oneshot = *blake3::hash(&payload).as_bytes();
-        assert_eq!(streamed, oneshot);
-    }
-
-    #[test]
-    fn hash_ptx_file_missing_path_errors() {
-        let err = hash_ptx_file(Path::new("definitely_no_such_ptx_42.ptx")).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("opening PTX file"), "got: {msg}");
     }
 
     #[test]

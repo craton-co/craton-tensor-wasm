@@ -47,6 +47,21 @@ pub async fn run(args: BenchArgs) -> Result<()> {
     if args.n == 0 {
         anyhow::bail!("--n must be >= 1");
     }
+    // perf (bench P5): cap the wasm file size before slurping it into RAM,
+    // mirroring `deploy`'s `MAX_WASM_BYTES`. Stat first and reject oversize
+    // files with a clear error so a misconfigured `--file` can't OOM the CLI
+    // via an unbounded `std::fs::read` allocation.
+    let metadata = std::fs::metadata(&args.file)
+        .with_context(|| format!("locating wasm file {}", args.file.display()))?;
+    if metadata.len() > super::deploy::MAX_WASM_BYTES {
+        anyhow::bail!(
+            "wasm file {} is {} bytes; the bench cap is {} bytes ({} MiB)",
+            args.file.display(),
+            metadata.len(),
+            super::deploy::MAX_WASM_BYTES,
+            super::deploy::MAX_WASM_BYTES / (1024 * 1024)
+        );
+    }
     let wasm = std::fs::read(&args.file)
         .with_context(|| format!("reading wasm file {}", args.file.display()))?;
     let engine = Arc::new(
