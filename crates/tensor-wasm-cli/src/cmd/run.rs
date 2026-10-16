@@ -70,6 +70,23 @@ pub async fn run(args: RunArgs) -> Result<()> {
         None => Vec::new(),
     };
 
+    // perf (run P5): cap the wasm file size before slurping it into RAM,
+    // mirroring `deploy`'s `MAX_WASM_BYTES`. A misconfigured `--file` path
+    // (or a deliberately huge file) would otherwise make `std::fs::read`
+    // allocate the whole thing with no upper bound, OOM-ing the CLI. We stat
+    // first and reject oversize files with a clear error rather than letting
+    // the allocation fail opaquely.
+    let metadata = std::fs::metadata(&args.file)
+        .with_context(|| format!("locating wasm file {}", args.file.display()))?;
+    if metadata.len() > super::deploy::MAX_WASM_BYTES {
+        anyhow::bail!(
+            "wasm file {} is {} bytes; the run cap is {} bytes ({} MiB)",
+            args.file.display(),
+            metadata.len(),
+            super::deploy::MAX_WASM_BYTES,
+            super::deploy::MAX_WASM_BYTES / (1024 * 1024)
+        );
+    }
     let wasm = std::fs::read(&args.file)
         .with_context(|| format!("reading wasm file {}", args.file.display()))?;
 
