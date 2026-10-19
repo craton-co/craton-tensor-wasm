@@ -45,23 +45,13 @@ pub async fn run(args: MetricsArgs, ctx: &HttpContext) -> Result<()> {
 
     let client = ctx.build_client(Duration::from_secs(30))?;
 
-    let resp = ctx
-        .apply(client.get(&url))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("GET {url}: {e}"))?;
-
-    let status = resp.status();
-    // T17: route the body through `bounded_text` so a malicious server
-    // streaming gigabytes of `text/plain` cannot OOM the CLI. The 16 MiB
-    // cap is comfortably above any legitimate Prometheus exposition.
-    let text = super::bounded_text(resp)
-        .await
-        .map_err(|e| anyhow::anyhow!("reading response body from {url}: {e}"))?;
-
-    if !status.is_success() {
-        return Err(super::render_error_response(status, &text));
-    }
+    // cli feature F6: route through the shared `send_and_read` choke point so
+    // the T17 in-memory cap (a malicious server streaming gigabytes of
+    // `text/plain` cannot OOM the CLI) and error-envelope rendering are
+    // applied uniformly.
+    let text = ctx
+        .send_and_read(client.get(&url), &format!("GET {url}"))
+        .await?;
 
     match args.output {
         OutputFormat::Text => {

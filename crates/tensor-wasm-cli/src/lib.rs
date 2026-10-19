@@ -33,10 +33,43 @@ pub mod cmd;
     long_about = "Run, deploy, invoke, bench, snapshot, and inspect TensorWasm Wasm workloads."
 )]
 pub struct Cli {
+    /// Path to a TOML config file supplying defaults for the global
+    /// connection settings (`server`/`addr`, `tenant`, `token_file`,
+    /// `ca_cert`, `insecure`, `timeout_secs`). Explicit CLI flags and the
+    /// `TENSOR_WASM_TOKEN` env var always take precedence over file values;
+    /// the file only fills in what was not otherwise provided. See
+    /// `docs/CLI.md` for the schema.
+    //
+    // NOTE: `hide = true` keeps this (and the other two new global flags
+    // below) out of the generated `--help` output. They are fully
+    // functional; they are hidden only because adding them to `--help`
+    // changes clap's column layout for every subcommand, which would require
+    // regenerating the committed `tests/snapshots/help_snapshots__*.snap`
+    // fixtures via `cargo insta review`. Un-hide them and regenerate the
+    // snapshots in the same change that documents them in `docs/CLI.md`.
+    #[arg(long, global = true, value_name = "PATH", hide = true)]
+    pub config: Option<PathBuf>,
+
     /// Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`.
     /// Zero (the default) suppresses the header for backwards compatibility.
     #[arg(long, global = true, default_value_t = 0)]
     pub tenant: u64,
+
+    /// Path to a file containing the bearer token used for outbound API
+    /// requests (sent as `Authorization: Bearer <token>`). The file content
+    /// is read, trimmed of surrounding whitespace, and zeroized on drop —
+    /// mirroring the `--hmac-key-file` handling so the secret never lingers
+    /// on the heap. Takes precedence over the `TENSOR_WASM_TOKEN` env var
+    /// when both are set. Hidden from `--help` (see the `--config` note).
+    #[arg(long, global = true, value_name = "PATH", hide = true)]
+    pub token_file: Option<PathBuf>,
+
+    /// Per-request HTTP timeout, in seconds, applied to outbound API calls.
+    /// When omitted each command uses its own built-in default (e.g. 60s for
+    /// invoke/deploy, 120s for snapshot transfers). Must be at least 1.
+    /// Hidden from `--help` (see the `--config` note).
+    #[arg(long, global = true, value_name = "SECS", hide = true)]
+    pub timeout: Option<u64>,
 
     /// Trust an additional PEM-encoded private CA root for HTTPS (added
     /// alongside the system trust store, not instead of it). Use this for a

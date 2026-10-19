@@ -596,30 +596,16 @@ fn looks_like_tensor_wasm_envelope(body: &str) -> bool {
 
 /// sec MEDIUM (URL/path/header injection): validate a user-supplied identifier
 /// against a strict charset before it is used in a request path or header
-/// value. Accepts only `[A-Za-z0-9._-]`, rejects the empty string and the
-/// traversal tokens `.` / `..`. This neutralises CR/LF/control-byte header
-/// smuggling on the `X-TensorWasm-As-Instance` header value and keeps the
-/// identifier free of any byte that could reshape a request target. Path-bound
-/// ids are *additionally* percent-encoded at their `format!` site.
+/// value, tagging any rejection with the snapshot `LOCAL_VALIDATION_FAILED`
+/// exit code.
+///
+/// cli feature F6: the predicate itself now lives in
+/// `super::validate_identifier_charset` (shared with `invoke`); this thin
+/// wrapper only re-tags its `String` error as a [`SnapshotExit`] so the
+/// snapshot dispatcher's exit-code mapping is preserved. Path-bound ids are
+/// *additionally* percent-encoded at their `format!` site.
 fn validate_identifier_charset(id: &str, flag: &str) -> Result<()> {
-    if id.is_empty() {
-        return Err(local_err(format!("{flag} must be non-empty")));
-    }
-    if id == "." || id == ".." {
-        return Err(local_err(format!(
-            "{flag} must not be `.` or `..` (path traversal)"
-        )));
-    }
-    if let Some(bad) = id
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
-    {
-        return Err(local_err(format!(
-            "{flag} contains an invalid character {bad:?}; only ASCII letters, \
-             digits, `.`, `_`, and `-` are allowed"
-        )));
-    }
-    Ok(())
+    super::validate_identifier_charset(id, flag).map_err(local_err)
 }
 
 /// Build an [`anyhow::Error`] tagged with the LOCAL_VALIDATION_FAILED exit code.

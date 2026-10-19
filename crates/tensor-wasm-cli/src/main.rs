@@ -62,24 +62,13 @@ async fn main() {
         .try_init();
 
     let cli = Cli::parse();
-    let tls = cmd::TlsOptions {
-        ca_cert: cli.ca_cert.clone(),
-        insecure: cli.insecure,
-    };
-    let ctx = cmd::HttpContext::from_env_with_tls(cli.tenant, tls);
-    let result: Result<()> = match cli.command {
-        Command::Run(args) => cmd::run::run(args).await,
-        Command::Deploy(args) => cmd::deploy::run(args, &ctx).await,
-        Command::Invoke(args) => cmd::invoke::run(args, &ctx).await,
-        Command::Bench(args) => cmd::bench::run(args).await,
-        Command::Snapshot { action } => cmd::snapshot::run(action, &ctx).await,
-        Command::Kernel { action } => cmd::kernel::run(action, &ctx).await,
-        Command::Metrics(args) => cmd::metrics::run(args, &ctx).await,
-        Command::Observe(args) => cmd::observe::run(args, &ctx).await,
-        Command::Serve(args) => cmd::serve::run(args).await,
-        Command::Completions { shell, out_dir } => cmd::completions::run(shell, out_dir),
-        Command::Man(args) => cmd::man::run(args),
-    };
+
+    // Resolve the global connection settings, applying the `--config` file
+    // (cli feature F6) as a *defaults* source: explicit CLI flags and the
+    // `TENSOR_WASM_TOKEN` env var always win, the file only fills gaps. We do
+    // this in a fallible helper so a bad config / token file surfaces as a
+    // clean `Error:` line rather than a panic.
+    let result: Result<()> = run_cli(cli).await;
 
     if let Err(e) = result {
         // If the error was tagged with a snapshot-specific exit code, honour
@@ -91,5 +80,76 @@ async fn main() {
             .unwrap_or(1);
         eprintln!("Error: {e:#}");
         std::process::exit(code);
+    }
+}
+
+/// Resolve global settings (config file, token precedence, TLS, timeout),
+/// build the [`cmd::HttpContext`], and dispatch the subcommand. Split out of
+/// `main` so config/token-file parsing errors flow through the same unified
+/// error reporter as command failures.
+async fn run_cli(cli: Cli) -> Result<()> {
+    use std::time::Duration;
+
+    // Load the optional config file first; its values are defaults only.
+    let config = match &cli.config {
+        Some(path) => cmd::config::CliConfig::load(path)?,
+        None => cmd::config::CliConfig::default(),
+    };
+
+    // Tenant precedence: an explicit non-zero `--tenant` wins; otherwise fall
+    // back to the config value; otherwise 0 (header suppressed). `--tenant`
+    // defaults to 0, so we cannot distinguish "operator passed --tenant 0"
+    // from "operator omitted it" — treating 0 as "unset, use config" matches
+    // the documented "0 == suppress header" semantics either way.
+    let tenant = if cli.tenant != 0 {
+        cli.tenant
+    } else {
+        config.tenant.unwrap_or(0)
+    };
+
+    // TLS precedence: `--ca-cert` flag wins over config; `--insecure` flag
+    // (a bool that defaults false) is OR'd with the config value so either
+    // source enabling it takes effect.
+    let tls = cmd::TlsOptions {
+        ca_cert: cli.ca_cert.clone().or_else(|| config.ca_cert.clone()),
+        insecure: cli.insecure || config.insecure.unwrap_or(false),
+    };
+
+    // Token precedence: `--token-file` flag > `TENSOR_WASM_TOKEN` env var >
+    // config `token_file`. The first source that yields a token wins.
+    let token = if let Some(path) = &cli.token_file {
+        Some(cmd::load_token_file(path)?)
+    } else if let Some(t) = cmd::token_from_env() {
+        Some(t)
+    } else if let Some(path) = &config.token_file {
+        Some(cmd::load_token_file(path)?)
+    } else {
+        None
+    };
+
+    // Timeout precedence: `--timeout` flag > config `timeout_secs`. Validate
+    // it is >= 1 so a `--timeout 0` (which reqwest treats as "no timeout")
+    // can't silently disable the bound the operator thought they set.
+    let timeout_secs = cli.timeout.or(config.timeout_secs);
+    let timeout_override = match timeout_secs {
+        Some(0) => anyhow::bail!("--timeout must be at least 1 second (got 0)"),
+        Some(s) => Some(Duration::from_secs(s)),
+        None => None,
+    };
+
+    let ctx = cmd::HttpContext::from_parts(token, tenant, tls, timeout_override);
+
+    match cli.command {
+        Command::Run(args) => cmd::run::run(args).await,
+        Command::Deploy(args) => cmd::deploy::run(args, &ctx).await,
+        Command::Invoke(args) => cmd::invoke::run(args, &ctx).await,
+        Command::Bench(args) => cmd::bench::run(args).await,
+        Command::Snapshot { action } => cmd::snapshot::run(action, &ctx).await,
+        Command::Kernel { action } => cmd::kernel::run(action, &ctx).await,
+        Command::Metrics(args) => cmd::metrics::run(args, &ctx).await,
+        Command::Observe(args) => cmd::observe::run(args, &ctx).await,
+        Command::Serve(args) => cmd::serve::run(args).await,
+        Command::Completions { shell, out_dir } => cmd::completions::run(shell, out_dir),
+        Command::Man(args) => cmd::man::run(args),
     }
 }
