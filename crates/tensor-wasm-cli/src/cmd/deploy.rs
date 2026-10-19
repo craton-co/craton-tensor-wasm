@@ -134,23 +134,13 @@ pub async fn run(args: DeployArgs, ctx: &HttpContext) -> Result<()> {
 
     let client = ctx.build_client(Duration::from_secs(60))?;
 
-    let resp = ctx
-        .apply(client.post(&url).json(&body))
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-
-    let status = resp.status();
-    // T17: bound the in-memory response body. The deploy endpoint emits a
-    // short `{"id": "<uuid>"}` ack or a structured error envelope on
-    // failure — both well under the 16 MiB cap.
-    let text = super::bounded_text(resp)
-        .await
-        .with_context(|| format!("reading response body from {url}"))?;
-
-    if !status.is_success() {
-        return Err(super::render_error_response(status, &text));
-    }
+    // cli feature F6: route send → status → bounded body → error rendering
+    // through the shared `send_and_read` choke point. The deploy endpoint
+    // emits a short `{"id": "<uuid>"}` ack or a structured error envelope —
+    // both well under the 16 MiB cap `send_and_read` enforces.
+    let text = ctx
+        .send_and_read(client.post(&url).json(&body), &format!("POST {url}"))
+        .await?;
 
     // The server response is `{"id": "<uuid>"}` per `tensor-wasm-api`. We deliberately
     // do NOT honour the legacy `function_id` field — early drafts of the API

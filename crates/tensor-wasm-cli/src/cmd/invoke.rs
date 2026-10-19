@@ -70,13 +70,13 @@ pub async fn run(args: InvokeArgs, ctx: &HttpContext) -> Result<()> {
     // `..`, arbitrary bytes), so an operator who fat-fingered an id got an
     // opaque server round-trip instead of a clear "invalid character" message.
     //
-    // The canonical implementation is `snapshot::validate_identifier_charset`
-    // (snapshot.rs), but it is private to that module AND tags its errors with
-    // the snapshot-specific `SnapshotExit` exit code, so it cannot be reused
-    // here without leaking snapshot semantics into `invoke`. We replicate the
-    // identical check (`[A-Za-z0-9._-]`, reject empty and `.`/`..`) with this
-    // crate's plain `anyhow` error handling. Keep the two in lockstep.
-    validate_identifier_charset(&args.id, "id")?;
+    // cli feature F6: the predicate is now the shared
+    // `super::validate_identifier_charset`, which returns the message as a
+    // `String` so we can map it into a plain `anyhow` error here (the
+    // `snapshot` caller wraps the same message in a `SnapshotExit` exit code
+    // instead). Previously this was a byte-identical private copy that could
+    // drift from the snapshot version.
+    super::validate_identifier_charset(&args.id, "id").map_err(|m| anyhow::anyhow!(m))?;
 
     // sec LOW (mod.rs L2): warn once if a bearer token would be sent over
     // plaintext http:// to a non-loopback host. Classified from the
@@ -124,22 +124,12 @@ pub async fn run(args: InvokeArgs, ctx: &HttpContext) -> Result<()> {
 
     let client = ctx.build_client(Duration::from_secs(60))?;
 
-    let resp = ctx
-        .apply(client.post(&url).json(&body))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
-
-    let status = resp.status();
-    // T17: bound the in-memory response body. A 16 MiB cap is far above
-    // any legitimate invoke result envelope the API server emits.
-    let text = super::bounded_text(resp)
-        .await
-        .map_err(|e| anyhow::anyhow!("reading response body from {url}: {e}"))?;
-
-    if !status.is_success() {
-        return Err(super::render_error_response(status, &text));
-    }
+    // cli feature F6: route send → status → bounded body → error rendering
+    // through the shared `send_and_read` choke point so the T17 in-memory cap
+    // and the error-envelope rendering can't be forgotten here.
+    let text = ctx
+        .send_and_read(client.post(&url).json(&body), &format!("POST {url}"))
+        .await?;
 
     match args.output {
         OutputFormat::Text => {
@@ -162,33 +152,6 @@ pub async fn run(args: InvokeArgs, ctx: &HttpContext) -> Result<()> {
         OutputFormat::Json => {
             println!("{}", invoke_to_json(&args.id, &args.export, &text));
         }
-    }
-    Ok(())
-}
-
-/// sec MEDIUM (URL/path injection, parity): validate the function `id` against
-/// a strict charset before it is used in a request path. Accepts only
-/// `[A-Za-z0-9._-]`, rejects the empty string and the traversal tokens `.` /
-/// `..`. This mirrors `snapshot::validate_identifier_charset` byte-for-byte;
-/// they are kept deliberately identical so every id-bearing command gives the
-/// same fast, clear local error. Unlike the snapshot copy, errors here are
-/// plain `anyhow` (the snapshot version tags a `SnapshotExit` exit code that
-/// has no meaning in `invoke`).
-fn validate_identifier_charset(id: &str, flag: &str) -> Result<()> {
-    if id.is_empty() {
-        anyhow::bail!("{flag} must be non-empty");
-    }
-    if id == "." || id == ".." {
-        anyhow::bail!("{flag} must not be `.` or `..` (path traversal)");
-    }
-    if let Some(bad) = id
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
-    {
-        anyhow::bail!(
-            "{flag} contains an invalid character {bad:?}; only ASCII letters, \
-             digits, `.`, `_`, and `-` are allowed"
-        );
     }
     Ok(())
 }
@@ -221,6 +184,11 @@ fn invoke_to_json(id: &str, export: &str, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // cli feature F6: the charset predicate now lives in `super` (mod.rs) and
+    // is shared with `snapshot`. These tests pin the behaviour through the
+    // shared entry point that `invoke` actually calls.
+    use super::super::validate_identifier_charset;
 
     #[test]
     fn validate_identifier_charset_accepts_typical_ids() {

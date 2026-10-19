@@ -17,6 +17,7 @@ use futures::StreamExt;
 
 pub mod bench;
 pub mod completions;
+pub mod config;
 pub mod deploy;
 pub mod invoke;
 pub mod kernel;
@@ -71,13 +72,21 @@ pub(crate) const TENANT_HEADER: &str = "X-TensorWasm-Tenant";
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct HttpContext {
-    /// Bearer token loaded from [`TENSOR_WASM_TOKEN_ENV`], if set.
-    token: Option<String>,
+    /// Bearer token, loaded from `--token-file`, [`TENSOR_WASM_TOKEN_ENV`], or
+    /// the config file (in that precedence order), if any. Wrapped in
+    /// [`zeroize::Zeroizing`] so the secret is scrubbed from the heap when the
+    /// context drops, mirroring the `--hmac-key-file` handling in
+    /// `snapshot.rs` (cli feature F6).
+    token: Option<zeroize::Zeroizing<String>>,
     /// Tenant id; `0` means "do not attach the header".
     tenant: u64,
     /// TLS knobs threaded from the global CLI flags (`--ca-cert`,
     /// `--insecure`). Applied in [`Self::build_client`].
     tls: TlsOptions,
+    /// Optional per-request timeout override from the global `--timeout` flag
+    /// (or the config file). When `Some`, it replaces the per-command default
+    /// passed to [`Self::build_client`] (cli feature F6).
+    timeout_override: Option<Duration>,
 }
 
 /// TLS configuration for the outbound HTTP client, threaded from the global
@@ -110,13 +119,41 @@ impl HttpContext {
     }
 
     /// Build a context from the environment plus explicit TLS options parsed
-    /// from the global CLI flags. This is the constructor `main` uses.
+    /// from the global CLI flags.
     pub fn from_env_with_tls(tenant: u64, tls: TlsOptions) -> Self {
-        let token = std::env::var(TENSOR_WASM_TOKEN_ENV)
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty());
-        Self { token, tenant, tls }
+        let token = token_from_env();
+        Self {
+            token,
+            tenant,
+            tls,
+            timeout_override: None,
+        }
+    }
+
+    /// Build a context from explicitly-resolved parts. This is the constructor
+    /// `main` uses once it has applied the precedence rules across `--token-file`,
+    /// the `TENSOR_WASM_TOKEN` env var, and the `--config` file (cli feature F6).
+    ///
+    /// `token` is the already-resolved secret (or `None` for no auth); it is
+    /// wrapped in [`zeroize::Zeroizing`] so it is scrubbed on drop.
+    /// `timeout_override` is the resolved `--timeout` (or config) value, if any.
+    ///
+    /// `pub` (gated by `#[doc(hidden)]`) so the in-tree binary (`main.rs`, a
+    /// separate crate from this lib) can construct the context after resolving
+    /// the global-flag precedence. NOT stable API.
+    #[doc(hidden)]
+    pub fn from_parts(
+        token: Option<zeroize::Zeroizing<String>>,
+        tenant: u64,
+        tls: TlsOptions,
+        timeout_override: Option<Duration>,
+    ) -> Self {
+        Self {
+            token,
+            tenant,
+            tls,
+            timeout_override,
+        }
     }
 
     /// Test-only constructor that bypasses the process environment so
@@ -126,9 +163,10 @@ impl HttpContext {
     #[doc(hidden)]
     pub fn from_env_for_test_with_token(token: impl Into<String>, tenant: u64) -> Self {
         Self {
-            token: Some(token.into()),
+            token: Some(zeroize::Zeroizing::new(token.into())),
             tenant,
             tls: TlsOptions::default(),
+            timeout_override: None,
         }
     }
 
@@ -138,9 +176,10 @@ impl HttpContext {
     #[doc(hidden)]
     pub fn from_env_for_test_with_token_optional(token: Option<String>, tenant: u64) -> Self {
         Self {
-            token,
+            token: token.map(zeroize::Zeroizing::new),
             tenant,
             tls: TlsOptions::default(),
+            timeout_override: None,
         }
     }
 
@@ -153,6 +192,7 @@ impl HttpContext {
             token: None,
             tenant,
             tls,
+            timeout_override: None,
         }
     }
 
@@ -160,6 +200,10 @@ impl HttpContext {
     /// per-request headers (auth, tenant) are applied per-call via
     /// [`Self::apply`] rather than baked into the client so each subcommand
     /// can still override the timeout cheaply.
+    ///
+    /// The global `--timeout` flag (cli feature F6), when set, takes
+    /// precedence over the per-command `timeout` argument passed here — the
+    /// operator's explicit choice wins over the command's built-in default.
     ///
     /// TLS policy comes from [`TlsOptions`]:
     ///   * `--ca-cert <PATH>` adds a PEM-encoded private CA root to the trust
@@ -170,7 +214,8 @@ impl HttpContext {
     ///     fires on every invocation so an operator cannot leave it on by
     ///     accident without a trail in their logs.
     pub(crate) fn build_client(&self, timeout: Duration) -> Result<reqwest::Client> {
-        let mut builder = reqwest::Client::builder().timeout(timeout);
+        let effective_timeout = self.timeout_override.unwrap_or(timeout);
+        let mut builder = reqwest::Client::builder().timeout(effective_timeout);
 
         if let Some(path) = &self.tls.ca_cert {
             let pem = std::fs::read(path)
@@ -232,7 +277,10 @@ impl HttpContext {
     /// request — streaming or not — is built). See sec LOW (mod.rs L2).
     pub fn apply(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(t) = &self.token {
-            req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
+            req = req.header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", t.as_str()),
+            );
         }
         if self.tenant != 0 {
             req = req.header(TENANT_HEADER, self.tenant.to_string());
@@ -271,6 +319,85 @@ impl HttpContext {
             }
         }
     }
+
+    /// Apply auth/tenant headers, send `req`, and return the response body as
+    /// a bounded `String` — or an `anyhow` error rendered from the server's
+    /// error envelope on a non-2xx status.
+    ///
+    /// cli feature F6: this is the single choke point for the
+    /// "send → check status → read body" dance so no call site can forget to
+    /// route the body through [`bounded_text`] (the T17 in-memory cap) or to
+    /// render a non-2xx response through [`render_error_response`]. Callers
+    /// build the request (path, JSON/body, any extra headers like the HMAC key
+    /// or content-type), hand it here, and get back either the success body or
+    /// a fully-formed error. The returned body is NOT terminal-sanitised —
+    /// callers that `println!` it must still pass it through
+    /// [`sanitise_terminal_output`], because some callers (`--output json`,
+    /// `serde_json::from_str`) consume the raw bytes instead.
+    ///
+    /// `what` is a short human label for the request (e.g. `"POST /functions"`
+    /// or the full URL) used to contextualise send / read errors.
+    pub(crate) async fn send_and_read(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<String> {
+        let resp = self
+            .apply(req)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
+        let status = resp.status();
+        let text = bounded_text(resp)
+            .await
+            .map_err(|e| anyhow::anyhow!("reading response body from {what}: {e}"))?;
+        if !status.is_success() {
+            return Err(render_error_response(status, &text));
+        }
+        Ok(text)
+    }
+}
+
+/// Read the bearer token from [`TENSOR_WASM_TOKEN_ENV`], trimming surrounding
+/// whitespace and treating an empty value as "unset". Returns the token
+/// wrapped in [`zeroize::Zeroizing`] so it is scrubbed on drop.
+///
+/// `pub` (gated by `#[doc(hidden)]`) so the in-tree binary can apply token
+/// precedence across `--token-file`, this env var, and the config file. NOT
+/// stable API.
+#[doc(hidden)]
+pub fn token_from_env() -> Option<zeroize::Zeroizing<String>> {
+    std::env::var(TENSOR_WASM_TOKEN_ENV)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .map(zeroize::Zeroizing::new)
+}
+
+/// Load a bearer token from a file (`--token-file`), trimming surrounding
+/// whitespace. Mirrors the `--hmac-key-file` handling (cli feature F6): the
+/// returned token is wrapped in [`zeroize::Zeroizing`] and the raw file buffer
+/// is held in a `Zeroizing<String>` so the on-heap copies are scrubbed on drop
+/// rather than lingering after use. An empty (or whitespace-only) file is a
+/// hard error so a mis-pathed flag doesn't silently disable auth.
+///
+/// `pub` (gated by `#[doc(hidden)]`) — called from the in-tree binary while
+/// resolving token precedence. NOT stable API.
+#[doc(hidden)]
+pub fn load_token_file(path: &std::path::Path) -> Result<zeroize::Zeroizing<String>> {
+    let raw = zeroize::Zeroizing::new(
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading --token-file {}", path.display()))?,
+    );
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!(
+            "--token-file {} is empty (or only whitespace); remove the flag to \
+             run without auth, or populate the file with the bearer token",
+            path.display()
+        );
+    }
+    Ok(zeroize::Zeroizing::new(trimmed.to_owned()))
 }
 
 /// Latch so the plaintext-token warning fires at most once per process.
@@ -365,6 +492,41 @@ pub fn validate_server_url(url: &str) -> Result<()> {
         anyhow::bail!(
             "URLs with embedded credentials are not allowed; pass auth via TENSOR_WASM_TOKEN env var"
         );
+    }
+    Ok(())
+}
+
+/// Validate a user-supplied identifier against a strict charset before it is
+/// used in a request path or header value.
+///
+/// Accepts only `[A-Za-z0-9._-]`, rejects the empty string and the traversal
+/// tokens `.` / `..`. This neutralises CR/LF/control-byte header smuggling and
+/// keeps the identifier free of any byte that could reshape a request target;
+/// path-bound ids are *additionally* percent-encoded at their `format!` site.
+///
+/// Returns the human-readable error message (as a `String`) on rejection so
+/// each caller can wrap it in whatever error type it needs — `invoke` uses a
+/// plain `anyhow` error while `snapshot` tags a `SnapshotExit` exit code.
+/// Centralising the predicate here (cli feature F6) removes the byte-identical
+/// copies that previously lived in `invoke.rs` and `snapshot.rs` and could
+/// drift apart silently.
+///
+/// `pub(crate)` — internal helper shared across the `cmd` submodules.
+pub(crate) fn validate_identifier_charset(id: &str, flag: &str) -> std::result::Result<(), String> {
+    if id.is_empty() {
+        return Err(format!("{flag} must be non-empty"));
+    }
+    if id == "." || id == ".." {
+        return Err(format!("{flag} must not be `.` or `..` (path traversal)"));
+    }
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    {
+        return Err(format!(
+            "{flag} contains an invalid character {bad:?}; only ASCII letters, \
+             digits, `.`, `_`, and `-` are allowed"
+        ));
     }
     Ok(())
 }
@@ -752,8 +914,9 @@ mod tests {
     fn http_context_picks_up_token_and_tenant() {
         temp_env::with_var(TENSOR_WASM_TOKEN_ENV, Some("  abc123  "), || {
             let ctx = HttpContext::from_env(42);
-            // Whitespace is trimmed.
-            assert_eq!(ctx.token.as_deref(), Some("abc123"));
+            // Whitespace is trimmed. The token is wrapped in `Zeroizing`, so
+            // reach the inner `&str` via `as_str()` for the comparison.
+            assert_eq!(ctx.token.as_ref().map(|t| t.as_str()), Some("abc123"));
             assert_eq!(ctx.tenant, 42);
         });
     }
@@ -769,9 +932,10 @@ mod tests {
     #[test]
     fn apply_adds_authorization_header_when_token_set() {
         let ctx = HttpContext {
-            token: Some("abc".to_string()),
+            token: Some(zeroize::Zeroizing::new("abc".to_string())),
             tenant: 0,
             tls: TlsOptions::default(),
+            timeout_override: None,
         };
         // Build an off-stack RequestBuilder so we can inspect headers.
         // `apply` no longer inspects the URL (the plaintext-token warning was
@@ -789,6 +953,7 @@ mod tests {
             token: None,
             tenant: 7,
             tls: TlsOptions::default(),
+            timeout_override: None,
         };
         let client = reqwest::Client::new();
         let req = ctx.apply(client.get("https://x")).build().unwrap();
@@ -802,6 +967,7 @@ mod tests {
             token: None,
             tenant: 0,
             tls: TlsOptions::default(),
+            timeout_override: None,
         };
         let client = reqwest::Client::new();
         let req = ctx.apply(client.get("https://x")).build().unwrap();
@@ -987,6 +1153,7 @@ mod tests {
             token: None,
             tenant: 0,
             tls: TlsOptions::default(),
+            timeout_override: None,
         };
         ctx.warn_if_plaintext_token("http://attacker.example.com:8080");
     }
@@ -997,14 +1164,57 @@ mod tests {
         // (dev) must not warn. These targets never flip the latch, so the
         // test is safe to run in any order alongside the positive case.
         let ctx = HttpContext {
-            token: Some("secret".to_string()),
+            token: Some(zeroize::Zeroizing::new("secret".to_string())),
             tenant: 0,
             tls: TlsOptions::default(),
+            timeout_override: None,
         };
         ctx.warn_if_plaintext_token("https://prod.example.com");
         ctx.warn_if_plaintext_token("http://localhost:8080");
         ctx.warn_if_plaintext_token("http://127.0.0.1:8080");
         ctx.warn_if_plaintext_token("http://[::1]:8080");
+    }
+
+    // cli feature F6: `--token-file` loader (mirrors `--hmac-key-file`).
+
+    #[test]
+    fn load_token_file_reads_and_trims() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "  s3cr3t-token\n").unwrap();
+        let t = load_token_file(&path).expect("token loads");
+        assert_eq!(t.as_str(), "s3cr3t-token");
+    }
+
+    #[test]
+    fn load_token_file_rejects_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty");
+        std::fs::write(&path, "   \n\t").unwrap();
+        let err = load_token_file(&path).expect_err("empty token file must error");
+        assert!(format!("{err}").contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn load_token_file_missing_path_errors() {
+        let err = load_token_file(std::path::Path::new("definitely_no_token_42")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("--token-file"),
+            "error should mention the flag: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_identifier_charset_shared_helper() {
+        // The cmd-level shared predicate (cli feature F6) used by both
+        // `invoke` and `snapshot`.
+        assert!(validate_identifier_charset("ok.id-1_2", "id").is_ok());
+        assert!(validate_identifier_charset("", "id").is_err());
+        assert!(validate_identifier_charset("..", "id").is_err());
+        assert!(validate_identifier_charset("a/b", "id").is_err());
+        // The flag name is interpolated into the message.
+        let msg = validate_identifier_charset("", "--as-instance").unwrap_err();
+        assert!(msg.contains("--as-instance"), "got: {msg}");
     }
 
     #[test]

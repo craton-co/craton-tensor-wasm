@@ -250,21 +250,13 @@ async fn publish(
         manifest: &manifest,
         ptx_text: &ptx_text,
     };
-    let resp = ctx
-        .apply(client.post(&url).json(&body))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
-
-    let status = resp.status();
-    // T17: bound the buffered response body — the publish endpoint should
-    // only ever respond with a short JSON ack, never a streamed blob.
-    let text = super::bounded_text(resp)
-        .await
-        .with_context(|| format!("reading response body from {url}"))?;
-    if !status.is_success() {
-        return Err(super::render_error_response(status, &text));
-    }
+    // cli feature F6: route through the shared `send_and_read` choke point —
+    // the publish endpoint only ever responds with a short JSON ack, well
+    // under the T17 cap. We ignore the success body (a bare ack); only the
+    // status matters, and a non-2xx is rendered as an error by the helper.
+    let _ack = ctx
+        .send_and_read(client.post(&url).json(&body), &format!("POST {url}"))
+        .await?;
 
     println!("published {name}@{version}");
     Ok(())
@@ -278,22 +270,13 @@ async fn list(server: &str, ctx: &HttpContext) -> Result<()> {
     ctx.warn_if_plaintext_token(server);
     let url = format!("{}/kernels", super::server_base(server));
     let client = ctx.build_client(KERNEL_REQUEST_TIMEOUT)?;
-    let resp = ctx
-        .apply(client.get(&url))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("GET {url}: {e}"))?;
-    let status = resp.status();
-    // T17: bound the buffered response body. A massively-populated kernel
-    // registry would still fit comfortably under 16 MiB of JSON; an
-    // operator who legitimately exceeds that should paginate, not bloat
-    // a single `list` call.
-    let text = super::bounded_text(resp)
-        .await
-        .with_context(|| format!("reading response body from {url}"))?;
-    if !status.is_success() {
-        return Err(super::render_error_response(status, &text));
-    }
+    // cli feature F6: route through the shared `send_and_read` choke point.
+    // A massively-populated kernel registry would still fit comfortably under
+    // the 16 MiB T17 cap `send_and_read` enforces; an operator who legitimately
+    // exceeds that should paginate, not bloat a single `list` call.
+    let text = ctx
+        .send_and_read(client.get(&url), &format!("GET {url}"))
+        .await?;
     let parsed: ListKernelsResponse = serde_json::from_str(&text)
         .with_context(|| format!("decoding /kernels response from {url}"))?;
     if parsed.manifests.is_empty() {
