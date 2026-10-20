@@ -691,6 +691,43 @@ fn bench_output_json_emits_valid_json() {
     );
 }
 
+/// cli tests F7: `run` must reject a wasm file larger than the size cap
+/// (mirrors `deploy`'s `MAX_WASM_BYTES`) before slurping it into RAM. We
+/// create a sparse file just over the 64 MiB cap via `set_len` so the test
+/// doesn't write 64 MiB of real bytes — the CLI stats the length and bails
+/// before reading.
+#[test]
+fn run_rejects_oversize_wasm_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path().join("huge.wasm");
+    let f = std::fs::File::create(&p).expect("create");
+    // 64 MiB + 1 byte — one over the cap.
+    f.set_len(64 * 1024 * 1024 + 1).expect("set_len");
+    drop(f);
+
+    tensor_wasm()
+        .args(["run", p.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("run cap"));
+}
+
+/// cli tests F7: same cap on `bench`.
+#[test]
+fn bench_rejects_oversize_wasm_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path().join("huge.wasm");
+    let f = std::fs::File::create(&p).expect("create");
+    f.set_len(64 * 1024 * 1024 + 1).expect("set_len");
+    drop(f);
+
+    tensor_wasm()
+        .args(["bench", p.to_str().unwrap(), "--n", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bench cap"));
+}
+
 #[test]
 fn kernel_help_lists_all_subactions() {
     // Help is the design-partner-facing surface — if `publish`, `list`,

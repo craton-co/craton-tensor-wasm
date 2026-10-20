@@ -971,4 +971,86 @@ mod tests {
         assert_eq!(tagged.code, codes::LOCAL_VALIDATION_FAILED);
         assert!(tagged.message.contains("not valid"));
     }
+
+    // cli tests F7: fail-closed on an unparseable server URL. A secret-leakage
+    // gate must NEVER pass when it cannot confirm a safe (https:// or loopback)
+    // target — otherwise a malformed `--server` value would let the HMAC key
+    // out over an unverified channel.
+    #[test]
+    fn refuse_hmac_key_on_plaintext_fails_closed_on_unparseable_url() {
+        // No recognised scheme → `extract_scheme_host` returns None → refuse.
+        for bad in ["ftp://host", "not-a-url", "://nohost", ""] {
+            let err = match refuse_hmac_key_on_plaintext(bad) {
+                Ok(()) => panic!("unparseable URL {bad:?} must fail closed"),
+                Err(e) => e,
+            };
+            let tagged: &SnapshotExit = err.downcast_ref().expect("typed error");
+            assert_eq!(tagged.code, codes::LOCAL_VALIDATION_FAILED);
+            assert!(
+                tagged.message.contains("could not parse server URL"),
+                "message should explain the fail-closed reason for {bad:?}: {}",
+                tagged.message
+            );
+        }
+    }
+
+    // cli tests F7: Unix key-file permission gate. A group/other-readable HMAC
+    // key file WARNS by default but is a HARD ERROR under
+    // `TENSOR_WASM_REQUIRE_KEY_PERMS=1`. Gated on `#[cfg(unix)]` because the
+    // mode bits don't exist on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn load_hmac_key_strict_mode_rejects_group_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.hex");
+        std::fs::write(&path, "42".repeat(32)).unwrap();
+        // 0o640: owner rw, group r — group-readable, so `mode & 0o077 != 0`.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        temp_env::with_var("TENSOR_WASM_REQUIRE_KEY_PERMS", Some("1"), || {
+            let err = load_hmac_key(&path)
+                .expect_err("strict mode must reject a group-readable key file");
+            let tagged: &SnapshotExit = err.downcast_ref().expect("typed error");
+            assert_eq!(tagged.code, codes::LOCAL_VALIDATION_FAILED);
+            assert!(
+                tagged.message.contains("group/other"),
+                "message should explain the permission failure: {}",
+                tagged.message
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_hmac_key_warn_mode_accepts_group_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.hex");
+        std::fs::write(&path, "42".repeat(32)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Default (non-strict): a group/other-readable key file only warns and
+        // the key still loads successfully.
+        temp_env::with_var("TENSOR_WASM_REQUIRE_KEY_PERMS", None::<&str>, || {
+            let k = load_hmac_key(&path).expect("warn mode must still load the key");
+            assert_eq!(*k, [0x42u8; 32]);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_hmac_key_strict_mode_accepts_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.hex");
+        std::fs::write(&path, "42".repeat(32)).unwrap();
+        // 0o600: owner-only → `mode & 0o077 == 0`, passes even in strict mode.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        temp_env::with_var("TENSOR_WASM_REQUIRE_KEY_PERMS", Some("1"), || {
+            let k = load_hmac_key(&path).expect("0600 key file must pass strict mode");
+            assert_eq!(*k, [0x42u8; 32]);
+        });
+    }
 }
