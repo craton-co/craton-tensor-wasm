@@ -248,9 +248,16 @@ async fn observe_one_tick_json_renders_health_and_metrics() {
 // T18 terminal-output sanitisation (malicious response bytes scrubbed)
 // ---------------------------------------------------------------------------
 
-async fn invoke_malicious() -> Json<serde_json::Value> {
-    // ANSI escape + bare CR smuggled into a server-controlled string value.
-    Json(serde_json::json!({ "msg": "evil\x1b[31mred\rOVERWRITE" }))
+async fn invoke_malicious() -> Response<Body> {
+    // A NON-JSON body so the CLI's text path echoes it verbatim through
+    // `sanitise_terminal_output` (the JSON pretty-print path would JSON-escape
+    // control bytes itself, which wouldn't exercise the sanitiser). The raw
+    // ESC + bare CR must be scrubbed before reaching stdout.
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from("evil\x1b[31mred\rOVERWRITE"))
+        .unwrap()
 }
 
 async fn kernels_list_malicious() -> Json<serde_json::Value> {
