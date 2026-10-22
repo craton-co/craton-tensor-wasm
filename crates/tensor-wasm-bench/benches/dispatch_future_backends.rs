@@ -71,6 +71,8 @@ mod bench {
     use std::time::{Duration, Instant};
 
     use criterion::black_box;
+    use cust::event::{Event, EventFlags};
+    use cust::stream::{Stream, StreamFlags};
     use tensor_wasm_bench::{percentile_nearest_rank, TailStats};
     use tensor_wasm_wasi_gpu::async_dispatch::{BackPressure, DispatchFuture};
 
@@ -99,10 +101,18 @@ mod bench {
         fn name(&self) -> &'static str;
     }
 
-    /// Current behaviour: mirrors `kernel_dispatch::bench_serial` — cap=1
-    /// back-pressure, `DispatchFuture::ready(permit).await`, drop. The
-    /// `BackPressure` is hoisted out of `dispatch_once` so we measure permit
-    /// acquire/release + future poll only, not semaphore construction.
+    /// Current behaviour: cap=1 back-pressure, drop. The `BackPressure` is
+    /// hoisted out of `dispatch_once` so we measure permit acquire/release +
+    /// future poll only, not semaphore construction.
+    ///
+    /// Finding 1: this used to call `DispatchFuture::ready`, which resolves on
+    /// the first poll even under `--features cuda` — so the bench measured the
+    /// scheduling floor, never GPU sync. We now record a real `cust` event on
+    /// a fresh stream per dispatch and drive `DispatchFuture::with_event`, so
+    /// this backend exercises the real `event.query()` busy-poll path — the
+    /// exact path cuda-async is meant to replace. No kernel is launched (the
+    /// event is recorded on an empty stream), so the number is the real-sync
+    /// machinery floor, comparable across backends, not a kernel runtime.
     struct BusyPollBackend {
         back_pressure: Arc<BackPressure>,
     }
@@ -117,13 +127,21 @@ mod bench {
 
     impl DispatchFutureBackend for BusyPollBackend {
         async fn dispatch_once(&self) -> Result<(), &'static str> {
+            // The polling thread (a tokio worker) must have the primary
+            // context current before any `cust` driver call.
+            tensor_wasm_wasi_gpu::cuda_ctx::ensure_current_context()
+                .map_err(|_| "busy-poll: CUDA context bind failed")?;
+            let stream = Stream::new(StreamFlags::NON_BLOCKING, None)
+                .map_err(|_| "busy-poll: Stream::new failed")?;
+            let event = Event::new(EventFlags::DEFAULT).map_err(|_| "busy-poll: Event::new failed")?;
+            event
+                .record(&stream)
+                .map_err(|_| "busy-poll: Event::record failed")?;
             let permit = self.back_pressure.acquire().await;
-            // Same constructor as `kernel_dispatch.rs` + `tail_latency.rs`,
-            // so numbers line up against those baselines. On a CUDA host
-            // with `Event` plumbed, this resolves via the
-            // `EventStatus::NotReady -> wake_by_ref` busy-poll — the path
-            // cuda-async is meant to replace.
-            DispatchFuture::ready(permit).await;
+            // Real GPU-sync path: resolves once `event.query()` reports
+            // `EventStatus::Ready` via the `poll`/sleep wake loop in
+            // `DispatchFuture::poll`.
+            DispatchFuture::with_event(permit, event).await;
             Ok(())
         }
 
@@ -267,14 +285,14 @@ mod bench {
             .expect("build multi-thread tokio runtime for dispatch_future_backends");
 
         let mut json_lines: Vec<String> = Vec::with_capacity(2);
-        // BusyPoll has no sentinel path; its "unexpected stub" reason only
-        // fires if the trait contract drifted. CudaAsync is the documented
-        // stub today; v0.4 wiring flips it to a measured line.
+        // BusyPoll now drives a real `cust` event; its skip path fires only
+        // when CUDA cannot init/bind at runtime (e.g. no device present even
+        // though the binary was built with `--features cuda`).
         run_backend(
             &rt,
             &BusyPollBackend::new(),
             &mut json_lines,
-            "unexpected stub return -- check trait contract",
+            "busy-poll: CUDA unavailable at runtime (no device / context bind failed)",
         );
         run_backend(
             &rt,

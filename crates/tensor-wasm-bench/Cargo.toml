@@ -28,6 +28,12 @@ tensor-wasm-mem = { workspace = true }
 tensor-wasm-snapshot = { workspace = true }
 tensor-wasm-wasi-gpu = { workspace = true }
 tokio.workspace = true
+# Pulled in only under `--features cuda` (via `dep:cust`) so the
+# `dispatch/real_sync` + dispatch_future_backends real-event paths can record a
+# `cust::event::Event` and drive `DispatchFuture::with_event`. Matches the
+# workspace cust 0.3.x pin the wasi-gpu launch path uses; absent on default
+# (cuda-toolkit-free) builds.
+cust = { workspace = true, optional = true }
 
 [dev-dependencies]
 axum = { workspace = true }
@@ -109,11 +115,12 @@ harness = false
 # Default off so the existing `cargo bench -p tensor-wasm-bench` pipeline
 # stays cuda-toolkit-free on CI runners and developer laptops.
 default = []
-# Forwards to `tensor-wasm-wasi-gpu/cuda`. Required to compile the real
-# body of `benches/dispatch_future_backends.rs`; without it the bench
-# emits two skip lines and exits cleanly so `cargo bench --bench
-# dispatch_future_backends` still works as a sanity check.
-cuda = ["tensor-wasm-wasi-gpu/cuda"]
+# Forwards to `tensor-wasm-wasi-gpu/cuda` and pulls in `cust` (via `dep:cust`)
+# so the real-event dispatch paths compile: `kernel_dispatch::bench_real_sync`
+# and the `CudaAsyncBackend` body in `benches/dispatch_future_backends.rs`.
+# Without it those paths are `#[cfg]`-ed out (the latter emits a skip line) so
+# `cargo bench --bench dispatch_future_backends` still works as a sanity check.
+cuda = ["tensor-wasm-wasi-gpu/cuda", "dep:cust"]
 # Forwards to `tensor-wasm-mem/cuda-oxide-backend`. Required (in addition
 # to `cuda`) once the v0.4 port wires the cuda-async path; v0.3.x doesn't
 # need it because the scaffold deliberately carries no `cuda-async` use

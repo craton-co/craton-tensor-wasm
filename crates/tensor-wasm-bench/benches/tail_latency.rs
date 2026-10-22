@@ -210,6 +210,11 @@ fn measure_dispatch_serial(rt: &tokio::runtime::Runtime) -> TailResult {
 /// Concurrent-cap-64 mirror of `benches/kernel_dispatch.rs::bench_concurrent`.
 /// The runtime is a 4-worker multi-thread runtime to match that bench's
 /// configuration — otherwise scheduling-related tail noise would diverge.
+///
+/// `cap=64` with `n=100` is *lightly* contended (the first 64 tasks acquire
+/// immediately, the remaining 36 queue briefly); the dedicated
+/// `dispatch/contended_cap1/1000` metric below is the heavily-contended tail
+/// reference where the permit-queue cost dominates.
 fn measure_dispatch_concurrent(rt: &tokio::runtime::Runtime) -> TailResult {
     let bp = BackPressure::with_cap(64);
     measure("dispatch/concurrent_cap64/100", || {
@@ -227,6 +232,77 @@ fn measure_dispatch_concurrent(rt: &tokio::runtime::Runtime) -> TailResult {
             }
         });
     })
+}
+
+/// Heavily-contended dispatch tail: `cap=1`, `n=1000` so every task but the
+/// first must wait on the back-pressure permit. The `p99_9 - p50` gap here is
+/// the long-tail cost of permit queueing, which the uncontended cap-64 metric
+/// (every task gets a permit immediately) cannot surface.
+fn measure_dispatch_contended(rt: &tokio::runtime::Runtime) -> TailResult {
+    let bp = BackPressure::with_cap(1);
+    measure("dispatch/contended_cap1/1000", || {
+        rt.block_on(async {
+            let mut handles = Vec::with_capacity(1000);
+            for _ in 0..1000u32 {
+                let bp = bp.clone();
+                handles.push(tokio::spawn(async move {
+                    let permit = bp.acquire().await;
+                    DispatchFuture::ready(permit).await;
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    })
+}
+
+/// Isolates the per-dispatch `tracing::info_span!` construction cost baked
+/// into every `DispatchFuture`. A single `acquire` + `ready` + `await` per
+/// sample, so the measured floor is span construction + permit RAII + one
+/// poll — the span tax that `DispatchFuture::ready` adds to the serial and
+/// concurrent numbers above. On a no-CUDA host this is also the entire
+/// `ready` cost (the future resolves on first poll); on a CUDA host the
+/// `dispatch/real_sync/1` metric below adds the event-query path on top.
+fn measure_dispatch_span_only(rt: &tokio::runtime::Runtime) -> TailResult {
+    let bp = BackPressure::with_cap(1);
+    measure("dispatch/span_only/1", || {
+        rt.block_on(async {
+            let permit = bp.acquire().await;
+            let fut = DispatchFuture::ready(permit);
+            black_box(&fut);
+            fut.await;
+        });
+    })
+}
+
+/// Real GPU-sync dispatch tail (CUDA only). Records a `cust` event on a fresh
+/// stream per sample and drives [`DispatchFuture::with_event`], so the tail
+/// captures the actual `event.query()` completion-poll path — the work
+/// `DispatchFuture::ready` short-circuits. No kernel is launched; the event
+/// is recorded on an empty stream, so this is the real-sync machinery floor,
+/// not launch-to-completion of a particular kernel.
+#[cfg(feature = "cuda")]
+fn measure_dispatch_real_sync(rt: &tokio::runtime::Runtime) -> Option<TailResult> {
+    use cust::event::{Event, EventFlags};
+    use cust::stream::{Stream, StreamFlags};
+
+    if tensor_wasm_wasi_gpu::cuda_ctx::ensure_current_context().is_err() {
+        eprintln!("TAIL_LATENCY dispatch/real_sync: skipped (no usable CUDA context at runtime)");
+        return None;
+    }
+    let bp = BackPressure::with_cap(1);
+    Some(measure("dispatch/real_sync/1", || {
+        rt.block_on(async {
+            tensor_wasm_wasi_gpu::cuda_ctx::ensure_current_context()
+                .expect("bind CUDA context on worker thread");
+            let stream = Stream::new(StreamFlags::NON_BLOCKING, None).expect("create CUDA stream");
+            let event = Event::new(EventFlags::DEFAULT).expect("create CUDA event");
+            event.record(&stream).expect("record CUDA event");
+            let permit = bp.acquire().await;
+            DispatchFuture::with_event(permit, event).await;
+        });
+    }))
 }
 
 fn make_router() -> axum::Router {
@@ -374,12 +450,22 @@ fn tail_latency_bench(c: &mut Criterion) {
         BACKEND_LABEL,
     );
 
-    let results = vec![
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut results = vec![
         measure_dispatch_serial(&serial_rt),
+        measure_dispatch_span_only(&serial_rt),
         measure_dispatch_concurrent(&concurrent_rt),
+        measure_dispatch_contended(&concurrent_rt),
         measure_healthz(&e2e_rt),
         measure_invoke_not_found(&e2e_rt),
     ];
+    // CUDA-only: append the real GPU-sync tail when a device is present.
+    // On a no-CUDA host this is compiled out entirely; on a CUDA host that
+    // cannot init a context at runtime it logs a skip and appends nothing.
+    #[cfg(feature = "cuda")]
+    if let Some(real_sync) = measure_dispatch_real_sync(&concurrent_rt) {
+        results.push(real_sync);
+    }
 
     // Stdout: one JSON line per metric, grep-prefixed. CI captures these.
     for r in &results {
