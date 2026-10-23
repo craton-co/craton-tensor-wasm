@@ -15,10 +15,12 @@
 //! Caveat for `bench_snapshot_restore`: the in-memory restore loop is hot —
 //! after the first iteration the zstd decode dictionary and the OS page
 //! cache are both warm, so the reported throughput is a *steady-state*
-//! number, not a true cold-disk read. The `disk_round_trip` group is the
-//! cold-disk reference: each sample re-writes and re-reads the file, so
-//! its number is bounded by your filesystem (tmpfs vs SSD vs spinning
-//! rust) rather than by zstd alone.
+//! number, not a true cold-disk read. For that reason the group is named
+//! `cold_start/restore_steady_state`, NOT `restore` — it is a warm-reuse
+//! decompression measurement, the opposite of cold start. The
+//! `disk_round_trip` group is the cold-disk reference: each sample re-writes
+//! and re-reads the file, so its number is bounded by your filesystem (tmpfs
+//! vs SSD vs spinning rust) rather than by zstd alone.
 
 use std::time::Duration;
 
@@ -28,11 +30,21 @@ use tensor_wasm_snapshot::reader::SnapshotReader;
 use tensor_wasm_snapshot::writer::{InstanceState, SnapshotWriter};
 
 /// Build a `(wasm, gpu, regs)` triple totalling roughly `size_bytes`.
+///
+/// Finding 2: the fixtures used to be single-byte fills (`0xAA`/`0xBB`),
+/// which zstd compresses to almost nothing — so the capture/restore numbers
+/// measured the compressor's run-length fast path, not realistic snapshot
+/// throughput. We now fill with a high-entropy counter pattern (`i % 251`,
+/// matching `memory_bandwidth.rs`): 251 is prime, so the byte stream has no
+/// short repeating period for zstd to collapse, and the captured size tracks
+/// the payload size the way a real (already-compressed weights / mixed code)
+/// snapshot would. The two halves use offset counters so they don't share a
+/// dictionary-friendly prefix.
 fn fixture_bytes(size_bytes: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let half = size_bytes / 2;
-    let wasm = vec![0xAAu8; half];
-    let gpu = vec![0xBBu8; half];
-    let regs = vec![0u8; 256];
+    let wasm: Vec<u8> = (0..half).map(|i| (i % 251) as u8).collect();
+    let gpu: Vec<u8> = (0..half).map(|i| ((i + 127) % 251) as u8).collect();
+    let regs: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
     (wasm, gpu, regs)
 }
 
@@ -67,7 +79,8 @@ fn bench_snapshot_capture(c: &mut Criterion) {
 }
 
 fn bench_snapshot_restore(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cold_start/restore");
+    // Warm-reuse steady-state decode, NOT cold start (see module + finding 2).
+    let mut group = c.benchmark_group("cold_start/restore_steady_state");
     group.measurement_time(Duration::from_secs(3));
     for &size in &[
         1024usize * 1024,
