@@ -319,6 +319,11 @@ fn measure_healthz(rt: &tokio::runtime::Runtime) -> TailResult {
     let router = make_router();
     measure("e2e/healthz/get", || {
         rt.block_on(async {
+            // `oneshot` consumes the service, so the per-sample `router.clone()`
+            // is unavoidable. It is a shallow `Arc`-bump of the route table —
+            // a constant offset that appears in P50 and the tail alike, so the
+            // `p99_9 - p50` tail signal is unaffected (finding 4; same
+            // rationale as the tracing-overhead note in the module docs).
             let resp = router
                 .clone()
                 .oneshot(
@@ -350,6 +355,7 @@ fn measure_invoke_not_found(rt: &tokio::runtime::Runtime) -> TailResult {
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from("{}"))
                 .unwrap();
+            // Constant Arc-bump bias — see `measure_healthz` (finding 4).
             let resp = router.clone().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         });

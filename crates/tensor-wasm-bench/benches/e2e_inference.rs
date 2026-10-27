@@ -9,6 +9,19 @@
 //! The runtime is a 2-thread multi-thread tokio runtime so that the
 //! per-iteration `block_on` enter/exit cost does not dominate as it
 //! would with a fresh current-thread runtime on every sample.
+//!
+//! ## `router.clone()` bias (finding 4)
+//!
+//! `tower::ServiceExt::oneshot` consumes the service it is called on, so each
+//! sample must hand it an owned `Router`. An axum `Router` clone is a shallow
+//! `Arc`-bump of the shared route table + middleware stack (no per-route deep
+//! copy), so the clone adds a small *constant* offset to every sample — it
+//! does not scale with request work and shows up identically in P50 and the
+//! tail, so any `p99 - p50` gap analysis cancels it out. We keep the clone
+//! inside the loop (it cannot be hoisted past a consuming `oneshot`) and
+//! document the bias here rather than papering over it. The
+//! `create_function` group already clones via `iter_batched` for a different
+//! reason (a fresh router per sample so the function table does not grow).
 
 use std::time::Duration;
 
@@ -54,6 +67,8 @@ fn bench_healthz(c: &mut Criterion) {
     group.bench_function("get", |b| {
         b.iter(|| {
             rt.block_on(async {
+                // Constant Arc-bump bias — see module docs (finding 4). The
+                // clone is unavoidable: `oneshot` consumes the service.
                 let resp = router
                     .clone()
                     .oneshot(
@@ -123,6 +138,7 @@ fn bench_invoke_not_found(c: &mut Criterion) {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from("{}"))
                     .unwrap();
+                // Constant Arc-bump bias — see module docs (finding 4).
                 let resp = router.clone().oneshot(req).await.unwrap();
                 assert_eq!(resp.status(), StatusCode::NOT_FOUND);
             });
