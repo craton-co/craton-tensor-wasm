@@ -9,35 +9,47 @@
 //! (acquire permit → await future → drop) and reports P50/P95/P99/P99.9
 //! + max so a v0.4 reviewer reads the speedup (or regression) in one diff.
 //!
-//! # What runs today
+//! # What runs today (finding 5: both backends wired against the GPU)
 //!
-//! - `BusyPollBackend` — the existing
-//!   `tensor_wasm_wasi_gpu::async_dispatch::DispatchFuture::ready` path
-//!   (W4.1-instrumented + post-CUDA-debug `EventStatus::NotReady ->
-//!   wake_by_ref` busy-poll). On a CUDA host with `--features cuda` this
-//!   measures real GPU sync; on a no-CUDA host it degenerates to the
-//!   scheduling-overhead floor (same as `kernel_dispatch::bench_serial`).
-//! - `CudaAsyncBackend` — a documented **stub**. Returns
-//!   `Err("cuda-async-backend: not yet wired -- see RFC 0001 v0.4 port")`;
-//!   bench loop emits a `"status":"skipped"` JSON line. Mirrors the
-//!   `tensor_wasm_mem::cuda_oxide_backend` scaffold pattern so the v0.4
-//!   port is a body-only diff.
+//! Both backends now record a real `cust` event on a fresh stream per
+//! dispatch (no kernel launched — the event is recorded on an empty stream,
+//! so each number is the sync-machinery floor, not a kernel runtime). The
+//! difference between them is the completion-wait strategy, which is exactly
+//! RFC 0001 Unresolved question #3:
 //!
-//! # v0.4 wiring contract
+//! - `BusyPollBackend` — drives
+//!   `tensor_wasm_wasi_gpu::async_dispatch::DispatchFuture::with_event`, which
+//!   polls `event.query()` and yields the Tokio worker for ~50 µs between
+//!   polls (the W4.1-instrumented + post-CUDA-debug path). This is the
+//!   hand-rolled busy-poll the RFC asks about.
+//! - `CudaAsyncBackend` — awaits a
+//!   `tokio::task::spawn_blocking(move || stream.synchronize())`, the
+//!   blocking-sync-on-a-pool-thread strategy the production launch path uses.
+//!   This is the stream-synchronize alternative the RFC contrasts against the
+//!   busy-poll.
 //!
-//! When the v0.4 cuda-oxide port lands, `CudaAsyncBackend` must (1)
-//! replace `dispatch_once` with a `cuda_async::Stream::synchronize`-
-//! equivalent await holding a `BackPressure` permit for the same RAII
-//! window; (2) drop the early-return `Err`; (3) keep `name() ->
-//! "cuda-async"` unchanged so downstream consumers don't need a rename;
-//! (4) delete the `TODO(v0.4)` markers.
+//! Both require `--features cuda`. Without it the file ships a stub `main`
+//! that announces two skips and exits cleanly (build smoke test).
+//!
+//! # v0.4/v0.5 note
+//!
+//! The genuine `cuda-async` / cuda-oxide async runtime is still the v0.5 cust
+//! successor (it needs the nightly override the workspace defers). Until it
+//! lands, `CudaAsyncBackend`'s mechanism is `cust`'s `stream.synchronize`,
+//! the closest faithful stand-in. The `name()` stays `"cuda-async"` per the
+//! stable-label contract, so when the real runtime ports in, only the
+//! `dispatch_once` body changes.
 //!
 //! # Honest disclosure
 //!
-//! - CudaAsync emits no numbers today. Anyone quoting a "BusyPoll vs
-//!   CudaAsync" speedup before v0.4 lands is quoting nothing.
-//! - On a no-CUDA host BusyPoll numbers are the scheduling floor, not
-//!   launch-to-completion latency. Same caveat as `kernel_dispatch.rs`.
+//! - Both numbers are the sync-machinery floor over a no-op (empty-stream)
+//!   dispatch, NOT launch-to-completion of any particular kernel. The A/B is
+//!   "busy-poll vs stream-synchronize wait strategy", which is the question.
+//! - `CudaAsyncBackend` uses `cust`'s `stream.synchronize`, not the (not-yet-
+//!   ported) cuda-async runtime; read the BusyPoll-vs-CudaAsync delta as
+//!   "event-query poll vs blocking stream sync", not "old crate vs new crate".
+//! - A skip line now means CUDA was unavailable at runtime, not that the
+//!   backend is unimplemented.
 //! - `harness = false` Criterion-shaped only so `cargo bench` discovers
 //!   it; the real loop is hand-rolled, mirroring W4.6 `tail_latency.rs`
 //!   (see its module docs for the 10 000-sample nearest-rank rationale).
@@ -58,7 +70,7 @@ fn main() {
         "DISPATCH_BACKEND {{\"backend\":\"busy-poll\",\"status\":\"skipped\",\"reason\":\"tensor-wasm-bench compiled without --features cuda; rebuild with `--features cuda` to exercise the DispatchFuture path\"}}"
     );
     println!(
-        "DISPATCH_BACKEND {{\"backend\":\"cuda-async\",\"status\":\"skipped\",\"reason\":\"cuda-async-backend: not yet wired -- see RFC 0001 v0.4 port\"}}"
+        "DISPATCH_BACKEND {{\"backend\":\"cuda-async\",\"status\":\"skipped\",\"reason\":\"tensor-wasm-bench compiled without --features cuda; rebuild with `--features cuda` to exercise the stream-synchronize path\"}}"
     );
 }
 
@@ -83,16 +95,17 @@ mod bench {
     /// Warm-up iterations before the timed loop, mirroring W4.6.
     const WARMUP: usize = 1_000;
 
-    /// Sentinel returned by every stub `dispatch_once`. Mirrors the
-    /// `tensor_wasm_mem::cuda_oxide_backend::NOT_YET_WIRED` string shape so
-    /// a grep for "not yet wired" surfaces both scaffold sites.
-    const CUDA_ASYNC_NOT_YET_WIRED: &str =
-        "cuda-async-backend: not yet wired -- see RFC 0001 v0.4 port";
+    /// Fallback skip reason for the `cuda-async` backend. Both real backends
+    /// now drive `cust` against the GPU (finding 5), so a skip only happens
+    /// when CUDA cannot init/bind at runtime (no device, despite the binary
+    /// being built with `--features cuda`).
+    const CUDA_ASYNC_RUNTIME_UNAVAILABLE: &str =
+        "cuda-async: CUDA unavailable at runtime (no device / context bind failed)";
 
     /// Backend-agnostic shape for one no-op dispatch + permit RAII window.
-    /// `Err(&'static str)` signals "skip this backend, the impl is a stub";
-    /// the bench loop converts it into a documented skip line rather than
-    /// counting it as latency.
+    /// `Err(&'static str)` signals "skip this backend": today that only fires
+    /// when CUDA cannot init at runtime. The bench loop converts it into a
+    /// documented skip line rather than counting it as latency.
     trait DispatchFutureBackend {
         #[allow(async_fn_in_trait)] // bench-only trait, no external impls
         async fn dispatch_once(&self) -> Result<(), &'static str>;
@@ -150,17 +163,56 @@ mod bench {
         }
     }
 
-    /// **Scaffold stub.** Always returns the sentinel `Err`. Carries no
-    /// `cuda-async` dep import so v0.3.x builds don't need the
-    /// nightly-2026-04-03 override; v0.4 reviewers flipping both
-    /// `--features cuda` and `--features cuda-oxide-backend` get a clean
-    /// body-only diff. TODO(v0.4): wire per module docs' four-point contract.
+    /// Real GPU-sync alternative to `BusyPollBackend` (finding 5, wired with
+    /// the GPU present).
+    ///
+    /// RFC 0001 Unresolved question #3 asks whether a stream-synchronize
+    /// strategy beats the hand-rolled `event.query()` busy-poll. With a device
+    /// present we can answer it with real numbers instead of a perpetual skip:
+    /// this backend records a `cust` event on a stream and then awaits a
+    /// `tokio::task::spawn_blocking(move || stream.synchronize())` — the same
+    /// blocking-sync-on-a-pool-thread shape the production launch path in
+    /// `tensor_wasm_wasi_gpu::host` uses. The contrast with `BusyPollBackend`
+    /// (async `event.query()` poll + 50 µs sleep-yield) is the A/B the RFC
+    /// wanted: two real GPU-sync strategies over the same no-op dispatch.
+    ///
+    /// The `cuda-async`/`cuda-oxide` crate itself is still a v0.4/v0.5 port
+    /// (it would need the nightly override the workspace defers), so the
+    /// `name()` stays `"cuda-async"` per the stable-label contract and the
+    /// underlying mechanism here is `cust`'s `stream.synchronize`, which is
+    /// the closest faithful stand-in available in v0.3.x. When the real
+    /// cuda-oxide async runtime lands, only this body changes.
+    ///
+    /// As with `BusyPollBackend`, no kernel is launched (the event is recorded
+    /// on an empty stream), so the number is the synchronize-machinery floor,
+    /// directly comparable to the busy-poll floor.
     struct CudaAsyncBackend;
 
     impl DispatchFutureBackend for CudaAsyncBackend {
         async fn dispatch_once(&self) -> Result<(), &'static str> {
-            // TODO(v0.4): replace with `cuda_async::Stream::synchronize`-equivalent.
-            Err(CUDA_ASYNC_NOT_YET_WIRED)
+            tensor_wasm_wasi_gpu::cuda_ctx::ensure_current_context()
+                .map_err(|_| "cuda-async: CUDA context bind failed")?;
+            let stream = Stream::new(StreamFlags::NON_BLOCKING, None)
+                .map_err(|_| "cuda-async: Stream::new failed")?;
+            let event =
+                Event::new(EventFlags::DEFAULT).map_err(|_| "cuda-async: Event::new failed")?;
+            event
+                .record(&stream)
+                .map_err(|_| "cuda-async: Event::record failed")?;
+            // Blocking synchronize moved onto the blocking pool so the runtime
+            // worker is free meanwhile — the strategy RFC 0001 contrasts with
+            // the busy-poll path. `_event` is moved in to keep it alive until
+            // the stream drains.
+            tokio::task::spawn_blocking(move || {
+                let _event = event;
+                tensor_wasm_wasi_gpu::cuda_ctx::ensure_current_context()
+                    .map_err(|_| "cuda-async: context bind on blocking pool failed")?;
+                stream
+                    .synchronize()
+                    .map_err(|_| "cuda-async: stream synchronize failed")
+            })
+            .await
+            .map_err(|_| "cuda-async: spawn_blocking join failed")?
         }
 
         fn name(&self) -> &'static str {
@@ -174,7 +226,8 @@ mod bench {
     // `cargo test`-visible unit tests. `skip_json` and `render_file` stay local
     // because they are specific to this bench's output document.
 
-    /// Skip line for stub backends.
+    /// Skip line for a backend whose `dispatch_once` returned `Err` (today:
+    /// CUDA unavailable at runtime).
     fn skip_json(backend: &str, reason: &str) -> String {
         format!(
             "{{\"backend\":\"{}\",\"status\":\"skipped\",\"reason\":\"{}\"}}",
@@ -183,8 +236,9 @@ mod bench {
         )
     }
 
-    /// Run `iters` samples through `backend`. Returns `None` for stub
-    /// backends (first call returns sentinel `Err`); caller emits skip line.
+    /// Run `iters` samples through `backend`. Returns `None` when the probe
+    /// `dispatch_once` returns `Err` (CUDA unavailable at runtime); caller
+    /// emits a skip line.
     // `async fn` in a trait isn't dyn-compatible (no vtable for the
     // returned `impl Future`), so the runner is generic over a concrete
     // `B: DispatchFutureBackend` instead of `&dyn`. Each backend gets its
@@ -194,8 +248,8 @@ mod bench {
         backend: &B,
         iters: usize,
     ) -> Option<TailStats> {
-        // Probe before warm-up so a stub short-circuits without burning
-        // 11 000 iterations. Same shape as the timed loop.
+        // Probe before warm-up so a runtime-unavailable backend short-circuits
+        // without burning 11 000 iterations. Same shape as the timed loop.
         if rt.block_on(backend.dispatch_once()).is_err() {
             return None;
         }
@@ -298,7 +352,7 @@ mod bench {
             &rt,
             &CudaAsyncBackend,
             &mut json_lines,
-            CUDA_ASYNC_NOT_YET_WIRED,
+            CUDA_ASYNC_RUNTIME_UNAVAILABLE,
         );
 
         // File sink: best-effort. Missing dir is not a bench failure — the
