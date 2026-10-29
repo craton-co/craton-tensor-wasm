@@ -24,19 +24,21 @@
 //!   `e2e/invoke_not_found/post`. Output goes to stdout and (when run
 //!   from the workspace root) to `bench-results/tail-latency.json`.
 //! - `benches/dispatch_future_backends.rs` — F3/RFC 0001 comparison of the
-//!   busy-poll `DispatchFuture` path against the `cuda-async` backend
-//!   (the latter a documented stub until v0.4). Meaningful only with
-//!   `--features cuda`; emits `DISPATCH_BACKEND` JSON lines and
+//!   busy-poll `event.query()` `DispatchFuture` path against a
+//!   `stream.synchronize()`-based `cuda-async` backend. Both drive real
+//!   `cust` work; meaningful only with `--features cuda`. Emits
+//!   `DISPATCH_BACKEND` JSON lines and
 //!   `bench-results/dispatch-future-backends.json`. Diagnostic, not gated.
 //! - `benches/metrics_label_validation.rs` — `HttpRequestLabels::try_new`
 //!   route-lookup cost against a 100-route allow-list (first/last/miss).
 //!   Pins the `Vec` → `HashSet` migration. Diagnostic, not gated.
-//! - `benches/call_export_args.rs` — `call_export_with_args` overhead vs
-//!   the legacy no-args `call_export` shim (`call_export/noargs/*` and
-//!   `call_export/args/two_i32`).
+//! - `benches/call_export_args.rs` — `call_export_with_args` overhead: a
+//!   `hot/*` group (instance reused across the loop) isolates args
+//!   marshalling, and an `envelope/*` group (spawn + invoke + terminate per
+//!   sample) matches the `/invoke` per-request shape.
 //! - `benches/streaming_invoke.rs` — `/invoke-stream` vs `/invoke` floor
-//!   (`invoke_stream/baseline_invoke`, `/sse`, `/chunked`). Placeholder
-//!   that emits skip lines until B7.1 wires the route.
+//!   (`invoke_stream/baseline_invoke`, `/sse`, `/chunked`), driven against a
+//!   pre-deployed `_start` no-op function through the live streaming route.
 //!
 //! See [`docs/PERFORMANCE.md`](../../../docs/PERFORMANCE.md) for the
 //! published bench inventory, reference numbers, and the regression-gate
@@ -205,6 +207,127 @@ impl TailStats {
             self.p99_9_ns,
             self.max_ns,
         )
+    }
+}
+
+/// Whether a metric participates in the CI regression gate or is published
+/// for diagnosis only (finding 6).
+///
+/// The gate fails CI when a [`Gated`](MetricClass::Gated) metric regresses by
+/// more than the configured threshold. [`Diagnostic`](MetricClass::Diagnostic)
+/// metrics are recorded and diffed by humans but never fail the build — they
+/// are too noisy (micro-benches dominated by allocator jitter) or too
+/// environment-dependent (disk round-trip) to gate on. This split is the
+/// "mark which metrics are gated vs diagnostic" half of the regression-gate
+/// methodology; the bench inventory in `docs/PERFORMANCE.md` carries the
+/// authoritative per-metric mapping, and [`classify_metric`] encodes the
+/// default rules a comparator applies when a metric is not explicitly listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricClass {
+    /// Regressions beyond the threshold fail CI.
+    Gated,
+    /// Recorded and diffed, but never fails CI.
+    Diagnostic,
+}
+
+/// Default gated-vs-diagnostic classification for a `<group>/<id>` metric key.
+///
+/// Rules (first match wins):
+/// * `dispatch/real_sync*`, `dispatch/contended*`, and every
+///   `*_steady_state*` / disk-round-trip / `dispatch_future_backends`
+///   backend-comparison metric is **diagnostic** — they depend on the GPU,
+///   the host filesystem, or are explicit A/B harnesses, none of which gate
+///   cleanly across CI runners.
+/// * the headline `dispatch/serial*`, `dispatch/concurrent*`,
+///   `e2e/healthz*`, `e2e/invoke_not_found*`, and `jit_compile/*` metrics are
+///   **gated** — they are CPU-bound, low-variance, and meaningful on any
+///   runner.
+/// * anything unrecognised defaults to **diagnostic** (fail-open for the
+///   gate: a new, unclassified metric must be opted *in* to gating, so adding
+///   a bench never accidentally breaks CI before its baseline is captured).
+#[must_use]
+pub fn classify_metric(metric: &str) -> MetricClass {
+    let diagnostic_markers = [
+        "real_sync",
+        "contended",
+        "steady_state",
+        "disk_round_trip",
+        "span_only",
+        "secured",
+        "metrics_label_validation",
+        "memory_bandwidth",
+    ];
+    if diagnostic_markers.iter().any(|m| metric.contains(m)) {
+        return MetricClass::Diagnostic;
+    }
+    let gated_prefixes = [
+        "dispatch/serial",
+        "dispatch/concurrent",
+        "e2e/healthz",
+        "e2e/invoke_not_found",
+        "jit_compile/",
+        "cold_start/capture",
+    ];
+    if gated_prefixes.iter().any(|p| metric.starts_with(p)) {
+        return MetricClass::Gated;
+    }
+    MetricClass::Diagnostic
+}
+
+/// Outcome of comparing one metric's current value against its baseline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegressionCheck {
+    /// The `<group>/<id>` metric key.
+    pub metric: String,
+    /// Gated or diagnostic (see [`MetricClass`]).
+    pub class: MetricClass,
+    /// Baseline value (e.g. `p99_ns` or mean ns), in the same unit as
+    /// `current`.
+    pub baseline: f64,
+    /// Current run's value, same unit as `baseline`.
+    pub current: f64,
+    /// Fractional change `(current - baseline) / baseline`. Positive means
+    /// slower (a regression); negative means faster.
+    pub delta_frac: f64,
+    /// `true` only when the metric is [`Gated`](MetricClass::Gated) AND
+    /// `delta_frac` exceeds `threshold_frac`. Diagnostic metrics are never
+    /// failing regardless of `delta_frac`.
+    pub is_failing_regression: bool,
+}
+
+/// Compare one metric against its baseline at the given fractional threshold
+/// (e.g. `0.10` for "fail on >10 % slower").
+///
+/// A non-positive `baseline` is treated as "no usable baseline" and yields a
+/// `delta_frac` of `0.0` and `is_failing_regression == false` — a fresh
+/// metric with a zero/placeholder baseline never fails the gate.
+///
+/// # Panics
+///
+/// Panics if `threshold_frac` is negative (a nonsensical gate config).
+#[must_use]
+pub fn check_regression(
+    metric: &str,
+    baseline: f64,
+    current: f64,
+    threshold_frac: f64,
+) -> RegressionCheck {
+    assert!(threshold_frac >= 0.0, "threshold_frac must be non-negative");
+    let class = classify_metric(metric);
+    let delta_frac = if baseline > 0.0 {
+        (current - baseline) / baseline
+    } else {
+        0.0
+    };
+    let is_failing_regression =
+        class == MetricClass::Gated && baseline > 0.0 && delta_frac > threshold_frac;
+    RegressionCheck {
+        metric: metric.to_string(),
+        class,
+        baseline,
+        current,
+        delta_frac,
+        is_failing_regression,
     }
 }
 

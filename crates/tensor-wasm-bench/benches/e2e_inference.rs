@@ -10,6 +10,25 @@
 //! per-iteration `block_on` enter/exit cost does not dominate as it
 //! would with a fresh current-thread runtime on every sample.
 //!
+//! ## Auth/rate-limit-enabled variant (finding 6)
+//!
+//! The `healthz`/`create`/`invoke_not_found` groups run with auth and rate
+//! limiting *disabled* (the historical floor). The `e2e/secured/*` group
+//! additionally exercises the bearer-auth + tenant-scope + token-bucket
+//! middleware path with a single accepted token (`BENCH_TOKEN`) and a
+//! deliberately high rate-limit ceiling (so the limiter admits every sample
+//! and the measurement reflects the per-request bucket *check* cost, not a
+//! 429 throttle).
+//!
+//! The secured group hits the `/functions/{id}/invoke` not-found path rather
+//! than `/healthz`: in this gateway `/healthz` (and `/metrics`) sit on a probe
+//! sub-router that *deliberately bypasses* the bearer-auth / rate-limit
+//! layers, so a "secured healthz" would measure nothing extra. The invoke
+//! route is on the authenticated sub-router, so a valid-token request
+//! traverses `bearer_auth → tenant_scope → rate_limit` before the 404. The
+//! delta between `e2e/invoke_not_found/post` and
+//! `e2e/secured/invoke_not_found_authed` is the security-middleware tax.
+//!
 //! ## `router.clone()` bias (finding 4)
 //!
 //! `tower::ServiceExt::oneshot` consumes the service it is called on, so each
@@ -30,10 +49,14 @@ use axum::http::{header, Request, StatusCode};
 use base64::Engine;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use http_body_util::BodyExt;
-use tensor_wasm_api::middleware::{AuthConfig, TenantConfig};
-use tensor_wasm_api::rate_limit::{RateLimitConfig, RateLimiter};
+use tensor_wasm_api::middleware::{AuthConfig, TenantConfig, HEADER_TENANT};
+use tensor_wasm_api::rate_limit::{PerTenantRateLimitConfig, RateLimitConfig, RateLimiter};
 use tensor_wasm_api::{build_router_with_full_config, AppState};
 use tower::ServiceExt;
+
+/// Bearer token the secured-variant router accepts (finding 6). Any other
+/// token (or none) is rejected with 401 by the auth middleware.
+const BENCH_TOKEN: &str = "bench-token";
 
 fn wasm_header_b64() -> String {
     // The 8-byte empty module: Wasm magic + version, no sections. This is
@@ -48,6 +71,27 @@ fn make_router() -> axum::Router {
     let auth = AuthConfig::default();
     let tenant = TenantConfig::default();
     let limiter = RateLimiter::new(RateLimitConfig::disabled());
+    build_router_with_full_config(state, auth, tenant, limiter)
+}
+
+/// Router with auth + rate limiting ENABLED (finding 6). One accepted token
+/// and a high QPS/burst ceiling so the limiter never throttles a bench sample
+/// — the sample measures the bucket *check* + bearer parse + tenant parse
+/// overhead, not a 429.
+fn make_router_secured() -> axum::Router {
+    let state = AppState::new();
+    let auth = AuthConfig::from_tokens([BENCH_TOKEN]);
+    let tenant = TenantConfig::default();
+    // High ceilings: the bench fires far fewer than 1e6 req/s, so the bucket
+    // always admits; only the per-request check cost is measured.
+    let limiter = RateLimiter::new(RateLimitConfig {
+        qps: 1_000_000,
+        burst: 1_000_000,
+        per_tenant_default: PerTenantRateLimitConfig {
+            burst: 1_000_000,
+            qps: 1_000_000.0,
+        },
+    });
     build_router_with_full_config(state, auth, tenant, limiter)
 }
 
@@ -147,10 +191,66 @@ fn bench_invoke_not_found(c: &mut Criterion) {
     group.finish();
 }
 
+/// Auth + rate-limit-enabled invoke-not-found (finding 6). Sends a valid
+/// bearer token + tenant header so the request clears every security layer
+/// (`bearer_auth → tenant_scope → rate_limit`) before the 404. The cost over
+/// `bench_invoke_not_found` is the security-middleware tax.
+fn bench_secured_invoke_not_found(c: &mut Criterion) {
+    let mut group = c.benchmark_group("e2e/secured");
+    group.measurement_time(Duration::from_secs(3));
+    let router = make_router_secured();
+    let rt = rt();
+    group.bench_function("invoke_not_found_authed", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/functions/00000000-0000-0000-0000-000000000000/invoke")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {BENCH_TOKEN}"))
+                    .header(HEADER_TENANT, "1")
+                    .body(Body::from("{}"))
+                    .unwrap();
+                let resp = router.clone().oneshot(req).await.unwrap();
+                // 404: token + tenant cleared auth/rate-limit; the function id
+                // simply does not exist. A 401/429 here would mean the secured
+                // path is misconfigured and the measurement is meaningless.
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+                let body = resp.into_body().collect().await.unwrap().to_bytes();
+                criterion::black_box(body);
+            });
+        });
+    });
+    group.finish();
+}
+
+/// Criterion configured with the pprof flamegraph profiler when
+/// `--features profiling` is on, else the default (finding 6). With the
+/// feature enabled, each bench in this file emits a flamegraph under
+/// `target/criterion/<group>/<id>/profile/`. The 100 Hz sampling rate is the
+/// pprof default — high enough to resolve the axum/middleware hot path without
+/// perturbing the measurement materially. See `docs/BENCHMARKING.md` for the
+/// quiet-host protocol the flamegraphs assume.
+#[cfg(feature = "profiling")]
+fn configured_criterion() -> Criterion {
+    Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(
+        100,
+        pprof::criterion::Output::Flamegraph(None),
+    ))
+}
+
+#[cfg(not(feature = "profiling"))]
+fn configured_criterion() -> Criterion {
+    Criterion::default()
+}
+
 criterion_group!(
-    benches,
-    bench_healthz,
-    bench_create_function,
-    bench_invoke_not_found
+    name = benches;
+    config = configured_criterion();
+    targets =
+        bench_healthz,
+        bench_create_function,
+        bench_invoke_not_found,
+        bench_secured_invoke_not_found
 );
 criterion_main!(benches);
