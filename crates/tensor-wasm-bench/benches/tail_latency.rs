@@ -501,7 +501,15 @@ fn tail_latency_bench(c: &mut Criterion) {
     // produce three sibling criterion directories that diff cleanly.
     let group_name = format!("tail_latency_{}", BACKEND_LABEL);
     let mut group = c.benchmark_group(group_name);
-    group.measurement_time(Duration::from_millis(500));
+    // The real measurement already ran above; this marker exists only so
+    // Criterion has a benchmark to "run" and doesn't print "no benches
+    // matched". Drive its cost to the floor: 10 is Criterion's minimum
+    // `sample_size`, and the warm-up + measurement windows are pushed to the
+    // smallest values Criterion accepts so the marker adds well under a
+    // second of wall-clock instead of the previous ~0.5 s + warm-up
+    // (finding 6).
+    group.measurement_time(Duration::from_millis(50));
+    group.warm_up_time(Duration::from_millis(50));
     group.sample_size(10);
     group.bench_function("noop_marker", |b| {
         b.iter(|| black_box(0u64));

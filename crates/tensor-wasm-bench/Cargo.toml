@@ -34,6 +34,16 @@ tokio.workspace = true
 # workspace cust 0.3.x pin the wasi-gpu launch path uses; absent on default
 # (cuda-toolkit-free) builds.
 cust = { workspace = true, optional = true }
+# Pulled in only under `--features regression-gate` (via `dep:serde_json`) so
+# the `bench_compare` CI-gate binary can parse the result JSON. `serde_json`
+# stays a dev-dependency for the bench/test code (so the hand-rolled
+# serialisers in `lib.rs` keep their reason to exist); the optional normal-dep
+# alias here is what makes it linkable into a `[[bin]]` target.
+serde_json = { workspace = true, optional = true }
+# pprof flamegraph hook, enabled only under `--features profiling`. Off by
+# default so the standard `cargo bench` path on CI / laptops needs no extra
+# system libs.
+pprof = { version = "0.13", features = ["flamegraph", "criterion"], optional = true }
 
 [dev-dependencies]
 axum = { workspace = true }
@@ -111,6 +121,13 @@ harness = false
 name = "streaming_invoke"
 harness = false
 
+[[bin]]
+# CI regression-gate comparator (finding 6). Behind `required-features` so it
+# only builds when `serde_json` is available as a normal dep; the default
+# `cargo build`/`cargo bench` path skips it and stays serde_json-dev-only.
+name = "bench_compare"
+required-features = ["regression-gate"]
+
 [features]
 # Default off so the existing `cargo bench -p tensor-wasm-bench` pipeline
 # stays cuda-toolkit-free on CI runners and developer laptops.
@@ -146,3 +163,13 @@ cuda-oxide-backend = ["tensor-wasm-mem/cuda-oxide-backend"]
 # and `docs/BENCHMARKING.md` for the operator recipe (run the bench three
 # times, diff the three JSON files).
 cudarc-backend = []
+# Builds the `bench_compare` CI-gate binary, pulling in `serde_json` as a
+# normal dependency so the comparator can parse the result documents. Off by
+# default so `cargo bench` stays serde_json-dev-only. See `src/bin/bench_compare.rs`.
+regression-gate = ["dep:serde_json"]
+# Enables the pprof flamegraph profiler hook for the Criterion benches. Off by
+# default (no extra system libs on the standard path). With it on, a bench can
+# attach `Criterion::with_profiler(...)` to emit flamegraphs to
+# `target/criterion/<bench>/profile/`. See `docs/BENCHMARKING.md` for the
+# capture recipe and the quiet-host protocol the profiles assume.
+profiling = ["dep:pprof"]
