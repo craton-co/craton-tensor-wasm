@@ -331,6 +331,124 @@ pub fn check_regression(
     }
 }
 
+/// Resolve the compile-time backend label from the two backend feature
+/// booleans, applying the documented priority order
+/// `cuda-oxide` > `cudarc` > `unified-memory`.
+///
+/// Pulled out as a pure function (rather than only the `#[cfg]`-selected
+/// `const` in `tail_latency.rs`) so the priority ordering is unit-testable
+/// across all four combinations without recompiling under different feature
+/// sets. [`backend_label`] wires the live `#[cfg]` flags into this function.
+#[must_use]
+pub const fn resolve_backend_label(cuda_oxide_backend: bool, cudarc_backend: bool) -> &'static str {
+    if cuda_oxide_backend {
+        "cuda-oxide"
+    } else if cudarc_backend {
+        "cudarc"
+    } else {
+        "unified-memory"
+    }
+}
+
+/// The active compile-time backend label for this build, resolved via
+/// [`resolve_backend_label`] over the live `cuda-oxide-backend` /
+/// `cudarc-backend` feature flags. `tail_latency.rs` uses this so its
+/// `BACKEND_LABEL` and the tested priority logic share one implementation.
+#[must_use]
+pub const fn backend_label() -> &'static str {
+    resolve_backend_label(
+        cfg!(feature = "cuda-oxide-backend"),
+        cfg!(feature = "cudarc-backend"),
+    )
+}
+
+/// Locate the workspace `bench-results/` directory, or `None` if neither the
+/// cwd nor the manifest-relative candidate resolves.
+///
+/// Shared by `tail_latency.rs` and `dispatch_future_backends.rs` (which used
+/// to carry byte-identical copies) so the lookup behaves the same under
+/// `cargo bench` regardless of which bench ran, and so the path logic is
+/// reachable from `cargo test` (it cannot be tested from inside a
+/// `harness = false` bench, where `cfg(test)` is unset).
+///
+/// First tries `<cwd>/bench-results` (true when invoked from the workspace
+/// root), then `<CARGO_MANIFEST_DIR>/../../bench-results` (true when `cargo
+/// bench` is launched from inside the crate dir and changes cwd).
+#[must_use]
+pub fn workspace_bench_results_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("bench-results");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let candidate = manifest.join("..").join("..").join("bench-results");
+    let canonical = std::fs::canonicalize(&candidate).ok()?;
+    canonical.is_dir().then_some(canonical)
+}
+
+/// Render the full `tail-latency.json` document from a metric set.
+///
+/// Extracted from `tail_latency.rs::render_file` so the document-level JSON
+/// validity (not just per-row validity) is provable from `cargo test` by
+/// round-tripping the output through `serde_json` — the bench file's own
+/// `cfg(test)` module never compiles under the bench profile. The schema is
+/// documented in `bench-results/README.md`.
+#[must_use]
+pub fn render_tail_results_document(
+    results: &[TailResult],
+    backend: &str,
+    samples: usize,
+) -> String {
+    let metrics = results
+        .iter()
+        .map(|r| format!("    {}", r.to_json()))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(
+        concat!(
+            "{{\n",
+            "  \"// generated\": \"P99.9 tail-latency snapshot (see crates/tensor-wasm-bench/benches/tail_latency.rs).\",\n",
+            "  \"// algorithm\": \"nearest-rank percentile per ISO/IEC 25062 over {} sorted samples per metric\",\n",
+            "  \"// backend-axis\": \"W4.4 RFC 0001 extension -- run the bench once per backend (default / --features cudarc-backend / --features cuda-oxide-backend) and diff the three files; see docs/BENCHMARKING.md for the operator recipe\",\n",
+            "  \"backend\": \"{}\",\n",
+            "  \"metrics\": [\n{}\n  ]\n",
+            "}}\n",
+        ),
+        samples,
+        json_escape(backend),
+        metrics,
+    )
+}
+
+/// Render the full `dispatch-future-backends.json` document from a set of
+/// already-serialised per-backend JSON lines (measured or skip).
+///
+/// Extracted from `dispatch_future_backends.rs::render_file` for the same
+/// `cargo test`-visible document-validity reason as
+/// [`render_tail_results_document`].
+#[must_use]
+pub fn render_backend_document(lines: &[String], samples: usize) -> String {
+    let body = lines
+        .iter()
+        .map(|l| format!("    {l}"))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(
+        concat!(
+            "{{\n",
+            "  \"// generated\": \"BusyPoll vs cuda-async DispatchFuture comparison (see crates/tensor-wasm-bench/benches/dispatch_future_backends.rs).\",\n",
+            "  \"// rfc\": \"rfcs/0001-cuda-oxide-integration.md -- Unresolved question #3\",\n",
+            "  \"// algorithm\": \"nearest-rank percentile per ISO/IEC 25062 over {} sorted samples per backend\",\n",
+            "  \"backends\": [\n{}\n  ]\n",
+            "}}\n",
+        ),
+        samples, body,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     // `super::*` re-exports the crate-root `use std::time::Duration;`, so no
@@ -471,5 +589,216 @@ mod tests {
         assert_eq!(v["samples"], 64);
         assert_eq!(v["p99_9_ns"], 40);
         assert_eq!(v["max_ns"], 50);
+    }
+
+    // ---- finding 7: json_escape edge cases ----
+
+    #[test]
+    fn json_escape_named_short_escapes_cr_bs_ff() {
+        // \r, \b (U+0008), \f (U+000C) must use their named short escapes,
+        // not the generic \uXXXX form.
+        assert_eq!(json_escape("a\rb"), "a\\rb");
+        assert_eq!(json_escape("a\u{08}b"), "a\\bb");
+        assert_eq!(json_escape("a\u{0c}b"), "a\\fb");
+        // And as a single combined string, parseable by serde_json.
+        let combined = json_escape("\r\u{08}\u{0c}");
+        let wrapped = format!("\"{combined}\"");
+        let v: serde_json::Value = serde_json::from_str(&wrapped).expect("valid JSON");
+        assert_eq!(v, serde_json::Value::String("\r\u{08}\u{0c}".to_string()));
+    }
+
+    #[test]
+    fn json_escape_passes_multibyte_utf8_through_unchanged() {
+        // Multi-byte UTF-8 (BMP + astral) must pass through verbatim — the
+        // escaper only touches ASCII control chars, quote, and backslash.
+        let s = "héllo — 日本語 — 😀 — Ωμέγα";
+        assert_eq!(json_escape(s), s);
+        // Round-trips as a JSON string value.
+        let wrapped = format!("\"{}\"", json_escape(s));
+        let v: serde_json::Value = serde_json::from_str(&wrapped).expect("valid JSON");
+        assert_eq!(v, serde_json::Value::String(s.to_string()));
+    }
+
+    // ---- finding 7: render_file document-level validity ----
+
+    fn sample_tail_result(metric: &str, backend: &'static str) -> TailResult {
+        TailResult {
+            metric: metric.to_string(),
+            backend,
+            samples: 10_000,
+            p50_ns: 1,
+            p95_ns: 2,
+            p99_ns: 3,
+            p99_9_ns: 4,
+            max_ns: 5,
+        }
+    }
+
+    #[test]
+    fn tail_results_document_is_valid_json_with_metrics_array() {
+        let results = vec![
+            sample_tail_result("dispatch/serial/100", "unified-memory"),
+            sample_tail_result("e2e/healthz/get", "unified-memory"),
+        ];
+        let doc = render_tail_results_document(&results, "unified-memory", 10_000);
+        // Whole document parses — proves the comma-joining + header lines
+        // produce a valid object, not just valid per-row fragments.
+        let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON document");
+        assert_eq!(v["backend"], "unified-memory");
+        let metrics = v["metrics"].as_array().expect("metrics is an array");
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0]["metric"], "dispatch/serial/100");
+        assert_eq!(metrics[1]["metric"], "e2e/healthz/get");
+        assert_eq!(metrics[0]["p99_9_ns"], 4);
+    }
+
+    #[test]
+    fn tail_results_document_escapes_backend_label() {
+        // A pathological backend label with a quote must not break the doc.
+        let results = vec![sample_tail_result("dispatch/serial/100", "unified-memory")];
+        let doc = render_tail_results_document(&results, "we\"ird", 10_000);
+        let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON document");
+        assert_eq!(v["backend"], "we\"ird");
+    }
+
+    #[test]
+    fn backend_document_is_valid_json_with_backends_array() {
+        let lines = vec![
+            TailStats {
+                backend: "busy-poll".to_string(),
+                samples: 10_000,
+                p50_ns: 1,
+                p95_ns: 2,
+                p99_ns: 3,
+                p99_9_ns: 4,
+                max_ns: 5,
+            }
+            .to_json(),
+            // A skip line shaped like the bench's own skip_json output.
+            "{\"backend\":\"cuda-async\",\"status\":\"skipped\",\"reason\":\"unavailable\"}"
+                .to_string(),
+        ];
+        let doc = render_backend_document(&lines, 10_000);
+        let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON document");
+        let backends = v["backends"].as_array().expect("backends is an array");
+        assert_eq!(backends.len(), 2);
+        assert_eq!(backends[0]["status"], "measured");
+        assert_eq!(backends[1]["status"], "skipped");
+    }
+
+    // ---- finding 7: workspace_bench_results_dir ----
+
+    #[test]
+    fn workspace_bench_results_dir_resolves_or_returns_none() {
+        // The function must never panic and must return either a real
+        // directory or `None`. (Whether `bench-results/` exists depends on the
+        // checkout; both outcomes are valid, but a returned path must be a
+        // directory that ends in `bench-results`.)
+        match workspace_bench_results_dir() {
+            Some(dir) => {
+                assert!(dir.is_dir(), "returned path must be an existing directory");
+                assert_eq!(
+                    dir.file_name().and_then(|n| n.to_str()),
+                    Some("bench-results"),
+                    "returned path must be the bench-results directory"
+                );
+            }
+            None => { /* acceptable: no bench-results/ in this checkout */ }
+        }
+    }
+
+    // ---- finding 7: BACKEND_LABEL cfg-priority ordering ----
+
+    #[test]
+    fn backend_label_priority_is_cuda_oxide_then_cudarc_then_unified() {
+        // cuda-oxide wins over everything.
+        assert_eq!(resolve_backend_label(true, true), "cuda-oxide");
+        assert_eq!(resolve_backend_label(true, false), "cuda-oxide");
+        // cudarc wins only when cuda-oxide is off.
+        assert_eq!(resolve_backend_label(false, true), "cudarc");
+        // Neither => the historical default.
+        assert_eq!(resolve_backend_label(false, false), "unified-memory");
+    }
+
+    #[test]
+    fn backend_label_matches_active_feature_set() {
+        // The live label must equal what the priority function returns for the
+        // compiled feature set — pins the const in `tail_latency.rs` to the
+        // tested logic.
+        let expected = resolve_backend_label(
+            cfg!(feature = "cuda-oxide-backend"),
+            cfg!(feature = "cudarc-backend"),
+        );
+        assert_eq!(backend_label(), expected);
+    }
+
+    // ---- finding 6: regression-gate comparator core ----
+
+    #[test]
+    fn classify_metric_gates_headline_diagnoses_the_rest() {
+        assert_eq!(classify_metric("dispatch/serial/100"), MetricClass::Gated);
+        assert_eq!(
+            classify_metric("dispatch/concurrent_cap64/100"),
+            MetricClass::Gated
+        );
+        assert_eq!(classify_metric("e2e/healthz/get"), MetricClass::Gated);
+        assert_eq!(classify_metric("jit_compile/emit_text"), MetricClass::Gated);
+        assert_eq!(
+            classify_metric("cold_start/capture"),
+            MetricClass::Gated
+        );
+        // Diagnostic markers.
+        assert_eq!(
+            classify_metric("dispatch/real_sync/1"),
+            MetricClass::Diagnostic
+        );
+        assert_eq!(
+            classify_metric("dispatch/contended_cap1/1000"),
+            MetricClass::Diagnostic
+        );
+        assert_eq!(
+            classify_metric("cold_start/restore_steady_state"),
+            MetricClass::Diagnostic
+        );
+        assert_eq!(
+            classify_metric("e2e/secured/invoke_not_found_authed"),
+            MetricClass::Diagnostic
+        );
+        // Unknown defaults to diagnostic (fail-open for the gate).
+        assert_eq!(classify_metric("some/brand_new_metric"), MetricClass::Diagnostic);
+    }
+
+    #[test]
+    fn check_regression_fails_only_gated_metrics_over_threshold() {
+        // Gated + 20% slower at a 10% threshold => failing.
+        let c = check_regression("dispatch/serial/100", 100.0, 120.0, 0.10);
+        assert_eq!(c.class, MetricClass::Gated);
+        assert!((c.delta_frac - 0.20).abs() < 1e-9);
+        assert!(c.is_failing_regression);
+
+        // Gated but within threshold => not failing.
+        let c = check_regression("dispatch/serial/100", 100.0, 105.0, 0.10);
+        assert!(!c.is_failing_regression);
+
+        // Gated and faster => not failing.
+        let c = check_regression("dispatch/serial/100", 100.0, 80.0, 0.10);
+        assert!(c.delta_frac < 0.0);
+        assert!(!c.is_failing_regression);
+
+        // Diagnostic metric, even a huge regression, never fails.
+        let c = check_regression("dispatch/real_sync/1", 100.0, 1000.0, 0.10);
+        assert_eq!(c.class, MetricClass::Diagnostic);
+        assert!(!c.is_failing_regression);
+
+        // Zero/placeholder baseline => never fails, delta 0.
+        let c = check_regression("dispatch/serial/100", 0.0, 999.0, 0.10);
+        assert_eq!(c.delta_frac, 0.0);
+        assert!(!c.is_failing_regression);
+    }
+
+    #[test]
+    #[should_panic(expected = "threshold_frac must be non-negative")]
+    fn check_regression_rejects_negative_threshold() {
+        let _ = check_regression("dispatch/serial/100", 100.0, 110.0, -0.1);
     }
 }
