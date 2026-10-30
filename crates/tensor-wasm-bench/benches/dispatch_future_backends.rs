@@ -78,7 +78,6 @@ fn main() {
 mod bench {
 
     use std::fs;
-    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -146,7 +145,8 @@ mod bench {
                 .map_err(|_| "busy-poll: CUDA context bind failed")?;
             let stream = Stream::new(StreamFlags::NON_BLOCKING, None)
                 .map_err(|_| "busy-poll: Stream::new failed")?;
-            let event = Event::new(EventFlags::DEFAULT).map_err(|_| "busy-poll: Event::new failed")?;
+            let event =
+                Event::new(EventFlags::DEFAULT).map_err(|_| "busy-poll: Event::new failed")?;
             event
                 .record(&stream)
                 .map_err(|_| "busy-poll: Event::record failed")?;
@@ -220,11 +220,12 @@ mod bench {
         }
     }
 
-    // `TailStats` and `percentile_nearest_rank` now live in the crate's
-    // `src/lib.rs` (imported above) so the percentile math and JSON schema are
+    // `TailStats`, `percentile_nearest_rank`, the document renderer, and
+    // `workspace_bench_results_dir` now live in the crate's `src/lib.rs`
+    // (used above) so the percentile math, JSON schema, and path logic are
     // shared with `tail_latency.rs` via a single source of truth, with real
-    // `cargo test`-visible unit tests. `skip_json` and `render_file` stay local
-    // because they are specific to this bench's output document.
+    // `cargo test`-visible unit tests. `skip_json` stays local because it is
+    // specific to this bench's skip-line shape.
 
     /// Skip line for a backend whose `dispatch_once` returned `Err` (today:
     /// CUDA unavailable at runtime).
@@ -280,38 +281,12 @@ mod bench {
         })
     }
 
-    /// Locate `bench-results/`. Mirrors W4.6 `workspace_bench_results_dir`
-    /// so both benches behave identically under `cargo bench`.
-    fn workspace_bench_results_dir() -> Option<PathBuf> {
-        if let Ok(cwd) = std::env::current_dir() {
-            let candidate = cwd.join("bench-results");
-            if candidate.is_dir() {
-                return Some(candidate);
-            }
-        }
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let candidate = manifest.join("..").join("..").join("bench-results");
-        let canonical = fs::canonicalize(&candidate).ok()?;
-        canonical.is_dir().then_some(canonical)
-    }
-
+    // `workspace_bench_results_dir` and the document renderer now live in
+    // `tensor_wasm_bench` (src/lib.rs), shared with `tail_latency.rs` and
+    // reachable from `cargo test`. `render_file` is a thin wrapper that pins
+    // this bench's `SAMPLES` into the shared renderer.
     fn render_file(lines: &[String]) -> String {
-        let body = lines
-            .iter()
-            .map(|l| format!("    {}", l))
-            .collect::<Vec<_>>()
-            .join(",\n");
-        format!(
-        concat!(
-            "{{\n",
-            "  \"// generated\": \"BusyPoll vs cuda-async DispatchFuture comparison (see crates/tensor-wasm-bench/benches/dispatch_future_backends.rs).\",\n",
-            "  \"// rfc\": \"rfcs/0001-cuda-oxide-integration.md -- Unresolved question #3\",\n",
-            "  \"// algorithm\": \"nearest-rank percentile per ISO/IEC 25062 over {} sorted samples per backend\",\n",
-            "  \"backends\": [\n{}\n  ]\n",
-            "}}\n",
-        ),
-        SAMPLES, body,
-    )
+        tensor_wasm_bench::render_backend_document(lines, SAMPLES)
     }
 
     /// Run `backend` and append either its measured line or a skip line.
@@ -357,7 +332,7 @@ mod bench {
 
         // File sink: best-effort. Missing dir is not a bench failure — the
         // stdout `DISPATCH_BACKEND` lines are what CI captures regardless.
-        if let Some(dir) = workspace_bench_results_dir() {
+        if let Some(dir) = tensor_wasm_bench::workspace_bench_results_dir() {
             let path = dir.join("dispatch-future-backends.json");
             if let Err(e) = fs::write(&path, render_file(&json_lines)) {
                 eprintln!(

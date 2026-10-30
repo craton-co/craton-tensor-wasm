@@ -63,6 +63,10 @@ fn bench_files(benches_dir: &Path) -> BTreeSet<String> {
 /// without pulling a `toml` crate into the workspace. It tolerates the
 /// inline comments that decorate several `[[bench]]` stanzas (lines like
 /// `# F3 — ...` between the `[[bench]]` header and its `name`).
+///
+/// Only `[[bench]]` tables are matched — a `[[bin]]` (or any other) table
+/// header flips the scanner off, so the comparator binary's `[[bin]]` stanza
+/// is correctly ignored.
 fn registered_benches(cargo_toml: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let mut in_bench_table = false;
@@ -89,6 +93,66 @@ fn registered_benches(cargo_toml: &str) -> BTreeSet<String> {
         }
     }
     names
+}
+
+/// Collect the names of every `[[bench]]` stanza that does NOT carry an
+/// explicit `harness = false`. A non-empty result is a registration bug: a
+/// Criterion bench without `harness = false` gets Cargo's default libtest
+/// harness bolted on, which clashes with the file's `criterion_main!` (every
+/// bench file in this crate uses `criterion_main!`). The scanner walks each
+/// `[[bench]]` table from its header to the next table header, recording the
+/// `name` and whether a `harness = false` line appeared in that window.
+fn benches_missing_harness_false(cargo_toml: &str) -> BTreeSet<String> {
+    let mut offenders = BTreeSet::new();
+    let mut in_bench_table = false;
+    let mut current_name: Option<String> = None;
+    let mut saw_harness_false = false;
+
+    // Flush the table we just finished: if it had a name but no
+    // `harness = false`, it's an offender.
+    fn flush(
+        offenders: &mut BTreeSet<String>,
+        name: &mut Option<String>,
+        saw_harness_false: &mut bool,
+    ) {
+        if let Some(n) = name.take() {
+            if !*saw_harness_false {
+                offenders.insert(n);
+            }
+        }
+        *saw_harness_false = false;
+    }
+
+    for raw in cargo_toml.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            // Leaving the previous table — evaluate it before switching.
+            if in_bench_table {
+                flush(&mut offenders, &mut current_name, &mut saw_harness_false);
+            }
+            in_bench_table = line == "[[bench]]";
+            continue;
+        }
+        if !in_bench_table {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("name") {
+            if let Some(value) = rest.trim_start().strip_prefix('=') {
+                current_name = Some(value.trim().trim_matches('"').to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("harness") {
+            if let Some(value) = rest.trim_start().strip_prefix('=') {
+                if value.trim() == "false" {
+                    saw_harness_false = true;
+                }
+            }
+        }
+    }
+    // Flush the final table (file may end inside a `[[bench]]` stanza).
+    if in_bench_table {
+        flush(&mut offenders, &mut current_name, &mut saw_harness_false);
+    }
+    offenders
 }
 
 #[test]
@@ -126,5 +190,31 @@ fn every_bench_file_is_registered() {
         "[[bench]] name(s) in Cargo.toml have no matching benches/<name>.rs \
          file: {orphaned:?}. Remove the stale registration or restore the \
          file.",
+    );
+}
+
+#[test]
+fn every_bench_stanza_declares_harness_false() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let cargo_toml_path = Path::new(manifest_dir).join("Cargo.toml");
+    let cargo_toml = fs::read_to_string(&cargo_toml_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", cargo_toml_path.display()));
+
+    // Sanity: the scanner must actually find some `[[bench]]` stanzas,
+    // otherwise this test would vacuously pass.
+    let registered = registered_benches(&cargo_toml);
+    assert!(
+        !registered.is_empty(),
+        "no [[bench]] stanzas parsed from Cargo.toml — the harness check would \
+         vacuously pass; the parser or manifest changed shape"
+    );
+
+    let offenders = benches_missing_harness_false(&cargo_toml);
+    assert!(
+        offenders.is_empty(),
+        "[[bench]] stanza(s) missing `harness = false`: {offenders:?}. Every \
+         Criterion bench in this crate uses `criterion_main!`; without \
+         `harness = false` Cargo bolts on the default libtest harness, which \
+         clashes with it. Add `harness = false` to each listed stanza.",
     );
 }

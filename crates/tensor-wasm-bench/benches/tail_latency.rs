@@ -91,7 +91,6 @@
 //! milestone in `docs/PATH-TO-V1.md`.
 
 use std::fs;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -138,12 +137,11 @@ const WARMUP: usize = 1_000;
 /// 0001 Unresolved questions, that label is on a v0.4-deprecation-warning /
 /// v0.5-removal track; the constant survives until then for backwards
 /// compatibility with the v0.3.x baseline files.
-#[cfg(feature = "cuda-oxide-backend")]
-const BACKEND_LABEL: &str = "cuda-oxide";
-#[cfg(all(feature = "cudarc-backend", not(feature = "cuda-oxide-backend")))]
-const BACKEND_LABEL: &str = "cudarc";
-#[cfg(all(not(feature = "cudarc-backend"), not(feature = "cuda-oxide-backend")))]
-const BACKEND_LABEL: &str = "unified-memory";
+// Single source of truth for the cfg priority (`cuda-oxide` > `cudarc` >
+// `unified-memory`): the lib's `resolve_backend_label`, which is unit-tested
+// across all combinations. `cfg!(...)` evaluates to a compile-time bool, so
+// this stays a `const` selected by the active feature set.
+const BACKEND_LABEL: &str = tensor_wasm_bench::backend_label();
 
 // `TailResult` and `percentile_nearest_rank` now live in the crate's
 // `src/lib.rs` (imported above) so the percentile math and the JSON schema
@@ -362,61 +360,13 @@ fn measure_invoke_not_found(rt: &tokio::runtime::Runtime) -> TailResult {
     })
 }
 
-/// Locate `bench-results/` relative to either the current working directory
-/// or the bench crate's `CARGO_MANIFEST_DIR`. Returns `None` if neither
-/// candidate resolves — in that case we skip the file write and rely on the
-/// stdout JSON lines (which CI captures regardless).
-fn workspace_bench_results_dir() -> Option<PathBuf> {
-    // First try cwd / bench-results — true when invoked from the workspace
-    // root (`cargo bench -p tensor-wasm-bench --bench tail_latency`).
-    if let Ok(cwd) = std::env::current_dir() {
-        let candidate = cwd.join("bench-results");
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-    }
-    // Fall back to manifest-relative — true when `cargo bench` is launched
-    // from inside the crate directory and changes cwd accordingly.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let candidate = manifest.join("..").join("..").join("bench-results");
-    let canonical = fs::canonicalize(&candidate).ok()?;
-    if canonical.is_dir() {
-        Some(canonical)
-    } else {
-        None
-    }
-}
-
-/// Pretty-print the full result set as a stable JSON document so a reviewer
-/// can `diff` two runs by eye. The schema is documented in
-/// `bench-results/README.md`.
-///
-/// The W4.4 `backend` field is rendered both as a top-level discriminator
-/// (so a reader sees which compile-time slot the run targeted without
-/// scanning every metric) and as a per-metric field on each entry (so a
-/// downstream parser that joins many files by `<metric, backend>` doesn't
-/// need to reach back into the document root). The redundant per-metric
-/// `backend` field is intentional — wave-4 ops work formalises the schema
-/// and may keep both fields, or may demote the per-metric one once the
-/// regression-gate Python parser is updated.
+// `workspace_bench_results_dir` and the document renderer now live in
+// `tensor_wasm_bench` (src/lib.rs) so both benches share one implementation
+// and the path logic + document-level JSON validity are reachable from
+// `cargo test`. `render_file` is a thin wrapper that pins this bench's
+// `SAMPLES` / `BACKEND_LABEL` into the shared renderer.
 fn render_file(results: &[TailResult]) -> String {
-    let metrics = results
-        .iter()
-        .map(|r| format!("    {}", r.to_json()))
-        .collect::<Vec<_>>()
-        .join(",\n");
-    format!(
-        concat!(
-            "{{\n",
-            "  \"// generated\": \"P99.9 tail-latency snapshot (see crates/tensor-wasm-bench/benches/tail_latency.rs).\",\n",
-            "  \"// algorithm\": \"nearest-rank percentile per ISO/IEC 25062 over {} sorted samples per metric\",\n",
-            "  \"// backend-axis\": \"W4.4 RFC 0001 extension -- run the bench once per backend (default / --features cudarc-backend / --features cuda-oxide-backend) and diff the three files; see docs/BENCHMARKING.md for the operator recipe\",\n",
-            "  \"backend\": \"{}\",\n",
-            "  \"metrics\": [\n{}\n  ]\n",
-            "}}\n",
-        ),
-        SAMPLES, BACKEND_LABEL, metrics,
-    )
+    tensor_wasm_bench::render_tail_results_document(results, BACKEND_LABEL, SAMPLES)
 }
 
 /// Entry point invoked under Criterion. We register a single dummy
@@ -479,7 +429,7 @@ fn tail_latency_bench(c: &mut Criterion) {
     }
 
     // File sink: best-effort. A missing directory is not a bench failure.
-    if let Some(dir) = workspace_bench_results_dir() {
+    if let Some(dir) = tensor_wasm_bench::workspace_bench_results_dir() {
         let path = dir.join("tail-latency.json");
         let body = render_file(&results);
         if let Err(e) = fs::write(&path, body) {
