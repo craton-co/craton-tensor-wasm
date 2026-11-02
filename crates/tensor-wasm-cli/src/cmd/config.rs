@@ -66,8 +66,7 @@ impl CliConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading --config file {}", path.display()))?;
-        Self::parse(&text)
-            .with_context(|| format!("parsing --config file {}", path.display()))
+        Self::parse(&text).with_context(|| format!("parsing --config file {}", path.display()))
     }
 
     /// Parse the flat TOML subset described in the module docs.
@@ -184,9 +183,15 @@ mod tests {
         "#,
         )
         .expect("valid config parses");
-        assert_eq!(cfg.server.as_deref(), Some("https://tensor-wasm.example.com"));
+        assert_eq!(
+            cfg.server.as_deref(),
+            Some("https://tensor-wasm.example.com")
+        );
         assert_eq!(cfg.tenant, Some(7));
-        assert_eq!(cfg.token_file, Some(PathBuf::from("/etc/tensor-wasm/token")));
+        assert_eq!(
+            cfg.token_file,
+            Some(PathBuf::from("/etc/tensor-wasm/token"))
+        );
         assert_eq!(cfg.ca_cert, Some(PathBuf::from("/etc/tensor-wasm/ca.pem")));
         assert_eq!(cfg.insecure, Some(false));
         assert_eq!(cfg.timeout_secs, Some(30));

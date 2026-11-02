@@ -145,8 +145,12 @@ async fn invoke_success_path_prints_response() {
 async fn metrics_success_path_prints_exposition() {
     let app = Router::new().route("/metrics", get(metrics_ok));
     let (addr, _h) = spawn_test_server(app).await;
-    let (stdout, stderr, ok) =
-        run_cli(vec!["metrics".into(), "--server".into(), format!("http://{addr}")]).await;
+    let (stdout, stderr, ok) = run_cli(vec![
+        "metrics".into(),
+        "--server".into(),
+        format!("http://{addr}"),
+    ])
+    .await;
     assert!(ok, "metrics should succeed; stderr: {stderr}");
     assert!(stdout.contains("foo 7"), "missing metric line: {stdout}");
 }
@@ -167,7 +171,10 @@ async fn kernel_list_success_path_renders_table() {
         stdout.contains("matmul.f32@1.0.0"),
         "missing manifest row: {stdout}"
     );
-    assert!(stdout.contains("publisher=acme"), "missing publisher: {stdout}");
+    assert!(
+        stdout.contains("publisher=acme"),
+        "missing publisher: {stdout}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -344,8 +351,12 @@ async fn oversize_response() -> Response<Body> {
 async fn metrics_rejects_oversize_body() {
     let app = Router::new().route("/metrics", get(oversize_response));
     let (addr, _h) = spawn_test_server(app).await;
-    let (_stdout, stderr, ok) =
-        run_cli(vec!["metrics".into(), "--server".into(), format!("http://{addr}")]).await;
+    let (_stdout, stderr, ok) = run_cli(vec![
+        "metrics".into(),
+        "--server".into(),
+        format!("http://{addr}"),
+    ])
+    .await;
     assert!(!ok, "metrics must fail on an over-cap body");
     assert!(
         stderr.to_lowercase().contains("cap") || stderr.to_lowercase().contains("exceeds"),
