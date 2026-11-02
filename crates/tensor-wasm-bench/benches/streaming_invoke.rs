@@ -81,10 +81,17 @@ fn deploy_start_fn(rt: &tokio::runtime::Runtime, router: &axum::Router) -> Strin
             .body(Body::from(body))
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "create-function must succeed");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "create-function must succeed"
+        );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        v["id"].as_str().expect("create response carries an id").to_string()
+        v["id"]
+            .as_str()
+            .expect("create response carries an id")
+            .to_string()
     })
 }
 

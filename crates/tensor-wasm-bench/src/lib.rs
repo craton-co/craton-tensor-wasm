@@ -743,10 +743,7 @@ mod tests {
         );
         assert_eq!(classify_metric("e2e/healthz/get"), MetricClass::Gated);
         assert_eq!(classify_metric("jit_compile/emit_text"), MetricClass::Gated);
-        assert_eq!(
-            classify_metric("cold_start/capture"),
-            MetricClass::Gated
-        );
+        assert_eq!(classify_metric("cold_start/capture"), MetricClass::Gated);
         // Diagnostic markers.
         assert_eq!(
             classify_metric("dispatch/real_sync/1"),
@@ -765,7 +762,10 @@ mod tests {
             MetricClass::Diagnostic
         );
         // Unknown defaults to diagnostic (fail-open for the gate).
-        assert_eq!(classify_metric("some/brand_new_metric"), MetricClass::Diagnostic);
+        assert_eq!(
+            classify_metric("some/brand_new_metric"),
+            MetricClass::Diagnostic
+        );
     }
 
     #[test]
