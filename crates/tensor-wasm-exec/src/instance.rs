@@ -344,6 +344,7 @@ impl InstanceState {
     /// `Self::deadline` value so a fresh `call_export` (which
     /// re-seeds `deadline = now + d` before calling this) gets the
     /// up-to-date `Instant` propagated through.
+    #[cfg(test)]
     pub(crate) fn rearm_scheduler(&mut self) {
         // Only propagate the absolute `Instant` deadline to the scheduler when
         // the instance was explicitly configured with a per-call deadline
