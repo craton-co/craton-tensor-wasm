@@ -9,10 +9,10 @@ Usage: tensor-wasm snapshot restore [OPTIONS] --input <INPUT> --as-instance <AS_
 Options:
       --input <INPUT>
           Path to the `.tensor-wasm` archive to upload
-      --tenant <TENANT>
-          Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
       --as-instance <AS_INSTANCE>
           Identifier to assign to the restored instance
+      --tenant <TENANT>
+          Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility [default: 0]
       --server <SERVER>
           Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
       --max-archive-bytes <MAX_ARCHIVE_BYTES>

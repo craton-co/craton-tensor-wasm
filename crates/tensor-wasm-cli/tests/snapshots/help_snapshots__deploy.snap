@@ -14,13 +14,13 @@ Options:
       --server <SERVER>
           Base URL of the target TensorWasm server (e.g. `http://localhost:8080`)
 
+      --name <NAME>
+          Tenant-supplied display name. Defaults to the file stem when omitted
+
       --tenant <TENANT>
           Tenant id to advertise on outbound API requests via `X-TensorWasm-Tenant`. Zero (the default) suppresses the header for backwards compatibility
           
           [default: 0]
-
-      --name <NAME>
-          Tenant-supplied display name. Defaults to the file stem when omitted
 
       --output <OUTPUT>
           Output format: `text` (the deployed id printed bare, default) or `json` (a stable machine-readable envelope carrying the deployed id, for scripting / CI).
