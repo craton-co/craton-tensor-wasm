@@ -10,19 +10,19 @@
 //! *logic* around them (size caps, owner checks, bounds checks, rollback on
 //! cap-trip) untestable without hardware.
 //!
-//! This module introduces a thin trait — [`CudaDriver`] — over exactly the
+//! This module introduces a thin trait — `CudaDriver` — over exactly the
 //! driver primitives those paths use. Two implementations exist:
 //!
-//! * [`RealCudaDriver`] (`#[cfg(feature = "cuda")]`) forwards each call to
+//! * `RealCudaDriver` (`#[cfg(feature = "cuda")]`) forwards each call to
 //!   the real `cust::sys` symbol. It is a pure pass-through: the verified
 //!   hardware behaviour is unchanged.
-//! * [`MockCudaDriver`] (always compiled) records every call and returns
+//! * `MockCudaDriver` (always compiled) records every call and returns
 //!   caller-configured verdicts. It lets the default (no-CUDA) test build
 //!   exercise the host-side control flow — including the driver-error and
 //!   cap-rollback branches — with zero hardware.
 //!
 //! The seam is deliberately small: it models a *device pointer* as an
-//! opaque `u64` and a *driver status* as [`SeamStatus`] (success / failure)
+//! opaque `u64` and a *driver status* as `SeamStatus` (success / failure)
 //! rather than re-exporting `cust` types, so the trait and its mock compile
 //! on a no-CUDA host.
 
@@ -54,7 +54,7 @@ impl SeamStatus {
 
 /// The set of CUDA driver primitives the device-memory + launch paths use.
 ///
-/// Every method is infallible at the Rust level (returns a [`SeamStatus`]
+/// Every method is infallible at the Rust level (returns a `SeamStatus`
 /// or a typed result) so the host code can map a driver failure onto the
 /// appropriate [`crate::abi::AbiError`] without panicking.
 pub trait CudaDriver: Send + Sync {
@@ -91,7 +91,7 @@ pub trait CudaDriver: Send + Sync {
     fn pointer_is_managed(&self, ptr: u64) -> Result<bool, SeamStatus>;
 }
 
-/// Pass-through [`CudaDriver`] backed by the real `cust::sys` symbols.
+/// Pass-through `CudaDriver` backed by the real `cust::sys` symbols.
 ///
 /// Only compiled under `--features cuda`. Each method forwards verbatim to
 /// the driver call the host functions previously made inline, so the
@@ -171,7 +171,7 @@ impl CudaDriver for RealCudaDriver {
     }
 }
 
-/// One recorded call against a [`MockCudaDriver`], in call order.
+/// One recorded call against a `MockCudaDriver`, in call order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MockCall {
     /// `mem_alloc(size)`.
@@ -186,7 +186,7 @@ pub enum MockCall {
     IsManaged(u64),
 }
 
-/// In-memory [`CudaDriver`] for unit tests — no hardware required.
+/// In-memory `CudaDriver` for unit tests — no hardware required.
 ///
 /// Hands out monotonically-increasing synthetic device pointers, records
 /// every call, and lets a test force failures (`fail_alloc` / `fail_copy`)
