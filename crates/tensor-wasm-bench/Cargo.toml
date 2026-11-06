@@ -40,10 +40,6 @@ cust = { workspace = true, optional = true }
 # serialisers in `lib.rs` keep their reason to exist); the optional normal-dep
 # alias here is what makes it linkable into a `[[bin]]` target.
 serde_json = { workspace = true, optional = true }
-# pprof flamegraph hook, enabled only under `--features profiling`. Off by
-# default so the standard `cargo bench` path on CI / laptops needs no extra
-# system libs.
-pprof = { version = "0.13", features = ["flamegraph", "criterion"], optional = true }
 
 [dev-dependencies]
 axum = { workspace = true }
@@ -167,9 +163,3 @@ cudarc-backend = []
 # normal dependency so the comparator can parse the result documents. Off by
 # default so `cargo bench` stays serde_json-dev-only. See `src/bin/bench_compare.rs`.
 regression-gate = ["dep:serde_json"]
-# Enables the pprof flamegraph profiler hook for the Criterion benches. Off by
-# default (no extra system libs on the standard path). With it on, a bench can
-# attach `Criterion::with_profiler(...)` to emit flamegraphs to
-# `target/criterion/<bench>/profile/`. See `docs/BENCHMARKING.md` for the
-# capture recipe and the quiet-host protocol the profiles assume.
-profiling = ["dep:pprof"]

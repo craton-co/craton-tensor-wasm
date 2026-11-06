@@ -224,22 +224,13 @@ fn bench_secured_invoke_not_found(c: &mut Criterion) {
     group.finish();
 }
 
-/// Criterion configured with the pprof flamegraph profiler when
-/// `--features profiling` is on, else the default (finding 6). With the
-/// feature enabled, each bench in this file emits a flamegraph under
-/// `target/criterion/<group>/<id>/profile/`. The 100 Hz sampling rate is the
-/// pprof default — high enough to resolve the axum/middleware hot path without
-/// perturbing the measurement materially. See `docs/BENCHMARKING.md` for the
-/// quiet-host protocol the flamegraphs assume.
-#[cfg(feature = "profiling")]
-fn configured_criterion() -> Criterion {
-    Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(
-        100,
-        pprof::criterion::Output::Flamegraph(None),
-    ))
-}
-
-#[cfg(not(feature = "profiling"))]
+/// Criterion configuration shared by every bench in this file (finding 6).
+///
+/// An in-process pprof flamegraph profiler hook was considered, but `pprof`'s
+/// `flamegraph` feature pulls `inferno` (CDDL-1.0), which is outside this
+/// workspace's Apache-2.0 license allowlist enforced by `cargo deny`. Capture
+/// profiles out-of-band instead, per the quiet-host protocol in
+/// `docs/BENCHMARKING.md`.
 fn configured_criterion() -> Criterion {
     Criterion::default()
 }
