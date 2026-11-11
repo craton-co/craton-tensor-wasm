@@ -2027,7 +2027,7 @@ pub fn restore_to_gpu_with(
     bytes: &[u8],
     device_index: u32,
 ) -> Result<RestoredOnGpu> {
-    use cust::memory::UnifiedBuffer;
+    use cust::memory::{MemoryAdvise, UnifiedBuffer};
     use cust::stream::{Stream, StreamFlags};
 
     let snapshot = reader.restore(bytes)?;
@@ -2037,27 +2037,27 @@ pub fn restore_to_gpu_with(
     let mut gpu_buf: UnifiedBuffer<u8> = if snapshot.gpu_memory.is_empty() {
         // SAFETY: capacity 0 -> no allocation, no uninitialised reads possible.
         unsafe { UnifiedBuffer::uninitialized(0) }.map_err(|e| {
-            TensorWasmError::CudaError(format!("UnifiedBuffer::uninitialized(0): {e:?}"))
+            TensorWasmError::CudaError(format!("UnifiedBuffer::uninitialized(0): {e:?}").into())
         })?
     } else {
         UnifiedBuffer::new(&0u8, snapshot.gpu_memory.len())
-            .map_err(|e| TensorWasmError::CudaError(format!("UnifiedBuffer::new: {e:?}")))?
+            .map_err(|e| TensorWasmError::CudaError(format!("UnifiedBuffer::new: {e:?}").into()))?
     };
 
     if !snapshot.gpu_memory.is_empty() {
         gpu_buf.as_mut_slice().copy_from_slice(&snapshot.gpu_memory);
 
-        let device = cust::device::Device::get_device(device_index as i32).map_err(|e| {
-            TensorWasmError::CudaError(format!("Device::get_device({device_index}): {e:?}"))
+        let device = cust::device::Device::get_device(device_index).map_err(|e| {
+            TensorWasmError::CudaError(format!("Device::get_device({device_index}): {e:?}").into())
         })?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)
-            .map_err(|e| TensorWasmError::CudaError(format!("Stream::new: {e:?}")))?;
+            .map_err(|e| TensorWasmError::CudaError(format!("Stream::new: {e:?}").into()))?;
         gpu_buf
             .prefetch_to_device(&stream, &device)
-            .map_err(|e| TensorWasmError::CudaError(format!("prefetch_to_device: {e:?}")))?;
+            .map_err(|e| TensorWasmError::CudaError(format!("prefetch_to_device: {e:?}").into()))?;
         stream
             .synchronize()
-            .map_err(|e| TensorWasmError::CudaError(format!("stream.synchronize: {e:?}")))?;
+            .map_err(|e| TensorWasmError::CudaError(format!("stream.synchronize: {e:?}").into()))?;
     }
 
     Ok(RestoredOnGpu {
