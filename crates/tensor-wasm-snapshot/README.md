@@ -59,3 +59,7 @@ Operators handling snapshots received from untrusted peers (cross-tenant restore
 ## Platform
 
 `tensor-wasm-snapshot` requires a 64-bit target (a `const _: () = assert!(usize::BITS >= 64, ...)` at the crate root enforces this at compile time). The size caps would silently truncate `usize` on 32-bit hosts.
+
+## License
+
+GNU Affero General Public License v3.0 (`AGPL-3.0-only`). See [`LICENSE`](LICENSE) or repository-level [`LICENSE-AGPL`](../../LICENSE-AGPL).

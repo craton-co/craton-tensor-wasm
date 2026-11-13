@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 Craton Software Company
 
 //! Pins commit baf379c: the v3 HMAC input MUST mix the `signature_kind` byte

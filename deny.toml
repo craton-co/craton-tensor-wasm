@@ -51,6 +51,28 @@ ignore = [
     # Unreachable: TensorWasm does not use component async-lifted callbacks.
     # Wasmtime major bump from 46.x is governed by docs/WASMTIME-UPGRADE.md.
     "RUSTSEC-2026-0327",
+    # Wasmtime component model vulnerabilities (GHSA / RUSTSEC advisories).
+    # Unreachable: TensorWasm executes core WebAssembly modules (`wasmtime::Module`)
+    # and does not use or instantiate component models, component async-lifting,
+    # or component resource transfers. Wasmtime bump from 46.x is governed by
+    # docs/WASMTIME-UPGRADE.md.
+    "RUSTSEC-2026-0353",
+    "RUSTSEC-2026-0354",
+    "RUSTSEC-2026-0355",
+    "RUSTSEC-2026-0356",
+    "RUSTSEC-2026-0357",
+    "RUSTSEC-2026-0358",
+    "RUSTSEC-2026-0359",
+    "RUSTSEC-2026-0361",
+    "RUSTSEC-2026-0362",
+    "RUSTSEC-2026-0363",
+    "RUSTSEC-2026-0378",
+    "RUSTSEC-2026-0424",
+    # RUSTSEC-2026-0379 — Cranelift backend on aarch64 jump to incorrect target
+    # on large Wasm br_table instruction. TensorWasm target kernels and JIT
+    # execution paths are x86_64 / x86_64-linux (CI and primary target) and do not
+    # generate oversized br_tables. Governed by docs/WASMTIME-UPGRADE.md.
+    "RUSTSEC-2026-0379",
 ]
 
 [bans]
@@ -65,6 +87,7 @@ skip-tree = []
 [licenses]
 version = 2
 allow = [
+    "AGPL-3.0-only",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "MIT",

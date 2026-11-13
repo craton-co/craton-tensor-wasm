@@ -35,3 +35,7 @@ External crates this crate depends on (pinned at workspace root):
 Internal crate dependencies:
 - `tensor-wasm-core` — shared core types/traits.
 - `tensor-wasm-mem` — memory management primitives.
+
+## License
+
+GNU Affero General Public License v3.0 (`AGPL-3.0-only`). See [`LICENSE`](LICENSE) or repository-level [`LICENSE-AGPL`](../../LICENSE-AGPL).

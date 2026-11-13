@@ -144,6 +144,6 @@ and triage SLO.
 
 ## License
 
-By submitting a contribution you agree it is licensed under the
-[Apache License 2.0](LICENSE), the same terms as the rest of the
-project.
+By submitting a contribution you agree that:
+- Contributions to `tensor-wasm-snapshot` and `tensor-wasm-wasi-gpu` are licensed under the [GNU Affero General Public License v3.0](LICENSE-AGPL).
+- Contributions to all other crates (the Wasmtime fork and core runtime) and the rest of the project are licensed under the [Apache License 2.0](LICENSE).

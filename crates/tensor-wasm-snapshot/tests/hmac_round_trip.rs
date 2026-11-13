@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 Craton Software Company
 
 //! Round-trip test for v3 HMAC-SHA256 signed snapshots.

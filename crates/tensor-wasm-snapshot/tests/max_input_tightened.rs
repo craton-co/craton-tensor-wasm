@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 Craton Software Company
 
 //! T9: pin `limits::MAX_INPUT_BYTES` at the tightened 1 GiB value.
