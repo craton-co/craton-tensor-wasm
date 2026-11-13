@@ -148,22 +148,29 @@ job_cmd() {
 # a single summary; the lane exits non-zero if any job failed.
 make_container_script() {
     local script='set -uo pipefail; rc=0; failed="";'
+    script+='
+run_lane() {'
     local job cmd
     for job in "$@"; do
         cmd="$(job_cmd "${job}")"
         script+="
-printf '\n\033[1;36m===> ci job: %s\033[0m\n' '${job}';
-if ${cmd}; then
-    printf '\033[1;32m===> %s: OK\033[0m\n' '${job}';
-else
-    printf '\033[1;31m===> %s: FAILED\033[0m\n' '${job}'; rc=1; failed=\"\${failed} ${job}\";"
+    printf '\n\033[1;36m===> ci job: %s\033[0m\n' '${job}';
+    if ${cmd}; then
+        printf '\033[1;32m===> %s: OK\033[0m\n' '${job}';
+    else
+        printf '\033[1;31m===> %s: FAILED\033[0m\n' '${job}';
+        printf '### CI_JOB_FAILED: %s ###\n' '${job}';
+        rc=1; failed=\"\${failed} ${job}\";"
         if [[ "${FAIL_FAST}" == "1" ]]; then
-            script+=" exit 1;"
+            script+=" return 1;"
         fi
         script+="
-fi;"
+    fi;"
     done
     script+='
+    return $rc;
+}
+run_lane || true;
 if [[ -n "${failed}" ]]; then
     printf "\n\033[1;31m===> lane FAILED:%s\033[0m\n" "${failed}";
 else
@@ -202,6 +209,7 @@ start_lane() {
     local jobs=("$@")
     [[ ${#jobs[@]} -eq 0 ]] && return 0
     local rcfile="${LANE_TMP}/${name}.rc"
+    local logfile="${LANE_TMP}/${name}.log"
     local script; script="$(make_container_script "${jobs[@]}")"
     echo ">> lane [${name}] (vol ${target_vol}) jobs: ${jobs[*]}"
     {
@@ -217,13 +225,19 @@ start_lane() {
             "${IMAGE}" \
             bash -c "${script}"
         echo "$?" > "${rcfile}"
-    } 2>&1 | while IFS= read -r line; do
-        printf '%b[%s]\033[0m %s\n' "${color}" "${name}" "${line}"
+    } 2>&1 | tee "${logfile}" | while IFS= read -r line; do
+        if [[ ! "${line}" =~ "### CI_JOB_FAILED:" ]]; then
+            printf '%b[%s]\033[0m %s\n' "${color}" "${name}" "${line}"
+        fi
     done &
     LANE_PIDS+=("$!")
     LANE_NAMES+=("${name}")
     LANE_RCFILES+=("${rcfile}")
+    LANE_LOGFILES+=("${logfile}")
+    LANE_JOBS+=("${jobs[*]}")
 }
+
+declare -a LANE_LOGFILES=() LANE_JOBS=()
 
 if [[ "${SERIAL}" == "1" ]]; then
     # Old behaviour: every selected job in one container, one shared cache.
@@ -248,20 +262,43 @@ done
 
 overall=0
 summary=""
+declare -a all_failed_jobs=()
 for i in "${!LANE_NAMES[@]}"; do
     name="${LANE_NAMES[$i]}"
     rc="$(cat "${LANE_RCFILES[$i]}" 2>/dev/null || echo 1)"
-    if [[ "${rc}" == "0" ]]; then
-        summary+=$'\n'"   [${name}] OK"
+    logfile="${LANE_LOGFILES[$i]}"
+    lane_jobs="${LANE_JOBS[$i]}"
+    lane_failed=()
+    if [[ -f "${logfile}" ]]; then
+        while IFS= read -r fline; do
+            if [[ "${fline}" =~ "### CI_JOB_FAILED: "([a-zA-Z0-9_-]+) ]]; then
+                lane_failed+=("${BASH_REMATCH[1]}")
+                all_failed_jobs+=("${BASH_REMATCH[1]} (lane: ${name})")
+            fi
+        done < "${logfile}"
+    fi
+
+    if [[ "${rc}" == "0" && ${#lane_failed[@]} -eq 0 ]]; then
+        summary+=$'\n'"   [${name}] OK: ${lane_jobs}"
     else
-        summary+=$'\n'"   [${name}] FAILED (rc=${rc})"
         overall=1
+        if [[ ${#lane_failed[@]} -gt 0 ]]; then
+            summary+=$'\n'"   [${name}] FAILED (rc=${rc}): ${lane_failed[*]}"
+        else
+            summary+=$'\n'"   [${name}] FAILED (rc=${rc})"
+            all_failed_jobs+=("unknown (lane: ${name}, rc=${rc})")
+        fi
     fi
 done
 
 if [[ "${overall}" == "0" ]]; then
-    printf '\n\033[1;32m===> CI OK (all lanes passed)\033[0m%s\n' "${summary}"
+    printf '\n\033[1;32m===> CI OK (all lanes passed)\033[0m\n'
 else
-    printf '\n\033[1;31m===> CI FAILED\033[0m%s\n' "${summary}"
+    printf '\n\033[1;31m===> CI FAILED\033[0m\n'
+    printf '\033[1;31mFailed jobs:\033[0m\n'
+    for fj in "${all_failed_jobs[@]}"; do
+        printf '\033[1;31m   - %s\033[0m\n' "${fj}"
+    done
 fi
+printf '\nLane summary:%s\n' "${summary}"
 exit "${overall}"

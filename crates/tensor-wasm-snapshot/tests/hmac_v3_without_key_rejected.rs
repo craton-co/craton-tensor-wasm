@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 Craton Software Company
 
 //! A signed v3 snapshot cannot be restored by a reader that has no HMAC key.

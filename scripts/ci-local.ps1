@@ -117,18 +117,23 @@ function Build-LaneScript([string[]]$laneJobs) {
     $q  = [char]34  # " — avoids confusing PowerShell's own string parser
     $nl = "`n"
     $s  = "set -uo pipefail${nl}rc=0${nl}failed=${q}${q}${nl}"
+    $s += "run_lane() {${nl}"
     foreach ($job in $laneJobs) {
         $cmd = Get-JobCmd $job
-        $s += "printf ${q}\n\033[1;36m===> ci job: $job\033[0m\n${q}${nl}"
-        $s += "if $cmd; then${nl}"
-        $s += "    printf ${q}\033[1;32m===> $($job): OK\033[0m\n${q}${nl}"
-        $s += "else${nl}"
-        $s += "    printf ${q}\033[1;31m===> $($job): FAILED\033[0m\n${q}${nl}"
-        $s += "    rc=1${nl}"
-        $s += "    failed=${q}`$failed $job${q}${nl}"
-        if ($FailFast) { $s += "    exit 1${nl}" }
-        $s += "fi${nl}"
+        $s += "    printf ${q}\n\033[1;36m===> ci job: $job\033[0m\n${q}${nl}"
+        $s += "    if $cmd; then${nl}"
+        $s += "        printf ${q}\033[1;32m===> $($job): OK\033[0m\n${q}${nl}"
+        $s += "    else${nl}"
+        $s += "        printf ${q}\033[1;31m===> $($job): FAILED\033[0m\n${q}${nl}"
+        $s += "        printf ${q}### CI_JOB_FAILED: $($job) ###\n${q}${nl}"
+        $s += "        rc=1${nl}"
+        $s += "        failed=${q}`$failed $job${q}${nl}"
+        if ($FailFast) { $s += "        return 1${nl}" }
+        $s += "    fi${nl}"
     }
+    $s += "    return `$rc${nl}"
+    $s += "}${nl}"
+    $s += "run_lane || true${nl}"
     $s += "if [ -n ${q}`$failed${q} ]; then${nl}"
     $s += "    printf ${q}\n\033[1;31m===> lane FAILED: %s\033[0m\n${q} ${q}`$failed${q}${nl}"
     $s += "else${nl}"
@@ -201,7 +206,7 @@ foreach ($lane in $laneDefs) {
     Write-Host ">> lane [$($lane.Name)] (vol $($lane.Vol)) jobs: $($lane.Jobs -join ', ')"
     $bg = Start-Job -Name "ci-$($lane.Name)" -ScriptBlock $laneBody `
         -ArgumentList $laneScript, $RepoRoot, $lane.Vol, $CargoVolume, $Image, $logFile
-    $started += [pscustomobject]@{ Name = $lane.Name; Job = $bg; Log = $logFile }
+    $started += [pscustomobject]@{ Name = $lane.Name; Job = $bg; Log = $logFile; Jobs = $lane.Jobs }
 }
 
 # Wait for every lane, then print each lane's captured output and tally.
@@ -209,22 +214,40 @@ $started.Job | Wait-Job | Out-Null
 
 $overall = 0
 $summary = @()
+$failedJobsAll = @()
 foreach ($entry in $started) {
     Write-Host ""
     Write-Host "==== lane [$($entry.Name)] output ====" -ForegroundColor Cyan
+    $laneFailedJobs = @()
     if (Test-Path $entry.Log) {
-        Get-Content $entry.Log | ForEach-Object { Write-Host $_ }
+        Get-Content $entry.Log | ForEach-Object {
+            if ($_ -match '### CI_JOB_FAILED:\s*(\S+)\s*###') {
+                $laneFailedJobs += $Matches[1]
+            }
+            else {
+                Write-Host $_
+            }
+        }
     }
     $rc = Receive-Job $entry.Job | Select-Object -Last 1
     Remove-Job $entry.Job -Force | Out-Null
     if (Test-Path $entry.Log) { Remove-Item $entry.Log -Force -ErrorAction SilentlyContinue }
     if ($null -eq $rc) { $rc = 1 }
-    if ([int]$rc -eq 0) {
-        $summary += "   [$($entry.Name)] OK"
+    if ([int]$rc -eq 0 -and $laneFailedJobs.Count -eq 0) {
+        $summary += "   [$($entry.Name)] OK: $($entry.Jobs -join ', ')"
     }
     else {
-        $summary += "   [$($entry.Name)] FAILED (rc=$rc)"
         $overall = 1
+        if ($laneFailedJobs.Count -gt 0) {
+            $summary += "   [$($entry.Name)] FAILED (rc=$rc): $($laneFailedJobs -join ', ')"
+            foreach ($fj in $laneFailedJobs) {
+                $failedJobsAll += [pscustomobject]@{ Job = $fj; Lane = $entry.Name }
+            }
+        }
+        else {
+            $summary += "   [$($entry.Name)] FAILED (rc=$rc)"
+            $failedJobsAll += [pscustomobject]@{ Job = "unknown (container exit $rc)"; Lane = $entry.Name }
+        }
     }
 }
 
@@ -234,6 +257,12 @@ if ($overall -eq 0) {
 }
 else {
     Write-Host '===> CI FAILED' -ForegroundColor Red
+    Write-Host 'Failed jobs:' -ForegroundColor Red
+    foreach ($item in $failedJobsAll) {
+        Write-Host "   - $($item.Job) (lane: $($item.Lane))" -ForegroundColor Red
+    }
 }
+Write-Host ''
+Write-Host 'Lane summary:'
 $summary | ForEach-Object { Write-Host $_ }
 exit $overall

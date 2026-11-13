@@ -16,7 +16,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.78"
 license = "Apache-2.0"
@@ -32,15 +32,15 @@ repository = "https://github.com/craton-co/craton-tensor-wasm"
 # (required by crates.io publish) are specified. Member crates reference these
 # via `tensor-wasm-foo = { workspace = true }`. `tensor-wasm-cli` and
 # `tensor-wasm-bench` are `publish = false`, so they are intentionally omitted.
-tensor-wasm-core = { path = "crates/tensor-wasm-core", version = "0.4.0" }
-tensor-wasm-mem = { path = "crates/tensor-wasm-mem", version = "0.4.0" }
-tensor-wasm-exec = { path = "crates/tensor-wasm-exec", version = "0.4.0" }
-tensor-wasm-wasi-gpu = { path = "crates/tensor-wasm-wasi-gpu", version = "0.4.0" }
-tensor-wasm-jit = { path = "crates/tensor-wasm-jit", version = "0.4.0" }
-tensor-wasm-snapshot = { path = "crates/tensor-wasm-snapshot", version = "0.4.0" }
-tensor-wasm-artifacts = { path = "crates/tensor-wasm-artifacts", version = "0.4.0" }
-tensor-wasm-tenant = { path = "crates/tensor-wasm-tenant", version = "0.4.0" }
-tensor-wasm-api = { path = "crates/tensor-wasm-api", version = "0.4.0" }
+tensor-wasm-core = { path = "crates/tensor-wasm-core", version = "0.5.0" }
+tensor-wasm-mem = { path = "crates/tensor-wasm-mem", version = "0.5.0" }
+tensor-wasm-exec = { path = "crates/tensor-wasm-exec", version = "0.5.0" }
+tensor-wasm-wasi-gpu = { path = "crates/tensor-wasm-wasi-gpu", version = "0.5.0" }
+tensor-wasm-jit = { path = "crates/tensor-wasm-jit", version = "0.5.0" }
+tensor-wasm-snapshot = { path = "crates/tensor-wasm-snapshot", version = "0.5.0" }
+tensor-wasm-artifacts = { path = "crates/tensor-wasm-artifacts", version = "0.5.0" }
+tensor-wasm-tenant = { path = "crates/tensor-wasm-tenant", version = "0.5.0" }
+tensor-wasm-api = { path = "crates/tensor-wasm-api", version = "0.5.0" }
 
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
@@ -127,10 +127,10 @@ zstd = "0.13"
 
 # Concurrency utilities
 dashmap = "6"
-# lru: bumped 0.12 -> 0.16.3 to clear RUSTSEC-2026-0002 (unsound `IterMut`
-# Stacked-Borrows violation; fixed in >=0.16.3). TensorWasm only uses
-# `LruCache::new`/`get`/`put` (never `iter_mut`), so the upgrade is API-compatible.
-lru = "0.16.3"
+# lru: bumped to >=0.18.2 to clear RUSTSEC-2026-0002 and RUSTSEC-2026-0253 (unsound
+# `LruCache::pop()` panic safety). TensorWasm only uses
+# `LruCache::new`/`get`/`put`, so the upgrade is API-compatible.
+lru = "0.18.2"
 parking_lot = "0.12"
 once_cell = "1"
 crossbeam-channel = "0.5"

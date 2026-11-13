@@ -19,7 +19,7 @@ Slide breaks are `---`. Speaker notes are HTML comments.
 
 Untrusted WebAssembly + explicit GPU dispatch + multi-tenant isolation +
 production observability — all in one runtime, sandboxed by Wasmtime, hot-pathed
-by CUDA, and shipped as Apache-2.0 source.
+by CUDA, and shipped as open source (Apache-2.0 / AGPLv3).
 
 - Run any `.wasm` module that fits WASI Preview 2
 - Talk to the GPU through a typed `wasi:cuda` host interface
@@ -303,8 +303,9 @@ A: Out of scope for v1.0 by explicit decision (PATH-TO-V1.md "Anti-goals").
 v2.x research item.
 
 **Q: What's the license?**
-A: Apache-2.0. Commercial use, modification, redistribution, sublicensing
-all permitted. `LICENSE` + `NOTICE` at repo root. Trademark policy is
+A: Split-licensed. Apache-2.0 for the Wasmtime fork and core runtime (`LICENSE`),
+and AGPLv3 for `tensor-wasm-snapshot` (<150ms cold start) and `tensor-wasm-wasi-gpu` orchestration (`LICENSE-AGPL`).
+`LICENSE` + `LICENSE-AGPL` + `NOTICE` at repo root. Trademark policy is
 permissive — see `docs/TRADEMARK.md`.
 
 **Q: Who's behind it?**
