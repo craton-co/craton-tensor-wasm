@@ -90,7 +90,7 @@ pliron = { version = "0.15", optional = true }
 # `PtxError::NotYetWired("twasm_to_llvm_dialect")` from the stage. W4.x
 # is the layer that pulls in pliron-llvm on a CI image with the LLVM
 # toolchain pre-installed.
-pliron-llvm = { version = "0.15", optional = true }
+pliron-llvm = { version = "0.16", optional = true }
 
 # Signed kernel registry (roadmap feature #3 scaffold). All four crates
 # are off by default — they only get pulled in when the
