@@ -29,7 +29,7 @@ cust = { workspace = true, optional = true }
 # constant-time equality check used to compare the trailing 32-byte
 # signature against the recomputed HMAC.
 hmac = { version = "0.12", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 subtle = { version = "2", optional = true }
 # Ed25519 asymmetric snapshot signing (v3 wire format, signature_kind = 2).
 # A publisher signs with a private `SigningKey`; many verifiers hold only the
